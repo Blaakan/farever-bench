@@ -516,6 +516,11 @@ export function buildCombat(cdb, ctx) {
            'runes gate a step or override a prop. But 72 of those talents DO ship an hscript body, and ' +
            'between them those scripts call only 63 names - about 39 real host functions once the hooks ' +
            'and built-ins are removed. The gap is the script kernel, not missing data. `bench talents`.' },
+    { severity: 'assumption', what: 'every step of a granted status is counted, including script-gated ones',
+      why: 'Priest_Talent_Sunlight_Status declares a Damage step AND an AreaDamage step, and its script only ' +
+           'plays the second when Priest_Talent_SunHalo is also taken. Nothing in the step row says so, so ' +
+           'the status reads as 1.2x Faith rather than 0.6x unless SunHalo is in the build. A talent that ' +
+           'grants a status can therefore be overstated by whatever its conditional steps add.' },
     { severity: 'assumption', what: 'charged skills are evaluated at full charge',
       why: 'Steps gated on cond.castHoldStep are mutually exclusive charge levels; the highest is used.' },
     { severity: 'unmodelled', what: 'runes (skill masteries) and talents',

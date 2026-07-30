@@ -798,6 +798,69 @@ group('rarity ceilings');
   }
 }
 
+
+// --- the texts.refs trap ---------------------------------------------------
+// `texts.refs.ref` fills ::ref_name:: and ::ref_dmg:: in a description, so it
+// points at whatever the text MENTIONS - not at something the talent grants.
+// 13 Rogue talents reference Rogue_Talent_LethalPoison_Status because they
+// MODIFY it. Following it for value would count one status's damage thirteen
+// times, and would take "readable" from 24 to 59 - a big, wrong, flattering
+// number. This asserts the tool keeps refusing it.
+group('talent links');
+{
+  const engine = createEngine();
+  const T = engine.talents;
+  const sk = cdb.byId('skill');
+
+  // The real link: a Status step applies its status, and that is where
+  // Sunlight's damage comes from.
+  const sun = T.readableValue('Priest_Talent_Sunlight');
+  ok('Priest_Talent_Sunlight is readable through its Status step', sun.readable, sun.kind);
+  ok('and it resolves to the Sunlight status',
+    sun.granted.includes('Priest_Talent_Sunlight_Status'), JSON.stringify(sun.granted));
+  ok('whose damage scales off Faith',
+    sun.effects.some((e) => e.scaling.some((s) => s.atb === 'Faith')),
+    JSON.stringify(sun.effects.map((e) => e.scaling)));
+
+  // The trap: many talents share one texts.refs target.
+  const byRef = new Map();
+  for (const c of engine.cat.classes) {
+    for (const n of T.treeFor(c.unit).nodes) {
+      const r = sk.get(n.skill)?.texts?.refs?.ref;
+      if (!r) continue;
+      byRef.set(r, (byRef.get(r) ?? 0) + 1);
+    }
+  }
+  const worst = [...byRef.entries()].sort((a, b) => b[1] - a[1])[0];
+  ok('several talents share one texts.refs target', worst && worst[1] > 5,
+    worst ? `${worst[0]} is referenced by ${worst[1]}` : 'none found');
+
+  // So a talent that only MENTIONS a status must stay unreadable.
+  const mentioners = [];
+  for (const c of engine.cat.classes) {
+    for (const n of T.treeFor(c.unit).nodes) {
+      const s = sk.get(n.skill);
+      const ref = s?.texts?.refs?.ref;
+      if (!ref || ref === n.skill) continue;
+      const grantsIt = (s.steps ?? []).some((st) => st.props?.status?.ref === ref)
+        || (s.props?.subskills ?? []).some((x) => x.skill === ref);
+      if (grantsIt) continue;
+      const v = T.readableValue(n.skill);
+      if (v.granted.includes(ref)) mentioners.push(`${n.skill} credited with ${ref}`);
+    }
+  }
+  ok('a talent that only mentions a status is never credited with it',
+    mentioners.length === 0, mentioners.slice(0, 3).join('; '));
+
+  // And the headline count stays honest.
+  let readable = 0, total = 0;
+  for (const c of engine.cat.classes) {
+    for (const n of T.treeFor(c.unit).nodes) { total++; if (T.readableValue(n.skill).readable) readable++; }
+  }
+  ok('readable talent count is in the low twenties, not the high fifties',
+    readable > 20 && readable < 35, `${readable} of ${total} - if this jumped, texts.refs is being followed`);
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

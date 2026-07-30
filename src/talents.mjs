@@ -16,10 +16,25 @@
 // a 16-point build can reach tier 4 in one branch (8 spent) with 8 left over,
 // or spread across two.
 //
-// A DemonSigil grants one tier-4 talent outright, so equipping one is 16 points
-// plus that node already slotted - and it does not consume a point, nor does it
-// count toward its branch's thresholds unless the game says so, which it does
-// not say anywhere readable. Treated as slotted-and-free, and flagged.
+// A DemonSigil grants one tier-4 talent outright: 16 points PLUS that node
+// already slotted. Confirmed in game - it costs no point, and no point may be
+// spent on that talent afterwards even where the thresholds would allow it,
+// because it is already yours. Whether it counts toward its branch's
+// thresholds is untestable today: it is always a tier-4 node and there is no
+// tier 5 for it to unlock. Treated as not counting, which is the conservative
+// reading.
+//
+// The tree ROOT costs a point, also confirmed, and it is the way in - nothing
+// else in the tree is reachable without it.
+//
+// One worked example of what a purely-scripted node is doing, so the shape is
+// on record. Priest_Talent_SolarDevotion says "You can trigger [Sunlight]
+// effects without consuming it anymore". Sunlight is a buff that is normally
+// CONSUMED by the next final combo attack to deal extra damage; the talent
+// stops the consumption so the buff persists. Nothing in the status row
+// expresses "consumed on trigger" - that lives in the script layer, which is
+// exactly why the kernel is the thing standing between this model and the
+// other 64 nodes.
 //
 // HOW MUCH OF IT CAN BE SCORED IS THE PROBLEM.
 //
@@ -67,18 +82,19 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
   const thresholds = cdb.constantFloats('Talents_TierThresholds');
   const unlockLevel = cdb.constant('UnlockLevel_Talents');
 
-  // Points available. The game declares the unlock level but nowhere declares
-  // the rate, so this is the one number that has to be told to us - the caller
-  // passes it and the default is the observed 16 at the level cap.
+  // Points available. The unlock level is declared; the rate is not, so the
+  // total is the one number that had to be told to us: 16 at the current cap,
+  // confirmed in game.
+  //
+  // Deliberately NOT interpolated for the levels in between. A half-built tree
+  // is not what anyone gears against, and a made-up rate would be a number this
+  // tool invented sitting in a column next to numbers it read. Below the unlock
+  // level you have none; at or above it you get the full allowance.
+  // `--talent-points` overrides if a partial build is what you want to see.
   const DEFAULT_POINTS_AT_CAP = 16;
   function pointsAt(level, override = null) {
     if (override != null) return override;
-    if (level < unlockLevel) return 0;
-    // Linear between the unlock level and the cap, which reproduces 16 at 25
-    // and 0 at 10. Stated as an assumption because no constant says it.
-    const cap = ctx.consts.maxLevel;
-    if (level >= cap) return DEFAULT_POINTS_AT_CAP;
-    return Math.floor(DEFAULT_POINTS_AT_CAP * (level - unlockLevel) / (cap - unlockLevel));
+    return level < unlockLevel ? 0 : DEFAULT_POINTS_AT_CAP;
   }
 
   // Tier N is gated on tierThreshold(N) points already spent in that branch.
@@ -122,11 +138,27 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     const prof = combat.profile(skillId, 3);
     const affixes = (s?.affixes ?? []).filter((a) => a.target?.attribute);
     const buffs = plan.selfBuffsOf(skillId);
-    // `props.subskills` is how a talent hands you a whole new skill - the two
-    // Mage conduit talents declare nothing themselves and grant
-    // Mage_Talent_Conduit*_Conduit through this field. Following it is the
-    // difference between "unreadable" and "adds a conduit that does X".
-    const granted = (s?.props?.subskills ?? []).map((x) => x.skill).filter(Boolean);
+    // Two data links hand a talent something it does not declare itself, and
+    // one tempting third that must NOT be followed.
+    //
+    //   props.subskills          - the Mage conduit talents grant a whole skill
+    //   steps[].props.status.ref - a Status step APPLIES that status, which is
+    //                              how Priest_Talent_Sunlight comes to be worth
+    //                              0.6x Faith Light damage on a 6s buff
+    //
+    // NOT texts.refs.ref. That is the placeholder that fills ::ref_name:: and
+    // ::ref_dmg:: in a description, so it points at whatever the text MENTIONS.
+    // 13 different Rogue talents reference Rogue_Talent_LethalPoison_Status and
+    // 11 Priest talents reference Priest_Talent_Sunlight_Status - they modify
+    // it, they do not each grant it. Following it would count one status's
+    // damage thirteen times and would take "readable" from 24 to 59, which is
+    // exactly the kind of large, wrong, flattering number worth refusing.
+    const granted = [
+      ...(s?.props?.subskills ?? []).map((x) => x.skill),
+      ...(s?.steps ?? [])
+        .filter((st) => st.props?.status?.ref)
+        .map((st) => st.props.status.ref),
+    ].filter((x, i, arr) => x && arr.indexOf(x) === i);
     const effects = [...(prof?.effects ?? [])];
     for (const g of granted) {
       const gp = combat.profile(g, 3);
@@ -228,9 +260,25 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       .reduce((sum, n) => sum + weight(n.skill), 0);
 
     const taken = new Set(picked);
+
+    // The root costs a point, and it is the way in. Confirmed in game: it is a
+    // node like any other, tier 0 in its own Root branch, and you pay for it.
+    // Taken first because nothing else in the tree is reachable without it.
+    const rootNode = tree.nodes.find((n) => n.tier === 0);
+    if (rootNode && !taken.has(rootNode.skill) && spent < budget) {
+      picked.push(rootNode.skill);
+      taken.add(rootNode.skill);
+      if (!readableValue(rootNode.skill).readable) blind.push(rootNode.skill);
+      perBranch.set(rootNode.branchIndex, (perBranch.get(rootNode.branchIndex) ?? 0) + 1);
+      spent++;
+    }
+
     while (spent < budget) {
       const legal = tree.nodes.filter((n) => {
         if (taken.has(n.skill)) return false;
+        // A talent a sigil handed you cannot also be bought, even where the
+        // thresholds would allow it - confirmed in game. It is already yours.
+        if (granted.has(n.skill)) return false;
         return (perBranch.get(n.branchIndex) ?? 0) >= tierThreshold(n.tier);
       });
       if (!legal.length) break;
