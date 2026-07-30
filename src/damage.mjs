@@ -1,0 +1,343 @@
+// ---------------------------------------------------------------------------
+// damage.mjs - turning a stat sheet into throughput, and a target to aim at.
+//
+// Every point of damage, healing and shielding in the game is emitted by a
+// `skill.steps[].effects[]` entry:
+//
+//   { effect: Damage|Heal|Shield|GainAtb|Status,
+//     affinity, baseVal, scaling: [{ ratio, atb, conds }], dynVal, flags }
+//
+// so the coefficient table is shipped and needs no guessing:
+//
+//   amount = baseVal + SUM(ratio * attributeValue(atb))
+//
+// What is NOT shipped is the composition order that turns that into a number
+// on screen - `ent.Unit.applyDamage` (findex 4835) and `computeDamage` (4841)
+// are still undisassembled. Three consequences, all of them visible in the
+// audit this module returns rather than hidden:
+//
+//   * Fervor's offensive half lands on no attribute. Its own description says
+//     it "increases the damage, healing and shielding of your Skills", but
+//     `DamageModifier.scaling` is empty and nothing in the sheet takes a
+//     scaling entry from Fervor except DamageTakenModifier (-0.5),
+//     HealGivenMultiplier (+1) and ShieldPowerMultiplier (+1). So the
+//     offensive half is a code-only path, modelled here as a multiplier and
+//     flagged UNVERIFIED.
+//   * PhysicalMastery and MagicMastery are the same shape of hole. They are
+//     also zero from every source this build ships, so the assumption is
+//     currently inert.
+//   * WeaponPower has no scaling entry and no atbScaling group, so it must be
+//     set from the equipped weapon. The model derives it from the weapon's own
+//     share of the primary budget, which is consistent with
+//     `WeaponPowerRatio`'s description, and flags it UNVERIFIED.
+//
+// Because absolute numbers rest on those three, the CLI reports throughput as
+// a relative score and refuses to call it DPS.
+// ---------------------------------------------------------------------------
+
+import { budget, resistForReduction, damageReduction } from './model.mjs';
+
+// Skill types that a player actually presses for damage.
+const FILLER_TYPES = new Set(['Attack', 'Attack2', 'Attack3', 'Attack4', 'AttackCombo']);
+const COOLDOWN_TYPES = new Set(['WeaponSkill', 'WeaponSubSkill', 'ClassSkill', 'SignatureSkill', 'Skill', 'Secondary']);
+
+export function buildCombat(cdb, ctx) {
+  const skills = cdb.byId('skill');
+  const affinities = cdb.byId('affinity');
+  const effectNames = cdb.enumValues('skill@steps@effects', 'effect');
+  const skillTypeNames = cdb.enumValues('skill', 'type');
+  const skillNatureNames = cdb.enumValues('skill', 'nature');
+
+  // An affinity's mitigation contract, inherited from the nearest ancestor
+  // that declares one. All 14 magic sub-schools are empty in this build, so in
+  // practice there are exactly three paths: Raw, Physical, Magic.
+  const affinityCache = new Map();
+  function affinityOf(id) {
+    if (!id) return { root: 'Raw', resist: null, pen: null, flat: [] };
+    let hit = affinityCache.get(id);
+    if (hit) return hit;
+    let resist = null, pen = null, flat = [], root = id;
+    for (let cur = affinities.get(id); cur; ) {
+      root = cur.id;
+      if (!resist && (cur.resistances ?? []).length) resist = cur.resistances[0].atb;
+      if (!pen && (cur.resistPen ?? []).length) pen = cur.resistPen[0].atb;
+      if (!flat.length && (cur.reductions ?? []).length) flat = cur.reductions.map((r) => r.atb);
+      cur = cur.parent ? affinities.get(cur.parent) : null;
+    }
+    hit = { root, resist, pen, flat };
+    affinityCache.set(id, hit);
+    return hit;
+  }
+
+  // A number field that may instead hold a vars key (about 60 sites do).
+  const num = (v, fallback = 0) => (typeof v === 'number' ? v : fallback);
+
+  // How long the actor is committed to a cast. There is no player global
+  // cooldown - `getSkillRecoveryTime` exists exactly once in the bytecode, as
+  // ent.Foe.getSkillRecoveryTime - so occupancy is the step DAG's own span
+  // plus a recovery window, and attacks recover four times faster.
+  function occupancyOf(skill, typeName) {
+    let end = 0;
+    for (const st of skill.steps ?? []) {
+      const t = num(st.delay) + num(st.duration);
+      if (t > end) end = t;
+    }
+    end = Math.max(end, num(skill.duration), 0.1);
+    const ratio = FILLER_TYPES.has(typeName) ? ctx.consts.attacksRecoveryRatio : 1;
+    return end + ctx.consts.skillRecoveryTime * ratio;
+  }
+
+  // Flatten a skill into the shape the objective needs. Rank gates on effects
+  // and steps are resolved against the weapon-skill rank the caller assumes.
+  const profileCache = new Map();
+  function profile(skillId, rank) {
+    const key = skillId + '@' + rank;
+    let p = profileCache.get(key);
+    if (p) return p;
+    const s = skills.get(skillId);
+    if (!s) return null;
+
+    const typeName = skillTypeNames[s.type ?? -1] ?? null;
+    const natureName = skillNatureNames[s.nature ?? -1] ?? null;
+    const effects = [];
+    for (const st of s.steps ?? []) {
+      const c = st.cond ?? {};
+      if (c.minRank != null && rank < c.minRank) continue;
+      if (c.maxRank != null && rank > c.maxRank) continue;
+      if (c.equalRank != null && rank !== c.equalRank) continue;
+      for (const e of st.effects ?? []) {
+        const kind = effectNames[e.effect ?? -1] ?? null;
+        if (!kind) continue;
+        const scaling = [];
+        for (const sc of e.scaling ?? []) {
+          const cc = sc.conds ?? {};
+          if (cc.minRank != null && rank < cc.minRank) continue;
+          if (cc.maxRank != null && rank > cc.maxRank) continue;
+          if (cc.equalRank != null && rank !== cc.equalRank) continue;
+          if (sc.atb) scaling.push({ atb: sc.atb, ratio: num(sc.ratio) });
+        }
+        effects.push({
+          kind,
+          affinity: e.affinity ?? null,
+          baseVal: num(e.baseVal),
+          scaling,
+          hasDynVal: (e.dynVal ?? 0) !== 0,
+          scaleWithStacks: !!((e.flags ?? 0) & 1),
+        });
+      }
+    }
+
+    p = {
+      id: skillId,
+      name: s.texts?.name ?? skillId,
+      type: typeName,
+      nature: natureName,
+      cooldown: num(s.cooldown),
+      occupancy: occupancyOf(s, typeName),
+      effects,
+      hasScript: !!s.script,
+      isFiller: FILLER_TYPES.has(typeName),
+      isCooldown: COOLDOWN_TYPES.has(typeName),
+    };
+    profileCache.set(key, p);
+    return p;
+  }
+
+  // --- reference targets ---------------------------------------------------
+  // A target is fully described by the damage reduction it is meant to have at
+  // the attacker's level: feeding resistForReduction back through the forward
+  // formula returns exactly that fraction at zero penetration. The default
+  // comes from the game's own `Armor_ExpectedReduction` constant, so it is the
+  // designers' reference and not one this tool invented.
+  const expected = cdb.constant('Armor_ExpectedReduction');
+  const FOES = {
+    dummy: { name: 'dummy (no mitigation)', physReduction: 0, magicReduction: 0 },
+    reference: { name: `reference (Armor_ExpectedReduction ${expected})`, physReduction: expected, magicReduction: expected },
+    armoured: { name: 'armoured (2x reference)', physReduction: Math.min(0.9, expected * 2), magicReduction: Math.min(0.9, expected * 2) },
+  };
+
+  function foe(name, level) {
+    const f = FOES[name];
+    if (!f) throw new Error(`unknown target "${name}". Known: ${Object.keys(FOES).join(', ')}`);
+    return {
+      ...f,
+      level,
+      armor: resistForReduction(level, f.physReduction, ctx.consts.resistFormula),
+      magicArmor: resistForReduction(level, f.magicReduction, ctx.consts.resistFormula),
+    };
+  }
+
+  // --- one cast ------------------------------------------------------------
+  function amountOf(effect, sheet) {
+    let a = effect.baseVal;
+    for (const s of effect.scaling) a += s.ratio * (sheet.get(s.atb) ?? 0);
+    return a;
+  }
+
+  function mitigate(effect, sheet, target) {
+    const aff = affinityOf(effect.affinity);
+    if (aff.root === 'Raw' || !aff.resist) return 1;
+    const resist = aff.resist === 'MagicArmor' ? target.magicArmor : target.armor;
+    const pen = aff.pen ? (sheet.get(aff.pen) ?? 0) : 0;
+    const red = damageReduction({
+      resist,
+      penetrationPct: pen,
+      attackerLevel: target.level,
+      flatReduction: 0, // the target's own flat reductions; a reference foe has none
+      formula: ctx.consts.resistFormula,
+    });
+    return Math.max(0, 1 - red);
+  }
+
+  /**
+   * Expected output of one cast, split by effect kind.
+   * `opts.assume` toggles the three unverified multipliers.
+   */
+  function castOutput(prof, sheet, target, opts) {
+    const critChance = Math.min(1, Math.max(0, (sheet.get('CritChance') ?? 0) / 100));
+    const critMult = 1 + critChance * ((sheet.get('CritDamage') ?? 100) / 100 - 1);
+    const dmgMod = (sheet.get('DamageModifier') ?? 100) / 100;
+    const healMod = (sheet.get('HealGivenMultiplier') ?? 100) / 100;
+    const shieldMod = (sheet.get('ShieldPowerMultiplier') ?? 100) / 100;
+    const fervor = (sheet.get('Fervor') ?? 0) / 100;
+    const physMastery = (sheet.get('PhysicalMastery') ?? 0) / 100;
+    const magicMastery = (sheet.get('MagicMastery') ?? 0) / 100;
+
+    let damage = 0, heal = 0, shield = 0;
+    for (const e of prof.effects) {
+      const raw = amountOf(e, sheet);
+      if (!raw) continue;
+      if (e.kind === 'Damage') {
+        const aff = affinityOf(e.affinity);
+        let m = dmgMod * critMult * mitigate(e, sheet, target);
+        if (opts.assume.fervorDamage) m *= 1 + fervor;
+        if (opts.assume.mastery) {
+          if (aff.root === 'Physical') m *= 1 + physMastery;
+          else if (aff.root === 'Magic') m *= 1 + magicMastery;
+        }
+        damage += raw * m;
+      } else if (e.kind === 'Heal') {
+        heal += raw * healMod;
+      } else if (e.kind === 'Shield') {
+        shield += raw * shieldMod;
+      }
+    }
+    return { damage, heal, shield };
+  }
+
+  // --- throughput ----------------------------------------------------------
+  /**
+   * A filler-plus-cooldowns rotation. Cooldown skills are assumed to be used
+   * on cooldown; whatever time is left goes to the base-attack chain. This is
+   * a priority list with no conditions, which is exactly as much player model
+   * as can be justified without a measured occupancy log.
+   */
+  function throughput(profs, sheet, target, opts) {
+    const cdr = 1 + (sheet.get('CooldownReduction') ?? 0) / 100;
+    let busy = 0;
+    const lines = [];
+    let dps = 0, hps = 0, sps = 0;
+
+    const fillers = profs.filter((p) => p.isFiller);
+    const cds = profs.filter((p) => p.isCooldown && p.cooldown > 0);
+
+    for (const p of cds) {
+      const out = castOutput(p, sheet, target, opts);
+      if (!out.damage && !out.heal && !out.shield) continue;
+      const effCd = Math.max(p.cooldown / cdr, p.occupancy);
+      const share = p.occupancy / effCd;
+      busy += share;
+      dps += out.damage / effCd;
+      hps += out.heal / effCd;
+      sps += out.shield / effCd;
+      lines.push({ id: p.id, name: p.name, kind: 'cooldown', perCast: out, interval: effCd, share });
+    }
+
+    // The whole chain is one cycle: you cannot press swing 3 without 1 and 2.
+    let chainDmg = 0, chainHeal = 0, chainShield = 0, chainTime = 0;
+    for (const p of fillers) {
+      const out = castOutput(p, sheet, target, opts);
+      chainDmg += out.damage;
+      chainHeal += out.heal;
+      chainShield += out.shield;
+      chainTime += p.occupancy;
+    }
+    const idle = Math.max(0, 1 - busy);
+    if (chainTime > 0) {
+      dps += (chainDmg / chainTime) * idle;
+      hps += (chainHeal / chainTime) * idle;
+      sps += (chainShield / chainTime) * idle;
+      lines.push({
+        id: '(base attack chain)', name: '(base attack chain)', kind: 'filler',
+        perCast: { damage: chainDmg, heal: chainHeal, shield: chainShield },
+        interval: chainTime, share: idle,
+      });
+    }
+
+    return { dps, hps, sps, busy, idle, lines };
+  }
+
+  // --- survivability -------------------------------------------------------
+  function survivability(sheet, target, mix = 0.5) {
+    const hp = sheet.get('MaxHealth') ?? 0;
+    const dtm = (sheet.get('DamageTakenModifier') ?? 100) / 100;
+    const red = (resistAtb, penFrom, flatAtbs) => damageReduction({
+      resist: sheet.get(resistAtb) ?? 0,
+      penetrationPct: 0, // a reference foe brings no penetration
+      attackerLevel: target.level,
+      flatReduction: (flatAtbs ?? []).reduce((s, a) => s + (sheet.get(a) ?? 0) / 100, 0),
+      formula: ctx.consts.resistFormula,
+    });
+    const phys = red('Armor', null, []);
+    const magic = red('MagicArmor', null, ['MagicReduction']);
+    const takenPhys = Math.max(1e-6, (1 - phys) * dtm);
+    const takenMagic = Math.max(1e-6, (1 - magic) * dtm);
+    return {
+      maxHealth: hp,
+      physReduction: phys,
+      magicReduction: magic,
+      ehpPhysical: hp / takenPhys,
+      ehpMagical: hp / takenMagic,
+      ehp: hp / (mix * takenPhys + (1 - mix) * takenMagic),
+    };
+  }
+
+  // WeaponPower: not shipped as a scaling entry or a budget group, so it has
+  // to come from the weapon. Modelled as the weapon slot's own share of the
+  // class primary budget at the weapon's effective level.
+  function weaponPowerFor(cat, loadout, cls) {
+    const apt = cdb.byId('aptitude').get(cls.aptitude);
+    const primary = (apt?.atbScaling ?? []).find((e) => (e.statGroup ?? 0) === 0);
+    if (!primary) return 0;
+    let total = 0;
+    for (const slotId of ['Slot_Weapon1', 'Slot_Weapon2']) {
+      const g = loadout.gear[slotId];
+      if (!g?.item) continue;
+      const item = cat.itemById.get(g.item);
+      if (!item) continue;
+      const ratio = cat.inherited(item.type, (t) => t?.atbRatio)?.primary ?? 0;
+      if (!ratio) continue;
+      const effLevel = cat.effectiveLevel(item, {
+        charLevel: loadout.level, stars: Math.min(g.stars ?? 0, cat.maxStars(item)), flawless: !!g.flawless,
+      });
+      const factor = cat.slotById.get(slotId)?.affixFactor ?? 1;
+      total += budget(effLevel, primary.start, primary.end, ctx.consts.earlyMaxLevel) * ratio * factor;
+    }
+    return total;
+  }
+
+  const audit = [
+    { severity: 'unverified', what: 'Fervor increases damage by its own percentage',
+      why: 'Its description says so; no attribute in the sheet carries the coefficient. Toggle with --no-fervor-damage.' },
+    { severity: 'unverified', what: 'PhysicalMastery / MagicMastery multiply matching-affinity damage',
+      why: 'Both have empty scaling and are zero from every source in this build, so the assumption is currently inert.' },
+    { severity: 'unverified', what: 'WeaponPower = the weapon slot\'s share of the class primary budget',
+      why: 'WeaponPower has no scaling entry and no budget group. Every base attack scales off it, so absolute damage depends on this.' },
+    { severity: 'unmodelled', what: 'skill scripts, statuses, DoTs, procs and talents',
+      why: '427 of 962 skills carry hscript bodies that this build does not execute; damage over time and conditional riders are absent.' },
+    { severity: 'unmodelled', what: 'per-swing damage variance',
+      why: 'WeaponAttack_RandomRange = 0.1 exists but its only located read is a UI text path, so casts are treated as deterministic.' },
+  ];
+
+  return { profile, foe, foes: Object.keys(FOES), castOutput, throughput, survivability, affinityOf, weaponPowerFor, audit };
+}

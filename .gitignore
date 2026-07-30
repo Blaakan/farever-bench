@@ -1,0 +1,14 @@
+# Where game.mjs remembers the install path it found, so every tool in the repo
+# answers the question once. Machine-specific, never committed.
+.cache/
+
+# Scratch space for probes and one-off scripts.
+.scratch/
+
+node_modules/
+*.log
+
+# Build exports. These are derived from the player's own copy of the game, and
+# the game's data is Shiro Games' - the generator ships, its output does not.
+out/
+*.bench.json
