@@ -164,7 +164,17 @@ function applyPins(engine, loadout, args, { stars, rarityRoll }) {
     const [, type] = p.key.split('/');
     const choices = cat.augmentCandidates(type).map((a) => a.id);
     if (!choices.length) die(`no augments exist for socket ${type}`);
-    loadout.augments[p.key] = resolve(p.value, choices, `augment for ${type}`);
+    const chosen = resolve(p.value, choices, `augment for ${type}`);
+    // A DemonSigil grants a talent, and a talent belongs to exactly one class.
+    // Without this a Warrior sigil pins onto a Priest and its talent is inserted
+    // into a tree it is not part of.
+    for (const grantedSkill of cat.itemById.get(chosen)?.skills ?? []) {
+      const owner = cat.classes.find((c) => engine.talents.treeFor(c.unit).byId.has(grantedSkill));
+      if (owner && owner.unit !== loadout.class) {
+        die(`${chosen} grants ${grantedSkill}, a ${owner.unit} talent - ${loadout.class} cannot use it`);
+      }
+    }
+    loadout.augments[p.key] = chosen;
   }
 
   // --skills weapon1=Sword_Swarm_Skill1,Sword_Swarm_Passive
@@ -258,11 +268,16 @@ function commonSetup(args) {
   if (exPattern) {
     try { exclude = new RegExp(exPattern); } catch (e) { die(`--exclude is not a valid regex: ${e.message}`); }
   }
+  let talentPoints = null;
+  if (args.flags[`talent-points`] != null && args.flags[`talent-points`] !== true) {
+    talentPoints = Number(args.flags[`talent-points`]);
+    if (!Number.isFinite(talentPoints) || talentPoints < 0) die(`--talent-points needs a number`);
+  }
   const rarityCap = typeof args.flags[`rarity-cap`] === 'string'
     ? resolve(args.flags[`rarity-cap`], engine.cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
     : null;
   return {
-    engine, level, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap,
+    engine, level, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap, talentPoints,
     // On by default: rarity is rolled at drop, so a Rare-authored chest that can
     // land Epic or Legendary should be on the table. --no-rarity-roll pins every
     // item to the rarity the CDB authors it at.
@@ -324,6 +339,7 @@ const commands = {
     const list = s.engine.cat.candidates(slot, {
       aptitude: cls.aptitude, charLevel: s.level,
       rarities: s.rarities, exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+      talentPoints: s.talentPoints,
     });
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${cls.unit} ${s.level} - ${f.short(slot)} - ${list.length} legal ` +
@@ -405,6 +421,7 @@ const commands = {
       loadout, ...pins, goal: s.goal, weights: s.weights, target,
       rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
       exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap, pinnedSkills: pins.pinnedSkills,
+      talentPoints: s.talentPoints,
       allowEmpty: !args.flags['no-empty'], restarts,
       onProgress: process.stderr.isTTY ? (n) => process.stderr.write(`\r  ${n} evaluations...`) : null,
     });
@@ -444,6 +461,7 @@ const commands = {
     }
     console.log(f.bold('SKILLS'));
     console.log(f.skillsBlock(s.engine, res.loadout, res.evaluation, { pinnedSkills: pins.pinnedSkills }) + '\n');
+    console.log(f.runeBlock(s.engine, res.loadout, res.evaluation) + '\n');
     console.log(f.sheetBlock(s.engine, res.evaluation, { level: s.level }));
     console.log(f.throughputBlock(s.engine, res.evaluation, { goal: s.goal }) + '\n');
 
@@ -687,6 +705,8 @@ Common flags
   --stars <n|max>         upgrade stars to assume       (default max)
   --rarity <list>         restrict to e.g. Rare,Epic
   --rank <n>              weapon-skill rank 1-3        (default max)
+  --talent-points <n>     talent points to spend  (default: the full allowance)
+  --talent-points <n>     points to spend in the tree (default: the full 16)
   --rarity-cap <r>        highest rarity a roll may reach (default: derived
                           per slot - see )
   --no-rarity-roll        pin every item to the rarity the CDB authors it at

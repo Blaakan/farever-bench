@@ -512,10 +512,10 @@ export function buildCombat(cdb, ctx) {
     { severity: 'unverified', what: 'WeaponPower = the weapon slot\'s share of the class primary budget',
       why: 'WeaponPower has no scaling entry and no budget group. Every base attack scales off it, so absolute damage depends on this.' },
     { severity: 'unmodelled', what: 'most of what a rune or a talent does, pending the script kernel',
-      why: '64 of the 88 talent nodes declare no affix, no effect and no status, and only 17 of the 84 ' +
-           'runes gate a step or override a prop. But 72 of those talents DO ship an hscript body, and ' +
-           'between them those scripts call only 63 names - about 39 real host functions once the hooks ' +
-           'and built-ins are removed. The gap is the script kernel, not missing data. `bench talents`.' },
+      why: 'Most talent nodes and most runes declare nothing this model reads, but they DO ship hscript ' +
+           'bodies calling a small, closed set of host functions - so the gap is the script kernel, not ' +
+           'missing data. `bench talents` prints the live counts rather than repeating them here, ' +
+           'because a hardcoded coverage figure goes stale the moment the model improves.' },
     { severity: 'assumption', what: 'every step of a granted status is counted, including script-gated ones',
       why: 'Priest_Talent_Sunlight_Status declares a Damage step AND an AreaDamage step, and its script only ' +
            'plays the second when Priest_Talent_SunHalo is also taken. Nothing in the step row says so, so ' +
@@ -523,9 +523,6 @@ export function buildCombat(cdb, ctx) {
            'grants a status can therefore be overstated by whatever its conditional steps add.' },
     { severity: 'assumption', what: 'charged skills are evaluated at full charge',
       why: 'Steps gated on cond.castHoldStep are mutually exclusive charge levels; the highest is used.' },
-    { severity: 'unmodelled', what: 'runes (skill masteries) and talents',
-      why: 'Steps gated on cond.mastery are excluded, and the 22-node talent trees are not modelled at all, ' +
-           'so a build that leans on either is understated.' },
     { severity: 'unmodelled', what: 'skill scripts, statuses beyond self-buffs, and DoTs',
       why: '427 of 962 skills carry hscript bodies this build does not execute. Self-buffs named by an ' +
            'addStatus(owner, Skill.X) call are resolved; everything else in a script is not.' },

@@ -861,6 +861,101 @@ group('talent links');
     readable > 20 && readable < 35, `${readable} of ${total} - if this jumped, texts.refs is being followed`);
 }
 
+
+// --- talent ranks ----------------------------------------------------------
+// 48 of the 88 nodes hold TWO points (`props.talent.maxPoints`), and their
+// affix rows are rank-gated to match: Sharp Mind is
+//   [{CooldownReduction, maxRank:1, val:3}, {CooldownReduction, minRank:2, val:6}]
+// Those rows are mutually exclusive. Summing them reads 9, which no character
+// can have - the same error as the castHoldStep charge levels, in a second
+// place. These tests exist because that shipped once.
+group('talent ranks');
+{
+  const engine = createEngine();
+  const T = engine.talents;
+  const sk = cdb.byId('skill');
+
+  const tally = {};
+  let nodes = 0;
+  for (const c of engine.cat.classes) {
+    for (const n of T.treeFor(c.unit).nodes) {
+      nodes++;
+      const mp = sk.get(n.skill)?.props?.talent?.maxPoints ?? 1;
+      tally[mp] = (tally[mp] ?? 0) + 1;
+    }
+  }
+  ok('more than one node holds two points', (tally[2] ?? 0) > 10,
+    `maxPoints tally ${JSON.stringify(tally)} - if this is all 1s, re-read props.talent`);
+  ok('every tier-4 node holds one point, which is what the sigil rule rests on',
+    engine.cat.classes.every((c) => T.treeFor(c.unit).nodes
+      .filter((n) => n.tier === 4)
+      .every((n) => (sk.get(n.skill)?.props?.talent?.maxPoints ?? 1) === 1)));
+
+  // The rank rows must be SELECTED, never summed.
+  const ranked = [];
+  for (const c of engine.cat.classes) {
+    for (const n of T.treeFor(c.unit).nodes) {
+      const afx = (sk.get(n.skill)?.affixes ?? []).filter((a) => a.target?.attribute);
+      if (afx.length > 1 && afx.some((a) => a.conds?.minRank != null || a.conds?.maxRank != null)) {
+        ranked.push(n.skill);
+      }
+    }
+  }
+  ok('some talents carry rank-gated affix rows', ranked.length > 0, String(ranked.length));
+  for (const id of ranked) {
+    const r1 = T.readableValue(id, 1).affixes;
+    const r2 = T.readableValue(id, 2).affixes;
+    const all = (sk.get(id).affixes ?? []).filter((a) => a.target?.attribute);
+    ok(`${id}: rank 1 takes fewer rows than exist`, r1.length < all.length,
+      `${r1.length} of ${all.length}`);
+    ok(`${id}: rank 2 differs from rank 1`,
+      JSON.stringify(r1.map((a) => a.val)) !== JSON.stringify(r2.map((a) => a.val)),
+      JSON.stringify(r1.map((a) => a.val)));
+    const sum = all.reduce((s, a) => s + (a.val ?? 0), 0);
+    const at2 = r2.reduce((s, a) => s + (a.val ?? 0), 0);
+    ok(`${id}: rank 2 is not the sum of every row`, Math.abs(at2 - sum) > 1e-9,
+      `rank2=${at2}, sum-of-all=${sum}`);
+  }
+
+  // The allocator must be able to buy a second rank, and must respect the cap.
+  const alloc = T.suggest('Priest', { level: 25 });
+  ok('the allocator buys second ranks', Object.values(alloc.ranks).some((r) => r > 1),
+    JSON.stringify(alloc.ranks));
+  ok('no node exceeds its cap',
+    Object.entries(alloc.ranks).every(([id, r]) => r <= (sk.get(id)?.props?.talent?.maxPoints ?? 1)));
+  ok('points spent equals the sum of ranks',
+    alloc.spent === Object.entries(alloc.ranks)
+      .filter(([id]) => !alloc.granted.includes(id))
+      .reduce((s, [, r]) => s + r, 0),
+    `spent ${alloc.spent}`);
+  ok('with ranks available the budget is nearly used up', alloc.unspent <= 2,
+    `${alloc.spent} of ${alloc.budget}, ${alloc.unspent} unspent`);
+
+  // The allocation must be legal by an independent replay.
+  ok('the suggested allocation is legal',
+    T.illegalAllocation('Priest', alloc.ranks, { level: 25, points: alloc.budget }) === null,
+    T.illegalAllocation('Priest', alloc.ranks, { level: 25, points: alloc.budget }) ?? '');
+  ok('over-ranking a node is rejected',
+    T.illegalAllocation('Priest', { Priest_Talent_Sunlight: 5 }, { level: 25, points: 16 }) !== null);
+  ok('overspending is rejected',
+    T.illegalAllocation('Priest', alloc.ranks, { level: 25, points: 2 }) !== null);
+
+  // Coverage counts points, not nodes.
+  const cov = T.coverage('Priest', alloc.ranks);
+  ok('coverage counts points not nodes', cov.spent >= cov.nodes, `${cov.spent} points, ${cov.nodes} nodes`);
+  ok('the tree holds more points than nodes', cov.totalPoints > cov.total,
+    `${cov.totalPoints} points, ${cov.total} nodes`);
+
+  // And the sheet must show the RANKED value, not the summed one.
+  const l = emptyLoadout(cat, 'Priest', 25);
+  l.talents = { Priest_Talent_SharpMind: 2 };
+  const cdr = engine.evaluate(l, { target: engine.combat.foe('boss', 25), rank: 3 }).sheet.get('CooldownReduction');
+  const rows = (sk.get('Priest_Talent_SharpMind').affixes ?? []).map((a) => a.val);
+  ok('a rank-2 talent contributes its rank-2 row, not the sum',
+    Math.abs(cdr - Math.max(...rows)) < 1e-9,
+    `sheet says ${cdr}, rows are ${JSON.stringify(rows)}`);
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

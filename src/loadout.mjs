@@ -28,7 +28,7 @@ export function emptyLoadout(cat, unitId, level) {
   // `skills` holds the choices a weapon or a class mechanic forces: two of the
   // three a weapon offers, three prayers out of three, and so on. Keyed the
   // same way sockets are, by what forced the choice.
-  return { class: cls.unit, level, gear: {}, augments: {}, skills: {}, runes: {}, talents: [] };
+  return { class: cls.unit, level, gear: {}, augments: {}, skills: {}, runes: {}, talents: {} };
 }
 
 export function classOf(cat, loadout) {
@@ -81,7 +81,9 @@ export function socketsOf(cat, loadout) {
 
 // Assemble the sheet. Returns the computed attributes plus the raw modifier
 // accumulator, so a caller can show where a number came from.
-export function evaluate(cat, loadout, { baseStatsFor, injectFlat = null }) {
+export function evaluate(cat, loadout, {
+  baseStatsFor, injectFlat = null, injectAddRatio = null, injectMulRatio = null,
+}) {
   const cls = classOf(cat, loadout);
   const armorReduction = cat.armorReductionFor(cls.aptitude);
   const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
@@ -127,6 +129,12 @@ export function evaluate(cat, loadout, { baseStatsFor, injectFlat = null }) {
   // only one today, because the weapon sets it and no budget group carries it.
   for (const [atb, v] of injectFlat ?? []) {
     mods.flat.set(atb, (mods.flat.get(atb) ?? 0) + v);
+  }
+  for (const [atb, v] of injectAddRatio ?? []) {
+    mods.addRatio.set(atb, (mods.addRatio.get(atb) ?? 0) + v);
+  }
+  for (const [atb, v] of injectMulRatio ?? []) {
+    mods.mulRatio.set(atb, (mods.mulRatio.get(atb) ?? 1) * v);
   }
 
   const base = baseStatsFor(cls.unit, loadout.level);

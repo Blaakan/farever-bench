@@ -190,16 +190,25 @@ export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {
   return table(['SLOT', 'SOCKET', 'AUGMENT', 'EFFECT', ''], rows);
 }
 
+// A ratio affix is a fraction, not a flat amount. Crusaders Resolve is
+// TAttribute_ARatio 0.08 Armor - eight percent - and printing "+0.08 Armor"
+// makes a real bonus look like a rounding error.
 export function affixSummary(affixes) {
   const parts = [];
   for (const a of affixes ?? []) {
     const atb = a.target?.attribute;
     if (!atb) continue;
     const v = a.val ?? 0;
-    parts.push(`${v > 0 ? '+' : ''}${v} ${atb.replace('Rating', 'Rtg')}`);
+    const name = atb.replace("Rating", "Rtg");
+    if (a.ref === "TAttribute_ARatio" || a.ref === "TAttribute_MRatio" || a.ref === "TAttribute_MRatioMin") {
+      parts.push(`${v > 0 ? "+" : ""}${(v * 100).toFixed(v * 100 % 1 ? 1 : 0)}% ${name}`);
+    } else {
+      parts.push(`${v > 0 ? "+" : ""}${v} ${name}`);
+    }
   }
-  return parts.join(' ');
+  return parts.join(" ");
 }
+
 
 // Which of the skills on offer this build actually slotted. A weapon hands you
 // three and you keep two, so this block is as much a part of the answer as the
@@ -242,31 +251,33 @@ export function talentBlock(engine, loadout, alloc, cov) {
   const granted = new Set(alloc.granted ?? []);
   const blind = new Set(alloc.blind ?? []);
 
-  const rows = (loadout.talents ?? []).map((id) => {
+  const rows = Object.entries(loadout.talents ?? {}).map(([id, rank]) => {
     const n = tree.byId.get(id);
-    const v = T.readableValue(id);
+    const v = T.readableValue(id, rank);
+    const cap = v.maxPoints;
     return [
-      '  ' + (n?.tier ?? '-'),
-      n?.branch ?? '-',
+      "  " + (n?.tier ?? "-"),
+      n?.branch ?? "-",
       n?.name ?? id,
-      granted.has(id) ? warn('from sigil') : blind.has(id) ? dim('gate point') : '',
-      v.readable ? (affixSummary(v.affixes) || v.kind) : dim('nothing readable'),
+      granted.has(id) ? warn("from sigil") : cap > 1 ? `${rank}/${cap}` : "",
+      blind.has(id) && rank === 1 ? dim("gate point") : "",
+      v.readable ? (affixSummary(v.affixes) || v.kind) : dim("nothing readable"),
     ];
   });
 
   return [
     dim(`  ${alloc.spent} of ${alloc.budget} points spent`
-      + (alloc.unspent ? `, ${alloc.unspent} unspent` : '')
-      + (granted.size ? `, ${granted.size} granted by a sigil` : '')),
+      + (alloc.unspent ? `, ${alloc.unspent} unspent` : "")
+      + (granted.size ? `, ${granted.size} granted by a sigil` : "")),
     rows.length
-      ? table(['  TIER', 'BRANCH', 'TALENT', '', 'GIVES'], rows)
-      : dim('  (nothing in this tree declares a value this model can score)'),
-    dim(`  ${cov.readable} of ${cov.spent} spent points landed on a node with a readable value; `
-      + `${tree.nodes.length - cov.totalReadable} of this\n  tree's ${tree.nodes.length} nodes declare nothing `
-      + 'at all, so points that only open a tier are spent blind\n  and marked. See `bench talents`.'),
-  ].join('\n');
+      ? table(["  TIER", "BRANCH", "TALENT", "RANK", "", "GIVES"], rows)
+      : dim("  (nothing in this tree declares a value this model can score)"),
+    dim(`  ${cov.readable} of ${cov.spent} spent points bought a readable value. `
+      + `The tree holds ${cov.totalPoints} points across\n  ${cov.total} nodes; `
+      + `${cov.total - cov.totalReadable} of those nodes declare nothing at all, so points that only `
+      + "open\n  a tier are spent blind and marked. See `bench talents`."),
+  ].join("\n");
 }
-
 export function throughputBlock(engine, ev, { goal }) {
   const t = ev.throughput;
   const s = ev.survivability;
@@ -318,4 +329,34 @@ export function auditBlock(engine) {
 
 export function short(slotId) {
   return slotId.replace(/^Slot_/, '');
+}
+
+// Which rune the search slotted on each skill, and how many of the three the
+// model can actually tell apart. A rune the tool picked but cannot value is a
+// coin flip, and saying so is worth more than presenting it as advice.
+export function runeBlock(engine, loadout, ev) {
+  const T = engine.talents;
+  const pools = T.runePools(ev.rotation);
+  if (!pools.length) return dim('  (no equipped skill offers a rune choice)');
+  const rows = [];
+  for (const p of pools) {
+    const chosen = loadout.runes?.[p.skill] ?? null;
+    const readable = p.options.filter((r) => r.gatesSteps.steps > 0 || r.overrides.length);
+    const pick = p.options.find((r) => r.id === chosen);
+    rows.push([
+      '  ' + p.name,
+      pick ? bold(pick.name) : dim('(none)'),
+      `${readable.length}/${p.options.length}`,
+      pick && (pick.gatesSteps.steps > 0 || pick.overrides.length)
+        ? dim([pick.gatesSteps.steps ? `${pick.gatesSteps.steps} gated step(s)` : null,
+          pick.overrides.length ? `overrides ${pick.overrides.join(', ')}` : null].filter(Boolean).join('; '))
+        : warn('nothing this model can read'),
+    ]);
+  }
+  return [
+    bold('RUNES'),
+    table(['  SKILL', 'SLOTTED', 'READABLE', 'WHAT IT CHANGES'], rows),
+    dim('  READABLE counts how many of the three gate a step or override a prop. Where it is 0,'
+      + '\n  the pick is a tie broken arbitrarily - the rune may still do something in game.'),
+  ].join('\n');
 }

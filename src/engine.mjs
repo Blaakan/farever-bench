@@ -61,7 +61,7 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
       + '|' + cat.combatSlots().map((s) => loadout.gear[s.id]?.item ?? '').join(',')
       + '|' + Object.entries(loadout.augments ?? {}).filter(([, v]) => v).sort().join(',')
       + '|' + Object.values(loadout.runes ?? {}).flat().filter(Boolean).sort().join(',')
-      + '|' + (loadout.talents ?? []).slice().sort().join(',');
+      + '|' + Object.entries(loadout.talents ?? {}).sort().map(([k, v]) => k + ':' + v).join(',');
     let r = rotationCache.get(key);
     if (!r) { r = plan.resolve(loadout, rank); rotationCache.set(key, r); }
     return r;
@@ -83,6 +83,8 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     //     entire value of an enchant slot, and without it the search correctly
     //     concluded that no enchant was worth having.
     const inject = new Map([['WeaponPower', weaponPower]]);
+    const addRatio = new Map();
+    const mulRatio = new Map();
     const addFlat = (atb, v) => inject.set(atb, (inject.get(atb) ?? 0) + v);
 
     for (const p of rot.passive ?? []) {
@@ -93,12 +95,24 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     // Talents you have allocated. Only 22 of the 88 nodes declare anything a
     // model can read; the rest are structurally present and numerically
     // invisible, which `bench talents` reports rather than hides.
-    for (const id of loadout.talents ?? []) {
-      const v = talents.readableValue(id);
-      for (const a of v.affixes) if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, a.val ?? 0);
-      for (const b of v.buffs) {
-        for (const a of b.affixes) if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, (a.val ?? 0) * b.stacks);
+    // Talents use all three affix models, not just the flat one.
+    // Priest_Talent_CrusadersResolve is TAttribute_ARatio +0.08 Armor - a
+    // RATIO, +8% armour - and reading it as a flat +0.08 threw away its entire
+    // value while printing a number that looks like a rounding error.
+    const applyAffix = (a, scale = 1) => {
+      const atb = a.target?.attribute;
+      if (!atb) return;
+      const v = (a.val ?? 0) * scale;
+      if (a.ref === 'TAttribute_Flat') addFlat(atb, v);
+      else if (a.ref === 'TAttribute_ARatio') addRatio.set(atb, (addRatio.get(atb) ?? 0) + v);
+      else if (a.ref === 'TAttribute_MRatio' || a.ref === 'TAttribute_MRatioMin') {
+        mulRatio.set(atb, (mulRatio.get(atb) ?? 1) * (1 + v));
       }
+    };
+    for (const [id, rank] of Object.entries(loadout.talents ?? {})) {
+      const v = talents.readableValue(id, rank);
+      for (const a of v.affixes) applyAffix(a);
+      for (const b of v.buffs) for (const a of b.affixes) applyAffix(a, b.stacks);
     }
 
     const buffs = plan.selfBuffs(rot);
@@ -108,7 +122,9 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
       }
     }
 
-    const r = evaluateLoadout(cat, loadout, { baseStatsFor, injectFlat: inject });
+    const r = evaluateLoadout(cat, loadout, {
+      baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio,
+    });
     const tp = combat.throughput(rot, r.sheet, tgt, opts);
     const sv = combat.survivability(r.sheet, tgt, mix);
     return { ...r, target: tgt, weaponPower, rotation: rot, buffs, throughput: tp, survivability: sv };

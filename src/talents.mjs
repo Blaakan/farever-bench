@@ -98,10 +98,22 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
   }
 
   // Tier N is gated on tierThreshold(N) points already spent in that branch.
-  // The list is indexed from tier 1, not from tier 0: [0,1,2,4,8] means tier 1
-  // is free, tier 2 needs 1, tier 3 needs 2 and tier 4 needs 4. Reading it as
-  // thresholds[tier] instead makes tier 4 cost 8 points in a branch that only
-  // holds 7 nodes - unreachable, and the allocator silently picks nothing.
+  //
+  // UNRESOLVED, and worth saying so. The implementation indexes from tier 1 -
+  // [0,1,2,4,8] read as "tier 1 free, tier 2 needs 1, tier 3 needs 2, tier 4
+  // needs 4". The original argument for that was that thresholds[tier] would
+  // make tier 4 cost 8 points in a branch holding only 7 NODES, i.e. be
+  // unreachable. That argument is dead: 48 of the 88 nodes hold two points, so
+  // a branch holds ELEVEN points (1 + 2+2 + 1+2+2 + 1) and 8 is perfectly
+  // reachable.
+  //
+  // So both readings are now internally consistent, and the other one matches
+  // the constant's own wording more literally while using all five entries:
+  // tier 1 needs 1 (the root, if the root counts toward a branch), tier 2 needs
+  // 2, tier 3 needs 4, tier 4 needs 8. This reading is kept because it is what
+  // the tool has been checked against, but it rests on nothing now and is one
+  // in-game observation away from being settled: note the point total in a
+  // branch at the moment its tier-4 node becomes clickable.
   const tierThreshold = (tier) => (tier <= 0 ? 0 : (thresholds[tier - 1] ?? 0));
 
   // --- the tree -------------------------------------------------------------
@@ -129,14 +141,36 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     return t;
   }
 
-  /** What a node can contribute that this model can actually read. */
+  /**
+   * What a node contributes AT A GIVEN RANK.
+   *
+   * A talent node holds up to `props.talent.maxPoints` points, and 48 of the 88
+   * nodes hold two. The affix rows are rank-gated to match, with exactly the
+   * shape damage.mjs already honours for weapon-skill ranks:
+   *
+   *   Priest_Talent_SharpMind.affixes = [
+   *     { CooldownReduction, conds: { maxRank: 1 }, val: 3 },
+   *     { CooldownReduction, conds: { minRank: 2 }, val: 6 },
+   *   ]
+   *
+   * Those two rows are MUTUALLY EXCLUSIVE - 3 at one point, 6 at two - and
+   * summing them reads 9, a number no character can have. Same error as the
+   * castHoldStep charge levels, in a second place.
+   */
   const valueCache = new Map();
-  function readableValue(skillId) {
-    let v = valueCache.get(skillId);
+  function maxPointsOf(skillId) {
+    return skills.get(skillId)?.props?.talent?.maxPoints ?? 1;
+  }
+  function readableValue(skillId, rank = 1) {
+    const key = skillId + '@' + rank;
+    let v = valueCache.get(key);
     if (v) return v;
     const s = skills.get(skillId);
     const prof = combat.profile(skillId, 3);
-    const affixes = (s?.affixes ?? []).filter((a) => a.target?.attribute);
+    const inRank = (c) => !(c?.minRank != null && rank < c.minRank)
+      && !(c?.maxRank != null && rank > c.maxRank)
+      && !(c?.equalRank != null && rank !== c.equalRank);
+    const affixes = (s?.affixes ?? []).filter((a) => a.target?.attribute && inRank(a.conds));
     const buffs = plan.selfBuffsOf(skillId);
     // Two data links hand a talent something it does not declare itself, and
     // one tempting third that must NOT be followed.
@@ -153,64 +187,87 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     // it, they do not each grant it. Following it would count one status's
     // damage thirteen times and would take "readable" from 24 to 59, which is
     // exactly the kind of large, wrong, flattering number worth refusing.
+    // A Status step can apply a DEBUFF to the enemy just as easily as a buff to
+    // you, and merging the debuff's affixes into your own sheet would credit you
+    // with the enemy's armour reduction. `props.status.types` says which, and a
+    // status that does not declare itself a Buff is not counted.
+    const isBuff = (id) => {
+      const types = (skills.get(id)?.props?.status?.types ?? []).map((x) => x.type);
+      return !types.length || types.includes('Buff');
+    };
     const granted = [
       ...(s?.props?.subskills ?? []).map((x) => x.skill),
       ...(s?.steps ?? [])
-        .filter((st) => st.props?.status?.ref)
+        .filter((st) => st.props?.status?.ref && isBuff(st.props.status.ref))
         .map((st) => st.props.status.ref),
     ].filter((x, i, arr) => x && arr.indexOf(x) === i);
     const effects = [...(prof?.effects ?? [])];
     for (const g of granted) {
       const gp = combat.profile(g, 3);
       for (const eff of gp?.effects ?? []) effects.push(eff);
-      for (const a of (skills.get(g)?.affixes ?? [])) if (a.target?.attribute) affixes.push(a);
+      for (const a of (skills.get(g)?.affixes ?? [])) if (a.target?.attribute && inRank(a.conds)) affixes.push(a);
     }
     v = {
       affixes, buffs, effects, granted,
       readable: affixes.length > 0 || buffs.length > 0 || effects.length > 0,
       kind: affixes.length ? 'affix' : buffs.length ? 'status'
         : granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : 'none',
-      // `props.talent.maxPoints` caps how many points a single node takes. Every
-      // node that declares it says 1, so one point per node - but it is read
-      // rather than assumed, in case a patch introduces a multi-point node.
-      maxPoints: s?.props?.talent?.maxPoints ?? 1,
+      // `props.talent.maxPoints` caps how many points a node takes. It is 2 on
+      // 48 of the 88 nodes - every tier-2, and two thirds of tier 3 - so "one
+      // point per node" was wrong for more than half the tree.
+      maxPoints: maxPointsOf(skillId),
+      rank,
       hasScript: !!s?.script,
       desc: s?.texts?.desc ?? '',
     };
-    valueCache.set(skillId, v);
+    valueCache.set(key, v);
     return v;
+  }
+
+  /** What the NEXT point in this node buys, which is what a greedy must rank. */
+  function marginalValue(skillId, currentRank) {
+    const next = currentRank + 1;
+    if (next > maxPointsOf(skillId)) return null;
+    return { rank: next, value: readableValue(skillId, next), from: readableValue(skillId, currentRank) };
   }
 
   /**
    * Is this allocation legal? Returns null, or a sentence saying what is wrong.
    * `granted` is the set of nodes handed over for free by a DemonSigil.
    */
-  function illegalAllocation(unitId, picked, { level, points, granted = new Set() }) {
+  function illegalAllocation(unitId, ranks, { level, points, granted = new Set() }) {
     const tree = treeFor(unitId);
-    if (!picked.length) return null;
+    const entries = Object.entries(ranks ?? {});
+    if (!entries.length) return null;
     if (level < unlockLevel) return `talents unlock at level ${unlockLevel}`;
 
-    const spent = picked.filter((id) => !granted.has(id));
-    if (spent.length > points) return `${spent.length} talents picked but only ${points} points available`;
-
-    // Threshold check, per branch, in tier order: a tier-N node needs
-    // thresholds[N] points already in that branch. Points from granted nodes do
-    // not count - nothing in the data says they should.
-    const perBranch = new Map();
-    const inOrder = picked.slice().sort((a, b) => (tree.byId.get(a)?.tier ?? 0) - (tree.byId.get(b)?.tier ?? 0));
-    for (const id of inOrder) {
+    let spent = 0;
+    for (const [id, rank] of entries) {
       const n = tree.byId.get(id);
       if (!n) return `${id} is not in the ${unitId} tree`;
-      const need = tierThreshold(n.tier);
+      const cap = maxPointsOf(id);
+      if (rank > cap) return `${n.name} holds at most ${cap} point${cap === 1 ? "" : "s"}, not ${rank}`;
+      if (granted.has(id) && rank > 1) return `${n.name} came from a sigil; no point may be spent on it`;
+      if (!granted.has(id)) spent += rank;
+    }
+    if (spent > points) return `${spent} points allocated but only ${points} available`;
+
+    // Thresholds are denominated in points in that branch, so replay the
+    // allocation point by point in tier order and check each one as it lands.
+    const perBranch = new Map();
+    const inOrder = entries
+      .map(([id, rank]) => ({ n: tree.byId.get(id), rank, granted: granted.has(id) }))
+      .sort((a, b) => a.n.tier - b.n.tier);
+    for (const { n, rank, granted: free } of inOrder) {
       const have = perBranch.get(n.branchIndex) ?? 0;
+      const need = tierThreshold(n.tier);
       if (n.tier > 0 && have < need) {
         return `${n.name} is tier ${n.tier} and needs ${need} points in ${n.branch}, but only ${have} are there`;
       }
-      if (!granted.has(id)) perBranch.set(n.branchIndex, have + 1);
+      if (!free) perBranch.set(n.branchIndex, have + rank);
     }
     return null;
   }
-
   /**
    * A greedy legal allocation over the nodes this model can score. Walks tiers
    * in order so thresholds are satisfiable, and stops when it runs out of
@@ -220,110 +277,113 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
   function suggest(unitId, { level, points = null, granted = new Set() } = {}) {
     const tree = treeFor(unitId);
     const budget = pointsAt(level, points);
-    const picked = [...granted];
     const perBranch = new Map();
     let spent = 0;
 
-    // Score a node in isolation: the sum of what it grants, which is enough to
-    // order the readable ones against each other.
-    const weight = (id) => {
-      const v = readableValue(id);
-      if (!v.readable) return 0;
+    // What a point is worth, at the rank it would buy. A node holding two
+    // points is two separate decisions, and the second is worth the DIFFERENCE
+    // between its two rank rows - Sharp Mind is +3 CooldownReduction for the
+    // first point and +3 more for the second, not +6 and not +9.
+    const magnitude = (v) => {
       let w = 0;
       for (const a of v.affixes) w += Math.abs(a.val ?? 0);
       for (const b of v.buffs) for (const a of b.affixes) w += Math.abs(a.val ?? 0) * (b.stacks ?? 1);
       for (const e of v.effects) w += Math.abs(e.baseVal ?? 0) + e.scaling.reduce((s, x) => s + Math.abs(x.ratio) * 50, 0);
       return w;
     };
+    const pointWeight = (id, atRank) => {
+      const here = magnitude(readableValue(id, atRank));
+      const before = atRank > 1 ? magnitude(readableValue(id, atRank - 1)) : 0;
+      return here - before;
+    };
 
-    // Greedy over every node that is LEGAL RIGHT NOW, one point at a time.
-    //
-    // A tier-by-tier walk that commits to one branch leaves points unspent as
-    // soon as that branch runs out - a Priest spent 8 of 16 and stopped. This
-    // instead re-derives the legal set after every point, so filling one
-    // branch to tier 4 and then spilling the remainder into the next-best is
-    // the natural outcome rather than a special case.
-    //
-    // The ordering problem underneath: a readable node is almost always gated
-    // behind unreadable ones. Every tree root declares nothing, so ranking by
-    // readable value alone picks nothing at all. Each candidate is therefore
-    // scored as its own readable value FIRST, and as a tiebreak by how much
-    // readable value still sits behind it in its branch - so the points that
-    // only open a tier at least open the tier worth opening. Those are marked
-    // blind and counted, never presented as considered picks.
+    // An allocation is a rank per node, not a set of nodes. `perBranch` counts
+    // POINTS, which is what the thresholds are denominated in.
+    const ranks = new Map();
+    for (const id of granted) ranks.set(id, 1);
     const blind = [];
 
-    // Readable value still unclaimed in a branch, which is what a gate point
-    // is really buying.
-    const promise = (branchIndex, taken) => tree.nodes
-      .filter((n) => n.branchIndex === branchIndex && !taken.has(n.skill))
-      .reduce((sum, n) => sum + weight(n.skill), 0);
-
-    const taken = new Set(picked);
-
-    // The root costs a point, and it is the way in. Confirmed in game: it is a
-    // node like any other, tier 0 in its own Root branch, and you pay for it.
-    // Taken first because nothing else in the tree is reachable without it.
-    const rootNode = tree.nodes.find((n) => n.tier === 0);
-    if (rootNode && !taken.has(rootNode.skill) && spent < budget) {
-      picked.push(rootNode.skill);
-      taken.add(rootNode.skill);
-      if (!readableValue(rootNode.skill).readable) blind.push(rootNode.skill);
-      perBranch.set(rootNode.branchIndex, (perBranch.get(rootNode.branchIndex) ?? 0) + 1);
+    const addPoint = (n, atRank) => {
+      ranks.set(n.skill, atRank);
+      if (atRank === 1 && !readableValue(n.skill, 1).readable) blind.push(n.skill);
+      perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + 1);
       spent++;
-    }
+    };
+
+    // The root costs a point and is the way in - confirmed in game.
+    const rootNode = tree.nodes.find((n) => n.tier === 0);
+    if (rootNode && !ranks.has(rootNode.skill) && spent < budget) addPoint(rootNode, 1);
+
+    // Readable value still unclaimed in a branch: what a gate point is buying.
+    const promise = (branchIndex) => tree.nodes
+      .filter((n) => n.branchIndex === branchIndex)
+      .reduce((sum, n) => {
+        const at = ranks.get(n.skill) ?? 0;
+        let rest = 0;
+        for (let r = at + 1; r <= maxPointsOf(n.skill); r++) rest += Math.max(0, pointWeight(n.skill, r));
+        return sum + rest;
+      }, 0);
 
     while (spent < budget) {
-      const legal = tree.nodes.filter((n) => {
-        if (taken.has(n.skill)) return false;
-        // A talent a sigil handed you cannot also be bought, even where the
-        // thresholds would allow it - confirmed in game. It is already yours.
-        if (granted.has(n.skill)) return false;
-        return (perBranch.get(n.branchIndex) ?? 0) >= tierThreshold(n.tier);
-      });
+      // Every point that could legally be bought right now: a fresh node whose
+      // tier is open, or a second rank in a node already held.
+      const legal = [];
+      for (const n of tree.nodes) {
+        const at = ranks.get(n.skill) ?? 0;
+        // A sigil-granted talent is already yours and takes no point, even
+        // where the thresholds would allow one - confirmed in game.
+        if (granted.has(n.skill)) continue;
+        if (at >= maxPointsOf(n.skill)) continue;
+        if (at === 0 && (perBranch.get(n.branchIndex) ?? 0) < tierThreshold(n.tier)) continue;
+        legal.push({ n, next: at + 1, w: pointWeight(n.skill, at + 1) });
+      }
       if (!legal.length) break;
 
       legal.sort((a, b) => {
-        const d = weight(b.skill) - weight(a.skill);
+        const d = b.w - a.w;
         if (Math.abs(d) > 1e-9) return d;
-        // Both unreadable (or equally readable): favour the branch with the
-        // most readable value still locked behind it, then the shallower
-        // node, then the id so a shared build is reproducible.
-        const p = promise(b.branchIndex, taken) - promise(a.branchIndex, taken);
+        const p = promise(b.n.branchIndex) - promise(a.n.branchIndex);
         if (Math.abs(p) > 1e-9) return p;
-        if (a.tier !== b.tier) return a.tier - b.tier;
-        return a.skill < b.skill ? -1 : 1;
+        if (a.n.tier !== b.n.tier) return a.n.tier - b.n.tier;
+        return a.n.skill < b.n.skill ? -1 : 1;
       });
 
-      const n = legal[0];
-      // Nothing readable is reachable any more and nothing is locked behind
-      // what is left: stop rather than spend the rest at random.
-      if (!weight(n.skill) && promise(n.branchIndex, taken) <= 0) break;
-
-      picked.push(n.skill);
-      taken.add(n.skill);
-      if (!readableValue(n.skill).readable) blind.push(n.skill);
-      perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + 1);
-      spent++;
+      const best = legal[0];
+      // Nothing readable is reachable and nothing is locked behind what is
+      // left: stop rather than spend the tail at random.
+      if (best.w <= 0 && promise(best.n.branchIndex) <= 0) break;
+      addPoint(best.n, best.next);
     }
-    return { picked, spent, budget, unspent: budget - spent, blind };
-  }
 
-  /** Coverage: how much of a build's talent spend the model can see. */
-  function coverage(unitId, picked, { granted = new Set() } = {}) {
-    const tree = treeFor(unitId);
-    const spent = picked.filter((id) => !granted.has(id));
-    const readable = spent.filter((id) => readableValue(id).readable);
+    const picked = [...ranks.keys()];
     return {
-      spent: spent.length,
-      readable: readable.length,
-      blind: spent.length - readable.length,
-      granted: [...granted],
-      total: tree.nodes.length,
-      totalReadable: tree.nodes.filter((n) => readableValue(n.skill).readable).length,
+      picked, ranks: Object.fromEntries(ranks), spent, budget,
+      unspent: budget - spent, blind, granted: [...granted],
     };
   }
 
+  /**
+   * Coverage, denominated in POINTS rather than nodes - 48 of the 88 nodes
+   * hold two, so counting nodes understates the spend by up to a third.
+   */
+  function coverage(unitId, ranks, { granted = new Set() } = {}) {
+    const tree = treeFor(unitId);
+    const entries = Object.entries(ranks ?? {});
+    let spent = 0, readable = 0;
+    for (const [id, rank] of entries) {
+      if (granted.has(id)) continue;
+      spent += rank;
+      for (let r = 1; r <= rank; r++) if (readableValue(id, r).readable) readable++;
+    }
+    return {
+      spent, readable, blind: spent - readable,
+      granted: [...granted],
+      nodes: entries.length,
+      total: tree.nodes.length,
+      totalPoints: tree.nodes.reduce((s, n) => s + maxPointsOf(n.skill), 0),
+      totalReadable: tree.nodes.filter((n) => readableValue(n.skill, 1).readable).length,
+    };
+  }
   // --- runes ----------------------------------------------------------------
   // A rune (the game calls them skill masteries) is one of three per skill, and
   // it modifies its skill two ways, both readable:

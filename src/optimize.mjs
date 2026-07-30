@@ -148,7 +148,7 @@ export function optimize(engine, spec) {
       + '#' + Object.entries(loadout.augments).filter(([, v]) => v).sort().map(([k, v]) => k + '=' + v).join('|')
       + '$' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + '=' + v.join('+')).join('|')
       + '&' + Object.entries(loadout.runes ?? {}).filter(([, x]) => x).sort().join('|')
-      + '%' + (loadout.talents ?? []).slice().sort().join('|');
+      + '%' + Object.entries(loadout.talents ?? {}).sort().map(([k, v]) => k + ':' + v).join('|');
     let v = evalCache.get(key);
     if (v === undefined) {
       const ev = engine.evaluate(loadout, { target, rank, mix });
@@ -204,7 +204,7 @@ export function optimize(engine, spec) {
       augments: { ...l.augments },
       skills: Object.fromEntries(Object.entries(l.skills ?? {}).map(([k, v]) => [k, v.slice()])),
       runes: { ...(l.runes ?? {}) },
-      talents: (l.talents ?? []).slice(),
+      talents: { ...(l.talents ?? {}) },
     };
   }
 
@@ -369,19 +369,24 @@ export function optimize(engine, spec) {
     const alloc = engine.talents.suggest(winner.loadout.class, {
       level: winner.loadout.level, points: spec.talentPoints ?? null, granted,
     });
-    winner.loadout.talents = alloc.picked;
+    winner.loadout.talents = alloc.ranks;
     winner.talentAlloc = { ...alloc, granted: [...granted] };
   }
 
   const finalEval = engine.evaluate(winner.loadout, { target, rank, mix });
+
+  // Talents are attached after the gear search converges, so `winner.score` is
+  // the PRE-talent number. Reporting it beside an evaluation that includes them
+  // printed two figures for one build that did not agree with each other.
   return {
     loadout: winner.loadout,
-    score: winner.score.score,
+    score: scorer.scoreFrom(finalEval),
+    scoreBeforeTalents: winner.score.score,
     indifferent: indifferentSlots(winner.loadout, winner.score),
     evaluation: finalEval,
     reference: refEval,
     talentAlloc: winner.talentAlloc ?? null,
-    talentCoverage: engine.talents.coverage(winner.loadout.class, winner.loadout.talents ?? [],
+    talentCoverage: engine.talents.coverage(winner.loadout.class, winner.loadout.talents ?? {},
       { granted: new Set(winner.talentAlloc?.granted ?? []) }),
     evaluations: counter,
     trace,
