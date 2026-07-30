@@ -72,7 +72,18 @@ function resolve(input, ids, what) {
 //   --pin feet/enchantfeet=FormulaFeetCritical_Z2
 //   --no-augment weapon1                  every socket on that slot: empty
 //
-function applyPins(engine, loadout, args, { stars }) {
+// The best rarity a pinned item can actually reach: capped by the slot ceiling
+// and by what the level band can roll, floored at what the row is authored as.
+function bestRarityFor(cat, item, slotId, charLevel) {
+  const options = cat.attainableRarities(item, charLevel, slotId);
+  let best = item.rarity;
+  for (const o of options) {
+    if ((cat.rarityOrder.get(o.rarity) ?? 0) > (cat.rarityOrder.get(best) ?? 0)) best = o.rarity;
+  }
+  return best;
+}
+
+function applyPins(engine, loadout, args, { stars, rarityRoll }) {
   const { cat } = engine;
   const slotIds = cat.combatSlots().map((s) => s.id);
   const augTypeIds = cat.augmentTypes.map((a) => a.id);
@@ -120,9 +131,12 @@ function applyPins(engine, loadout, args, { stars }) {
       console.error(f.warn(`note: ${itemId} pinned at instance level ${instanceLevel}, above the build's ${loadout.level}`));
     }
 
+    // With no @rarity given, take the best the slot can reach - the same
+    // "assume the good version" default that `--stars max` already applies.
+    // Pinning an item should not quietly hand you the weakest roll of it.
     const rarity = m[3]
       ? resolve(m[3], cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
-      : item.rarity;
+      : (rarityRoll ? bestRarityFor(cat, item, slot, loadout.level) : item.rarity);
 
     const cap = cat.maxStars(item, rarity);
     const want = m[4] != null ? Number(m[4]) : (stars === 'max' ? cap : Math.min(stars, cap));
@@ -329,7 +343,7 @@ const commands = {
   sheet(args) {
     const s = commonSetup(args);
     const loadout = loadBuild(args, s.engine, s.level);
-    const pins = applyPins(s.engine, loadout, args, { stars: s.stars });
+    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll });
     const target = s.engine.combat.foe(s.targetName, s.level);
     const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix });
     console.log(f.header(s.engine, VERSION) + '\n');
@@ -350,7 +364,7 @@ const commands = {
   rank(args) {
     const s = commonSetup(args);
     const loadout = loadBuild(args, s.engine, s.level);
-    applyPins(s.engine, loadout, args, { stars: s.stars });
+    applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll });
     const slotIds = s.engine.cat.combatSlots().map((x) => x.id);
     if (typeof args.flags.slot !== 'string') die(`--slot is required. One of: ${slotIds.map(f.short).join(', ')}`);
     const slot = resolve(args.flags.slot, slotIds, 'slot');
@@ -381,7 +395,7 @@ const commands = {
   optimize(args) {
     const s = commonSetup(args);
     const loadout = loadBuild(args, s.engine, s.level);
-    const pins = applyPins(s.engine, loadout, args, { stars: s.stars });
+    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll });
     const target = s.engine.combat.foe(s.targetName, s.level);
     const restarts = args.flags.restarts ? Number(args.flags.restarts) : 3;
 
@@ -412,7 +426,15 @@ const commands = {
       `over ${restarts} restart${restarts === 1 ? '' : 's'} (best score from restart ` +
       `${res.trace.reduce((b, x) => (x.score > b.score ? x : b)).restart})`));
     console.log('');
-    console.log(f.gearBlock(s.engine, res.loadout, { pinnedGear: pins.pinnedGear }) + '\n');
+    console.log(f.gearBlock(s.engine, res.loadout, {
+      pinnedGear: pins.pinnedGear, indifferent: new Set(res.indifferent),
+    }));
+    if (res.indifferent.length) {
+      console.log(f.dim(`  no effect: emptying ${res.indifferent.map(f.short).join(', ')} scores exactly the ` +
+        `same for ${s.goal}.\n  The pick is the best of equals - a shield grants only armour, so a damage goal\n` +
+        '  cannot tell one from another, or from none at all.'));
+    }
+    console.log('');
     console.log(f.bold('AUGMENTS'));
     console.log(f.augmentBlock(s.engine, res.loadout, { pinnedAug: pins.pinnedAug }) + '\n');
     console.log(f.bold('SKILLS'));

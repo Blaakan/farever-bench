@@ -148,12 +148,50 @@ export function optimize(engine, spec) {
       + '$' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + '=' + v.join('+')).join('|');
     let v = evalCache.get(key);
     if (v === undefined) {
-      v = scorer.score(loadout);
+      const ev = engine.evaluate(loadout, { target, rank, mix });
+      // Ties are common and they are not noise: a shield's atbRatio is
+      // `{armor: 0.337}` and nothing else, so for a dps goal every offhand -
+      // and no offhand at all - scores identically, and whichever one a restart
+      // happened to seed would stick. That reads as a considered choice when it
+      // is a coin flip. So the comparison is lexicographic: the objective
+      // first, then the total magnitude of everything the build grants. A
+      // Legendary shield beats a Rare one and both beat an empty slot, even
+      // when the goal cannot tell them apart - which is what a player expects
+      // and is never worse. `indifferent` below then NAMES the slots where this
+      // happened, so the output says "makes no difference" rather than quietly
+      // asserting a preference.
+      let tie = 0;
+      for (const x of ev.mods.flat.values()) tie += Math.abs(x);
+      v = { score: scorer.scoreFrom(ev), tie };
       evalCache.set(key, v);
       counter++;
       if (onProgress && counter % 500 === 0) onProgress(counter);
     }
     return v;
+  }
+
+  // Lexicographic: objective, then tiebreak.
+  const EPS = 1e-9;
+  const better = (a, b) => (a.score > b.score + EPS) || (Math.abs(a.score - b.score) <= EPS && a.tie > b.tie + EPS);
+
+  /**
+   * Slots whose contents make no difference to the goal - emptying them scores
+   * the same. A shield on a dps build is the honest example: it grants armour
+   * and nothing else, so the tool has an opinion about it only through the
+   * tiebreak. Saying so is worth more than presenting the pick as a result.
+   */
+  function indifferentSlots(loadout, at) {
+    const out = [];
+    for (const slotId of cat.combatSlots().map((x) => x.id)) {
+      if (!loadout.gear[slotId] || pinnedGear.has(slotId)) continue;
+      const trial = clone(loadout);
+      delete trial.gear[slotId];
+      pruneAugments(trial);
+      let got;
+      try { got = scoreOf(trial); } catch { continue; }
+      if (Math.abs(got.score - at.score) <= EPS) out.push(slotId);
+    }
+    return out;
   }
 
   function clone(l) {
@@ -209,9 +247,9 @@ export function optimize(engine, spec) {
           else delete trial.gear[slotId];
           pruneAugments(trial);
           const s = scoreOf(trial);
-          if (s > bestScore + 1e-12) { bestScore = s; bestPick = pick; }
+          if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
         }
-        if (bestScore > best + 1e-12) {
+        if (better(bestScore, best)) {
           if (bestPick) cur.gear[slotId] = { item: bestPick.item, rarity: bestPick.rarity, stars: bestPick.stars };
           else delete cur.gear[slotId];
           pruneAugments(cur);
@@ -233,9 +271,9 @@ export function optimize(engine, spec) {
           const trial = clone(cur);
           trial.skills[pool.key] = pick;
           const s = scoreOf(trial);
-          if (s > bestScore + 1e-12) { bestScore = s; bestPick = pick; }
+          if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
         }
-        if (bestScore > best + 1e-12) {
+        if (better(bestScore, best)) {
           cur.skills[pool.key] = bestPick.slice();
           best = bestScore;
           improved = true;
@@ -252,9 +290,9 @@ export function optimize(engine, spec) {
           if (pick) trial.augments[sock.key] = pick;
           else delete trial.augments[sock.key];
           const s = scoreOf(trial);
-          if (s > bestScore + 1e-12) { bestScore = s; bestPick = pick; }
+          if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
         }
-        if (bestScore > best + 1e-12) {
+        if (better(bestScore, best)) {
           if (bestPick) cur.augments[sock.key] = bestPick;
           else delete cur.augments[sock.key];
           best = bestScore;
@@ -285,14 +323,15 @@ export function optimize(engine, spec) {
       pruneAugments(seed);
     }
     const got = ascend(seed, rand);
-    trace.push({ restart: r, score: got.score, passes: got.passes });
-    if (!winner || got.score > winner.score) winner = got;
+    trace.push({ restart: r, score: got.score.score, passes: got.passes });
+    if (!winner || better(got.score, winner.score)) winner = got;
   }
 
   const finalEval = engine.evaluate(winner.loadout, { target, rank, mix });
   return {
     loadout: winner.loadout,
-    score: winner.score,
+    score: winner.score.score,
+    indifferent: indifferentSlots(winner.loadout, winner.score),
     evaluation: finalEval,
     reference: refEval,
     evaluations: counter,

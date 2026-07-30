@@ -94,7 +94,7 @@ export function sheetBlock(engine, ev, { level }) {
   return out.join('\n');
 }
 
-export function gearBlock(engine, loadout, { pinnedGear = new Set() } = {}) {
+export function gearBlock(engine, loadout, { pinnedGear = new Set(), indifferent = new Set() } = {}) {
   const { cat } = engine;
   const cls = cat.classes.find((x) => x.unit === loadout.class);
   const rows = [];
@@ -118,7 +118,9 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set() } = {}) {
       // is what you actually looted, so name which one this row assumes.
       it.faction ?? dim('-'),
       ratingGiven(cat, it, cls.aptitude, rarity) ?? dim('-'),
-      pinnedGear.has(slot.id) ? bold('pinned') : (rolled ? dim('rolled') : ''),
+      pinnedGear.has(slot.id) ? bold('pinned')
+        : indifferent.has(slot.id) ? warn('no effect')
+        : (rolled ? dim('rolled') : ''),
     ]);
   }
   return table(['SLOT', 'ITEM', 'RAR', 'UPG', 'iLVL', 'FACTION', 'GIVES', ''], rows, { align: [null, null, null, null, 'r'] });
@@ -164,9 +166,11 @@ export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {
       // An empty socket has two very different meanings, and conflating them is
       // how a tool misleads: "nothing here beats nothing" versus "I cannot put a
       // number on any of these". Say which.
-      // An augment is scoreable if it carries a stat affix OR if a skill it
+      // An augment is scoreable if it carries a stat affix, or if a skill it
       // grants resolves to a self-buff status - which is exactly how a weapon
-      // enchant comes to be worth anything.
+      // enchant comes to be worth anything. A talent that merely declares a
+      // damage effect does NOT count: without a trigger rate the model cannot
+      // value it, and the DemonSigil talents do not even declare that much.
       const options = cat.augmentCandidates(s.type);
       const scoreable = options.filter((o) => (o.affixes ?? []).some((a) => a.target?.attribute)
         || (o.skills ?? []).some((sk) => engine.plan.selfBuffsOf(sk).length));

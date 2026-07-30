@@ -155,10 +155,18 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
            'but a short fight or a movement-heavy one would not reach it.',
     },
     {
-      severity: 'assumption',
-      what: 'only the main-hand weapon\'s base-attack chain is used',
-      why: 'The arsenal is a weapon you swap to, so counting both chains at once would double the filler. ' +
-           'Its slotted skills still contribute, which is what UnlockLevel_Arsenal describes.',
+      severity: 'verified',
+      what: 'the arsenal gives two skills and 40% of its stats, and nothing else',
+      why: 'Confirmed in game: you do not swap to it. It contributes no base-attack chain and no combo ' +
+           'attack, so the main hand supplies all of the filler; its two slotted skills and its discounted ' +
+           'stats are its entire contribution.',
+    },
+    {
+      severity: 'unmodelled',
+      what: 'the DemonSigil socket cannot be scored',
+      why: 'Each of the 12 sigils grants one talent, and the talents declare no effect, no affix and no ' +
+           'status - Priest_Talent_SunHalo carries only vars.damage 0.5 and no script at all, so its ' +
+           'behaviour lives in game code keyed on the talent being present. Nothing in the data to read.',
     },
   ];
 
