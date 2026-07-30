@@ -234,6 +234,39 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = 
   return out.join('\n');
 }
 
+// The allocated tree, with the honest part attached: which points bought
+// something the model can read, and which were spent only to open a tier.
+export function talentBlock(engine, loadout, alloc, cov) {
+  const T = engine.talents;
+  const tree = T.treeFor(loadout.class);
+  const granted = new Set(alloc.granted ?? []);
+  const blind = new Set(alloc.blind ?? []);
+
+  const rows = (loadout.talents ?? []).map((id) => {
+    const n = tree.byId.get(id);
+    const v = T.readableValue(id);
+    return [
+      '  ' + (n?.tier ?? '-'),
+      n?.branch ?? '-',
+      n?.name ?? id,
+      granted.has(id) ? warn('from sigil') : blind.has(id) ? dim('gate point') : '',
+      v.readable ? (affixSummary(v.affixes) || v.kind) : dim('nothing readable'),
+    ];
+  });
+
+  return [
+    dim(`  ${alloc.spent} of ${alloc.budget} points spent`
+      + (alloc.unspent ? `, ${alloc.unspent} unspent` : '')
+      + (granted.size ? `, ${granted.size} granted by a sigil` : '')),
+    rows.length
+      ? table(['  TIER', 'BRANCH', 'TALENT', '', 'GIVES'], rows)
+      : dim('  (nothing in this tree declares a value this model can score)'),
+    dim(`  ${cov.readable} of ${cov.spent} spent points landed on a node with a readable value; `
+      + `${tree.nodes.length - cov.totalReadable} of this\n  tree's ${tree.nodes.length} nodes declare nothing `
+      + 'at all, so points that only open a tier are spent blind\n  and marked. See `bench talents`.'),
+  ].join('\n');
+}
+
 export function throughputBlock(engine, ev, { goal }) {
   const t = ev.throughput;
   const s = ev.survivability;

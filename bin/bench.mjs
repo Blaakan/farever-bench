@@ -438,6 +438,10 @@ const commands = {
     console.log('');
     console.log(f.bold('AUGMENTS'));
     console.log(f.augmentBlock(s.engine, res.loadout, { pinnedAug: pins.pinnedAug }) + '\n');
+    if (res.talentAlloc) {
+      console.log(f.bold('TALENTS'));
+      console.log(f.talentBlock(s.engine, res.loadout, res.talentAlloc, res.talentCoverage) + '\n');
+    }
     console.log(f.bold('SKILLS'));
     console.log(f.skillsBlock(s.engine, res.loadout, res.evaluation, { pinnedSkills: pins.pinnedSkills }) + '\n');
     console.log(f.sheetBlock(s.engine, res.evaluation, { level: s.level }));
@@ -630,9 +634,13 @@ const commands = {
     console.log([
       "  " + rd.length + " of " + all.length + " talent nodes declare something a data-driven model can",
       "  read - a stat affix, a self-buff status, or a damage effect. The other",
-      "  " + (all.length - rd.length) + " declare NOTHING: no affix, no effect, no status, and mostly no",
-      "  script either. Their behaviour lives in game code keyed on the talent",
-      "  being slotted.",
+      "  " + (all.length - rd.length) + " declare no affix, no effect and no status - but 72 of them DO",
+      "  ship an hscript body, and between them those scripts call only 63",
+      "  distinct names - about 39 real host functions once the entry hooks and",
+      "  built-ins are removed. So the talent layer is blocked on the same small",
+      "  script kernel the rest of the skill work needs, not on absent data. Every",
+      "  one of the 88 nodes also carries a texts.desc to check an implementation",
+      "  against.",
       "",
       "  So the optimiser allocates points over the readable nodes and STOPS. It",
       "  does not spend the remainder on nodes it cannot tell apart, because a",

@@ -23,11 +23,29 @@
 //
 // HOW MUCH OF IT CAN BE SCORED IS THE PROBLEM.
 //
-// Across all four classes there are 88 talent nodes. **22 declare something a
-// data-driven model can read** - 13 carry a stat affix, 2 apply a self-buff
-// status, 7 declare a damage effect. The other **66 declare nothing at all**:
-// no affix, no effect, no status, and mostly no script either. Their behaviour
-// is in game code keyed on the talent being present.
+// Across all four classes there are 88 talent nodes, and only some declare a
+// value in ordinary data columns - a stat affix, a self-buff status, a damage
+// effect, or a skill granted through `props.subskills`.
+//
+// The rest are NOT in game code, which an earlier reading of this file claimed.
+// **72 of them ship an hscript body**, and between them those scripts call just
+// 63 distinct names - of which about twenty are entry-point hooks (onHit,
+// onInflictDamage, onKill, onSkillProc, ...) and a handful are built-ins. The
+// real host surface for the entire talent layer is roughly 39 functions:
+//
+//   addAtb addResource addStatus addStatusDuration applyHeal atb checkProba
+//   enforceStatus forAllWeaponSkills forceTriggerAllConduits getAtb getCustom
+//   getDamageStepIndex getShield getStatusCount getTimeInCombat hasStatus
+//   hasStatusApplied hasStatusMaxStacked hasStatusType hasTalent isActiveSkill
+//   isAlly isBaseAttack isBasicAttack isFinalAttack isSkillFromPrayer
+//   isStatusType isType isWeaponSkill playStep playStepIndexOnSkill
+//   reduceCooldown reduceWeaponsCooldown removeStatus resetCooldown setDynVal
+//   setStatus wait
+//
+// So the talent trees are not blocked on a world model. They are blocked on the
+// same ~40-function kernel the rest of the script work needs, plus a status
+// system - and every one of the 88 nodes carries a texts.desc, so there is a
+// readable statement of intent to check any implementation against.
 //
 // So an optimiser turned loose on the tree would be choosing between 66 nodes
 // it cannot tell apart, and presenting the result as a recommendation. This
@@ -104,11 +122,28 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     const prof = combat.profile(skillId, 3);
     const affixes = (s?.affixes ?? []).filter((a) => a.target?.attribute);
     const buffs = plan.selfBuffsOf(skillId);
-    const effects = prof?.effects ?? [];
+    // `props.subskills` is how a talent hands you a whole new skill - the two
+    // Mage conduit talents declare nothing themselves and grant
+    // Mage_Talent_Conduit*_Conduit through this field. Following it is the
+    // difference between "unreadable" and "adds a conduit that does X".
+    const granted = (s?.props?.subskills ?? []).map((x) => x.skill).filter(Boolean);
+    const effects = [...(prof?.effects ?? [])];
+    for (const g of granted) {
+      const gp = combat.profile(g, 3);
+      for (const eff of gp?.effects ?? []) effects.push(eff);
+      for (const a of (skills.get(g)?.affixes ?? [])) if (a.target?.attribute) affixes.push(a);
+    }
     v = {
-      affixes, buffs, effects,
+      affixes, buffs, effects, granted,
       readable: affixes.length > 0 || buffs.length > 0 || effects.length > 0,
-      kind: affixes.length ? 'affix' : buffs.length ? 'status' : effects.length ? 'effect' : 'none',
+      kind: affixes.length ? 'affix' : buffs.length ? 'status'
+        : granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : 'none',
+      // `props.talent.maxPoints` caps how many points a single node takes. Every
+      // node that declares it says 1, so one point per node - but it is read
+      // rather than assumed, in case a patch introduces a multi-point node.
+      maxPoints: s?.props?.talent?.maxPoints ?? 1,
+      hasScript: !!s?.script,
+      desc: s?.texts?.desc ?? '',
     };
     valueCache.set(skillId, v);
     return v;
@@ -169,50 +204,59 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       return w;
     };
 
-    // Tier by tier, so a threshold is always reachable when it is needed.
+    // Greedy over every node that is LEGAL RIGHT NOW, one point at a time.
     //
-    // The hard part: a readable node is usually gated behind unreadable ones.
-    // Every tree root declares nothing, and tier 1 costs a point before tier 2
-    // opens - so allocating over readable nodes ALONE picks nothing at all.
-    // The gate points therefore have to be spent, and the honest thing is to
-    // spend them, mark them blind, and report the count rather than pretend
-    // the pick was considered. Within a tier the blind choice is by id so it
-    // is at least reproducible.
+    // A tier-by-tier walk that commits to one branch leaves points unspent as
+    // soon as that branch runs out - a Priest spent 8 of 16 and stopped. This
+    // instead re-derives the legal set after every point, so filling one
+    // branch to tier 4 and then spilling the remainder into the next-best is
+    // the natural outcome rather than a special case.
+    //
+    // The ordering problem underneath: a readable node is almost always gated
+    // behind unreadable ones. Every tree root declares nothing, so ranking by
+    // readable value alone picks nothing at all. Each candidate is therefore
+    // scored as its own readable value FIRST, and as a tiebreak by how much
+    // readable value still sits behind it in its branch - so the points that
+    // only open a tier at least open the tier worth opening. Those are marked
+    // blind and counted, never presented as considered picks.
     const blind = [];
-    const targetBranch = (() => {
-      // Commit to the branch whose readable nodes are worth the most, so the
-      // gate points at least buy depth somewhere useful.
-      const per = new Map();
-      for (const n of tree.nodes) {
-        if (n.tier === 0) continue;
-        per.set(n.branchIndex, (per.get(n.branchIndex) ?? 0) + weight(n.skill));
-      }
-      let best = null, bw = -1;
-      for (const [b, w] of per) if (w > bw) { bw = w; best = b; }
-      return best;
-    })();
 
-    for (let tier = 0; tier <= 4 && spent < budget; tier++) {
-      const need = tierThreshold(tier);
-      const here = tree.nodes
-        .filter((n) => n.tier === tier && !picked.includes(n.skill))
-        .sort((a, b) => {
-          // Readable first, then by value, then by id for reproducibility.
-          const d = weight(b.skill) - weight(a.skill);
-          if (d) return d;
-          return a.skill < b.skill ? -1 : 1;
-        });
-      for (const n of here) {
-        if (spent >= budget) break;
-        // Stay in the chosen branch once past the root, so the thresholds
-        // actually accumulate instead of being spread thin.
-        if (tier > 0 && targetBranch != null && n.branchIndex !== targetBranch) continue;
-        if (tier > 0 && (perBranch.get(n.branchIndex) ?? 0) < need) continue;
-        picked.push(n.skill);
-        if (!weight(n.skill)) blind.push(n.skill);
-        perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + 1);
-        spent++;
-      }
+    // Readable value still unclaimed in a branch, which is what a gate point
+    // is really buying.
+    const promise = (branchIndex, taken) => tree.nodes
+      .filter((n) => n.branchIndex === branchIndex && !taken.has(n.skill))
+      .reduce((sum, n) => sum + weight(n.skill), 0);
+
+    const taken = new Set(picked);
+    while (spent < budget) {
+      const legal = tree.nodes.filter((n) => {
+        if (taken.has(n.skill)) return false;
+        return (perBranch.get(n.branchIndex) ?? 0) >= tierThreshold(n.tier);
+      });
+      if (!legal.length) break;
+
+      legal.sort((a, b) => {
+        const d = weight(b.skill) - weight(a.skill);
+        if (Math.abs(d) > 1e-9) return d;
+        // Both unreadable (or equally readable): favour the branch with the
+        // most readable value still locked behind it, then the shallower
+        // node, then the id so a shared build is reproducible.
+        const p = promise(b.branchIndex, taken) - promise(a.branchIndex, taken);
+        if (Math.abs(p) > 1e-9) return p;
+        if (a.tier !== b.tier) return a.tier - b.tier;
+        return a.skill < b.skill ? -1 : 1;
+      });
+
+      const n = legal[0];
+      // Nothing readable is reachable any more and nothing is locked behind
+      // what is left: stop rather than spend the rest at random.
+      if (!weight(n.skill) && promise(n.branchIndex, taken) <= 0) break;
+
+      picked.push(n.skill);
+      taken.add(n.skill);
+      if (!readableValue(n.skill).readable) blind.push(n.skill);
+      perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + 1);
+      spent++;
     }
     return { picked, spent, budget, unspent: budget - spent, blind };
   }

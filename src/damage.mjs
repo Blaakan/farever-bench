@@ -511,10 +511,11 @@ export function buildCombat(cdb, ctx) {
       why: 'Both have empty scaling and are zero from every source in this build, so the assumption is currently inert.' },
     { severity: 'unverified', what: 'WeaponPower = the weapon slot\'s share of the class primary budget',
       why: 'WeaponPower has no scaling entry and no budget group. Every base attack scales off it, so absolute damage depends on this.' },
-    { severity: 'unmodelled', what: 'most of what a rune or a talent does',
-      why: '66 of the 88 talent nodes declare no affix, no effect and no status at all, and only 17 of the ' +
-           '84 runes gate a step or override a prop. The rest live in game code keyed on being slotted, so ' +
-           'they are structurally visible and numerically invisible. `bench talents` reports the split.' },
+    { severity: 'unmodelled', what: 'most of what a rune or a talent does, pending the script kernel',
+      why: '64 of the 88 talent nodes declare no affix, no effect and no status, and only 17 of the 84 ' +
+           'runes gate a step or override a prop. But 72 of those talents DO ship an hscript body, and ' +
+           'between them those scripts call only 63 names - about 39 real host functions once the hooks ' +
+           'and built-ins are removed. The gap is the script kernel, not missing data. `bench talents`.' },
     { severity: 'assumption', what: 'charged skills are evaluated at full charge',
       why: 'Steps gated on cond.castHoldStep are mutually exclusive charge levels; the highest is used.' },
     { severity: 'unmodelled', what: 'runes (skill masteries) and talents',

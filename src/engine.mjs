@@ -179,7 +179,7 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     {
       severity: 'unmodelled',
       what: 'the DemonSigil socket cannot be scored',
-      why: 'Each of the 12 sigils grants one talent, and the talents declare no effect, no affix and no ' +
+      why: 'Each of the 12 sigils grants one tier-4 talent, and most of those declare no effect, no affix and no ' +
            'status - Priest_Talent_SunHalo carries only vars.damage 0.5 and no script at all, so its ' +
            'behaviour lives in game code keyed on the talent being present. Nothing in the data to read.',
     },
