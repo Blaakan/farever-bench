@@ -13,7 +13,7 @@
 // ---------------------------------------------------------------------------
 
 import { readFileSync, writeFileSync } from 'node:fs';
-import { createEngine, GOALS } from '../src/engine.mjs';
+import { createEngine, GOALS, FERVOR_SCOPES } from '../src/engine.mjs';
 import { emptyLoadout, classOf } from '../src/loadout.mjs';
 import { optimize, rankSlot } from '../src/optimize.mjs';
 import * as f from '../src/format.mjs';
@@ -24,7 +24,7 @@ export const VERSION = '0.1.0';
 
 function parseArgs(argv) {
   const out = { _: [], flags: {}, repeated: {} };
-  const REPEATABLE = new Set(['pin', 'no-augment', 'weight']);
+  const REPEATABLE = new Set(['pin', 'no-augment', 'weight', 'skills']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('-')) { out._.push(a); continue; }
@@ -78,7 +78,6 @@ function applyPins(engine, loadout, args, { stars }) {
   const augTypeIds = cat.augmentTypes.map((a) => a.id);
   const pinnedGear = new Set();
   const pinnedAug = new Set();
-  const aptFree = new Set();
   const augPins = [];
 
   for (const spec of args.repeated.pin ?? []) {
@@ -100,8 +99,8 @@ function applyPins(engine, loadout, args, { stars }) {
     pinnedGear.add(slot);
     if (/^(none|empty|-)$/i.test(rhs)) { delete loadout.gear[slot]; continue; }
 
-    // item [ @rarity ] [ :aptitude ] [ *stars ]
-    const m = /^([^@:*]+)(?:@([^:*]+))?(?::([^*]+))?(?:\*(\d+))?$/.exec(rhs);
+    // item [ ^instanceLevel ] [ @rarity ] [ *stars ]
+    const m = /^([^@*^]+)(?:\^(\d+))?(?:@([^*^]+))?(?:\*(\d+))?$/.exec(rhs);
     if (!m) die(`--pin "${spec}": cannot read the item part "${rhs}"`);
     const itemId = resolve(m[1], cat.items.filter((i) => i.slots.includes(slot)).map((i) => i.id), `item for ${f.short(slot)}`);
     const item = cat.itemById.get(itemId);
@@ -113,24 +112,17 @@ function applyPins(engine, loadout, args, { stars }) {
       die(`${itemId} needs level ${item.level}, the build is level ${loadout.level}`);
     }
 
-    const rarity = m[2]
-      ? resolve(m[2], cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
-      : item.rarity;
-
-    // Craft jewellery names several alternative aptitudes and only one of them
-    // is the piece you looted, so it can be pinned explicitly.
-    const aptOptions = cat.payingAptitudes(item, cls.aptitude);
-    let aptitude = null;
-    if (m[3]) {
-      aptitude = resolve(m[3], aptOptions, `aptitude for ${itemId}`);
-    } else if (aptOptions.length > 1) {
-      // The item is fixed but which version of it is not, so leave that one
-      // decision to the search instead of silently taking the first.
-      aptFree.add(slot);
-      aptitude = aptOptions[0];
-      console.error(f.warn(`note: ${itemId} can be ${aptOptions.join(' / ')}; the item is pinned but the ` +
-        `search will pick which (pin ${f.short(slot)}=${itemId}:<aptitude> to fix that too)`));
+    // The instance level - what your copy actually dropped at. The authored
+    // level is only a reference, so this is what you need to reproduce a real
+    // character sheet.
+    const instanceLevel = m[2] != null ? Number(m[2]) : null;
+    if (instanceLevel != null && instanceLevel > loadout.level) {
+      console.error(f.warn(`note: ${itemId} pinned at instance level ${instanceLevel}, above the build's ${loadout.level}`));
     }
+
+    const rarity = m[3]
+      ? resolve(m[3], cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
+      : item.rarity;
 
     const cap = cat.maxStars(item, rarity);
     const want = m[4] != null ? Number(m[4]) : (stars === 'max' ? cap : Math.min(stars, cap));
@@ -138,7 +130,7 @@ function applyPins(engine, loadout, args, { stars }) {
     if (m[4] != null && capped < want) {
       console.error(f.warn(`note: ${itemId} is ${rarity} and caps at ${capped} upgrade stars, not ${want}`));
     }
-    loadout.gear[slot] = { item: itemId, rarity, aptitude, stars: capped };
+    loadout.gear[slot] = { item: itemId, rarity, stars: capped, level: instanceLevel };
   }
 
   // --no-augment <slot> pins every socket that slot can have to empty. Applied
@@ -161,7 +153,43 @@ function applyPins(engine, loadout, args, { stars }) {
     loadout.augments[p.key] = resolve(p.value, choices, `augment for ${type}`);
   }
 
-  return { pinnedGear, pinnedAug, aptFree };
+  // --skills weapon1=Sword_Swarm_Skill1,Sword_Swarm_Passive
+  // --skills prayer=Smite,Life
+  // A weapon offers three and you slot two, so this is a real build decision.
+  // Left alone, the search picks; named here, it is fixed.
+  const pinnedSkills = new Set();
+  loadout.skills ??= {};
+  engine.plan.pruneSelection(loadout);
+  for (const spec of args.repeated.skills ?? []) {
+    if (spec === true) die('--skills needs a value, e.g. --skills weapon1=Skill1,Passive');
+    const eq = String(spec).indexOf('=');
+    if (eq < 0) die(`--skills "${spec}" needs the form pool=skill,skill`);
+    const poolRaw = spec.slice(0, eq);
+    const pools = engine.plan.pools(loadout);
+    if (!pools.length) die('--skills: nothing is equipped that offers a skill choice yet (pin the weapon first)');
+    const keys = pools.map((p) => p.key);
+    // "weapon1", "arsenal", "prayers" and the raw key all resolve.
+    const alias = new Map(pools.flatMap((p) => [
+      [p.key.toLowerCase(), p.key],
+      [f.short(p.key).toLowerCase(), p.key],
+      [p.label.replace(/\s+/g, '').toLowerCase(), p.key],
+      [(p.mechanic ?? '').toLowerCase(), p.key],
+    ].filter(([k]) => k)));
+    const wanted = alias.get(String(poolRaw).toLowerCase())
+      ?? resolve(poolRaw, keys, `skill pool (one of ${pools.map((p) => f.short(p.key) + ' "' + p.label + '"').join(', ')})`);
+    const pool = pools.find((p) => p.key === wanted);
+
+    const picks = spec.slice(eq + 1).split(',').map((x) => x.trim()).filter(Boolean)
+      .map((x) => resolve(x, pool.options, `skill for ${pool.label}`));
+    if (picks.length > pool.slots) {
+      die(`${pool.label}: only ${pool.slots} slot${pool.slots === 1 ? '' : 's'} at level ${loadout.level}, ` +
+        `but ${picks.length} skills were named`);
+    }
+    loadout.skills[pool.key] = picks;
+    pinnedSkills.add(pool.key);
+  }
+
+  return { pinnedGear, pinnedAug, pinnedSkills };
 }
 
 function parseWeights(args) {
@@ -182,7 +210,9 @@ const DEFAULT_EXCLUDE = '^GM_';
 
 function commonSetup(args) {
   const assume = {};
-  if (args.flags['no-fervor-damage']) assume.fervorDamage = false;
+  if (typeof args.flags[`fervor-scope`] === 'string') assume.fervorScope = args.flags[`fervor-scope`];
+  if (args.flags['no-fervor-damage']) assume.fervorScope = 'none';
+  if (!FERVOR_SCOPES.includes(assume.fervorScope ?? 'skills')) die(`--fervor-scope must be one of ${FERVOR_SCOPES.join(', ')}`);
   if (args.flags['no-mastery']) assume.mastery = false;
   const engine = createEngine({
     game: typeof args.flags.game === 'string' ? args.flags.game : undefined,
@@ -212,7 +242,10 @@ function commonSetup(args) {
   }
   return {
     engine, level, stars, rarities, goal, targetName, rank, mix, exclude,
-    rarityRoll: !!args.flags['rarity-roll'],
+    // On by default: rarity is rolled at drop, so a Rare-authored chest that can
+    // land Epic or Legendary should be on the table. --no-rarity-roll pins every
+    // item to the rarity the CDB authors it at.
+    rarityRoll: !args.flags['no-rarity-roll'],
     weights: parseWeights(args),
   };
 }
@@ -274,14 +307,14 @@ const commands = {
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${cls.unit} ${s.level} - ${f.short(slot)} - ${list.length} legal ` +
       `${s.rarityRoll ? '(item, rarity) pairs' : 'items'}\n`);
-    console.log(f.table(['ITEM', 'NAME', 'RAR', 'ROLL', 'MAX UPG', 'LVL', 'FACTION/APT', 'GIVES', 'SKILLS'],
+    console.log(f.table(['ITEM', 'NAME', 'RAR', 'ROLL', 'MAX UPG', 'LVL', 'FACTION', 'GIVES', 'SKILLS'],
       list.map((c) => [
         c.item.id, c.item.name === c.item.id ? '' : c.item.name, c.rarity,
         c.chance != null && !c.authored ? f.pct(c.chance, 0) : '',
         s.engine.cat.maxStars(c.item, c.rarity),
         c.item.level ?? f.dim('(scales)'),
-        c.item.faction ?? (c.aptitudeIsChoice ? f.dim(c.aptitude) : f.dim('-')),
-        f.ratingGiven(s.engine.cat, c.item, cls.aptitude, c.rarity, c.aptitude) ?? f.dim('-'),
+        c.item.faction ?? f.dim('-'),
+        f.ratingGiven(s.engine.cat, c.item, cls.aptitude, c.rarity) ?? f.dim('-'),
         c.item.skills.length ? f.warn(String(c.item.skills.length)) : '',
       ]), { align: [null, null, null, 'r', 'r', 'r'] }));
   },
@@ -289,7 +322,7 @@ const commands = {
   sheet(args) {
     const s = commonSetup(args);
     const loadout = loadBuild(args, s.engine, s.level);
-    applyPins(s.engine, loadout, args, { stars: s.stars });
+    const pins = applyPins(s.engine, loadout, args, { stars: s.stars });
     const target = s.engine.combat.foe(s.targetName, s.level);
     const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix });
     console.log(f.header(s.engine, VERSION) + '\n');
@@ -297,6 +330,10 @@ const commands = {
     if (s.engine.socketsOf(loadout).length) {
       console.log(f.bold('AUGMENTS'));
       console.log(f.augmentBlock(s.engine, loadout) + '\n');
+    }
+    if (s.engine.plan.pools(loadout).length) {
+      console.log(f.bold('SKILLS'));
+      console.log(f.skillsBlock(s.engine, loadout, ev, { pinnedSkills: pins.pinnedSkills }) + '\n');
     }
     console.log(f.sheetBlock(s.engine, ev, { level: s.level }));
     console.log(f.throughputBlock(s.engine, ev, { goal: s.goal }) + '\n');
@@ -320,13 +357,13 @@ const commands = {
     console.log('');
     const limit = args.flags.all ? rows.length : 15;
     const apt = classOf(s.engine.cat, loadout).aptitude;
-    console.log(f.table(['', 'ITEM', 'RAR', 'ROLL', 'UPG', 'FACTION/APT', 'GIVES', s.goal.toUpperCase(), 'DELTA'],
+    console.log(f.table(['', 'ITEM', 'RAR', 'ROLL', 'UPG', 'FACTION', 'GIVES', s.goal.toUpperCase(), 'DELTA'],
       rows.slice(0, limit).map((r) => [
         r.equipped ? f.bold('>') : '', r.item.id, r.rarity,
         r.chance != null && r.rarity !== r.item.rarity ? f.pct(r.chance, 0) : '',
         r.stars ? '*'.repeat(r.stars) : '',
-        r.item.faction ?? (r.aptitudeIsChoice ? f.dim(r.aptitude) : f.dim('-')),
-        f.ratingGiven(s.engine.cat, r.item, apt, r.rarity, r.aptitude) ?? f.dim('-'),
+        r.item.faction ?? f.dim('-'),
+        f.ratingGiven(s.engine.cat, r.item, apt, r.rarity) ?? f.dim('-'),
         f.num(r.score, 1),
         r.delta == null ? f.dim('-') : f.signedPct(r.delta),
       ]), { align: [null, null, null, 'r', null, null, null, 'r', 'r'] }));
@@ -345,7 +382,7 @@ const commands = {
     const res = optimize(s.engine, {
       loadout, ...pins, goal: s.goal, weights: s.weights, target,
       rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
-      exclude: s.exclude, rarityRoll: s.rarityRoll,
+      exclude: s.exclude, rarityRoll: s.rarityRoll, pinnedSkills: pins.pinnedSkills,
       allowEmpty: !args.flags['no-empty'], restarts,
       onProgress: process.stderr.isTTY ? (n) => process.stderr.write(`\r  ${n} evaluations...`) : null,
     });
@@ -371,6 +408,8 @@ const commands = {
     console.log(f.gearBlock(s.engine, res.loadout, { pinnedGear: pins.pinnedGear }) + '\n');
     console.log(f.bold('AUGMENTS'));
     console.log(f.augmentBlock(s.engine, res.loadout, { pinnedAug: pins.pinnedAug }) + '\n');
+    console.log(f.bold('SKILLS'));
+    console.log(f.skillsBlock(s.engine, res.loadout, res.evaluation, { pinnedSkills: pins.pinnedSkills }) + '\n');
     console.log(f.sheetBlock(s.engine, res.evaluation, { level: s.level }));
     console.log(f.throughputBlock(s.engine, res.evaluation, { goal: s.goal }) + '\n');
 
@@ -387,9 +426,9 @@ const commands = {
         version: VERSION,
         cdbSha: s.engine.meta.cdbSha,
         bootSha: s.engine.meta.bootSha,
-        goal: s.goal, weights: s.weights, target: target.name,
+        goal: s.goal, weights: s.weights, target: target.name, fervorScope: s.engine.opts.assume.fervorScope,
         stars: s.stars, rank: s.rank,
-        pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug] },
+        pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills] },
         build: res.loadout,
         metrics: {
           dps: res.evaluation.throughput.dps,
@@ -398,6 +437,7 @@ const commands = {
           ehp: res.evaluation.survivability.ehp,
         },
         sheet: Object.fromEntries(res.evaluation.sheet),
+        unmodelled: res.evaluation.throughput.unmodelled,
         assumptions: s.engine.audit,
       }, null, 2));
       console.log(f.dim(`\nwrote ${args.flags.json}`));
@@ -433,10 +473,14 @@ Common flags
   --stars <n|max>         upgrade stars to assume       (default max)
   --rarity <list>         restrict to e.g. Rare,Epic
   --rank <n>              weapon-skill rank 1-3        (default max)
-  --rarity-roll           treat rarity as rolled at drop, not authored
+  --no-rarity-roll        pin every item to the rarity the CDB authors it at
+                          (by default rarity is treated as rolled at drop, so
+                          Epic and Legendary versions are on the table)
   --exclude <regex>       drop matching item ids       (default ^GM_)
   --include-all           no id exclusions at all
-  --no-fervor-damage      drop the unverified "Fervor multiplies damage" model
+  --fervor-scope <s>      skills | all | none   (default skills)
+                          whether the unverified Fervor damage bonus applies to
+                          base attacks too, or at all
   --no-mastery            drop the unverified mastery multipliers
   --build <file.json>     start from a saved build
   --json <file.json>      write the result as JSON
@@ -447,8 +491,13 @@ Pinning
   --pin weapon1=Sword_Swarm*3          fix an item at 3 upgrade stars
   --pin trinket=none                   force a slot empty
   --pin feet/enchantfeet=none          force one socket empty
-  --pin neck=Necklace_Z1RCraft:Crit    pick which version of a multi-aptitude item
   --pin chest=Chest_RManfish_Cle@Epic  assume a particular drop rarity
+  --pin weapon1=Spear_Eruption^10*0    an instance that dropped at level 10, 0 stars
+
+Skill selection
+  --skills weapon1=Skill1,Passive      slot two of the three a weapon offers
+  --skills prayers=Smite,Life          choose the prayer sequence
+  (left alone, the optimiser chooses and prints what it dropped)
   --no-augment weapon1                 no augments at all on that slot
 
 Example

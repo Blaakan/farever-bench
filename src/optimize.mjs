@@ -78,10 +78,8 @@ export function optimize(engine, spec) {
 
   const pinnedGear = spec.pinnedGear ?? new Set();
   const pinnedAug = spec.pinnedAug ?? new Set();
-  // Slots where the ITEM is pinned but which version of it is not: craft
-  // jewellery names several alternative aptitudes and only one is the piece you
-  // looted, so that single decision stays in the search.
-  const aptFree = spec.aptFree ?? new Set();
+  // Skill pools the user chose by hand.
+  const pinnedSkills = spec.pinnedSkills ?? new Set();
 
   // The reference used to normalise a weighted blend: the seed as given, so
   // the numbers a user reads are relative to where they started.
@@ -90,7 +88,7 @@ export function optimize(engine, spec) {
 
   const freeSlots = cat.combatSlots()
     .map((s) => s.id)
-    .filter((id) => !pinnedGear.has(id) || aptFree.has(id));
+    .filter((id) => !pinnedGear.has(id));
 
   // Candidate lists are stable for the whole run, so build them once.
   const cls = cat.classes.find((c) => c.unit === spec.loadout.class);
@@ -111,17 +109,6 @@ export function optimize(engine, spec) {
       candidates.set(slotId, [null]);
       continue;
     }
-    // An aptitude-free pin: the only choice left is which version of the one
-    // pinned item, so the candidate list is exactly that.
-    if (aptFree.has(slotId)) {
-      const g = spec.loadout.gear[slotId];
-      const item = cat.itemById.get(g.item);
-      candidates.set(slotId, cat.payingAptitudes(item, cls.aptitude).map((apt) => ({
-        item: g.item, rarity: g.rarity ?? item.rarity, chance: null,
-        aptitude: apt, aptitudeIsChoice: true, stars: g.stars ?? 0,
-      })));
-      continue;
-    }
     const list = cat.candidates(slotId, {
       aptitude: cls.aptitude, charLevel: spec.loadout.level,
       rarities, exclude: spec.exclude, rarityRoll: spec.rarityRoll,
@@ -129,8 +116,6 @@ export function optimize(engine, spec) {
       item: c.item.id,
       rarity: c.rarity,
       chance: c.chance,
-      aptitude: c.aptitude,
-      aptitudeIsChoice: c.aptitudeIsChoice,
       stars: stars === 'max' ? cat.maxStars(c.item, c.rarity) : Math.min(stars, cat.maxStars(c.item, c.rarity)),
     })).filter((c) => !(slotId === 'Slot_Weapon1' && offhandPinnedFull && !cat.allowsOffhand(cat.itemById.get(c.item))));
     if (allowEmpty || slotId === 'Slot_OffhandWeapon') list.push(null);
@@ -157,8 +142,10 @@ export function optimize(engine, spec) {
     // Only the decisions matter, so key on them rather than the whole object.
     const key = cat.combatSlots().map((s) => {
       const g = loadout.gear[s.id];
-      return g ? `${s.id}=${g.item}/${g.rarity ?? ''}/${g.aptitude ?? ''}:${g.stars ?? 0}${g.flawless ? 'f' : ''}` : '';
-    }).join('|') + '#' + Object.entries(loadout.augments).filter(([, v]) => v).sort().map(([k, v]) => k + '=' + v).join('|');
+      return g ? `${s.id}=${g.item}/${g.rarity ?? ''}:${g.stars ?? 0}${g.flawless ? 'f' : ''}` : '';
+    }).join('|')
+      + '#' + Object.entries(loadout.augments).filter(([, v]) => v).sort().map(([k, v]) => k + '=' + v).join('|')
+      + '$' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + '=' + v.join('+')).join('|');
     let v = evalCache.get(key);
     if (v === undefined) {
       v = scorer.score(loadout);
@@ -170,17 +157,38 @@ export function optimize(engine, spec) {
   }
 
   function clone(l) {
-    return { ...l, gear: { ...l.gear }, augments: { ...l.augments } };
+    return {
+      ...l,
+      gear: { ...l.gear },
+      augments: { ...l.augments },
+      skills: Object.fromEntries(Object.entries(l.skills ?? {}).map(([k, v]) => [k, v.slice()])),
+    };
   }
 
-  // Drop augments whose host slot no longer holds an item that can host them,
-  // and any offhand a two-handed mainhand has just made illegal.
+  // Drop anything the current gear no longer supports: augments whose host is
+  // gone, an offhand a two-handed mainhand has just made illegal, and skill
+  // choices belonging to a weapon that is no longer equipped.
   function pruneAugments(l) {
     if (!pinnedGear.has('Slot_OffhandWeapon')) pruneIllegal(cat, l);
     const live = new Set(socketsOf(cat, l).map((s) => s.key));
     for (const k of Object.keys(l.augments)) {
       if (!live.has(k) && !pinnedAug.has(k)) delete l.augments[k];
     }
+    engine.plan.pruneSelection(l);
+  }
+
+  // --- skill choices -------------------------------------------------------
+  // Every way to fill one pool: C(options, slots). Weapons offer three and give
+  // two, so this is three combinations - cheap enough to enumerate exactly.
+  function combinations(options, k) {
+    if (k >= options.length) return [options.slice()];
+    const out = [];
+    const walk = (start, acc) => {
+      if (acc.length === k) { out.push(acc.slice()); return; }
+      for (let i = start; i < options.length; i++) { acc.push(options[i]); walk(i + 1, acc); acc.pop(); }
+    };
+    walk(0, []);
+    return out;
   }
 
   function ascend(start, rand) {
@@ -197,16 +205,38 @@ export function optimize(engine, spec) {
         let bestScore = best;
         for (const pick of candidates.get(slotId)) {
           const trial = clone(cur);
-          if (pick) trial.gear[slotId] = { item: pick.item, rarity: pick.rarity, aptitude: pick.aptitude, stars: pick.stars };
+          if (pick) trial.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars };
           else delete trial.gear[slotId];
           pruneAugments(trial);
           const s = scoreOf(trial);
           if (s > bestScore + 1e-12) { bestScore = s; bestPick = pick; }
         }
         if (bestScore > best + 1e-12) {
-          if (bestPick) cur.gear[slotId] = { item: bestPick.item, rarity: bestPick.rarity, aptitude: bestPick.aptitude, stars: bestPick.stars };
+          if (bestPick) cur.gear[slotId] = { item: bestPick.item, rarity: bestPick.rarity, stars: bestPick.stars };
           else delete cur.gear[slotId];
           pruneAugments(cur);
+          best = bestScore;
+          improved = true;
+        }
+      }
+
+      // Then which skills to slot. This has to come after gear, because the
+      // pool is whatever the equipped weapon offers, and before augments, since
+      // an enchant's value depends on what it is procking off.
+      for (const pool of shuffled(engine.plan.pools(cur), rand)) {
+        if (pinnedSkills.has(pool.key)) continue;
+        const opts = combinations(pool.options, pool.slots);
+        if (opts.length < 2) continue;
+        let bestPick = cur.skills[pool.key];
+        let bestScore = best;
+        for (const pick of opts) {
+          const trial = clone(cur);
+          trial.skills[pool.key] = pick;
+          const s = scoreOf(trial);
+          if (s > bestScore + 1e-12) { bestScore = s; bestPick = pick; }
+        }
+        if (bestScore > best + 1e-12) {
+          cur.skills[pool.key] = bestPick.slice();
           best = bestScore;
           improved = true;
         }
@@ -244,12 +274,13 @@ export function optimize(engine, spec) {
   for (let r = 0; r < Math.max(1, restarts); r++) {
     const rand = rng(0x9e3779b9 + r * 2654435761);
     let seed = clone(spec.loadout);
+    engine.plan.pruneSelection(seed);
     if (r > 0) {
       for (const slotId of freeSlots) {
         const list = candidates.get(slotId).filter(Boolean);
         if (!list.length) continue;
         const pick = list[Math.floor(rand() * list.length)];
-        seed.gear[slotId] = { item: pick.item, rarity: pick.rarity, aptitude: pick.aptitude, stars: pick.stars };
+        seed.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars };
       }
       pruneAugments(seed);
     }
@@ -293,20 +324,21 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
     const st = stars === 'max' ? cat.maxStars(it, cand.rarity) : Math.min(stars, cat.maxStars(it, cand.rarity));
     const trial = {
       ...loadout,
-      gear: { ...loadout.gear, [slotId]: { item: it.id, rarity: cand.rarity, aptitude: cand.aptitude, stars: st } },
+      gear: { ...loadout.gear, [slotId]: { item: it.id, rarity: cand.rarity, stars: st } },
       augments: { ...loadout.augments },
     };
-    // A different host item may not host the same augments.
+    // A different host item may not host the same augments, and a different
+    // weapon offers a different skill pool.
     const live = new Set(engine.socketsOf(trial).map((s) => s.key));
     for (const k of Object.keys(trial.augments)) if (!live.has(k)) delete trial.augments[k];
+    trial.skills = Object.fromEntries(Object.entries(trial.skills ?? {}).map(([k, v]) => [k, v.slice()]));
+    engine.plan.pruneSelection(trial);
     const ev = engine.evaluate(trial, { target, rank, mix });
     const score = scorer.scoreFrom(ev);
     rows.push({
       item: it,
       rarity: cand.rarity,
       chance: cand.chance,
-      aptitude: cand.aptitude,
-      aptitudeIsChoice: cand.aptitudeIsChoice,
       stars: st,
       score,
       // A delta needs something to be relative to. With the slot empty the

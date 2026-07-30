@@ -154,8 +154,12 @@ export function buildCatalog(cdb, ctx) {
   // iLevel is ten times the level. Items with neither (every `*_R<Faction>_*`
   // row - 501 of them) drop at the character's level, so that is what they
   // are worth. Rarity, upgrade stars and "flawless" each add iLevel on top.
-  function effectiveLevel(item, { charLevel, stars = 0, flawless = false, rarity = null }) {
-    const baseILevel = item.iLevel ?? (item.level != null ? item.level * 10 : charLevel * 10);
+  function effectiveLevel(item, { charLevel, stars = 0, flawless = false, rarity = null, level = null }) {
+    // `level` is the INSTANCE level - what the thing actually dropped at. The
+    // authored `item.level` is a reference, and a real drop is often higher, so
+    // checking the tool against a character sheet needs the instance level.
+    const baseILevel = level != null ? level * 10
+      : (item.iLevel ?? (item.level != null ? item.level * 10 : charLevel * 10));
     const rar = cdb.byId('rarity').get(rarity ?? item.rarity);
     const iLevel = baseILevel
       + (rar?.props?.iLevelBonus ?? 0)
@@ -215,39 +219,30 @@ export function buildCatalog(cdb, ctx) {
     return item.aptitudes.some((a) => a === aptitude || isGeneric(a));
   }
 
-  // An item's `aptitudes` column is the set of aptitudes the item CAN be, not a
-  // set it is all of at once - `$HItem.getAptitude` is singular. Two shapes
-  // exist and they behave differently:
+  // EVERY aptitude on an item pays, and the contributions SUM. This is checked
+  // against the game: `Spear_Eruption` (Rare, Kobold, [Assassin, Cleric]) at
+  // effective level 11 reads, in game,
   //
-  //   * a class item names one or two CLASS aptitudes (`Chest_Z2U2_FigCle` is
-  //     [Fighter, Cleric]), of which at most one can ever be yours, so the
-  //     choice is forced;
-  //   * craft jewellery names several GENERIC ones (`Necklace_Z1RCraft` is
-  //     [Crit, Fervor, ArPen, MaPen]), which is a real choice - one necklace
-  //     id, four different necklaces.
+  //     +36 Vitality  +18 Dexterity  +15 Faith  +39 Critical  +39 Armor Pen
   //
-  // No item mixes the two shapes, so filtering to what this character can use
-  // leaves either one class aptitude or a list of generics. Summing that list
-  // would pay the shared MaxHealth budget once per entry, which is why this
-  // returns options and the caller picks exactly one.
-  function payingAptitudes(item, aptitude) {
-    if (!item.aptitudes.length) return [];
-    return item.aptitudes.filter((a) => a === aptitude || isGeneric(a));
-  }
-
-  // The single aptitude an equipped instance resolves to. `chosen` comes from
-  // the loadout; without it the first option wins, which is deterministic and
-  // reported rather than hidden.
-  function resolveAptitude(item, aptitude, chosen = null) {
-    const options = payingAptitudes(item, aptitude);
-    if (!options.length) return null;
-    if (chosen) {
-      if (!options.includes(chosen)) {
-        throw new Error(`${item.id} cannot be a ${chosen} item (options: ${options.join(', ')})`);
-      }
-      return chosen;
-    }
-    return options[0];
+  // and every one of those five falls out of summing both aptitudes. Dexterity
+  // is Assassin's primary budget (36..648) and Faith is Cleric's (30..540) -
+  // hence 18 and 15, a 1.2 ratio that matches the budgets exactly. Vitality is
+  // the sum of both MaxHealth budgets. The two ratings come from the two
+  // aptitudes' different readings of the same Kobold faction: Assassin gets
+  // ArmorPen from Kobold, Cleric gets Crit.
+  //
+  // And they pay REGARDLESS of your class. Your aptitude decides only whether
+  // you can equip the thing (see `usableBy`); once it is on, you get everything
+  // it grants. That is why a Rogue reading that spear's tooltip sees +15 Faith,
+  // a stat the Cleric aptitude put there and that a Rogue barely uses.
+  //
+  // Untested extrapolation: the craft jewellery that names four GENERIC
+  // aptitudes (`Necklace_Z1RCraft` is [Crit, Fervor, ArPen, MaPen]) then pays
+  // all four ratings and four shares of MaxHealth. That follows the same rule,
+  // but no in-game reading confirms it yet.
+  function payingAptitudes(item /* , aptitude */) {
+    return item.aptitudes;
   }
 
   // --- affix application ----------------------------------------------------
@@ -261,12 +256,18 @@ export function buildCatalog(cdb, ctx) {
     TAttribute_MRatioMin: 'mulRatio',
   };
 
-  function applyAffixes(affixes, mods, factor = 1) {
+  // `ceilFlat` reproduces the arsenal rule for authored affixes as well as for
+  // budget-derived ones. Checked in game: a Rare Corrupted Gift is -20/+20 in
+  // the main hand and -8/+8 in the arsenal, and ceil(-20*0.4) = -8 as well as
+  // ceil(20*0.4) = 8. Ratios are scaled but not ceiled - they are fractions,
+  // not integers.
+  function applyAffixes(affixes, mods, factor = 1, ceilFlat = false) {
     for (const a of affixes ?? []) {
       const kind = AFFIX_KIND[a.ref];
       const atb = a.target?.attribute;
       if (!kind || !atb) continue;
-      const v = (a.val ?? 0) * factor;
+      let v = (a.val ?? 0) * factor;
+      if (kind === 'flat' && ceilFlat) v = Math.ceil(v);
       if (kind === 'mulRatio') {
         mods.mulRatio.set(atb, (mods.mulRatio.get(atb) ?? 1) * (1 + v));
       } else {
@@ -311,8 +312,11 @@ export function buildCatalog(cdb, ctx) {
     const ov = (rarities ?? []).find((r) => r.rarity === rarity)?.atbRatio;
     if (ov) Object.assign(ratios, ov);
 
-    const aptId = resolveAptitude(item, opts.aptitude, opts.itemAptitude);
-    if (aptId) {
+    // Accumulated per item, not straight into `mods`, because the slot factor
+    // applies to the finished per-stat total - see the ceil() below.
+    const own = new Map();
+
+    for (const aptId of payingAptitudes(item)) {
       const apt = aptitudes.get(aptId);
       for (const e of apt?.atbScaling ?? []) {
         const c = e.conds ?? {};
@@ -331,14 +335,28 @@ export function buildCatalog(cdb, ctx) {
         if (!total) continue;
 
         const target = e.sourceAtb ?? e.endAtb;
-        const amount = (total * ratio * affixFactor) / sourceConversion(e.endAtb, e.sourceAtb);
-        mods.flat.set(target, (mods.flat.get(target) ?? 0) + amount);
+        // Each aptitude's contribution is rounded on its own before the sum.
+        // That is a one-unit discriminator and the game agrees with it: rounding
+        // per aptitude gives Spear_Eruption 36 Vitality (16 + 20), summing first
+        // gives 35, and the character sheet says 36.
+        const amount = Math.round((total * ratio) / sourceConversion(e.endAtb, e.sourceAtb));
+        own.set(target, (own.get(target) ?? 0) + amount);
       }
     }
 
-    // Authored affixes, if any, and the item's own slot factor applies to them
-    // too - an arsenal weapon is 40% of itself in every respect.
-    applyAffixes(item.affixes, mods, affixFactor);
+    // The slot factor applies to the finished total, and it CEILS.
+    // The same spear in the arsenal reads +15/+8/+6/+16/+16 against its
+    // main-hand +36/+18/+15/+39/+39, and `ceil(v * 0.4)` is the only
+    // combination that reproduces all five - round gives 14 and 7, floor gives
+    // 14/7/15/15. It is 0.4 and not 0.5: the ceiling is what makes the small
+    // values look nearly halved.
+    for (const [atb, v] of own) {
+      const scaled = affixFactor === 1 ? v : Math.ceil(v * affixFactor);
+      mods.flat.set(atb, (mods.flat.get(atb) ?? 0) + scaled);
+    }
+
+    // Authored affixes are already integers, so the same slot rule applies.
+    applyAffixes(item.affixes, mods, affixFactor, affixFactor !== 1);
   }
 
   // The mean of the character's aptitudes' armorReduction - what the runtime
@@ -354,7 +372,7 @@ export function buildCatalog(cdb, ctx) {
     cdb, ctx,
     slots, slotById, classes, items, itemById,
     chain, inherited, socketsFor, augmentTypes,
-    effectiveLevel, maxStars, usableBy, payingAptitudes, resolveAptitude,
+    effectiveLevel, maxStars, usableBy, payingAptitudes,
     contribute, applyAffixes, armorReductionFor,
     rarityOrder, isGeneric, attainableRarities,
     allowsOffhand, handednessOf,
@@ -381,18 +399,9 @@ export function buildCatalog(cdb, ctx) {
         const rarityVariants = rarityRoll
           ? attainableRarities(it, charLevel)
           : [{ rarity: it.rarity, chance: null, authored: true }];
-        // One row per (rarity, aptitude) the instance could be. For most items
-        // that is one row; craft jewellery genuinely offers several.
-        const aptVariants = payingAptitudes(it, aptitude);
         for (const v of rarityVariants) {
           if (rarities && !rarities.has(v.rarity)) continue;
-          for (const apt of aptVariants.length ? aptVariants : [null]) {
-            out.push({
-              item: it, rarity: v.rarity, chance: v.chance, authored: v.authored,
-              aptitude: apt,
-              aptitudeIsChoice: aptVariants.length > 1,
-            });
-          }
+          out.push({ item: it, rarity: v.rarity, chance: v.chance, authored: v.authored });
         }
       }
       return out;

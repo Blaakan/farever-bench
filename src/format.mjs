@@ -116,8 +116,8 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set() } = {}) {
       num(eff * 10),
       // Craft jewellery lists several alternative aptitudes; only one of them
       // is what you actually looted, so name which one this row assumes.
-      it.faction ?? (cat.payingAptitudes(it, cls.aptitude).length > 1 ? dim(g.aptitude ?? '?') : dim('-')),
-      ratingGiven(cat, it, cls.aptitude, rarity, g.aptitude) ?? dim('-'),
+      it.faction ?? dim('-'),
+      ratingGiven(cat, it, cls.aptitude, rarity) ?? dim('-'),
       pinnedGear.has(slot.id) ? bold('pinned') : (rolled ? dim('rolled') : ''),
     ]);
   }
@@ -126,11 +126,14 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set() } = {}) {
 
 // Which secondary rating this piece pays out for this class - the cross of the
 // item's faction with the class's own atbScaling conditions.
-export function ratingGiven(cat, item, aptitude, rarity = null, chosen = null) {
+export function ratingGiven(cat, item, aptitude, rarity = null) {
+  // Every paying aptitude contributes, so a dual-aptitude item can grant two
+  // different ratings out of the same faction - a Kobold AssCle spear gives a
+  // Rogue ArmorPen and a Priest Crit, and gives both to nobody, because only
+  // one aptitude is ever yours.
   const rar = rarity ?? item.rarity;
   const aptitudes = cat.cdb.byId('aptitude');
-  const aptId = cat.resolveAptitude(item, aptitude, chosen);
-  if (aptId) {
+  for (const aptId of cat.payingAptitudes(item, aptitude)) {
     for (const e of aptitudes.get(aptId)?.atbScaling ?? []) {
       if ((e.statGroup ?? 0) !== 3) continue;
       const cd = e.conds ?? {};
@@ -150,11 +153,31 @@ export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {
   for (const s of socks) {
     const id = loadout.augments[s.key];
     const aug = id ? cat.itemById.get(id) : null;
+    let label = dim('(none)');
+    let effect = '';
+    if (aug) {
+      label = aug.name === aug.id ? aug.id : aug.name;
+      effect = affixSummary(aug.affixes);
+    } else {
+      // An empty socket has two very different meanings, and conflating them is
+      // how a tool misleads: "nothing here beats nothing" versus "I cannot put a
+      // number on any of these". Say which.
+      // An augment is scoreable if it carries a stat affix OR if a skill it
+      // grants resolves to a self-buff status - which is exactly how a weapon
+      // enchant comes to be worth anything.
+      const options = cat.augmentCandidates(s.type);
+      const scoreable = options.filter((o) => (o.affixes ?? []).some((a) => a.target?.attribute)
+        || (o.skills ?? []).some((sk) => engine.plan.selfBuffsOf(sk).length));
+      if (options.length && !scoreable.length) {
+        label = warn('(none - not scoreable)');
+        effect = dim(`all ${options.length} options grant a skill or talent, which this model does not score`);
+      }
+    }
     rows.push([
       short(s.slot),
       s.type.replace(/^Augment/, ''),
-      aug ? (aug.name === aug.id ? aug.id : aug.name) : dim('(none)'),
-      aug ? affixSummary(aug.affixes) : '',
+      label,
+      effect,
       pinnedAug.has(s.key) ? bold('pinned') : '',
     ]);
   }
@@ -170,6 +193,39 @@ export function affixSummary(affixes) {
     parts.push(`${v > 0 ? '+' : ''}${v} ${atb.replace('Rating', 'Rtg')}`);
   }
   return parts.join(' ');
+}
+
+// Which of the skills on offer this build actually slotted. A weapon hands you
+// three and you keep two, so this block is as much a part of the answer as the
+// gear table is.
+export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = {}) {
+  const pools = engine.plan.pools(loadout);
+  if (!pools.length) return dim('(nothing equipped that offers a skill choice)');
+  const skills = engine.cdb.byId('skill');
+  const name = (id) => skills.get(id)?.texts?.name ?? id;
+  const rows = [];
+  for (const p of pools) {
+    const chosen = loadout.skills?.[p.key] ?? p.options.slice(0, p.slots);
+    const dropped = p.options.filter((id) => !chosen.includes(id));
+    rows.push([
+      p.label,
+      `${chosen.length}/${p.options.length}`,
+      chosen.map((id) => bold(name(id))).join(', '),
+      dropped.length ? dim('not taken: ' + dropped.map(name).join(', ')) : '',
+      pinnedSkills.has(p.key) ? bold('pinned') : '',
+    ]);
+  }
+  const out = [table(['POOL', 'SLOTS', 'TAKEN', '', ''], rows)];
+
+  // Anything real that the model knows it is not scoring, named.
+  const un = ev?.throughput?.unmodelled ?? [];
+  if (un.length) {
+    out.push('');
+    out.push(warn(`not modelled in this build (${un.length}) - these contribute zero:`));
+    for (const u of un.slice(0, 10)) out.push('  ' + u.id.padEnd(34) + dim(u.why));
+    if (un.length > 10) out.push(dim(`  ... and ${un.length - 10} more`));
+  }
+  return out.join('\n');
 }
 
 export function throughputBlock(engine, ev, { goal }) {
@@ -189,19 +245,25 @@ export function throughputBlock(engine, ev, { goal }) {
       { align: [null, 'r'] }
     ),
     '',
-    bold('ROTATION'),
+    bold('ROTATION') + dim(`   attacks ${t.attackRate.toFixed(2)}/s, combos ${t.comboRate.toFixed(2)}/s`)
+      + (t.oversubscribed
+        ? '\n' + warn('  cooldowns alone exceed the clock, so every one is scaled to fit and nothing is left '
+          + 'for the base-attack chain. A real rotation would drop the weakest skill instead.')
+        : ''),
     table(
-      ['  SKILL', 'PER CAST', 'EVERY', 'SHARE'],
+      ['  SKILL', 'KIND', 'PER CAST', 'EVERY', 'SHARE', ''],
       t.lines
         .slice()
         .sort((a, b) => (b.perCast.damage + b.perCast.heal) / b.interval - (a.perCast.damage + a.perCast.heal) / a.interval)
         .map((l) => [
           '  ' + (l.name === l.id ? l.id : `${l.name}`),
+          l.kind === 'triggered' ? warn(l.kind) : dim(l.kind),
           num(l.perCast.damage + l.perCast.heal + l.perCast.shield, 1),
-          l.interval.toFixed(2) + 's',
-          pct(l.share, 0),
+          Number.isFinite(l.interval) ? l.interval.toFixed(2) + 's' : '-',
+          l.kind === 'triggered' ? '' : pct(l.share, 0),
+          l.why ? dim(l.why) : '',
         ]),
-      { align: [null, 'r', 'r', 'r'] }
+      { align: [null, null, 'r', 'r', 'r'] }
     ),
   ];
   return lines.join('\n');

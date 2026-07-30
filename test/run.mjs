@@ -236,8 +236,8 @@ group('computed sheet');
   const two = { ...naked, gear: { Slot_Weapon2: { item: wpn.item.id, rarity: wpn.rarity, stars: 0 } }, augments: {} };
   const f1 = engine.evaluate(one).mods.flat.get('Faith') ?? 0;
   const f2 = engine.evaluate(two).mods.flat.get('Faith') ?? 0;
-  near('Slot_Weapon2 contributes affixFactor of Slot_Weapon1',
-    f2, f1 * cat.slotById.get('Slot_Weapon2').affixFactor, 1e-9);
+  near('Slot_Weapon2 contributes ceil(affixFactor) of Slot_Weapon1',
+    f2, Math.ceil(f1 * cat.slotById.get('Slot_Weapon2').affixFactor), 1e-9);
 
   // Upgrade stars and rarity must both move the effective level by the
   // constants the game authors them with.
@@ -250,52 +250,124 @@ group('computed sheet');
     cat.effectiveLevel(item, { charLevel: 25, stars: 0, flawless: true }) - e0, K.flawlessILevelBonus / 10, 1e-9);
 }
 
-// --- alternative aptitudes -------------------------------------------------
-// An item's `aptitudes` column is a set of alternatives, not a set the item is
-// all of at once. Summing them would pay the shared MaxHealth budget once per
-// entry - which is a 4x error on the craft necklaces.
-group('alternative aptitudes');
+// --- checked against the game ----------------------------------------------
+// The only readings this project has from the running game, and therefore the
+// most valuable tests in the file. Spear_Eruption is Rare, Kobold faction,
+// aptitudes [Assassin, Cleric]; the instance read in game is level 10, which
+// with Rare's +10 iLevelBonus is effective level 11.
+//
+//   main hand:  +36 Vitality  +18 Dexterity  +15 Faith  +39 Critical  +39 ArPen
+//   arsenal:    +15 Vitality   +8 Dexterity   +6 Faith  +16 Critical  +16 ArPen
+//
+// Three rules fall out of those ten numbers and all three are asserted here:
+// every aptitude pays and they sum; each aptitude's share is rounded on its own
+// before summing; and the arsenal factor is 0.4 with a CEILING.
+group('checked against the game: Spear_Eruption');
+{
+  const engine = createEngine();
+  const spear = cat.itemById.get('Spear_Eruption');
+  ok('the item is still in the data', !!spear, 'Spear_Eruption');
+  ok('and still Rare / Kobold / Assassin+Cleric',
+    spear.rarity === 'Rare' && spear.faction === 'Kobold'
+      && spear.aptitudes.join('+') === 'Assassin+Cleric',
+    `${spear.rarity} ${spear.faction} ${spear.aptitudes.join('+')}`);
+
+  // Level 10 instance: the CDB authors level 8, so the reading is pinned to the
+  // effective level rather than to the authored one.
+  const INSTANCE_LEVEL = 10;
+  ok('a level-10 Rare instance is effective level 11',
+    cat.effectiveLevel({ ...spear, level: INSTANCE_LEVEL, iLevel: null }, { charLevel: 25, stars: 0 }) === 11);
+
+  const OBSERVED = {
+    mainHand: { Vitality: 36, Dexterity: 18, Faith: 15, CritChanceRating: 39, ArmorPenetrationRating: 39 },
+    arsenal: { Vitality: 15, Dexterity: 8, Faith: 6, CritChanceRating: 16, ArmorPenetrationRating: 16 },
+  };
+
+  for (const [slotId, want] of [['Slot_Weapon1', OBSERVED.mainHand], ['Slot_Weapon2', OBSERVED.arsenal]]) {
+    const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
+    cat.contribute({ ...spear, level: INSTANCE_LEVEL, iLevel: null }, slotId, {
+      aptitude: 'Assassin', charLevel: 25, stars: 0,
+      rarity: 'Rare', armorReduction: cat.armorReductionFor('Assassin'),
+    }, mods);
+    for (const [atb, v] of Object.entries(want)) {
+      near(`${slotId} ${atb} matches the character sheet`, mods.flat.get(atb) ?? 0, v, 1e-9);
+    }
+    // Nothing else should appear: no Strength, no Intellect, no Fervor.
+    const extra = [...mods.flat.keys()].filter((k) => !(k in want));
+    ok(`${slotId} grants nothing the sheet does not show`, extra.length === 0, extra.join(', '));
+  }
+
+  // The two aptitudes read the same faction differently, which is what produces
+  // two ratings from one item.
+  const apts = cdb.byId('aptitude');
+  const ratingFor = (aptId) => (apts.get(aptId).atbScaling ?? [])
+    .filter((e) => (e.statGroup ?? 0) === 3 && (e.conds?.factions ?? []).some((f) => f.ref === 'Kobold'))
+    .map((e) => e.endAtb);
+  ok('Assassin reads Kobold as ArmorPenetration',
+    ratingFor('Assassin').join() === 'ArmorPenetrationRating', ratingFor('Assassin').join());
+  ok('Cleric reads Kobold as CritChance',
+    ratingFor('Cleric').join() === 'CritChanceRating', ratingFor('Cleric').join());
+
+  // And a Rare Corrupted Gift, -20/+20 in the main hand, reads -8/+8 in the
+  // arsenal - the same ceil(v * 0.4) applied to an authored affix.
+  const gift = cat.itemById.get('DemonGearUpgradeRare_FervToCrit');
+  ok('the Rare Corrupted Gift is still +/-20', gift.affixes.every((a) => Math.abs(a.val) === 20));
+  for (const [slotId, want] of [['Slot_Weapon1', 20], ['Slot_Weapon2', 8]]) {
+    const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
+    const af = cat.slotById.get(slotId).affixFactor;
+    cat.applyAffixes(gift.affixes, mods, af, af !== 1);
+    near(`${slotId}: Corrupted Gift gives +${want} CritChanceRating`, mods.flat.get('CritChanceRating'), want, 1e-9);
+    near(`${slotId}: and -${want} FervorRating`, mods.flat.get('FervorRating'), -want, 1e-9);
+  }
+}
+
+// --- every aptitude pays ---------------------------------------------------
+group('multi-aptitude items');
 {
   const engine = createEngine();
   const multi = cat.items.find((i) => !i.isAugment && i.slots.length
-    && cat.payingAptitudes(i, 'Cleric').length > 1);
-  ok('an item with alternative aptitudes exists', !!multi, multi?.id);
+    && i.aptitudes.length > 1 && cat.usableBy(i, 'Cleric')
+    && (i.level == null || i.level <= 25)
+    && i.slots.some((s) => cat.slotById.get(s)?.combat));
+  ok('an item naming several aptitudes exists', !!multi, multi?.id);
   ok('no item mixes class and generic aptitudes',
     !cat.items.some((i) => {
       const classApts = new Set(cat.classes.map((c) => c.aptitude));
       return i.aptitudes.some((a) => classApts.has(a)) && i.aptitudes.some((a) => cat.isGeneric(a));
     }));
 
+  // Confirmed on the spear: all of them pay, so a two-rating item is real.
   const slot = multi.slots.find((s) => cat.slotById.get(s)?.combat);
-  const options = cat.payingAptitudes(multi, 'Cleric');
-  const seen = new Map();
-  for (const apt of options) {
-    const l = { ...emptyLoadout(cat, 'Priest', 25) };
-    l.gear[slot] = { item: multi.id, rarity: multi.rarity, aptitude: apt, stars: 0 };
-    const ev = engine.evaluate(l);
-    seen.set(apt, ev);
-  }
-  const healths = [...seen.values()].map((ev) => ev.sheet.get('MaxHealth'));
-  ok('every alternative pays the same shared MaxHealth budget',
-    new Set(healths.map((h) => h.toFixed(6))).size === 1, healths.join(', '));
+  const l = emptyLoadout(cat, 'Priest', 25);
+  l.gear[slot] = { item: multi.id, rarity: multi.rarity, stars: 0 };
+  const ev = engine.evaluate(l);
+  // Both aptitudes pay their MaxHealth share, so Vitality is the SUM of the two
+  // budgets - not one of them. Two aptitudes may well map the same faction to
+  // the same rating (Mace_Benediction is Crimson, and both Fighter and Cleric
+  // read Crimson as Fervor), so the rating COUNT is not the thing to assert;
+  // the Spear_Eruption case above covers two-different-ratings rigorously.
+  const single = emptyLoadout(cat, 'Priest', 25);
+  single.gear[slot] = { item: { ...multi, aptitudes: [multi.aptitudes[0]] }.id, rarity: multi.rarity, stars: 0 };
+  const oneApt = new Map();
+  cat.contribute({ ...multi, aptitudes: [multi.aptitudes[0]] }, slot,
+    { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: multi.rarity, armorReduction: 0.25 },
+    { flat: oneApt, addRatio: new Map(), mulRatio: new Map() });
+  const bothApt = new Map();
+  cat.contribute(multi, slot,
+    { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: multi.rarity, armorReduction: 0.25 },
+    { flat: bothApt, addRatio: new Map(), mulRatio: new Map() });
+  ok(`${multi.id} pays more with both aptitudes than with one`,
+    (bothApt.get('Vitality') ?? 0) > (oneApt.get('Vitality') ?? 0),
+    `${bothApt.get('Vitality')} vs ${oneApt.get('Vitality')} (${multi.aptitudes.join('+')})`);
+  ok('and it grants at least one rating', ratingsOf(ev.sheet).length > 0, ratingsOf(ev.sheet).join(','));
+  ok('every stat a full-factor slot grants is a whole number',
+    [...bothApt.values()].every((v) => Number.isInteger(v)),
+    [...bothApt.entries()].map(([k, v]) => k + '=' + v).join(' '));
+}
 
-  // The whole point: choosing one must give ONE rating, not all of them.
-  for (const [apt, ev] of seen) {
-    const ratings = ['CritChanceRating', 'FervorRating', 'ArmorPenetrationRating', 'SpellPenetrationRating']
-      .filter((r) => (ev.sheet.get(r) ?? 0) > 0);
-    ok(`${multi.id} as ${apt} grants exactly one rating`, ratings.length === 1, ratings.join('+'));
-  }
-
-  // And the pinned-item-but-free-aptitude path must actually vary it.
-  const pinned = emptyLoadout(cat, 'Priest', 25);
-  pinned.gear[slot] = { item: multi.id, rarity: multi.rarity, aptitude: options[0], stars: 0 };
-  const r = optimize(engine, {
-    loadout: pinned, goal: 'dps', target: engine.combat.foe('reference', 25), rank: 3, restarts: 1,
-    pinnedGear: new Set([slot]), aptFree: new Set([slot]),
-  });
-  ok('an aptitude-free pin keeps the item', r.loadout.gear[slot].item === multi.id);
-  ok('an aptitude-free pin picks a legal aptitude',
-    options.includes(r.loadout.gear[slot].aptitude), String(r.loadout.gear[slot].aptitude));
+function ratingsOf(sheet) {
+  return ['CritChanceRating', 'FervorRating', 'ArmorPenetrationRating', 'SpellPenetrationRating']
+    .filter((r) => (sheet.get(r) ?? 0) > 0);
 }
 
 // --- rarity ----------------------------------------------------------------
@@ -404,20 +476,196 @@ group('optimiser');
   ok('optimising dps beats the ehp build on dps',
     a.evaluation.throughput.dps >= d.evaluation.throughput.dps - 1e-6);
 
-  // Dropping the unverified Fervor multiplier must change what is optimal -
-  // that is the whole reason it is flagged.
-  const noFervor = createEngine({ assume: { fervorDamage: false } });
-  const e = optimize(noFervor, {
-    loadout: JSON.parse(JSON.stringify(seed)), goal: 'dps',
-    target: noFervor.combat.foe('reference', 25), rank: 3, restarts: 2,
-  });
-  ok('the Fervor-damage assumption changes the answer',
-    JSON.stringify(e.loadout.gear) !== JSON.stringify(a.loadout.gear));
+  // Dropping the unverified Fervor multiplier must change the numbers - that is
+  // the whole reason it is a switch. Asserted on the same build under both
+  // readings rather than on two searches, so the check is deterministic.
+  const noFervor = createEngine({ assume: { fervorScope: 'none' } });
+  const withFervor = createEngine({ assume: { fervorScope: 'all' } });
+  // Build one deliberately: Crimson gear is what pays a Priest in Fervor.
+  const fervorBuild = JSON.parse(JSON.stringify(seed));
+  for (const slot of cat.combatSlots()) {
+    const c = cat.candidates(slot.id, { aptitude: 'Cleric', charLevel: 25 })
+      .find((x) => x.item.faction === 'Crimson');
+    if (c) fervorBuild.gear[slot.id] = { item: c.item.id, rarity: c.rarity, aptitude: c.aptitude, stars: 0 };
+  }
+  pruneIllegal(cat, fervorBuild);
+  const dpsOn = withFervor.evaluate(fervorBuild, { target: withFervor.combat.foe('reference', 25), rank: 3 });
+  const dpsOff = noFervor.evaluate(fervorBuild, { target: noFervor.combat.foe('reference', 25), rank: 3 });
+  ok('a Crimson Priest build actually has Fervor', (dpsOn.sheet.get('Fervor') ?? 0) > 5,
+    String(dpsOn.sheet.get('Fervor')));
+  ok('the Fervor scope changes the damage of a Fervor build',
+    dpsOn.throughput.dps > dpsOff.throughput.dps * 1.01,
+    `${dpsOn.throughput.dps.toFixed(1)} vs ${dpsOff.throughput.dps.toFixed(1)}`);
+
+  // And with the skills modelled, the dps optimum should be led by PENETRATION
+  // rather than by the unverified Fervor multiplier. Before the rotation was
+  // modelled, base attacks were the only damage, Fervor was the only multiplier
+  // that touched them, and the search dressed a Priest entirely in Fervor gear.
+  // If this starts failing, the rotation has regressed to that state.
+  const pen = (a.evaluation.sheet.get('SpellPenetrationRating') ?? 0)
+    + (a.evaluation.sheet.get('ArmorPenetrationRating') ?? 0);
+  ok('the dps optimum is led by penetration, not by the Fervor assumption',
+    pen > (a.evaluation.sheet.get('FervorRating') ?? 0),
+    `penetration ${pen.toFixed(0)} vs Fervor ${(a.evaluation.sheet.get('FervorRating') ?? 0).toFixed(0)}`
+      + ' - skills may have stopped being scored');
 
   // Exclusions must actually exclude.
   const f = runOnce({ exclude: /^GM_/ });
   ok('excluded ids never appear',
     !Object.values(f.loadout.gear).some((g) => /^GM_/.test(g.item)));
+}
+
+// --- skill selection -------------------------------------------------------
+group('skill selection');
+{
+  const engine = createEngine();
+  const target = engine.combat.foe('reference', 25);
+  const seed = emptyLoadout(cat, 'Priest', 25);
+
+  // The 2-of-3 restriction is the ARSENAL's, not the main hand's: in game the
+  // main hand grants every skill it has plus the combo attack, while the
+  // arsenal grants exactly two, and the weapon passive counts against those two.
+  const three = cat.items.find((i) => i.slots.includes('Slot_Weapon2')
+    && cat.usableBy(i, 'Cleric') && (i.level == null || i.level <= 25)
+    && i.skills.filter((s) => ['WeaponSkill', 'WeaponPassive'].includes(engine.plan.typeOf(s))).length >= 3);
+  ok('a weapon offering three arsenal skills exists', !!three, three?.id);
+
+  const l = JSON.parse(JSON.stringify(seed));
+  l.gear.Slot_Weapon2 = { item: three.id, rarity: three.rarity, stars: 0 };
+  engine.plan.pruneSelection(l);
+  const pools = engine.plan.pools(l);
+  const wp = pools.find((p) => p.key === 'Slot_Weapon2');
+  ok('the arsenal pool is discovered', !!wp);
+  ok('it offers more than it can slot', wp.options.length > wp.slots, `${wp.options.length} options, ${wp.slots} slots`);
+  ok('slot count comes from UnlockLevel_Arsenal',
+    wp.slots === Math.min(engine.plan.arsenalSlotsAt(25), wp.options.length), String(wp.slots));
+  ok('the arsenal pool includes the weapon passive',
+    wp.options.some((id) => engine.plan.typeOf(id) === 'WeaponPassive'),
+    wp.options.map((id) => engine.plan.typeOf(id)).join(','));
+
+  // The main hand's pool covers only its WeaponSkills; its passive is free.
+  const mh = JSON.parse(JSON.stringify(seed));
+  mh.gear.Slot_Weapon1 = { item: three.id, rarity: three.rarity, stars: 0 };
+  engine.plan.pruneSelection(mh);
+  const mhPool = engine.plan.pools(mh).find((p) => p.key === 'Slot_Weapon1');
+  ok('the main-hand pool excludes the weapon passive',
+    !mhPool.options.some((id) => engine.plan.typeOf(id) === 'WeaponPassive'),
+    mhPool.options.map((id) => engine.plan.typeOf(id)).join(','));
+  const mhRot = engine.plan.resolve(mh, 3);
+  ok('and the main-hand passive is active anyway',
+    [...mhRot.triggered, ...mhRot.passive].some((x) => engine.plan.typeOf(x.prof.id) === 'WeaponPassive')
+      || mhRot.unmodelled.some((u) => engine.plan.typeOf(u.id) === 'WeaponPassive'),
+    'the passive should be resolved, not dropped');
+  ok('the main hand supplies the base-attack chain', mhRot.filler.length > 0);
+  ok('fewer slots at a lower level', engine.plan.weaponSlotsAt(1) < engine.plan.weaponSlotsAt(25),
+    `${engine.plan.weaponSlotsAt(1)} vs ${engine.plan.weaponSlotsAt(25)}`);
+  ok('the arsenal has no slots before its first unlock level', engine.plan.arsenalSlotsAt(1) === 0,
+    String(engine.plan.arsenalSlotsAt(1)));
+
+  // Which two you take must change the answer, or the choice is not reaching
+  // the objective.
+  const scores = new Set();
+  for (let i = 0; i < wp.options.length; i++) {
+    for (let j = i + 1; j < wp.options.length; j++) {
+      const t = JSON.parse(JSON.stringify(l));
+      t.skills = { Slot_Weapon2: [wp.options[i], wp.options[j]] };
+      scores.add(engine.evaluate(t, { target, rank: 3 }).throughput.dps.toFixed(4));
+    }
+  }
+  ok('different skill picks give different damage', scores.size > 1, `${scores.size} distinct results`);
+
+  // The search must make that choice, and pinning must override it.
+  const opt = optimize(engine, {
+    loadout: JSON.parse(JSON.stringify(l)), goal: 'dps', target, rank: 3, restarts: 1,
+    pinnedGear: new Set(['Slot_Weapon2']),
+  });
+  ok('the search fills the skill selection', (opt.loadout.skills?.Slot_Weapon2 ?? []).length === wp.slots,
+    JSON.stringify(opt.loadout.skills));
+  ok('every chosen skill is from the pool',
+    opt.loadout.skills.Slot_Weapon2.every((id) => wp.options.includes(id)));
+
+  const forced = [wp.options[wp.options.length - 1], wp.options[0]];
+  const pinnedRun = optimize(engine, {
+    loadout: { ...JSON.parse(JSON.stringify(l)), skills: { Slot_Weapon2: forced } },
+    goal: 'dps', target, rank: 3, restarts: 1,
+    pinnedGear: new Set(['Slot_Weapon2']), pinnedSkills: new Set(['Slot_Weapon2']),
+  });
+  ok('a pinned skill selection is respected',
+    JSON.stringify(pinnedRun.loadout.skills.Slot_Weapon2.slice().sort()) === JSON.stringify(forced.slice().sort()),
+    JSON.stringify(pinnedRun.loadout.skills.Slot_Weapon2));
+
+  // Swapping the weapon must not leave the old weapon's skills behind.
+  const other = cat.items.find((i) => i.slots.includes('Slot_Weapon2') && i.id !== three.id
+    && cat.usableBy(i, 'Cleric') && i.skills.length);
+  const swapped = JSON.parse(JSON.stringify(opt.loadout));
+  swapped.gear.Slot_Weapon2 = { item: other.id, rarity: other.rarity, stars: 0 };
+  engine.plan.pruneSelection(swapped);
+  ok('a weapon swap discards the old weapon\'s skill picks',
+    (swapped.skills.Slot_Weapon2 ?? []).every((id) => other.skills.includes(id)),
+    JSON.stringify(swapped.skills.Slot_Weapon2));
+}
+
+// --- triggered skills ------------------------------------------------------
+group('triggered skills and self-buffs');
+{
+  const engine = createEngine();
+  const target = engine.combat.foe('reference', 25);
+
+  // A resource-gated skill with no cooldown must NOT be treated as spammable.
+  const rageStrike = engine.combat.profile('Warrior_Rage_Strike', 3);
+  ok('Warrior_Rage_Strike has no cooldown', !(rageStrike.cooldown > 0), String(rageStrike.cooldown));
+  ok('and it declares a resource cost', rageStrike.costs.length > 0, JSON.stringify(rageStrike.costs));
+  const w = emptyLoadout(cat, 'Warrior', 25);
+  const wOpt = optimize(engine, { loadout: w, goal: 'dps', target, rank: 3, restarts: 1 });
+  const rot = wOpt.evaluation.rotation;
+  ok('a resource-gated skill is reported unmodelled rather than scored',
+    rot.unmodelled.some((u) => u.id === 'Warrior_Rage_Strike')
+      && !rot.active.some((x) => x.prof.id === 'Warrior_Rage_Strike'),
+    JSON.stringify(rot.unmodelled.map((u) => u.id)));
+
+  // Charge levels are mutually exclusive, not cumulative.
+  const charged = engine.combat.profile('GA_Craft_Skill1', 3);
+  const ratios = charged.effects.flatMap((e) => e.scaling.map((s) => s.ratio));
+  ok('a charged skill keeps only its highest charge step', ratios.length === 1,
+    `kept ratios ${ratios.join(',')}`);
+
+  // A prayer fires off the combo, not off its 1-second guard field.
+  const smite = engine.combat.profile('Priest_Prayer_Smite', 3);
+  ok('Priest_Prayer_Smite has a 1s cooldown field', smite.cooldown === 1, String(smite.cooldown));
+  const p = optimize(engine, { loadout: emptyLoadout(cat, 'Priest', 25), goal: 'dps', target, rank: 3, restarts: 1 });
+  const prayerLine = p.evaluation.throughput.lines.find((l) => l.id === 'Priest_Prayer_Smite');
+  ok('and it is scored as triggered, not as a 1s cooldown', !prayerLine || prayerLine.kind === 'triggered',
+    prayerLine ? prayerLine.kind : '(not in the rotation)');
+  if (prayerLine) {
+    ok('its interval is far longer than its cooldown field', prayerLine.interval > 2,
+      prayerLine.interval.toFixed(2) + 's');
+  }
+
+  // A weapon enchant is worth something, via the status its script names.
+  const zealot = engine.plan.selfBuffsOf('Enchant_Zealot');
+  ok('Enchant_Zealot resolves to a self-buff status', zealot.length === 1, JSON.stringify(zealot));
+  ok('and that status carries a rating affix and a stack cap',
+    zealot[0]?.stacks > 1 && zealot[0]?.affixes.some((a) => a.target.attribute.endsWith('Rating')),
+    JSON.stringify(zealot[0]));
+
+  // A debuff applied to the target must never be read as a self-buff.
+  for (const id of ['Sword_Swarm_Skill1']) {
+    for (const b of engine.plan.selfBuffsOf(id)) {
+      const neg = b.affixes.some((a) => (a.val ?? 0) < 0);
+      ok(`${id}'s resolved buffs are not enemy debuffs`, !neg, JSON.stringify(b));
+    }
+  }
+
+  // The rotation must never claim more than the clock.
+  for (const cls of ['Warrior', 'Rogue', 'Mage', 'Priest']) {
+    const r = optimize(engine, { loadout: emptyLoadout(cat, cls, 25), goal: 'dps', target, rank: 3, restarts: 1 });
+    ok(`${cls}: occupancy never exceeds 100%`, r.evaluation.throughput.busy <= 1 + 1e-9,
+      (r.evaluation.throughput.busy * 100).toFixed(1) + '%');
+    ok(`${cls}: the base-attack chain comes from one weapon only`,
+      new Set(r.evaluation.rotation.filler.map((x) => x.source)).size <= 1,
+      [...new Set(r.evaluation.rotation.filler.map((x) => x.source))].join(','));
+    ok(`${cls}: something is actually being cast`, r.evaluation.throughput.dps > 0);
+  }
 }
 
 // --- targets ---------------------------------------------------------------

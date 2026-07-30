@@ -25,7 +25,10 @@ export function emptyLoadout(cat, unitId, level) {
       `unknown class "${unitId}". Known: ${cat.classes.map((c) => c.unit).join(', ')}`
     );
   }
-  return { class: cls.unit, level, gear: {}, augments: {} };
+  // `skills` holds the choices a weapon or a class mechanic forces: two of the
+  // three a weapon offers, three prayers out of three, and so on. Keyed the
+  // same way sockets are, by what forced the choice.
+  return { class: cls.unit, level, gear: {}, augments: {}, skills: {} };
 }
 
 export function classOf(cat, loadout) {
@@ -102,7 +105,7 @@ export function evaluate(cat, loadout, { baseStatsFor, injectFlat = null }) {
     const rarity = g.rarity ?? item.rarity;
     const stars = Math.min(g.stars ?? 0, cat.maxStars(item, rarity));
     cat.contribute(item, slot.id, {
-      ...opts, stars, rarity, flawless: !!g.flawless, itemAptitude: g.aptitude ?? null,
+      ...opts, stars, rarity, flawless: !!g.flawless, level: g.level ?? null
     }, mods);
   }
 
@@ -116,7 +119,8 @@ export function evaluate(cat, loadout, { baseStatsFor, injectFlat = null }) {
     if (aug.augmentType !== sock.type) {
       throw new Error(`loadout: ${augId} is a ${aug.augmentType}, not a ${sock.type}`);
     }
-    cat.applyAffixes(aug.affixes, mods, cat.slotById.get(sock.slot)?.affixFactor ?? 1);
+    const af = cat.slotById.get(sock.slot)?.affixFactor ?? 1;
+    cat.applyAffixes(aug.affixes, mods, af, af !== 1);
   }
 
   // Anything the caller computes outside the gear layer - WeaponPower is the
@@ -130,9 +134,9 @@ export function evaluate(cat, loadout, { baseStatsFor, injectFlat = null }) {
   return { sheet, mods, cls, armorReduction };
 }
 
-// Skills the build can actually press: whatever the equipped weapons grant,
-// plus the class's own list. Items that grant a skill (augment sigils, weapon
-// enchants) contribute too, which is why they cannot be ranked on stats.
+// Every skill id this build touches, with where it came from. Used for
+// reporting and for the coverage manifest; the rotation itself is built by
+// skills.mjs, which knows which of these you actually get to press.
 export function skillsOf(cat, loadout) {
   const cls = classOf(cat, loadout);
   const ids = new Set();

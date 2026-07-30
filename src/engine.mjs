@@ -15,12 +15,17 @@ import { loadCdb } from './cdb.mjs';
 import { buildContext, baseStats, auditModel } from './model.mjs';
 import { buildCatalog } from './catalog.mjs';
 import { buildCombat } from './damage.mjs';
-import { evaluate as evaluateLoadout, skillsOf, classOf, socketsOf } from './loadout.mjs';
+import { buildSkillPlan } from './skills.mjs';
+import { evaluate as evaluateLoadout, classOf, socketsOf } from './loadout.mjs';
 
 export const GOALS = ['dps', 'hps', 'sps', 'ehp', 'mixed'];
+export const FERVOR_SCOPES = ['skills', 'all', 'none'];
 
 export const DEFAULT_ASSUME = {
-  fervorDamage: true,
+  // Fervor's description says "your Skills", so base attacks are excluded by
+  // default. Which reading is right decides whether Fervor gear or penetration
+  // gear wins, and neither is verified - see docs/MODEL.md.
+  fervorScope: 'skills',
   mastery: true,
 };
 
@@ -29,7 +34,11 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
   const ctx = buildContext(cdb);
   const cat = buildCatalog(cdb, ctx);
   const combat = buildCombat(cdb, ctx);
+  const plan = buildSkillPlan(cdb, ctx, cat, combat);
   const opts = { assume: { ...DEFAULT_ASSUME, ...assume } };
+  if (!FERVOR_SCOPES.includes(opts.assume.fervorScope)) {
+    throw new Error(`fervorScope must be one of ${FERVOR_SCOPES.join(', ')}`);
+  }
 
   const baseCache = new Map();
   const baseStatsFor = (unit, level) => {
@@ -39,17 +48,18 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     return b;
   };
 
-  // Skill profiles depend only on (id, rank), and both are stable across a
-  // search, so the whole rotation is resolved once per distinct skill set.
+  // The rotation depends on the gear AND on which skills are slotted, so the
+  // cache key has to carry both. It is worth caching: the search re-evaluates
+  // the same weapon plus skill choice thousands of times.
   const rotationCache = new Map();
   function rotationFor(loadout, rank) {
-    const { ids } = skillsOf(cat, loadout);
-    const key = rank + '|' + ids.slice().sort().join(',');
+    const key = rank + '|' + (loadout.gear.Slot_Weapon1?.item ?? '-')
+      + '|' + (loadout.gear.Slot_Weapon2?.item ?? '-')
+      + '|' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + ':' + v.join('+')).join(';')
+      + '|' + cat.combatSlots().map((s) => loadout.gear[s.id]?.item ?? '').join(',')
+      + '|' + Object.entries(loadout.augments ?? {}).filter(([, v]) => v).sort().join(',');
     let r = rotationCache.get(key);
-    if (!r) {
-      r = ids.map((id) => combat.profile(id, rank)).filter(Boolean);
-      rotationCache.set(key, r);
-    }
+    if (!r) { r = plan.resolve(loadout, rank); rotationCache.set(key, r); }
     return r;
   }
 
@@ -58,14 +68,35 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     const cls = classOf(cat, loadout);
     const tgt = target ?? combat.foe('reference', loadout.level);
     const weaponPower = combat.weaponPowerFor(cat, loadout, cls);
-    const r = evaluateLoadout(cat, loadout, {
-      baseStatsFor,
-      injectFlat: new Map([['WeaponPower', weaponPower]]),
-    });
-    const profs = rotationFor(loadout, rank);
-    const tp = combat.throughput(profs, r.sheet, tgt, opts);
+    const rot = rotationFor(loadout, rank);
+
+    // Stats that come from what you know rather than from what you wear:
+    //
+    //   * a passive ability's own affixes - the weapon-class block skills at
+    //     +50/+60 BlockMitigation;
+    //   * self-buff statuses a skill applies, at full stacks - the weapon
+    //     enchants, where Zealot is +6 CritChanceRating x 5 stacks. That is the
+    //     entire value of an enchant slot, and without it the search correctly
+    //     concluded that no enchant was worth having.
+    const inject = new Map([['WeaponPower', weaponPower]]);
+    const addFlat = (atb, v) => inject.set(atb, (inject.get(atb) ?? 0) + v);
+
+    for (const p of rot.passive ?? []) {
+      for (const a of p.affixes ?? []) {
+        if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, a.val ?? 0);
+      }
+    }
+    const buffs = plan.selfBuffs(rot);
+    for (const b of buffs) {
+      for (const a of b.affixes) {
+        if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, (a.val ?? 0) * b.stacks);
+      }
+    }
+
+    const r = evaluateLoadout(cat, loadout, { baseStatsFor, injectFlat: inject });
+    const tp = combat.throughput(rot, r.sheet, tgt, opts);
     const sv = combat.survivability(r.sheet, tgt, mix);
-    return { ...r, target: tgt, weaponPower, rotation: profs, throughput: tp, survivability: sv };
+    return { ...r, target: tgt, weaponPower, rotation: rot, buffs, throughput: tp, survivability: sv };
   }
 
   /**
@@ -108,10 +139,31 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     };
   }
 
-  const audit = [...auditModel(cdb, ctx), ...combat.audit];
+  const audit = [
+    ...auditModel(cdb, ctx),
+    ...combat.audit.filter((a) => !(a.what.startsWith('Fervor') && opts.assume.fervorScope === 'none')),
+    {
+      severity: 'unverified',
+      what: 'Slot_Weapon2 contributes 40% of its stats (slot.affixFactor = 0.4)',
+      why: 'That is what the data says. Players report the arsenal weapon feeling halved, so if the ' +
+           'in-game sheet shows 50%, the number to change is itemType Slot_Weapon2 slot.affixFactor.',
+    },
+    {
+      severity: 'assumption',
+      what: 'self-buff statuses are counted at full stacks and 100% uptime',
+      why: 'A 15-second buff refreshed by a 30%-per-attack proc does sit at its cap in sustained combat, ' +
+           'but a short fight or a movement-heavy one would not reach it.',
+    },
+    {
+      severity: 'assumption',
+      what: 'only the main-hand weapon\'s base-attack chain is used',
+      why: 'The arsenal is a weapon you swap to, so counting both chains at once would double the filler. ' +
+           'Its slotted skills still contribute, which is what UnlockLevel_Arsenal describes.',
+    },
+  ];
 
   return {
-    cdb, ctx, cat, combat, opts, audit,
+    cdb, ctx, cat, combat, plan, opts, audit,
     baseStatsFor, evaluate, makeScorer, socketsOf: (l) => socketsOf(cat, l),
     meta: cdb.meta,
   };

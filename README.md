@@ -65,14 +65,44 @@ optimised around it.
 --pin weapon1=Sword_Swarm*3        # fix an item at 3 upgrade stars
 --pin trinket=none                 # force a slot empty
 --pin feet/enchantfeet=none        # force one socket empty
---pin neck=Necklace_Z1RCraft:Crit  # pick which version of a multi-aptitude item
 --pin chest=Chest_RManfish_Cle@Epic  # assume a particular drop rarity
+--pin weapon1=Spear_Eruption^10*0  # the instance that dropped at level 10, unupgraded
 --no-augment weapon1               # no augments at all on that slot
 ```
 
 Slot and item names are matched loosely: `chest`, `Chest`, `Slot_Chest` and
 `fingerleft` all work. Ambiguity is an error that lists the candidates rather
 than a silent guess.
+
+### Which skills to slot
+
+A weapon offers three skills and you get two. That is a build decision, so the
+optimiser makes it and tells you what it dropped:
+
+```
+SKILLS
+POOL              SLOTS  TAKEN
+main-hand skills  2/3    Heat Emission, Hot, hot, hot!   not taken: Flamie
+arsenal skills    2/3    Luon Shackles, Hidden Power     not taken: Blinding Light
+prayers           3/3    Prayer: Life, Prayer: Smite, Prayer: Virtue
+```
+
+Slot counts come from the game's own constants —
+`UnlockLevel_WeaponSkillSlots`, `UnlockLevel_Arsenal`,
+`Priest_Prayer_Slot_Unlocks`, `Mage_Conduit_Levels` — so a level-12 character
+correctly gets two main-hand skills and only one arsenal skill. Fix a choice by
+hand:
+
+```bash
+--skills weapon1=Scepter_Flamie_Skill1,Scepter_Flamie_Passive
+--skills prayers=Smite,Life
+```
+
+Only the **main-hand** weapon's base-attack chain is used — the arsenal is a
+weapon you swap to, not a second set of swings — while its slotted skills still
+count. The arsenal contributes `ceil(stat * 0.4)` rather than half, which is
+**checked against the game**: the same spear reads +36/+18/+15/+39/+39 in the
+main hand and +15/+8/+6/+16/+16 in the arsenal.
 
 ### Goals
 
@@ -98,7 +128,7 @@ You need [Node.js](https://nodejs.org/) 18+ and a copy of Farever.
 ```bash
 git clone https://github.com/<you>/farever-bench
 cd farever-bench
-node test/run.mjs                  # 132 checks against your own game data
+node test/run.mjs                  # 191 checks against your own game data
 node bin/bench.mjs optimize --class Warrior
 ```
 
@@ -145,7 +175,9 @@ Two consequences worth knowing as a player, neither visible in game:
   **3.8% of its value per character level you gain**.
 - **Faction decides your secondary stat.** The same Manfish chest gives a
   Priest Fervor and a Warrior ArmorPenetration, out of one data row. Gear with
-  no faction has no secondary stat at all.
+  no faction has no secondary stat at all — and an item naming two aptitudes
+  gets *both* readings, which is how one Kobold spear grants +39 Critical and
+  +39 Armor Penetration at once.
 
 ---
 
@@ -160,16 +192,31 @@ audit` prints this list with every result.
   half, the two Masteries, and `WeaponPower`. Toggle the first two off with
   `--no-fervor-damage` and `--no-mastery` and watch the answer move — that is
   how much it depends on them.
-- **No skill scripts.** 427 of 962 skills carry hscript bodies that this build
-  does not execute, so damage over time, procs, statuses, talents and every
-  conditional rider are absent. Items that grant a *skill* rather than stats —
-  weapon enchants, Demon sigils — are therefore scored at zero.
-- **No player model.** The rotation is "cooldowns on cooldown, base-attack
-  chain in the gaps". Occupancy is estimated from each skill's step timings, not
-  measured.
-- **Nothing has been checked against the running game.** Every formula was read
-  statically. "The bytecode says X" and "the process does X" are different
-  claims, and only the first is established here.
+- **Partial skill scripts.** 427 of 962 skills carry hscript bodies this build
+  does not execute. Two things are read out of them because the data records
+  them nowhere else: the proc rate (`vars.chance`) and the self-buff a skill
+  applies (`addStatus(owner, Skill.X)`, which is how a weapon enchant is worth
+  anything). Everything else in a script — damage over time, conditional riders,
+  resource generation — is absent, and every skill it costs is **named** in the
+  output rather than silently dropped.
+- **No talents or runes.** The 22-node trees are not modelled, and steps gated on
+  `cond.mastery` are excluded. A Demon sigil grants a talent outright, so those
+  sockets report *not scoreable* rather than *empty*.
+- **No resource tracking.** Rage, Spark, ComboPoints and prayer charges live in
+  scripts. A skill gated by one — `Warrior_Rage_Strike` — is reported unmodelled
+  instead of being treated as spammable.
+- **No player model.** The rotation is "cooldowns on cooldown, base-attack chain
+  in the gaps, procs off the measured attack rate". Occupancy is estimated from
+  each skill's step timings, not measured. If cooldowns oversubscribe the clock
+  they are scaled to fit and the output says so.
+- **Almost nothing has been checked against the running game.** One item has:
+  , main-hand and arsenal, all ten values reproduced exactly.
+  That one reading corrected two things the static model had wrong — every
+  aptitude on an item pays and they sum, and each share is rounded before the
+  sum — and confirmed the arsenal factor as  rather than a half.
+  See [docs/MODEL.md section 12](docs/MODEL.md#12-checked-against-the-game).
+  Everything else is still "the bytecode says X", which is not the same claim as
+  "the process does X".
 
 ---
 

@@ -182,7 +182,10 @@ amount = budget(effectiveLevel, entry.start, entry.end) * atbRatio[group] * affi
 ```
 
 - `entry` — a row of `aptitude.atbScaling`, gated by `conds.minRarity` and
-  `conds.factions`.
+  `conds.factions`. **Every aptitude an item names pays, and they sum**, and they
+  pay regardless of your class — see [section 12](#12-checked-against-the-game),
+  which is checked against a character sheet. Each aptitude's share is rounded
+  on its own before the sum; that is a one-unit difference and the game agrees.
 - `group` — `aptitude@atbScaling.statGroup` is the enum
   `Primary | Vitality | Armor | Ratings`, matching `itemType.atbRatio`'s four
   keys exactly.
@@ -193,6 +196,13 @@ amount = budget(effectiveLevel, entry.start, entry.end) * atbRatio[group] * affi
 - `affixFactor` — `Slot_Weapon2` carries `slot.affixFactor = 0.4`, so the
   arsenal weapon contributes two fifths of everything, stats and augments
   alike. A character effectively wears 1.4 weapons.
+
+  **Verified against the game.** The same spear reads +36/+18/+15/+39/+39 in the
+  main hand and +15/+8/+6/+16/+16 in the arsenal. `ceil(v * 0.4)` is the only
+  combination that reproduces all five — `round` gives 14 and 7, `floor` gives
+  14/7/15/15, and 0.5 is not close. So it is 0.4, and the CEILING is what makes
+  small values look nearly halved. A Rare Corrupted Gift confirms it on authored
+  affixes too: -20/+20 in the main hand, -8/+8 in the arsenal.
 
 **`sourceAtb`.** A row like `{endAtb: MaxHealth, sourceAtb: Vitality}` states
 its budget in MaxHealth but delivers it as Vitality, so the amount is divided by
@@ -275,7 +285,112 @@ flag**. Every weapon type inherits from exactly one of:
 Pinning a shield therefore constrains the mainhand to one-handers, and pinning
 a two-hander plus a shield is refused by name.
 
-## 9. Damage
+## 9. Skills: what you press, and what you had to choose
+
+A weapon does not hand you its kit. It grants a base-attack chain and a combo
+unconditionally, plus a **pool** of `WeaponSkill` and `WeaponPassive` entries of
+which you slot only some — usually three offered and two taken. Slot counts come
+from the game's constants:
+
+| constant | value | means |
+|---|---|---|
+| `UnlockLevel_WeaponSkillSlots` | `[1, 2]` | 2 main-hand skill slots, from level 2 |
+| `UnlockLevel_Arsenal` | `[7, 20, 50]` | arsenal slots at 7 and 20 (a third at 50) |
+| `Priest_Prayer_Slot_Unlocks` | `[1, 1, 9]` | 3 prayers in the sequence |
+| `Mage_Conduit_Levels` | `[1, 1, 4]` | 3 conduits |
+
+So the count moves on its own if a patch moves it, and a level-12 character
+correctly gets two main-hand skills and only one arsenal skill.
+
+**A `WeaponSubSkill` is a follow-up, not a choice.**
+`Book_WaterOrbs_Skill2_Recast` exists only because Skill2 does, and the wiring is
+by id prefix, which is how the data names them. One that prefixes nothing —
+`Staff_Censer_Ultimate` — has no discoverable trigger and is reported unmodelled
+rather than handed out free. It does 658 damage, so guessing would not be a
+rounding error.
+
+**Only the main-hand chain is used.** The arsenal is a weapon you swap to, so
+counting both base-attack chains at once would double the filler. Its slotted
+skills still contribute, which is exactly what `UnlockLevel_Arsenal` describes.
+
+### Cast, or fired at you
+
+Roughly a third of what a build knows is `nature: Passive`, and a `cooldown` on
+one of those is an anti-double-fire guard rather than a cast rate.
+`Priest_Prayer_Smite` reads `cooldown: 1` and does 279 damage; scoring it every
+second would make it the entire build. Its real trigger is stated twice in the
+data — in its own description, *"Becomes ready after you use your
+[ComboAttack]"*, and in `Priest_Rosary`'s script:
+
+```js
+function onSkillProc(ctx) {
+  if( ctx.skill.isFinalAttack() ) { chargePrayer(); }
+}
+```
+
+So skills are sorted into four buckets, and a triggered skill only earns a rate
+from an **explicit rule tied to something the data states**:
+
+| bucket | rate | rule |
+|---|---|---|
+| `filler` | the chain cycles in whatever time is left | — |
+| `active` | `max(cooldown / (1+CDR), occupancy)` | needs `cooldown > 0` |
+| `triggered` | `comboRate / prayersSlotted` | prayers, per `Priest_Rosary` |
+| | `attackRate × vars.chance` | `vars.chance` is the proc rate the data ships |
+| `passive` | not throughput; contributes stats | own affixes, or a self-buff status |
+| `unmodelled` | **zero, and named** | anything else |
+
+**No cooldown and no rule means unmodelled, not spammable.**
+`Warrior_Rage_Strike` has no cooldown and `props.costs: [{amount: 10, atb:
+Rage}]` — it is gated by Rage income, which lives in a script. Treating it as
+castable every 1.4s tripled the Warrior's damage before this was caught.
+
+**`props.rankOverride`** restates props at a weapon-skill rank;
+`GA_Craft_Skill1` drops from a 16s cooldown to 12s at rank 2, and `--rank`
+applies it.
+
+**`cond.castHoldStep` steps are mutually exclusive charge levels.**
+`GA_Craft_Skill1` declares Hit1/Hit2/Hit3 at 2.5×/4×/6× Strength for how long
+you held it. Summing all three overstated the skill twofold; full charge is
+assumed and stated in the audit.
+
+**`cond.mastery` steps are excluded.** Which rune is slotted is a build axis
+this model does not carry, so a rune-gated step is left out rather than granted.
+
+**Cooldowns cannot oversubscribe the clock.** If the sum of
+`occupancy / interval` exceeds 1, every active skill is scaled by `1/busy` and
+the output says so — a real rotation would drop its weakest skill rather than
+slow all of them, and this model has no priority order to do that with.
+
+### Self-buffs, and why an enchant is worth anything
+
+A weapon enchant's whole value is a stacking buff, and the *link* to it lives
+only in script text:
+
+```js
+// Enchant_Zealot
+function onInflictHit(hit) {
+  if( hit.isBaseAttack) {
+    if(checkProba(vars.chance)) { addStatus(owner, Skill.Enchant_Zealot_Status); }
+  }
+}
+```
+
+`Enchant_Zealot_Status` then carries `TAttribute_Flat CritChanceRating +6` with
+`props.status.maxStacks: 5` and `duration: 15` in ordinary data columns. So the
+model reads `addStatus(<self>, Skill.<X>)` out of the script — the link, and
+nothing else — resolves X, and applies its affixes **at full stacks**. A
+15-second buff refreshed by a 30%-per-attack proc does sit at its cap in
+sustained combat; a short fight would not reach it, and the audit says so.
+
+Only self-targets count: `owner`, `hit.source`, `dmg.source`. `addStatus(hit.target, …)`
+is a debuff on the enemy and must never be read as your own stat — the model
+checks the target and the status's `props.status.types` includes `Buff`.
+
+Without this, every weapon-enchant socket came back empty, and the tool was
+implicitly claiming "no enchant is better than any enchant".
+
+## 10. Damage
 
 Every point of damage, healing and shielding is emitted by a
 `skill.steps[].effects[]` entry:
@@ -379,6 +494,39 @@ weight vector is wrong somewhere. So the optimiser evaluates the real objective
 for every candidate instead. It costs more and it cannot get this class of
 answer backwards.
 
+## The Fervor question
+
+This is the single assumption that most changes the answer, so it is a switch.
+
+Fervor's in-game description reads *"Increases the damage, healing and
+shielding of your Skills. Reduces damage taken by half of that amount."* Two of
+those three are verified straight out of `attribute.scaling`:
+
+```
+DamageTakenModifier    scaling: [{ attribute: Fervor, scale: -0.5 }]
+HealGivenMultiplier    scaling: [{ attribute: Fervor, scale:  1   }]
+ShieldPowerMultiplier  scaling: [{ attribute: Fervor, scale:  1   }]
+```
+
+The offensive half lands on **no attribute at all** — `DamageModifier.scaling`
+is empty. So it is a code-only path, and `--fervor-scope` picks the reading:
+
+| `--fervor-scope` | |
+|---|---|
+| `skills` (default) | it multiplies skills, matching the words "your Skills" |
+| `all` | it multiplies base attacks too |
+| `none` | it does not touch damage; only the three verified consumers apply |
+
+Note that `HealGivenMultiplier` already carries Fervor, so healing must not have
+it applied a second time — that one is verified and lives in the sheet.
+
+Worth knowing what this cost before the rotation was modelled properly: with
+skills ignored, base attacks were the only damage, Fervor was the only
+multiplier that touched them, and the optimiser dressed a Priest head-to-toe in
+Fervor gear. With prayers, weapon skills, procs and enchants scored, the same
+search picks **SpellPenetration** across every slot and Fervor drops to noise.
+The rotation model, not the Fervor switch, was what made that answer wrong.
+
 ## The search
 
 Coordinate ascent with exhaustive per-slot enumeration: walk the free
@@ -453,3 +601,62 @@ slot.
 running game. Every formula was read statically out of `data.cdb` and
 `hlboot.dat`. "The bytecode says X" and "the process does X" are different
 claims, and only the first is established.
+
+---
+
+## 12. Checked against the game
+
+Everything above this section was read statically out of `data.cdb` and
+`hlboot.dat`. This section is the exception: it is the one place where the model
+has been compared with what a character sheet actually shows, and it corrected
+two things the static reading had wrong.
+
+**The reading.** `Spear_Eruption` — "Gorgon Ratsay's Toothpick", Rare, Kobold
+faction, aptitudes `[Assassin, Cleric]` — on a level-10 instance, which with
+Rare's `+10 iLevelBonus` is effective level 11:
+
+| | Vitality | Dexterity | Faith | Critical | Armor Pen |
+|---|---|---|---|---|---|
+| main hand | 36 | 18 | 15 | 39 | 39 |
+| arsenal | 15 | 8 | 6 | 16 | 16 |
+
+**What it settled.** All ten numbers fall out of three rules, and each rule is
+discriminated by at least one of them:
+
+1. **Every aptitude pays, and they sum.** Dexterity 18 is Assassin's primary
+   budget (36..648) and Faith 15 is Cleric's (30..540) — a 1.2 ratio that
+   matches the budgets exactly. Vitality is the sum of both MaxHealth budgets.
+   The static reading had assumed an item resolves to ONE aptitude, which would
+   have produced 18 *or* 15, never both.
+2. **They pay regardless of your class.** Your aptitude gates whether you can
+   equip the thing; once it is on you get everything it grants. That is why a
+   Rogue's tooltip shows +15 Faith.
+3. **Each aptitude's share is rounded on its own, then summed.** Rounding per
+   aptitude gives Vitality 16 + 20 = 36; summing first and rounding once gives
+   35. The sheet says 36.
+4. **The arsenal factor is 0.4 with a ceiling.** `ceil(v * 0.4)` is the only
+   combination reproducing all five arsenal values; `round` gives 14 and 7,
+   `floor` gives 14/7/15/15, and 0.5 is not close. The ceiling is why the
+   arsenal *feels* halved.
+
+**And the two ratings from one item** are the clearest illustration of the
+faction rule: Assassin reads Kobold as ArmorPenetration, Cleric reads Kobold as
+CritChance, so a single Kobold `AssCle` spear grants both — 39 of each, each at
+the full `ratings` share rather than a split.
+
+`test/run.mjs` asserts all ten values plus the Corrupted Gift's -20/+20 →
+-8/+8, so a regression here fails the suite by name.
+
+**Also confirmed by observation, not derivation:**
+
+- the main hand grants every skill it has, plus the combo attack;
+- an equippable offhand grants full stats and every skill it has;
+- the arsenal grants **two** skills, chosen, and the weapon passive counts
+  against those two — which is why `--skills weapon2=...` exists;
+- the combo attack cannot be performed with the arsenal weapon.
+
+To reproduce a reading yourself, pin the instance level:
+
+```bash
+bench sheet --class Rogue --level 25 --pin 'weapon1=Spear_Eruption^10*0'
+```
