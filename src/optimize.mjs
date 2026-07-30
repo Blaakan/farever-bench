@@ -117,6 +117,7 @@ export function optimize(engine, spec) {
       item: c.item.id,
       rarity: c.rarity,
       chance: c.chance,
+      generic: c.generic ?? null,
       stars: stars === 'max' ? cat.maxStars(c.item, c.rarity) : Math.min(stars, cat.maxStars(c.item, c.rarity)),
     })).filter((c) => !(slotId === 'Slot_Weapon1' && offhandPinnedFull && !cat.allowsOffhand(cat.itemById.get(c.item))));
     if (allowEmpty || slotId === 'Slot_OffhandWeapon') list.push(null);
@@ -130,11 +131,68 @@ export function optimize(engine, spec) {
   function augOptions(type) {
     let l = augCandidates.get(type);
     if (!l) {
-      l = cat.augmentCandidates(type, { exclude: spec.exclude }).map((a) => a.id);
+      l = cat.augmentCandidates(type, { exclude: spec.exclude })
+        // A sigil grants a talent, and a talent belongs to exactly one class.
+        // All twelve fit the socket; only this class's three are legal to wear
+        // meaningfully, and offering the rest let the search pin a Warrior
+        // talent into a Priest tree.
+        .filter((a) => type !== 'AugmentDemonSigil'
+          || (a.skills ?? []).some((s) => treeNodes.has(s)))
+        .map((a) => a.id);
       l.push(null); // leaving a socket empty is a legitimate choice
       augCandidates.set(type, l);
     }
     return l;
+  }
+
+  // --- the talent tree, inside the search ----------------------------------
+  // Talents used to be allocated once, AFTER the gear search had converged, so
+  // every weapon was compared against a build with an empty tree. That is
+  // backwards in both directions: Sharp Mind's CooldownReduction is worth more
+  // on a weapon whose skills have long cooldowns, and a DemonSigil is worth a
+  // whole tier-4 node that the gear search could not see. So the tree is
+  // allocated as part of the build and re-allocated whenever what feeds it -
+  // the sigils - changes.
+  const treeNodes = new Set(engine.talents.treeFor(spec.loadout.class).nodes.map((n) => n.skill));
+
+  /** The tier-4 talents this build's sigils hand over for free. */
+  function grantedTalents(loadout) {
+    const granted = new Set();
+    for (const [key, augId] of Object.entries(loadout.augments ?? {})) {
+      if (!key.endsWith('/AugmentDemonSigil') || !augId) continue;
+      for (const sk of cat.itemById.get(augId)?.skills ?? []) {
+        // A sigil grants a talent, and a talent belongs to exactly one class.
+        // Without this check a Warrior sigil lands on a Priest and inserts a
+        // node into a tree it is not part of.
+        if (treeNodes.has(sk)) granted.add(sk);
+      }
+    }
+    return granted;
+  }
+
+  function allocateTalents(loadout, { byObjective = false } = {}) {
+    if (spec.pinnedTalents) return null;
+    const granted = grantedTalents(loadout);
+    // Ranking a point by the REAL objective costs one evaluation per candidate
+    // per point. That is worth paying once the gear has settled, and not worth
+    // paying inside every pass, so the search allocates by the cheap heuristic
+    // while it moves and re-allocates by the objective when it stops.
+    // The value of a point is the DELTA it buys, not the score of the build
+    // that holds it - `suggest` stops when the best remaining point is worth
+    // nothing, and an absolute score is never zero.
+    const at = (ranks, extra) => {
+      const trial = clone(loadout);
+      trial.talents = { ...Object.fromEntries(ranks), ...extra };
+      try { return scoreOf(trial).score; } catch { return -Infinity; }
+    };
+    const value = byObjective
+      ? (id, atRank, ranks) => at(ranks, { [id]: atRank }) - at(ranks, {})
+      : null;
+    const alloc = engine.talents.suggest(loadout.class, {
+      level: loadout.level, points: spec.talentPoints ?? null, granted, value,
+    });
+    loadout.talents = alloc.ranks;
+    return { ...alloc, granted: [...granted] };
   }
 
   let counter = 0;
@@ -143,7 +201,7 @@ export function optimize(engine, spec) {
     // Only the decisions matter, so key on them rather than the whole object.
     const key = cat.combatSlots().map((s) => {
       const g = loadout.gear[s.id];
-      return g ? `${s.id}=${g.item}/${g.rarity ?? ''}:${g.stars ?? 0}${g.flawless ? 'f' : ''}` : '';
+      return g ? `${s.id}=${g.item}/${g.rarity ?? ''}:${g.stars ?? 0}${g.flawless ? 'f' : ''}~${g.generic ?? ''}` : '';
     }).join('|')
       + '#' + Object.entries(loadout.augments).filter(([, v]) => v).sort().map(([k, v]) => k + '=' + v).join('|')
       + '$' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + '=' + v.join('+')).join('|')
@@ -165,7 +223,17 @@ export function optimize(engine, spec) {
       // asserting a preference.
       let tie = 0;
       for (const x of ev.mods.flat.values()) tie += Math.abs(x);
-      v = { score: scorer.scoreFrom(ev), tie };
+      // Third rung of the ladder: a DemonSigil hands over a whole tier-4 talent
+      // for nothing, and most of those talents declare no affix, no effect and
+      // no status - so the objective and the stat tiebreak are both blind to
+      // them and the socket stayed empty. An empty socket is never better than
+      // a free talent, so "how many talents did this build get for free" breaks
+      // the tie, and the output says the pick is not scoreable rather than
+      // presenting it as a considered choice.
+      const grants = Object.entries(loadout.augments ?? {})
+        .filter(([k, v2]) => v2 && k.endsWith('/AugmentDemonSigil'))
+        .reduce((n, [, v2]) => n + (cat.itemById.get(v2)?.skills ?? []).filter((s) => treeNodes.has(s)).length, 0);
+      v = { score: scorer.scoreFrom(ev), tie, grants };
       evalCache.set(key, v);
       counter++;
       if (onProgress && counter % 500 === 0) onProgress(counter);
@@ -173,9 +241,15 @@ export function optimize(engine, spec) {
     return v;
   }
 
-  // Lexicographic: objective, then tiebreak.
+  // Lexicographic: objective, then stat magnitude, then free talents.
   const EPS = 1e-9;
-  const better = (a, b) => (a.score > b.score + EPS) || (Math.abs(a.score - b.score) <= EPS && a.tie > b.tie + EPS);
+  const better = (a, b) => {
+    if (a.score > b.score + EPS) return true;
+    if (a.score < b.score - EPS) return false;
+    if (a.tie > b.tie + EPS) return true;
+    if (a.tie < b.tie - EPS) return false;
+    return (a.grants ?? 0) > (b.grants ?? 0);
+  };
 
   /**
    * Slots whose contents make no difference to the goal - emptying them scores
@@ -237,6 +311,9 @@ export function optimize(engine, spec) {
   function ascend(start, rand) {
     let cur = clone(start);
     pruneAugments(cur);
+    // The tree is part of the build from the first evaluation onward, so every
+    // weapon is compared against a character who has one.
+    allocateTalents(cur);
     let best = scoreOf(cur);
 
     for (let pass = 0; pass < maxPasses; pass++) {
@@ -248,14 +325,14 @@ export function optimize(engine, spec) {
         let bestScore = best;
         for (const pick of candidates.get(slotId)) {
           const trial = clone(cur);
-          if (pick) trial.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars };
+          if (pick) trial.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars, generic: pick.generic };
           else delete trial.gear[slotId];
           pruneAugments(trial);
           const s = scoreOf(trial);
           if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
         }
         if (better(bestScore, best)) {
-          if (bestPick) cur.gear[slotId] = { item: bestPick.item, rarity: bestPick.rarity, stars: bestPick.stars };
+          if (bestPick) cur.gear[slotId] = { item: bestPick.item, rarity: bestPick.rarity, stars: bestPick.stars, generic: bestPick.generic };
           else delete cur.gear[slotId];
           pruneAugments(cur);
           best = bestScore;
@@ -285,12 +362,17 @@ export function optimize(engine, spec) {
         }
       }
 
-      // Then runes: one of three per skill you have. Only 17 of the 84 gate a
-      // step or override a prop, so most comparisons tie and the tiebreak
-      // settles them - which is the honest outcome rather than a hidden
-      // preference. `bench talents` says which ones are inert.
+      // Then runes: one of three per skill you have. Only some of the 84 gate a
+      // step, suppress one, gate an affix or override a prop, so many
+      // comparisons tie and the tiebreak settles them - which is the honest
+      // outcome rather than a hidden preference. `bench talents` counts them
+      // live. The pool comes from the LOADOUT, never from the resolved
+      // rotation: a rune-gated step is exactly what can give a skill its first
+      // damage effect, and a skill with no damage effect never reaches the
+      // rotation - so asking the rotation meant such a rune could never be
+      // found.
       if (!pinnedRunes.size) {
-        const pools = engine.talents.runePools(engine.evaluate(cur, { target, rank, mix }).rotation);
+        const pools = engine.talents.runePools(cur);
         for (const pool of shuffled(pools, rand)) {
           let bestPick = cur.runes[pool.skill] ?? null;
           let bestScore = best;
@@ -328,6 +410,14 @@ export function optimize(engine, spec) {
         }
       }
 
+      // Sigils are augments, and a sigil changes which tier-4 node is already
+      // yours - which changes what the remaining 16 points should buy. So the
+      // tree is re-allocated after the augment pass, not before it.
+      const before = best;
+      allocateTalents(cur);
+      best = scoreOf(cur);
+      if (better(best, before)) improved = true;
+
       if (!improved) return { loadout: cur, score: best, passes: pass + 1 };
     }
     return { loadout: cur, score: best, passes: maxPasses };
@@ -346,7 +436,7 @@ export function optimize(engine, spec) {
         const list = candidates.get(slotId).filter(Boolean);
         if (!list.length) continue;
         const pick = list[Math.floor(rand() * list.length)];
-        seed.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars };
+        seed.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars, generic: pick.generic };
       }
       pruneAugments(seed);
     }
@@ -355,33 +445,22 @@ export function optimize(engine, spec) {
     if (!winner || better(got.score, winner.score)) winner = got;
   }
 
-  // Talents last. They do not interact with the gear the way skills do, and 66
-  // of the 88 nodes declare nothing a model can read, so a greedy legal
-  // allocation over the 22 that do is as much as can be justified - spending
-  // the rest on nodes it cannot tell apart would be inventing a recommendation.
-  // `granted` is the tier-4 talent a DemonSigil hands over for free.
-  if (!spec.pinnedTalents) {
-    const granted = new Set();
-    for (const [key, augId] of Object.entries(winner.loadout.augments ?? {})) {
-      if (!key.endsWith('/AugmentDemonSigil') || !augId) continue;
-      for (const sk of cat.itemById.get(augId)?.skills ?? []) granted.add(sk);
-    }
-    const alloc = engine.talents.suggest(winner.loadout.class, {
-      level: winner.loadout.level, points: spec.talentPoints ?? null, granted,
-    });
-    winner.loadout.talents = alloc.ranks;
-    winner.talentAlloc = { ...alloc, granted: [...granted] };
-  }
+  // One last allocation, this time ranking each point by the REAL objective
+  // rather than by the size of the numbers on it. The gear has stopped moving,
+  // so it is worth the evaluations here and not inside every pass. Nodes the
+  // model cannot read still score flat, so the heuristic and the branch
+  // `promise` continue to order those - the search does not invent a
+  // preference it does not have.
+  const scoreBeforeObjectiveTalents = winner.score.score;
+  winner.talentAlloc = allocateTalents(winner.loadout, { byObjective: true });
+  if (winner.talentAlloc) winner.score = scoreOf(winner.loadout);
 
   const finalEval = engine.evaluate(winner.loadout, { target, rank, mix });
 
-  // Talents are attached after the gear search converges, so `winner.score` is
-  // the PRE-talent number. Reporting it beside an evaluation that includes them
-  // printed two figures for one build that did not agree with each other.
   return {
     loadout: winner.loadout,
     score: scorer.scoreFrom(finalEval),
-    scoreBeforeTalents: winner.score.score,
+    scoreBeforeTalents: scoreBeforeObjectiveTalents,
     indifferent: indifferentSlots(winner.loadout, winner.score),
     evaluation: finalEval,
     reference: refEval,
@@ -417,7 +496,7 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
     const st = stars === 'max' ? cat.maxStars(it, cand.rarity) : Math.min(stars, cat.maxStars(it, cand.rarity));
     const trial = {
       ...loadout,
-      gear: { ...loadout.gear, [slotId]: { item: it.id, rarity: cand.rarity, stars: st } },
+      gear: { ...loadout.gear, [slotId]: { item: it.id, rarity: cand.rarity, stars: st, generic: cand.generic ?? null } },
       augments: { ...loadout.augments },
     };
     // A different host item may not host the same augments, and a different
@@ -432,6 +511,7 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
       item: it,
       rarity: cand.rarity,
       chance: cand.chance,
+      generic: cand.generic ?? null,
       stars: st,
       score,
       // A delta needs something to be relative to. With the slot empty the
@@ -439,7 +519,8 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
       // and the caller shows the absolute score instead.
       delta: baseScore > 1e-9 ? score / baseScore - 1 : null,
       equipped: loadout.gear[slotId]?.item === it.id
-        && (loadout.gear[slotId]?.rarity ?? it.rarity) === cand.rarity,
+        && (loadout.gear[slotId]?.rarity ?? it.rarity) === cand.rarity
+        && (loadout.gear[slotId]?.generic ?? null) === (cand.generic ?? null),
       evaluation: ev,
     });
   }

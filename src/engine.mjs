@@ -30,14 +30,29 @@ export const DEFAULT_ASSUME = {
   mastery: true,
 };
 
-export function createEngine({ game, assume = {}, quiet = false } = {}) {
+export function createEngine({ game, assume = {}, fight = {}, quiet = false, classSkillSlots } = {}) {
   const cdb = loadCdb({ game, quiet });
   const ctx = buildContext(cdb);
   const cat = buildCatalog(cdb, ctx);
   const combat = buildCombat(cdb, ctx);
-  const plan = buildSkillPlan(cdb, ctx, cat, combat);
+  const plan = buildSkillPlan(cdb, ctx, cat, combat,
+    classSkillSlots != null ? { classSkillSlots } : {});
   const talents = buildTalentPlan(cdb, ctx, cat, combat, plan);
-  const opts = { assume: { ...DEFAULT_ASSUME, ...assume } };
+  const opts = {
+    assume: { ...DEFAULT_ASSUME, ...assume },
+    // The fight the numbers are computed over. 200 seconds because that is the
+    // length a damage meter typically reports, and because a fight length is
+    // what makes a banked charge worth anything.
+    fight: fight.seconds ?? 200,
+    fights: fight.count ?? 1,
+    targets: fight.targets ?? 1,
+    // How far ahead the rotation looks before choosing a cast. 0 is a plain
+    // first-available priority list, which is what SimulationCraft does with an
+    // authored APL; anything above 0 lets a setup cast win on what it makes the
+    // NEXT few seconds worth.
+    lookahead: fight.lookahead ?? 0,
+    seed: fight.seed ?? 0x9e3779b9,
+  };
   if (!FERVOR_SCOPES.includes(opts.assume.fervorScope)) {
     throw new Error(`fervorScope must be one of ${FERVOR_SCOPES.join(', ')}`);
   }
@@ -55,7 +70,14 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
   // the same weapon plus skill choice thousands of times.
   const rotationCache = new Map();
   function rotationFor(loadout, rank) {
-    const key = rank + '|' + (loadout.gear.Slot_Weapon1?.item ?? '-')
+    // CLASS AND LEVEL FIRST. The key used to be built from gear, skills,
+    // augments, runes and talents alone - all of which are empty on a naked
+    // character - so evaluating a naked Rogue and then a naked Warrior through
+    // one engine handed the Warrior the ROGUE's rotation, complete with
+    // Rogue_Sig_Finisher. The class also decides which unit skills exist and
+    // the level decides which of them are unlocked, so both belong in the key.
+    const key = loadout.class + '@' + loadout.level + '|' + rank
+      + '|' + (loadout.gear.Slot_Weapon1?.item ?? '-')
       + '|' + (loadout.gear.Slot_Weapon2?.item ?? '-')
       + '|' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + ':' + v.join('+')).join(';')
       + '|' + cat.combatSlots().map((s) => loadout.gear[s.id]?.item ?? '').join(',')
@@ -92,6 +114,42 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
         if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, a.val ?? 0);
       }
     }
+
+    // The effect a weapon's upgrade stars unlock. The game's own window says
+    // upgrading a weapon gives "access to a unique effect", and each weapon
+    // type has a `<Type>_Upgrade` skill whose affix rows are gated by the
+    // upgrade level - `Scepter_Upgrade` is +4 SpellPenetration at one star
+    // rising to +8 at five, `Staff_Upgrade` +2..+6 CooldownReduction. Eight of
+    // the twenty carry readable affixes; the other twelve are procs whose
+    // payload lives in a script, and those are named in the audit.
+    //
+    // The rows are MUTUALLY EXCLUSIVE per star, the same shape as every other
+    // rank-gated affix in this database, so they are filtered and never summed.
+    //
+    // Only the weapons you actually wield: the arsenal grants two chosen skills
+    // and its discounted stats, and the upgrade effect is neither.
+    const upgradeGaps = [];
+    for (const slotId of ['Slot_Weapon1', 'Slot_OffhandWeapon']) {
+      const g = loadout.gear[slotId];
+      if (!g?.item) continue;
+      const item = cat.itemById.get(g.item);
+      const upgradeId = cat.upgradeSkillFor(item);
+      if (!upgradeId) continue;
+      const stars = Math.min(g.stars ?? 0, cat.maxStars(item, g.rarity));
+      if (stars < 1) continue;
+      const up = cdb.byId('skill').get(upgradeId);
+      const rows = (up?.affixes ?? []).filter((a) => a.target?.attribute
+        && !(a.conds?.minRank != null && stars < a.conds.minRank)
+        && !(a.conds?.maxRank != null && stars > a.conds.maxRank)
+        && !(a.conds?.equalRank != null && stars !== a.conds.equalRank));
+      if (!rows.length) {
+        upgradeGaps.push({ id: upgradeId, slot: slotId, stars });
+        continue;
+      }
+      for (const a of rows) {
+        if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, a.val ?? 0);
+      }
+    }
     // Talents you have allocated. Only 22 of the 88 nodes declare anything a
     // model can read; the rest are structurally present and numerically
     // invisible, which `bench talents` reports rather than hides.
@@ -99,34 +157,210 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     // Priest_Talent_CrusadersResolve is TAttribute_ARatio +0.08 Armor - a
     // RATIO, +8% armour - and reading it as a flat +0.08 threw away its entire
     // value while printing a number that looks like a rounding error.
-    const applyAffix = (a, scale = 1) => {
+    //
+    // The three affix models are NOT interchangeable, and the multiplicative
+    // one is the trap. `TAttribute_MRatio` REPLACES the multiplier - a status
+    // carrying `DamageTakenModifier` MRatio 0.6 means "you take 60% of what you
+    // would have", i.e. a 40% reduction. Reading it as `* (1 + 0.6)` turned
+    // `Warrior_IgnorePainStatus` from -40% damage taken into +60% damage taken,
+    // and `GM_MassGrab_Skill2_Status`'s DamageModifier MRatio 1.5 into +150%.
+    // `uptime` therefore has to be blended between the multiplier and 1, not
+    // multiplied into the value: a buff that is up half the time gives
+    // `0.5*val + 0.5*1`, never `val/2`.
+    const applyAffix = (a, scale = 1, uptime = 1) => {
       const atb = a.target?.attribute;
-      if (!atb) return;
-      const v = (a.val ?? 0) * scale;
-      if (a.ref === 'TAttribute_Flat') addFlat(atb, v);
-      else if (a.ref === 'TAttribute_ARatio') addRatio.set(atb, (addRatio.get(atb) ?? 0) + v);
-      else if (a.ref === 'TAttribute_MRatio' || a.ref === 'TAttribute_MRatioMin') {
-        mulRatio.set(atb, (mulRatio.get(atb) ?? 1) * (1 + v));
+      const kind = ctx.affix.kindOf(a.ref);
+      if (!atb || !kind) return;
+      if (kind === 'flat') addFlat(atb, (a.val ?? 0) * scale * uptime);
+      else if (kind === 'addRatio') addRatio.set(atb, (addRatio.get(atb) ?? 0) + (a.val ?? 0) * scale * uptime);
+      else {
+        // A multiplier that is only up part of the time averages toward 1, and
+        // `uptime * val + (1 - uptime)` is that average - never `val / 2`,
+        // which would turn a half-uptime -40% into a -70%. Composition with
+        // whatever is already there is the `affix` sheet's business.
+        const m = uptime * (a.val ?? 0) + (1 - uptime);
+        mulRatio.set(atb, ctx.affix.composeMul(a.ref, mulRatio.get(atb) ?? 1, m));
       }
     };
+    // Talents. A talent has no cooldown of its own, so a status it grants is
+    // permanent unless the status says otherwise - and where the status DOES
+    // declare a short duration with no applier cooldown to divide it by, the
+    // uptime is not in the data and counting it whole would make an emergency
+    // button a passive. Those are refused and named.
+    const talentBuffGaps = [];
     for (const [id, rank] of Object.entries(loadout.talents ?? {})) {
       const v = talents.readableValue(id, rank);
       for (const a of v.affixes) applyAffix(a);
-      for (const b of v.buffs) for (const a of b.affixes) applyAffix(a, b.stacks);
-    }
-
-    const buffs = plan.selfBuffs(rot);
-    for (const b of buffs) {
-      for (const a of b.affixes) {
-        if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, (a.val ?? 0) * b.stacks);
+      for (const b of v.buffs) {
+        const src = combat.profile(b.from, rank, new Set(rot.runes ?? []));
+        const timed = b.duration > 0 && !(src?.cooldown > 0);
+        if (timed) {
+          talentBuffGaps.push({ id: b.status, from: id, duration: b.duration });
+          continue;
+        }
+        for (const a of b.affixes) applyAffix(a, b.stacks);
       }
     }
 
-    const r = evaluateLoadout(cat, loadout, {
+    // Self-buffs, at the uptime the fight actually supports rather than at a
+    // flat 100%. `Priest_BlessingOfFervor` is fifteen seconds of +10 Fervor on
+    // a hundred-and-twenty-second cooldown: counting it whole credits a build
+    // with a button it presses once every two minutes as if it were always on.
+    // A buff with no cooldown behind it - the weapon enchants, which refresh
+    // off a proc every few swings - keeps its full uptime, which is the case
+    // the old blanket assumption was actually written for.
+    // Self-buffs split in two, and the split is the whole point of a stateful
+    // fight. A buff with no cooldown behind it - a weapon enchant refreshed off
+    // a proc every few swings - is effectively always on and belongs in the
+    // sheet. A buff on a cooldown is a WINDOW: it lands, it changes what the
+    // next few casts are worth, and it expires. Averaging that into the sheet
+    // at duration/cooldown is the right number for a stat block and the wrong
+    // model for a rotation, because it makes bursting inside the window worth
+    // exactly the same as bursting outside it.
+    //
+    // So the permanent ones go into the sheet, and the timed ones are handed to
+    // the fight, which applies them when they are cast and prices what follows
+    // against them. The printed sheet still shows the timed ones at their
+    // uptime, because that IS what a character averages - but the fight does
+    // not read that sheet.
+    const buffs = plan.selfBuffs(rot);
+    const timed = [];
+    for (const b of buffs) {
+      const src = combat.profile(b.from, rank, new Set(rot.runes ?? []));
+      const cd = src?.cooldown ?? 0;
+      const dur = b.duration;
+      b.uptime = (cd > 0 && dur > 0) ? Math.min(1, dur / Math.max(cd, src.occupancy)) : 1;
+      b.timed = cd > 0 && dur > 0;
+      if (b.timed) timed.push(b);
+      else for (const a of b.affixes) applyAffix(a, b.stacks, 1);
+    }
+
+    // The sheet the FIGHT starts from: everything permanent, nothing timed.
+    const combatBase = evaluateLoadout(cat, loadout, {
       baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio,
     });
-    const tp = combat.throughput(rot, r.sheet, tgt, opts);
-    const sv = combat.survivability(r.sheet, tgt, mix);
+
+    // ...and the sheet averaged over the fight, with the timed buffs folded in
+    // at their uptime. That is a useful number and it is NOT the character
+    // sheet: a level-25 Warrior with no gear reads 5.8% crit in game, and this
+    // one read 8.3% because Battle Shout's +20 CritChance on a 120-second
+    // cooldown was averaged in at 12.5% uptime. Anyone comparing the tool to
+    // their own character sheet was comparing against a different question.
+    //
+    // So both are computed and both are reported: `sheet` is what the game
+    // shows you standing still, `averaged` is what the fight sees.
+    const resting = combatBase;
+    for (const b of timed) for (const a of b.affixes) applyAffix(a, b.stacks, b.uptime);
+    const averaged = evaluateLoadout(cat, loadout, {
+      baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio,
+    });
+    const r = { ...resting, averaged: averaged.sheet };
+
+    /**
+     * The sheet with a given set of statuses live on top of the combat base.
+     * Memoised on the status set, because a fight cycles through a handful of
+     * distinct combinations thousands of times.
+     */
+    const restatCache = new Map();
+    function restat(active) {
+      if (!active.length) return combatBase.sheet;
+      const key = active.map((b) => b.status + '#' + (b.stacks ?? 1)).sort().join('|');
+      let hit = restatCache.get(key);
+      if (hit) return hit;
+      const f2 = new Map(inject), a2 = new Map(addRatio), m2 = new Map(mulRatio);
+      const put = (a, scale) => {
+        const atb = a.target?.attribute;
+        const kind = ctx.affix.kindOf(a.ref);
+        if (!atb || !kind) return;
+        if (kind === 'flat') f2.set(atb, (f2.get(atb) ?? 0) + (a.val ?? 0) * scale);
+        else if (kind === 'addRatio') a2.set(atb, (a2.get(atb) ?? 0) + (a.val ?? 0) * scale);
+        else m2.set(atb, ctx.affix.composeMul(a.ref, m2.get(atb) ?? 1, a.val ?? 0));
+      };
+      for (const b of active) for (const a of b.affixes) put(a, b.stacks ?? 1);
+      hit = evaluateLoadout(cat, loadout, {
+        baseStatsFor, injectFlat: f2, injectAddRatio: a2, injectMulRatio: m2,
+      }).sheet;
+      restatCache.set(key, hit);
+      return hit;
+    }
+    // Scoped damage modifiers the allocated talents confer. These are not stats
+    // - "+20% critical damage on weapon skills" cannot be written on a sheet -
+    // so they travel to the fight separately and are applied where their scope
+    // says. `targetBleeding` ones are credited whole: the model only reaches
+    // them when a pool dot is running, and a bleed re-applied off every crit is
+    // up essentially all of the time. That is an assumption and it is in the
+    // audit.
+    const mods = {
+      critDamageByType: {}, critChanceByType: {}, damageByAffinity: {},
+      armorIgnore: {}, bleed: {},
+    };
+    // Modifiers whose scope this fight does not separate. Named, not dropped.
+    const unreadMods = [];
+    const modsFrom = [];
+    for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
+      for (const mod of talents.modifiersOf(id, nodeRank)) {
+        modsFrom.push(mod);
+        const add = (bag, key) => { bag[key] = (bag[key] ?? 0) + mod.amount; };
+        // Routing is EXPLICIT, with no default. A scope this does not recognise
+        // is dropped, not folded into "everything": `Rogue_Talent_LethalDose`
+        // scopes its +20% to Poison damage, and the model has no poison pool to
+        // put it on, so it must contribute nothing rather than +20% globally.
+        const type = mod.scope === 'attack' ? 'Attack'
+          : mod.scope === 'weaponSkill' ? 'WeaponSkill' : null;
+        if (mod.field === 'healShare' && mod.scope === 'bleed') add(mods.bleed, 'healShare');
+        else if (mod.scope === 'bleed') add(mods.bleed, mod.field);
+        else if (mod.field === 'critDmgMult' && type) add(mods.critDamageByType, type);
+        else if (mod.field === 'critChance' && type) add(mods.critChanceByType, type);
+        else if (mod.field === 'dmgMult' && mod.scope === 'physical') add(mods.damageByAffinity, 'Physical');
+        else if (mod.field === 'dmgMult' && mod.scope === 'magic') add(mods.damageByAffinity, 'Magic');
+        else if (mod.field === 'dmgMult' && type) add(mods.damageByAffinity, type);
+        else if (mod.field === 'dmgMult' && mod.scope === 'all') add(mods.damageByAffinity, 'all');
+        // Cooldown reduction earned per bleed tick. The bleed's own tick
+        // interval turns "a 12% chance for one second" into a rate: at one tick
+        // every two seconds that is 0.06 seconds of cooldown back per second,
+        // i.e. 6 points of CooldownReduction, which IS a sheet stat - so it
+        // goes on the sheet and every cooldown in the fight sees it.
+        //
+        // It is credited only while a bleed is actually running. A build with
+        // no pool dot earns nothing from it, which is correct and is why this
+        // reads the resolved rotation rather than the talent alone.
+        else if (mod.field === 'cooldownPerTick' && mod.scope === 'bleed') {
+          const tickInterval = (rot.dots ?? []).find((d) => d.pool)?.tick ?? 0;
+          if (tickInterval > 0) addFlat('CooldownReduction', (mod.amount / tickInterval) * 100);
+          else unreadMods.push(mod);
+        } else if (mod.field === 'armorIgnore') add(mods.armorIgnore, 'Physical');
+        else if (mod.field === 'magicArmorIgnore') add(mods.armorIgnore, 'Magic');
+        else unreadMods.push(mod);
+      }
+    }
+
+    const tp = combat.throughput(rot, combatBase.sheet, tgt, opts,
+      { restat, timedBuffs: timed, averagedSheet: averaged.sheet, mods });
+    // Survivability is what you average over a fight, so it reads the averaged
+    // sheet - a defensive cooldown you press is real mitigation, just not
+    // mitigation you are standing in right now.
+    const sv = combat.survivability(averaged.sheet, tgt, mix);
+    // A talent buff whose uptime is not derivable is a real gap, and the list
+    // the user reads has to carry it.
+    const extraGaps = [
+      ...talentBuffGaps.map((g) => ({
+        id: g.id,
+        source: 'talent',
+        why: `${g.from} grants it for ${g.duration}s but declares no cooldown, so its uptime is not in the data`,
+      })),
+      ...upgradeGaps.map((g) => ({
+        id: g.id,
+        source: g.slot,
+        why: `the effect ${g.stars} upgrade star${g.stars === 1 ? '' : 's'} unlock is a script proc, not an affix`,
+      })),
+    ];
+    for (const u of unreadMods) {
+      extraGaps.push({
+        id: u.from, source: talent,
+        why: `it modifies ${u.field} for ${u.scope} damage, which is a category this fight does not separate`,
+      });
+    }
+    if (extraGaps.length) tp.unmodelled = [...tp.unmodelled, ...extraGaps];
     return { ...r, target: tgt, weaponPower, rotation: rot, buffs, throughput: tp, survivability: sv };
   }
 
@@ -174,30 +408,89 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
     ...auditModel(cdb, ctx),
     ...combat.audit.filter((a) => !(a.what.startsWith('Fervor') && opts.assume.fervorScope === 'none')),
     {
-      severity: 'unverified',
-      what: 'Slot_Weapon2 contributes 40% of its stats (slot.affixFactor = 0.4)',
-      why: 'That is what the data says. Players report the arsenal weapon feeling halved, so if the ' +
-           'in-game sheet shows 50%, the number to change is itemType Slot_Weapon2 slot.affixFactor.',
+      severity: 'assumption',
+      what: 'a self-buff is worth duration/cooldown of itself, at full stacks',
+      why: 'A buff on a cooldown is credited at min(1, duration / cooldown) - Priest_BlessingOfFervor is ' +
+           '15s on 120s, so 13%. One with no cooldown behind it keeps 100%: a 15-second enchant buff ' +
+           'refreshed by a 30%-per-attack proc does sit at its cap in sustained combat. Stacks are ' +
+           'still counted at the cap, which a short or movement-heavy fight would not reach.',
     },
     {
       severity: 'assumption',
-      what: 'self-buff statuses are counted at full stacks and 100% uptime',
-      why: 'A 15-second buff refreshed by a 30%-per-attack proc does sit at its cap in sustained combat, ' +
-           'but a short fight or a movement-heavy one would not reach it.',
+      what: 'a damage-over-time snapshots its multipliers when it is applied',
+      why: 'A DoT ticks at the value it was worth at the moment it landed and does not follow buffs that ' +
+           'come and go while it runs. Nothing in the CDB states this either way; it is the convention ' +
+           'SimulationCraft uses for World of Warcraft, where target debuffs snapshot at cast end and ' +
+           'player buffs at impact, and it is the one this model follows. A re-application re-snapshots.',
+    },
+    {
+      severity: 'assumption',
+      what: opts.lookahead > 0
+        ? `the rotation is searched ${opts.lookahead}s ahead, and the better of that and priority order is kept`
+        : 'the rotation is a first-available priority list, with no lookahead',
+      why: 'SimulationCraft answers this with a human-authored Action Priority List and does no search at ' +
+           'all - its wiki says outright that there is "no lookahead or optimization of action orderings". ' +
+           'Nobody authors those lists for this game, so a bounded rollout stands in for one. It is a ' +
+           'heuristic and a myopic one: it maximises what lands inside the horizon while the cost of ' +
+           'spending a cooldown early falls outside it, and on two classes that made the answer WORSE ' +
+           'than plain priority order. So the fight is played both ways and the better kept, which is a ' +
+           'lower bound on what a player can get rather than a claim about what they would do. Sequencing ' +
+           'is worth 0-0.4% on the builds in this data: the player-facing debuffs are mostly movement ' +
+           'slows, and the few damage amplifiers sit on cooldowns long relative to their windows.',
+    },
+    {
+      severity: 'assumption',
+      what: `throughput is a ${opts.fight}-second fight, not a steady state`,
+      why: 'Cooldowns are pressed in priority order - highest damage per second of commitment first - ' +
+           'charges are spent as the bank allows, statuses tick and expire, and the base-attack chain ' +
+           'fills what is left. --fight changes the length and --fights rolls the procs for real ' +
+           'instead of folding them in at their expected rate.',
+    },
+    {
+      severity: 'assumption',
+      what: `an area effect is priced against ${opts.targets} target${opts.targets === 1 ? '' : 's'}`,
+      why: 'The geometry is fully authored - shape, range, height, and an expanding rangeScale - but ' +
+           'nothing anywhere says how many enemies stand inside it. `unitGroup` describes spawn points ' +
+           'and the `spawner` sheet is empty because placement is level data. So --targets is an input, ' +
+           'never a derived number, and only Area and Aura steps scale with it.',
+    },
+    {
+      severity: 'unverified',
+      what: 'a cast costs only its own authored duration - no global recovery window',
+      why: 'Skill_RecoveryTime (1s) used to be added to every cast, which billed a level-25 Priest 0.59 ' +
+           'attacks a second for a chain whose authored durations run at 2.2. It sits in the constant ' +
+           'sheet inside the SpawnTime/Aggro/Panic/PathSearch block between Skill_Pick_RetryCooldown and ' +
+           'Skill_RecoveryTime_Boss, and its only bytecode symbol is ent.Foe.getSkillRecoveryTime - so it ' +
+           'reads as foe AI. That is circumstantial: bare `recoveryTime` and `get_recoveryTime` symbols ' +
+           'also exist and have not been placed. ComboWindow (0.6) and AttackQueueTime (0.4) are ' +
+           'consistent with a chain that runs back to back.',
+    },
+    {
+      severity: 'unmodelled',
+      what: 'whether a `Mono` step carrying an area cleaves',
+      why: '80 Mono steps carry a props.area, and structurally identical rows disagree in their own ' +
+           'descriptions - DM_Base_Attack1 is Mono + Cone(160) "to nearby enemies", Daggers_Base_Attack ' +
+           'is Mono + Cone(150) "to an enemy". Mono is treated as single-target, which is the reading ' +
+           'that agrees with the descriptions on 87% of player skills and the one that cannot flatter.',
     },
     {
       severity: 'verified',
       what: 'the arsenal gives two skills and 40% of its stats, and nothing else',
       why: 'Confirmed in game: you do not swap to it. It contributes no base-attack chain and no combo ' +
            'attack, so the main hand supplies all of the filler; its two slotted skills and its discounted ' +
-           'stats are its entire contribution.',
+           'stats are its entire contribution. The same spear reads +36/+18/+15/+39/+39 in the main hand ' +
+           'and +15/+8/+6/+16/+16 in the arsenal, which is ceil(v * 0.4) on all five and not a half. The ' +
+           'factor itself is read from itemType Slot_Weapon2 slot.affixFactor, so a patch moves it on its own.',
     },
     {
-      severity: 'unmodelled',
-      what: 'the DemonSigil socket cannot be scored',
-      why: 'Each of the 12 sigils grants one tier-4 talent, and most of those declare no effect, no affix and no ' +
-           'status - Priest_Talent_SunHalo carries only vars.damage 0.5 and no script at all, so its ' +
-           'behaviour lives in game code keyed on the talent being present. Nothing in the data to read.',
+      severity: 'assumption',
+      what: 'a DemonSigil is taken because a free talent beats an empty socket, not because it scored',
+      why: 'Each of the 12 sigils grants one tier-4 talent, and most of those declare no effect, no affix ' +
+           'and no status - Priest_Talent_SunHalo carries only vars.damage 0.5 and no script at all, so ' +
+           'its behaviour lives in game code keyed on the talent being present. The objective therefore ' +
+           'cannot rank the sigils against each other, and the socket used to be left empty because of ' +
+           'it. The search now breaks that tie towards taking one, and the output says the pick is not ' +
+           'scoreable rather than presenting it as a considered choice.',
     },
   ];
 

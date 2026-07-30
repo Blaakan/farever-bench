@@ -168,7 +168,57 @@ export function buildCatalog(cdb, ctx) {
     return iLevel / 10;
   }
 
+  // --- upgrade stars --------------------------------------------------------
+  // `rarity.props.gearUpgrades` says how MANY upgrades a rarity allows (2/3/4/5
+  // for Uncommon..Legendary), and reading only that column had every armour
+  // piece sitting at three stars. It is not what the game does: WEAPONS ONLY.
+  //
+  // Three independent readings of the shipped data agree, so this is derived
+  // rather than a rule typed in here:
+  //
+  //   * the game's own window text, `text.windows_gearUpgrade.description`:
+  //     "You can upgrade weapons to increase their Attributes and gain access
+  //     to a unique effect. The number of upgrades and their cost will increase
+  //     depending on the rarity of the weapon."
+  //   * exactly twenty skills are named `<itemType>_Upgrade` - Sword, Mace,
+  //     Axe, DualSwords, DualMaces, DualAxes, Daggers, Fists, GreatSword,
+  //     GreatAxe, GreatMace, Spear, Crescent, Staff, Bow, Book, Halos, Scepter,
+  //     Thrown, Shield - and every one of those itemTypes inherits from
+  //     `Weapon`. There is no Chest_Upgrade, Head_Upgrade or Necklace_Upgrade.
+  //   * `item.flags` carries an explicit `PreventUpgrade` bit, set on the five
+  //     starter pieces (Sword_Start, Shield_Start, Book_Start, Daggers_Start,
+  //     Scepter_Start), which are all weapons - the flag would be pointless if
+  //     nothing else could be upgraded either.
+  //
+  // So the set of upgradable itemTypes is READ from the skill sheet, and the
+  // day a patch authors `Chest_Upgrade` this starts allowing chest upgrades on
+  // its own.
+  const upgradeSkillByType = new Map();
+  for (const s of cdb.lines('skill')) {
+    const m = /^(.+)_Upgrade$/.exec(s.id);
+    if (m && itemTypes.has(m[1])) upgradeSkillByType.set(m[1], s.id);
+  }
+  const preventUpgradeBit = cdb.enumValues('item', 'flags').indexOf('PreventUpgrade');
+  if (preventUpgradeBit < 0) throw new Error('item.flags has no PreventUpgrade - the game changed shape');
+
+  // Which `<type>_Upgrade` effect this item's stars unlock, or null.
+  function upgradeSkillFor(item) {
+    if (!item) return null;
+    for (const t of item.chain) {
+      const hit = upgradeSkillByType.get(t);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function canUpgrade(item) {
+    if (!item) return false;
+    if (((item.raw?.flags ?? 0) >> preventUpgradeBit) & 1) return false;
+    return !!upgradeSkillFor(item);
+  }
+
   function maxStars(item, rarity = null) {
+    if (!canUpgrade(item)) return 0;
     return cdb.byId('rarity').get(rarity ?? item.rarity)?.props?.gearUpgrades ?? 0;
   }
 
@@ -284,43 +334,80 @@ export function buildCatalog(cdb, ctx) {
     return item.aptitudes.some((a) => a === aptitude || isGeneric(a));
   }
 
-  // EVERY aptitude on an item pays, and the contributions SUM. This is checked
-  // against the game: `Spear_Eruption` (Rare, Kobold, [Assassin, Cleric]) at
-  // effective level 11 reads, in game,
+  // ONE aptitude pays: the wearer's own. An item naming several is naming who
+  // may WEAR it, not how many budgets it hands out.
   //
-  //     +36 Vitality  +18 Dexterity  +15 Faith  +39 Critical  +39 Armor Pen
+  // The whole stat system rests on this, and the proof is in `itemType.atbRatio`
+  // itself. Summed over one item per core slot - mainhand, the eight armour
+  // pieces, neck and two fingers - every stat group comes to EXACTLY 1.0:
   //
-  // and every one of those five falls out of summing both aptitudes. Dexterity
-  // is Assassin's primary budget (36..648) and Faith is Cleric's (30..540) -
-  // hence 18 and 15, a 1.2 ratio that matches the budgets exactly. Vitality is
-  // the sum of both MaxHealth budgets. The two ratings come from the two
-  // aptitudes' different readings of the same Kobold faction: Assassin gets
-  // ArmorPen from Kobold, Cleric gets Crit.
+  //     primary 1.0   vitality 1.0   armor 1.0   ratings 1.0
   //
-  // And they pay REGARDLESS of your class. Your aptitude decides only whether
-  // you can equip the thing (see `usableBy`); once it is on, you get everything
-  // it grants. That is why a Rogue reading that spear's tooltip sees +15 Faith,
-  // a stat the Cleric aptitude put there and that a Rogue barely uses.
+  // A full set is designed to deliver exactly one aptitude curve per group. So
+  // paying every named aptitude hands a dual-class item two of them, and the
+  // four-generic craft necklace four - and 271 of the 513 stat-bearing items
+  // name two. Three consequences that were all visible in the output:
   //
-  // Untested extrapolation: the craft jewellery that names four GENERIC
-  // aptitudes (`Necklace_Z1RCraft` is [Crit, Fervor, ArPen, MaPen]) then pays
-  // all four ratings and four shares of MaxHealth. That follows the same rule,
-  // but no in-game reading confirms it yet.
-  function payingAptitudes(item /* , aptitude */) {
-    return item.aptitudes;
+  //   * a level-25 Priest read 453 Vitality where a real character sits at 193,
+  //     and the one-budget ceiling is 182 + 39 naked = 221;
+  //   * a Priest read Intellect 185 AND Faith 206, both near a full primary
+  //     budget, off gear that is Mage-or-Priest;
+  //   * worst of all, ARMOUR doubled - and armour is the one stat that cannot,
+  //     because its budget is `resistForReduction(level, the WEARER's
+  //     props.armorReduction)` and does not depend on the aptitude at all.
+  //     Cleric declares 0.25 and the sheet was showing 40.3% reduction. The
+  //     model was contradicting the class row it had read itself.
+  //
+  // A dual-aptitude item would also be strictly twice a single-aptitude item of
+  // the same slot, rarity and drop level, for BOTH classes that can wear it -
+  // which would make every shared piece best-in-slot for everyone.
+  //
+  // What the earlier reading rested on is a real in-game observation, and it is
+  // not contradicted: `Spear_Eruption` (Kobold, [Assassin, Cleric]) READS
+  // +36 Vitality +18 Dexterity +15 Faith +39 Critical +39 ArmorPen, which is
+  // exactly the union of the two aptitudes. But that is an ITEM TOOLTIP, and a
+  // tooltip has no wearer - the six `combines` aptitude rows (FigAss, WizCle,
+  // ...) exist precisely to label an item as belonging to a class PAIR, carry
+  // no atbScaling of their own, and are the only aptitude rows with an icon.
+  // The character sheet is a different question, and 193 Vitality answers it.
+  //
+  // Generic aptitudes - the five nameless rows Crit / ArPen / MaPen / Fervor /
+  // Vita that jewellery uses - are the same rule from the other side: nobody's
+  // class matches them, so an item naming only generics pays exactly ONE of
+  // them, and WHICH one is a decision rather than a sum. That is the difference
+  // between "Pendant of Adaptability" granting 46 rating and granting 184.
+  // Nothing in the data says which one you get, so it is enumerated as a
+  // candidate and printed, never chosen silently.
+  function payingAptitudes(item, aptitude = null, generic = null, { all = false } = {}) {
+    if (!item.aptitudes.length) return [];
+    // `all` is the ITEM TOOLTIP reading - what the row grants across every
+    // class that can wear it, with no wearer in the picture. It is the only
+    // in-game reading on record for this rule and it is reproduced exactly, so
+    // it is kept as a mode rather than deleted.
+    if (all) return item.aptitudes;
+    // The wearer's own, if the item names it.
+    const own = item.aptitudes.filter((a) => a === aptitude);
+    if (own.length) return own;
+    const generics = item.aptitudes.filter((a) => isGeneric(a));
+    if (!generics.length) return [];
+    if (generic && generics.includes(generic)) return [generic];
+    return [generics[0]];
+  }
+
+  /** The generic aptitudes an item lets you choose between, or []. */
+  function genericChoices(item) {
+    if (!item || !item.aptitudes.length) return [];
+    const generics = item.aptitudes.filter((a) => isGeneric(a));
+    return generics.length > 1 ? generics : [];
   }
 
   // --- affix application ----------------------------------------------------
-  // Only four of the twelve affix rows target an attribute, and they are the
-  // only ones any equippable or augment uses. The rest are inventory size,
-  // craft chances and internal markers.
-  const AFFIX_KIND = {
-    TAttribute_Flat: 'flat',
-    TAttribute_ARatio: 'addRatio',
-    TAttribute_MRatio: 'mulRatio',
-    TAttribute_MRatioMin: 'mulRatio',
-  };
-
+  // Which accumulator a row feeds, and how it composes with another of its
+  // kind, both come from the `affix` sheet through ctx.affix - see
+  // model.buildAffixRules. This used to compose a multiplicative affix as
+  // `cur * (1 + v)` while engine.mjs composed the same ref as `cur * v`, so one
+  // row meant two different things depending on where it arrived from.
+  //
   // `ceilFlat` reproduces the arsenal rule for authored affixes as well as for
   // budget-derived ones. Checked in game: a Rare Corrupted Gift is -20/+20 in
   // the main hand and -8/+8 in the arsenal, and ceil(-20*0.4) = -8 as well as
@@ -328,13 +415,13 @@ export function buildCatalog(cdb, ctx) {
   // not integers.
   function applyAffixes(affixes, mods, factor = 1, ceilFlat = false) {
     for (const a of affixes ?? []) {
-      const kind = AFFIX_KIND[a.ref];
+      const kind = ctx.affix.kindOf(a.ref);
       const atb = a.target?.attribute;
       if (!kind || !atb) continue;
-      let v = (a.val ?? 0) * factor;
+      let v = ctx.affix.scaleValue(a.ref, a.val ?? 0, factor);
       if (kind === 'flat' && ceilFlat) v = Math.ceil(v);
       if (kind === 'mulRatio') {
-        mods.mulRatio.set(atb, (mods.mulRatio.get(atb) ?? 1) * (1 + v));
+        mods.mulRatio.set(atb, ctx.affix.composeMul(a.ref, mods.mulRatio.get(atb) ?? 1, v));
       } else {
         mods[kind].set(atb, (mods[kind].get(atb) ?? 0) + v);
       }
@@ -381,7 +468,7 @@ export function buildCatalog(cdb, ctx) {
     // applies to the finished per-stat total - see the ceil() below.
     const own = new Map();
 
-    for (const aptId of payingAptitudes(item)) {
+    for (const aptId of payingAptitudes(item, opts.aptitude, opts.generic, { all: !!opts.allAptitudes })) {
       const apt = aptitudes.get(aptId);
       for (const e of apt?.atbScaling ?? []) {
         const c = e.conds ?? {};
@@ -437,7 +524,9 @@ export function buildCatalog(cdb, ctx) {
     cdb, ctx,
     slots, slotById, classes, items, itemById,
     chain, inherited, socketsFor, augmentTypes,
-    effectiveLevel, maxStars, usableBy, payingAptitudes,
+    effectiveLevel, maxStars, canUpgrade, upgradeSkillFor,
+    upgradableTypes: upgradeSkillByType,
+    usableBy, payingAptitudes, genericChoices,
     contribute, applyAffixes, armorReductionFor,
     rarityOrder, isGeneric, attainableRarities, rarityCeiling, isWeaponSlot,
     allowsOffhand, handednessOf,
@@ -464,9 +553,20 @@ export function buildCatalog(cdb, ctx) {
         const rarityVariants = rarityRoll
           ? attainableRarities(it, charLevel, slotId, rarityCap)
           : [{ rarity: it.rarity, chance: null, authored: true }];
+        // Craft jewellery names several generic aptitudes and pays exactly one,
+        // so each is its own candidate - the same shape as a rarity roll, and
+        // for the same reason: it is a property of the instance, not of the row.
+        // Four items in the whole sheet are affected.
+        const generics = genericChoices(it);
         for (const v of rarityVariants) {
           if (rarities && !rarities.has(v.rarity)) continue;
-          out.push({ item: it, rarity: v.rarity, chance: v.chance, authored: v.authored });
+          if (generics.length) {
+            for (const g of generics) {
+              out.push({ item: it, rarity: v.rarity, chance: v.chance, authored: v.authored, generic: g });
+            }
+          } else {
+            out.push({ item: it, rarity: v.rarity, chance: v.chance, authored: v.authored, generic: null });
+          }
         }
       }
       return out;

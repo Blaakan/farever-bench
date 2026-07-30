@@ -83,13 +83,25 @@ function bestRarityFor(cat, item, slotId, charLevel) {
   return best;
 }
 
-function applyPins(engine, loadout, args, { stars, rarityRoll }) {
+function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
   const { cat } = engine;
   const slotIds = cat.combatSlots().map((s) => s.id);
   const augTypeIds = cat.augmentTypes.map((a) => a.id);
   const pinnedGear = new Set();
   const pinnedAug = new Set();
   const augPins = [];
+
+  // A saved envelope records what was held fixed. Re-reading it re-pins the
+  // same things, so `optimize --json x` then `optimize --build x` reproduces
+  // the run rather than quietly re-opening every slot the user had fixed.
+  // Any --pin on the command line replaces the saved set outright, because
+  // merging two pin sets silently is how a user ends up unable to unpin.
+  const savedPins = saved?.envelope?.pinned ?? null;
+  if (savedPins && !(args.repeated.pin ?? []).length) {
+    for (const slot of savedPins.gear ?? []) if (slotIds.includes(slot)) pinnedGear.add(slot);
+    for (const key of savedPins.augments ?? []) pinnedAug.add(key);
+  }
+  const savedSkillPins = savedPins && !(args.repeated.skills ?? []).length ? (savedPins.skills ?? []) : [];
 
   for (const spec of args.repeated.pin ?? []) {
     if (spec === true) die('--pin needs a value, e.g. --pin chest=Chest_RManfish_Cle');
@@ -110,8 +122,8 @@ function applyPins(engine, loadout, args, { stars, rarityRoll }) {
     pinnedGear.add(slot);
     if (/^(none|empty|-)$/i.test(rhs)) { delete loadout.gear[slot]; continue; }
 
-    // item [ ^instanceLevel ] [ @rarity ] [ *stars ]
-    const m = /^([^@*^]+)(?:\^(\d+))?(?:@([^*^]+))?(?:\*(\d+))?$/.exec(rhs);
+    // item [ ^instanceLevel ] [ @rarity ] [ *stars ] [ +generic ]
+    const m = /^([^@*^+]+)(?:\^(\d+))?(?:@([^*^+]+))?(?:\*(\d+))?(?:\+([A-Za-z]+))?$/.exec(rhs);
     if (!m) die(`--pin "${spec}": cannot read the item part "${rhs}"`);
     const itemId = resolve(m[1], cat.items.filter((i) => i.slots.includes(slot)).map((i) => i.id), `item for ${f.short(slot)}`);
     const item = cat.itemById.get(itemId);
@@ -144,7 +156,20 @@ function applyPins(engine, loadout, args, { stars, rarityRoll }) {
     if (m[4] != null && capped < want) {
       console.error(f.warn(`note: ${itemId} is ${rarity} and caps at ${capped} upgrade stars, not ${want}`));
     }
-    loadout.gear[slot] = { item: itemId, rarity, stars: capped, level: instanceLevel };
+    // Craft jewellery names several generic aptitudes and pays exactly one, so
+    // a pinned one has to say which. Left unnamed it takes the first, and the
+    // gear table prints it in the FACTION column rather than leaving the choice
+    // invisible.
+    const generics = cat.genericChoices(item);
+    let generic = null;
+    if (generics.length) {
+      generic = m[5]
+        ? resolve(m[5], generics, `aptitude for ${itemId} (one of ${generics.join(', ')})`)
+        : generics[0];
+    } else if (m[5]) {
+      die(`--pin "${spec}": ${itemId} names no generic aptitudes to choose between`);
+    }
+    loadout.gear[slot] = { item: itemId, rarity, stars: capped, level: instanceLevel, generic };
   }
 
   // --no-augment <slot> pins every socket that slot can have to empty. Applied
@@ -212,6 +237,8 @@ function applyPins(engine, loadout, args, { stars, rarityRoll }) {
     loadout.skills[pool.key] = picks;
     pinnedSkills.add(pool.key);
   }
+  // Saved skill pins hold whatever the file already put in `loadout.skills`.
+  for (const key of savedSkillPins) if (loadout.skills[key]?.length) pinnedSkills.add(key);
 
   return { pinnedGear, pinnedAug, pinnedSkills };
 }
@@ -232,36 +259,129 @@ function parseWeights(args) {
 // rather than silent: a filter you cannot see is a filter you cannot check.
 const DEFAULT_EXCLUDE = '^GM_';
 
+// How far the rotation looks ahead before choosing a cast, in seconds. Set
+// from measurement rather than taste: below ~6s a setup cast that only pays off
+// through the skill after it cannot be seen, and above ~12s the answer stops
+// moving while the search gets slower. 0 turns it off and gives a plain
+// first-available priority list.
+const DEFAULT_LOOKAHEAD = 8;
+
+// --- saved builds ----------------------------------------------------------
+//
+// `--json` writes an ENVELOPE - the build plus the settings it was computed
+// under plus the resulting metrics - because a loadout with no target, no goal
+// and no cdb hash beside it is a number nobody can check. `--build` therefore
+// has to accept both that envelope and a bare loadout, or the tool cannot read
+// its own output.
+//
+// Everything the envelope recorded becomes a DEFAULT, so re-reading a file
+// reproduces the run it came from, and any flag you pass still wins.
+export const ENVELOPE_KEYS = ['goal', 'weights', 'target', 'fervorScope', 'stars', 'rank', 'level', 'mix'];
+
+function readBuildFile(args) {
+  if (typeof args.flags.build !== 'string') return null;
+  let raw;
+  try { raw = JSON.parse(readFileSync(args.flags.build, 'utf8')); } catch (e) {
+    die(`${args.flags.build}: ${e.message}`);
+  }
+  // An envelope carries the loadout under `build`; a bare loadout carries
+  // `class` itself. Anything else is neither.
+  const isEnvelope = raw && typeof raw === 'object' && raw.build && typeof raw.build === 'object';
+  const loadout = isEnvelope ? raw.build : raw;
+  if (!loadout?.class) {
+    die(`${args.flags.build}: no "class" in the build file` +
+      (isEnvelope ? ' (its "build" object has no class either)' : '') +
+      '\nA build file is either the object --json writes, or a bare loadout {class, level, gear, augments}.');
+  }
+  return { envelope: isEnvelope ? raw : null, loadout, path: args.flags.build };
+}
+
 function commonSetup(args) {
+  const saved = readBuildFile(args);
+  const env = saved?.envelope ?? {};
+  // A saved setting is a default; an explicit flag always wins.
+  const from = (flag, key, fallback) => (args.flags[flag] !== undefined && args.flags[flag] !== null
+    ? args.flags[flag]
+    : (env[key] !== undefined && env[key] !== null ? env[key] : fallback));
+
   const assume = {};
+  if (env.fervorScope) assume.fervorScope = env.fervorScope;
   if (typeof args.flags[`fervor-scope`] === 'string') assume.fervorScope = args.flags[`fervor-scope`];
   if (args.flags['no-fervor-damage']) assume.fervorScope = 'none';
   if (!FERVOR_SCOPES.includes(assume.fervorScope ?? 'skills')) die(`--fervor-scope must be one of ${FERVOR_SCOPES.join(', ')}`);
   if (args.flags['no-mastery']) assume.mastery = false;
+
+  // The fight the numbers are computed over. Every one of these is an input,
+  // never a derived number, and each is recorded in --json so a result can be
+  // re-derived: a dps figure with no fight length and no target count behind it
+  // is not comparable to anything, least of all to an in-game meter.
+  const numFlag = (name, fallback, { integer = false } = {}) => {
+    // A bare `--fight` with no value is a typo, not a request for the default.
+    if (args.flags[name] === true) die(`--${name} needs a value`);
+    const raw = args.flags[name] !== undefined ? args.flags[name] : (env[name] ?? fallback);
+    const v = Number(raw);
+    if (!Number.isFinite(v) || v <= 0) die(`--${name} needs a positive number`);
+    // Rounding after validating let `--fights 0.4` pass and then write `0` into
+    // an envelope the tool refuses to read back.
+    if (integer && !Number.isInteger(v)) die(`--${name} needs a whole number, not ${raw}`);
+    return v;
+  };
+  const fight = {
+    seconds: numFlag('fight', 200),
+    count: numFlag('fights', 1, { integer: true }),
+    targets: numFlag('targets', 1),
+    // 0 is legal here and means "no lookahead", so it cannot go through numFlag.
+    lookahead: (() => {
+      if (args.flags.lookahead === true) die('--lookahead needs a value');
+      const raw = args.flags.lookahead ?? env.lookahead ?? DEFAULT_LOOKAHEAD;
+      const v = Number(raw);
+      if (!Number.isFinite(v) || v < 0) die('--lookahead needs a number of seconds, or 0 to turn it off');
+      return v;
+    })(),
+  };
   const engine = createEngine({
     game: typeof args.flags.game === 'string' ? args.flags.game : undefined,
-    assume,
+    assume, fight,
+    // How many of the class-skill bar's slots you get. Not in the data - see
+    // CLASS_SKILL_SLOTS in skills.mjs - so it is overridable rather than fixed.
+    classSkillSlots: args.flags['class-skills'] != null && args.flags['class-skills'] !== true
+      ? Number(args.flags['class-skills']) : undefined,
   });
-  const level = args.flags.level ? Number(args.flags.level) : engine.ctx.consts.maxLevel;
+
+  // The two hashes travel with every export precisely so a build assembled
+  // against different numbers is rejectable rather than silently re-scored.
+  if (saved?.envelope?.cdbSha && saved.envelope.cdbSha !== engine.meta.cdbSha) {
+    console.error(f.warn(`note: ${saved.path} was written against cdb ${saved.envelope.cdbSha.slice(0, 8)}, ` +
+      `this game is ${engine.meta.cdbSha.slice(0, 8)} - the numbers will not match that run`));
+  }
+
+  const level = Number(from('level', 'level', engine.ctx.consts.maxLevel));
   if (!Number.isFinite(level) || level < 1) die('--level needs a positive number');
   if (level > engine.ctx.consts.maxLevel) {
     console.error(f.warn(`note: --level ${level} is above this build's MaxLevel of ${engine.ctx.consts.maxLevel}; curves extrapolate`));
   }
-  const starsFlag = args.flags.stars ?? 'max';
+  const starsFlag = from('stars', 'stars', 'max');
   const stars = starsFlag === 'max' ? 'max' : Number(starsFlag);
   if (stars !== 'max' && !Number.isFinite(stars)) die("--stars needs a number or 'max'");
   const rarities = typeof args.flags.rarity === 'string'
     ? new Set(args.flags.rarity.split(',').map((r) => resolve(r, engine.cdb.lines('rarity').map((x) => x.id), 'rarity')))
     : null;
-  const goal = String(args.flags.goal ?? 'dps');
+  const goal = String(from('goal', 'goal', 'dps'));
   if (!GOALS.includes(goal)) die(`--goal must be one of ${GOALS.join(', ')}`);
   // Default to a boss rather than to `Armor_ExpectedReduction`. Every named boss
   // and every world elite sits at 0.40 reduction while that constant is 0.25,
   // which understates penetration by nearly half against the content anyone
   // actually gears for. See `bench targets`.
-  const targetName = String(args.flags.target ?? 'boss');
-  const rank = args.flags.rank ? Number(args.flags.rank) : engine.ctx.consts.weaponSkillMaxRank;
-  const mix = args.flags.mix != null ? Number(args.flags.mix) : 0.5;
+  //
+  // An envelope written by this version records the target NAME. One written
+  // by an older version recorded only the label ("named boss (Ratsar: 0.4/0.4)"),
+  // so the unit id is recovered from the parentheses rather than failing.
+  const savedTarget = typeof env.target === 'string'
+    ? (/^[A-Za-z0-9_]+$/.test(env.target) ? env.target : (/\(([A-Za-z0-9_]+):/.exec(env.target)?.[1] ?? null))
+    : null;
+  const targetName = String(args.flags.target ?? savedTarget ?? 'boss');
+  const rank = Number(from('rank', 'rank', engine.ctx.consts.weaponSkillMaxRank));
+  const mix = Number(from('mix', 'mix', 0.5));
   const exPattern = args.flags['include-all'] ? null
     : (typeof args.flags.exclude === 'string' ? args.flags.exclude : DEFAULT_EXCLUDE);
   let exclude = null;
@@ -277,20 +397,42 @@ function commonSetup(args) {
     ? resolve(args.flags[`rarity-cap`], engine.cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
     : null;
   return {
-    engine, level, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap, talentPoints,
+    engine, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap, talentPoints,
+    saved, fight, numFlag,
+    // A bare loadout carries its own level, and the foe, the rating->percent
+    // conversions and the candidate list all have to agree with it. Reporting a
+    // level-10 character against a level-25 foe mixed two levels in one page.
+    level: (args.flags.level == null && env.level == null && saved?.loadout?.level > 0)
+      ? saved.loadout.level : level,
     // On by default: rarity is rolled at drop, so a Rare-authored chest that can
     // land Epic or Legendary should be on the table. --no-rarity-roll pins every
-    // item to the rarity the CDB authors it at.
-    rarityRoll: !args.flags['no-rarity-roll'],
-    weights: parseWeights(args),
+    // item to the rarity the CDB authors it at. It round-trips like everything
+    // else: an envelope written with --no-rarity-roll re-reads that way.
+    rarityRoll: args.flags['no-rarity-roll'] ? false : (env.rarityRoll ?? true),
+    // A saved blend must not outrank a typed --goal. It used to: re-reading an
+    // envelope written with --weight and passing --goal ehp still optimised the
+    // saved dps blend, and no flag could clear it.
+    weights: parseWeights(args)
+      ?? (args.flags.goal !== undefined ? null : (env.weights ?? null)),
   };
 }
 
-function loadBuild(args, engine, level) {
-  if (typeof args.flags.build === 'string') {
-    const raw = JSON.parse(readFileSync(args.flags.build, 'utf8'));
-    if (!raw.class) die(`${args.flags.build}: no "class" in the build file`);
-    return { level, ...raw, gear: { ...(raw.gear ?? {}) }, augments: { ...(raw.augments ?? {}) } };
+function loadBuild(args, engine, level, saved = null) {
+  const file = saved ?? readBuildFile(args);
+  if (file) {
+    const raw = file.loadout;
+    // Deep enough to be independent of the parsed file: every one of these is
+    // mutated by the pin layer and by the search.
+    return {
+      ...raw,
+      // An explicit --level re-levels a saved build; otherwise it keeps its own.
+      level: args.flags.level != null ? level : (raw.level ?? level),
+      gear: Object.fromEntries(Object.entries(raw.gear ?? {}).map(([k, v]) => [k, { ...v }])),
+      augments: { ...(raw.augments ?? {}) },
+      skills: Object.fromEntries(Object.entries(raw.skills ?? {}).map(([k, v]) => [k, [...v]])),
+      runes: { ...(raw.runes ?? {}) },
+      talents: { ...(raw.talents ?? {}) },
+    };
   }
   const cls = args.flags.class;
   if (typeof cls !== 'string') {
@@ -331,7 +473,7 @@ const commands = {
 
   items(args) {
     const s = commonSetup(args);
-    const loadout = loadBuild(args, s.engine, s.level);
+    const loadout = loadBuild(args, s.engine, s.level, s.saved);
     const cls = classOf(s.engine.cat, loadout);
     const slotIds = s.engine.cat.combatSlots().map((x) => x.id);
     if (typeof args.flags.slot !== 'string') die(`--slot is required. One of: ${slotIds.map(f.short).join(', ')}`);
@@ -350,16 +492,16 @@ const commands = {
         c.chance != null && !c.authored ? f.pct(c.chance, 0) : '',
         s.engine.cat.maxStars(c.item, c.rarity),
         c.item.level ?? f.dim('(scales)'),
-        c.item.faction ?? f.dim('-'),
-        f.ratingGiven(s.engine.cat, c.item, cls.aptitude, c.rarity) ?? f.dim('-'),
+        c.item.faction ?? (c.generic ? f.warn(c.generic) : f.dim("-")),
+        f.ratingGiven(s.engine.cat, c.item, cls.aptitude, c.rarity, c.generic) ?? f.dim('-'),
         c.item.skills.length ? f.warn(String(c.item.skills.length)) : '',
       ]), { align: [null, null, null, 'r', 'r', 'r'] }));
   },
 
   sheet(args) {
     const s = commonSetup(args);
-    const loadout = loadBuild(args, s.engine, s.level);
-    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll });
+    const loadout = loadBuild(args, s.engine, s.level, s.saved);
+    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved });
     const target = s.engine.combat.foe(s.targetName, s.level);
     const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix });
     console.log(f.header(s.engine, VERSION) + '\n');
@@ -380,8 +522,8 @@ const commands = {
 
   rank(args) {
     const s = commonSetup(args);
-    const loadout = loadBuild(args, s.engine, s.level);
-    applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll });
+    const loadout = loadBuild(args, s.engine, s.level, s.saved);
+    applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved });
     const slotIds = s.engine.cat.combatSlots().map((x) => x.id);
     if (typeof args.flags.slot !== 'string') die(`--slot is required. One of: ${slotIds.map(f.short).join(', ')}`);
     const slot = resolve(args.flags.slot, slotIds, 'slot');
@@ -400,8 +542,8 @@ const commands = {
         r.equipped ? f.bold('>') : '', r.item.id, r.rarity,
         r.chance != null && r.rarity !== r.item.rarity ? f.pct(r.chance, 0) : '',
         r.stars ? '*'.repeat(r.stars) : '',
-        r.item.faction ?? f.dim('-'),
-        f.ratingGiven(s.engine.cat, r.item, apt, r.rarity) ?? f.dim('-'),
+        r.item.faction ?? (r.generic ? f.warn(r.generic) : f.dim('-')),
+        f.ratingGiven(s.engine.cat, r.item, apt, r.rarity, r.generic) ?? f.dim('-'),
         f.num(r.score, 1),
         r.delta == null ? f.dim('-') : f.signedPct(r.delta),
       ]), { align: [null, null, null, 'r', null, null, null, 'r', 'r'] }));
@@ -411,10 +553,13 @@ const commands = {
 
   optimize(args) {
     const s = commonSetup(args);
-    const loadout = loadBuild(args, s.engine, s.level);
-    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll });
+    const loadout = loadBuild(args, s.engine, s.level, s.saved);
+    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved });
     const target = s.engine.combat.foe(s.targetName, s.level);
-    const restarts = args.flags.restarts ? Number(args.flags.restarts) : 3;
+    // Validated like every other number: `--restarts abc` used to make the
+    // search loop run zero times and surface as a null dereference inside
+    // optimize() rather than as a message.
+    const restarts = s.numFlag('restarts', 3, { integer: true });
 
     const t0 = Date.now();
     const res = optimize(s.engine, {
@@ -432,7 +577,9 @@ const commands = {
       ? Object.entries(s.weights).map(([k, v]) => `${k}x${v}`).join(' + ')
       : s.goal;
     console.log(`${f.bold(loadout.class + ' ' + s.level)} - maximising ${f.bold(goalLabel)} vs ${target.name}`);
-    console.log(f.dim(`upgrade stars: ${s.stars === 'max' ? 'max for rarity' : s.stars}   weapon-skill rank: ${s.rank}   ` +
+    console.log(f.dim(`upgrade stars: ${s.stars === 'max' ? 'max for rarity' : s.stars}   `
+      + `weapon mastery: ${s.rank === s.engine.ctx.consts.weaponSkillMaxRank
+        ? `rank ${s.rank}, fully mastered` : `rank ${s.rank}`}   ` +
       `rarities: ${s.rarities ? [...s.rarities].join('/') : 'all'}   ` +
       `drop-rarity: ${s.rarityRoll ? 'rolled' : 'as authored'}` +
       (s.exclude ? `   excluding /${s.exclude.source}/` : '')));
@@ -478,8 +625,16 @@ const commands = {
         version: VERSION,
         cdbSha: s.engine.meta.cdbSha,
         bootSha: s.engine.meta.bootSha,
-        goal: s.goal, weights: s.weights, target: target.name, fervorScope: s.engine.opts.assume.fervorScope,
-        stars: s.stars, rank: s.rank,
+        // `target` is the name you can pass back to --target; `targetLabel` is
+        // the sentence a reader needs. Recording only the label is what made
+        // this file unreadable by the tool that wrote it.
+        goal: s.goal, weights: s.weights,
+        target: s.targetName, targetLabel: target.name,
+        fervorScope: s.engine.opts.assume.fervorScope,
+        stars: s.stars, rank: s.rank, level: s.level, mix: s.mix,
+        rarityRoll: s.rarityRoll,
+        fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
+        lookahead: s.fight.lookahead,
         pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills] },
         build: res.loadout,
         metrics: {
@@ -667,10 +822,24 @@ const commands = {
       "  build assembled that way would look authoritative and be arbitrary. The",
       "  unspent points are reported rather than quietly filled.",
       "",
-      f.bold("  Runes are the same shape.") + " 28 skills offer three each. Only 17 of the 84",
-      "  gate a step (cond.mastery) or override a prop (charges, cooldown), and",
-      "  those the model applies exactly. The rest promise things in their own",
-      "  description that live in code.",
+    ].join("\n"));
+
+    // Every figure below is counted from the sheet at print time. The line this
+    // replaced said "17 of 84" from a stale hand count; the data says 26 through
+    // steps and props alone, and 31 once mastery-gated affixes are read too.
+    const rc = T.runeCoverage();
+    console.log([
+      f.bold("  Runes are the same shape.") + ` ${rc.skillsWithRunes} skills offer a choice, ` +
+        `${rc.total} runes in all, and ${rc.readable} of them`,
+      "  declare something this model reads:",
+      `    ${String(rc.gatesSteps).padStart(3)}  gate a step        steps[].cond.mastery`,
+      `    ${String(rc.excludesSteps).padStart(3)}  suppress a step    steps[].cond.masteryExclude`,
+      `    ${String(rc.overridesProps).padStart(3)}  override a prop    mastery[].props (${rc.overrideKeys.join(", ")})`,
+      `    ${String(rc.gatesAffixes).padStart(3)}  gate a stat affix  affixes[].conds.mastery`,
+      "  The sets barely overlap, and the gates are not local: three gated steps sit",
+      "  on a *_Status row while the rune that gates them is declared on the ability",
+      `  that applies it, so the count is taken over the whole sheet. The other ${rc.total - rc.readable}`,
+      "  promise things in their own description that live in code.",
     ].join("\n"));
   },
 
@@ -704,9 +873,30 @@ Common flags
   --weight <g>=<n>        blend goals, e.g. --weight dps=1 --weight ehp=0.25
   --target <t>            dummy | small | trash | big | elite | boss | dungeon
                           | reference | any unit id     (default boss)
+  --fight <s>             how long the simulated fight is    (default 200s)
+  --fights <n>            roll the procs for real n times and report the mean
+                          and the spread; 1 folds them in at their expected
+                          rate, which is the same mean without the sampling
+  --lookahead <s>         seconds of rollout when choosing a cast (default 8);
+                          0 gives a plain first-available priority list. The
+                          fight is played both ways and the better kept.
+  --targets <n>           how many enemies stand in an area  (default 1)
+                          Only Area and Aura steps scale with it, and nothing
+                          in the data says how many there are - it is an input.
   --stars <n|max>         upgrade stars to assume       (default max)
+                          Weapons only: the game upgrades weapons, and armour
+                          has no upgrade path at all.
   --rarity <list>         restrict to e.g. Rare,Epic
-  --rank <n>              weapon-skill rank 1-3        (default max)
+  --rank <n>              weapon mastery rank 1-3      (default max, i.e. fully
+                          mastered). A weapon levels with kills and each of its
+                          skills - passives included - takes two upgrades, so
+                          rank 3 is a weapon you have finished. It applies to
+                          weapon skills, combos and weapon passives; class
+                          skills do not rank, they take a rune instead.
+  --class-skills <n>      how many class skills fit on the bar (default 4).
+                          Six exist per class, at levels 3/5/10/15/20/30, so a
+                          level-25 character has learned five and slots four.
+                          That count is not in the game data.
   --talent-points <n>     talent points to spend  (default: the full allowance)
   --talent-points <n>     points to spend in the tree (default: the full 16)
   --rarity-cap <r>        highest rarity a roll may reach (default: derived
@@ -720,8 +910,11 @@ Common flags
                           whether the unverified Fervor damage bonus applies to
                           base attacks too, or at all
   --no-mastery            drop the unverified mastery multipliers
-  --build <file.json>     start from a saved build
-  --json <file.json>      write the result as JSON
+  --build <file.json>     start from a saved build - either a bare loadout or
+                          the envelope --json writes, whose recorded goal,
+                          target, level, fight and pins become the defaults
+  --json <file.json>      write the result as JSON, and read it back with
+                          --build to reproduce the run exactly
   --game <path>           the Farever install, if it cannot be found
 
 Pinning
@@ -731,6 +924,8 @@ Pinning
   --pin feet/enchantfeet=none          force one socket empty
   --pin chest=Chest_RManfish_Cle@Epic  assume a particular drop rarity
   --pin weapon1=Spear_Eruption^10*0    an instance that dropped at level 10, 0 stars
+  --pin neck=Necklace_Z2RCraft+MaPen   craft jewellery pays ONE of the generic
+                                       aptitudes it names; this picks which
 
 Skill selection
   --skills weapon1=Skill1,Passive      slot two of the three a weapon offers

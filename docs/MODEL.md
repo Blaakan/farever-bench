@@ -182,10 +182,43 @@ amount = budget(effectiveLevel, entry.start, entry.end) * atbRatio[group] * affi
 ```
 
 - `entry` — a row of `aptitude.atbScaling`, gated by `conds.minRarity` and
-  `conds.factions`. **Every aptitude an item names pays, and they sum**, and they
-  pay regardless of your class — see [section 12](#12-checked-against-the-game),
-  which is checked against a character sheet. Each aptitude's share is rounded
-  on its own before the sum; that is a one-unit difference and the game agrees.
+  `conds.factions`. **One aptitude pays: the wearer's own.** An item naming two
+  is naming who may WEAR it, not how many budgets it hands out — 271 of the 513
+  stat-bearing items name a class pair, and the six `combines` aptitude rows
+  (FigAss, WizCle, …) exist to label exactly that. Each aptitude's share is
+  rounded on its own before any sum; that is a one-unit difference and the game
+  agrees.
+
+  **The proof is `itemType.atbRatio` itself.** Summed over one item per core
+  slot — mainhand, the eight armour pieces, neck and two fingers — every stat
+  group comes to *exactly* 1.0:
+
+  ```
+  primary 1.0    vitality 1.0    armor 1.0    ratings 1.0
+  ```
+
+  A full set is designed to deliver one aptitude curve per group, so paying
+  every named aptitude hands a dual-class item two of them. That is what put a
+  level-25 Priest at 453 Vitality where a real character sits at 193, gave the
+  same Priest a near-full Intellect budget *and* a near-full Faith one off gear
+  that is Mage-or-Priest, and — worst — doubled ARMOUR, which cannot double
+  because its budget is `resistForReduction(level, the wearer's
+  props.armorReduction)` and does not depend on the aptitude at all. Cleric
+  declares 0.25 and the sheet was reading 40.3%.
+
+  The in-game reading in [section 12](#12-checked-against-the-game) is not
+  contradicted: it is an ITEM TOOLTIP, and a tooltip has no wearer. `cat.contribute`
+  keeps that as an explicit `allAptitudes` mode and the test suite still asserts
+  all ten of its numbers.
+
+  **Generic aptitudes** — the five nameless rows `Crit / ArPen / MaPen / Fervor
+  / Vita` that jewellery uses — are the same rule from the other side: nobody's
+  class matches them, so an item naming only generics pays exactly ONE, and
+  which one is a decision rather than a sum. Four items are affected
+  (`Necklace_Z1RCraft`, `Necklace_Z2RCraft`, `Finger_Z2RCraft_CriAP`,
+  `Finger_Z2RCraft_FerMP`); each appears once per generic in the candidate list,
+  the same way a rarity roll does, and the pick is printed. Nothing in the data
+  says which one you get — only that it is one.
 - `group` — `aptitude@atbScaling.statGroup` is the enum
   `Primary | Vitality | Armor | Ratings`, matching `itemType.atbRatio`'s four
   keys exactly.
@@ -203,6 +236,27 @@ amount = budget(effectiveLevel, entry.start, entry.end) * atbRatio[group] * affi
   14/7/15/15, and 0.5 is not close. So it is 0.4, and the CEILING is what makes
   small values look nearly halved. A Rare Corrupted Gift confirms it on authored
   affixes too: -20/+20 in the main hand, -8/+8 in the arsenal.
+
+**How a modifier composes is authored too.** The `affix` sheet's `stack` column
+is an `AffixStacking` custom type and nothing read it:
+
+| ref | `stack` | means |
+|---|---|---|
+| `TAttribute_Flat` | — | additive |
+| `TAttribute_ARatio` | — | additive, into `modAdd` |
+| `TAttribute_MRatio` | `Multiplicative` | the multiplier **replaces** and compounds: `DamageTakenModifier 0.6` is "you take 60% of what you would" |
+| `TAttribute_MRatioMin` | `Min(base: 1)` | the **strongest applies** and they do not compound — two 30% slows are a 30% slow, not 51% |
+
+Two readings were wrong before this was read. `catalog.applyAffixes` composed a
+multiplicative affix as `cur * (1 + v)` while `engine.applyAffix` composed the
+same ref as `cur * v`, so one row meant different things depending on whether it
+arrived on an item or in a status; and `MRatioMin` was treated as `MRatio`
+everywhere. Neither is live today — no equippable or augment carries a
+multiplicative affix, and all eight `MRatioMin` rows target `MoveSpeedFactor`,
+which nothing here scores — so this changed no number. It stops the day one is
+authored from being a silent factor of two. A slot factor now blends a
+multiplier toward 1 rather than scaling it, because `0.6 × 0.4 = 0.24` is a
+*bigger* reduction than the affix grants.
 
 **`sourceAtb`.** A row like `{endAtb: MaxHealth, sourceAtb: Vitality}` states
 its budget in MaxHealth but delivers it as Vitality, so the amount is divided by
@@ -302,6 +356,39 @@ from the game's constants:
 So the count moves on its own if a patch moves it, and a level-12 character
 correctly gets two main-hand skills and only one arsenal skill.
 
+### The chain's length is authored
+
+`moveSet.comboLength` says how many links a weapon's base-attack chain has, per
+weapon class — 4 for one-handers, 5 for duals and bows. It went unread, and the
+chain was whatever the item row happened to list. On **2 of the 33 weapons that
+carry a chain** those disagree, and both are missing links that exist as rows:
+
+| weapon | item row lists | `comboLength` | missing |
+|---|---|---|---|
+| `Scepter_Flamie` | 2 | 4 | `Scepter_Base_Attack2`, `Scepter_Base_Attack3` |
+| `DM_Multispin` | 4 | 5 | `DM_Base_Attack4` |
+
+`DM_Base_Attack4` is the **only** chain-link row in the sheet that no player
+weapon references, and the two scepter rows are what `Scepter_Start` swings. So
+the item row is incomplete and the game resolves the rest from the type.
+
+It is not cosmetic. The combo finisher charges a Priest's prayers and is what
+every `isFinalCombo` guard rolls against, so a 2-link chain fires all of them
+**twice** as often: a Priest holding `Scepter_Flamie` read 0.65 combos/s against
+`Scepter_Start`'s 0.31, prayers every 4.62s against 9.68s, and a headline figure
+44% above what the fixed chain gives. Short is also the *flattering* reading.
+
+The fill is derived: take the common id prefix of the links the weapon does
+declare, and use it to find the row filling each missing slot; an ambiguous or
+absent match fills nothing. `Net_Basic` (a capture net) matches nothing and is
+reported short rather than faked. What was filled is printed with the rotation.
+
+**A slot is not one row.** Every staff declares `Staff_Base_Attack` and
+`Staff_Base_Attack2` and *both are typed `Attack`* — there is no `Attack2` row
+for staffs at all. Keying the chain by type slot merged them and made every
+staff a link short, so the item's own declaration order is the chain and the
+slot type is only how a missing link is found.
+
 **A `WeaponSubSkill` is a follow-up, not a choice.**
 `Book_WaterOrbs_Skill2_Recast` exists only because Skill2 does, and the wiring is
 by id prefix, which is how the data names them. One that prefixes nothing —
@@ -334,16 +421,168 @@ from an **explicit rule tied to something the data states**:
 | bucket | rate | rule |
 |---|---|---|
 | `filler` | the chain cycles in whatever time is left | — |
-| `active` | `max(cooldown / (1+CDR), occupancy)` | needs `cooldown > 0` |
-| `triggered` | `comboRate / prayersSlotted` | prayers, per `Priest_Rosary` |
-| | `attackRate × vars.chance` | `vars.chance` is the proc rate the data ships |
+| `active` | `cooldown / (1+CDR)`, a bank of `charges`, floor `occupancy` | needs `cooldown > 0` |
+| `triggered` | per combo | prayers, per `Priest_Rosary` |
+| | per swing or per combo × `vars.chance` | `vars.chance` is the proc rate the data ships; the script's own guard says which event it rolls against |
+| `dots` | applied by an event, then tick until they expire | a status carrying `props.loop.tick` |
 | `passive` | not throughput; contributes stats | own affixes, or a self-buff status |
 | `unmodelled` | **zero, and named** | anything else |
 
-**No cooldown and no rule means unmodelled, not spammable.**
-`Warrior_Rage_Strike` has no cooldown and `props.costs: [{amount: 10, atb:
-Rage}]` — it is gated by Rage income, which lives in a script. Treating it as
-castable every 1.4s tripled the Warrior's damage before this was caught.
+**A follow-up's parent is declared, not guessed.** `skill.props.subskills[].skill`
+names it, on 7 rows covering all five `WeaponSubSkill`s, and the binary follows
+the same link (`resolveSubSkills`, `isSubSkillOf`, `get_subskills`). The model
+used to infer it from the id prefix, which never resolved one *wrongly* but
+found nothing for the two that matter — `GS_Nova_Passive → GS_Nova_Ultimate` and
+`Staff_Censer_Passive → Staff_Censer_Ultimate`, where neither id starts with the
+other. A follow-up is therefore TRIGGERED at its parent's cast rate, not an
+active waiting for a cooldown it does not have; asking it for one sent every
+follow-up in the game to "no cast rate can be derived".
+
+Where the parent is a weapon **passive**, there is still no rate — those two
+ultimates are armed by a stack counter that banks per damage event — and the
+output says exactly that instead of blaming the link.
+
+**A skill you have not learned is not a gap.** `unit@skills.level` gates the
+class list, and ignoring it put three level-30 capstones in a level-25
+character's coverage report as things the model had failed to score.
+
+**A guard has more in it than the event.** The reader used to match its four
+predicates and ignore the rest of the same `if`, which credits a proc with a
+rate it does not have. 37 of the skills carrying a `vars.chance` and 20 of the
+`addStatus` call sites carry a second condition, and they are not all the same
+kind of thing:
+
+| in the guard | | |
+|---|---|---|
+| `rank >= 2` | **evaluated** | it is the weapon-skill rank, the same number `--rank` resolves on every step, effect and affix. A rank-1 character was being handed rank-2 riders: `Sword_Swarm_Passive`'s poison, `Bow_Craft_Passive`'s status and `GM_MassGrab_Combo`'s proc all appear only at rank 3 now |
+| `hasTalent(X)`, `hasMastery(X)` | **evaluated** | the loadout says which talents and runes it has |
+| `hasStatus`, `getStatusCount`, `hasStatusMaxStacked`, `.stacks >= getMaxStacks()`, `isStatusType`, `isInCooldown` | **refused, and named** | a question about live state at the moment the proc rolls |
+
+`DA_Water_Combo_PassiveRank3` is why it matters: its guard is `isBaseAttack &&
+status.stacks >= status.getMaxStacks() && checkProba(0.35)`, and reading only
+the first and last credits it 0.35 per swing when it needs a max-stacked buff
+first. It is now reported `conditional` rather than scored.
+
+The guard is the block around the **roll**, not the whole script.
+`Daggers_DuplicatePoison_ComboAttack` rolls in `onInflictDamage` while a
+different handler entirely calls `getStatusCount`, and reading the file as one
+guard refused a rate the roll does not depend on.
+
+**And a closed sibling branch takes its header with it.** Dropping only the body
+left `if (ctx.target.hasStatus(mark) && …)` sitting at depth 0, so the guard on
+the branch that ran was attributed to the branch that did not —
+`Bow_BigGame_Passive` marks its target in an `else if` and the condition above
+it read as a condition on the mark.
+
+**`props.rankPassives` is a rank gate too.** Two rows carry it, both on player
+weapons, both at `minRank: 3` — which is the rank `--rank` defaults to, so the
+character always had them and the model did not know they existed.
+`DA_Water_Combo` grants `DA_Water_Combo_PassiveRank3` and
+`Crescent_FlowerSpiral_Skill_1` grants its `_Charge` counter. Neither turns out
+to be scoreable, so what this buys is not damage but coverage that names them.
+
+**`props.enableCond` says when a skill may be used at all** — `InCombat |
+InCombatOrTargetting | OutOfCombat`. An `OutOfCombat` skill is not a gap in the
+model, it is unavailable in a fight, so it is left out rather than reported as
+damage nobody could score.
+
+**Which event a proc rolls against is in the guard, not assumed.**
+`Enchant_Lifestealing` reads `vars.chance = 0.5` and its script says
+`if( hit.isFinalCombo && checkProba(vars.chance))`. A combo finisher lands about
+a third as often as a swing, so pricing every proc per-attack overstated that
+enchant threefold. The model reads `isFinalCombo` / `isFinalAttack` /
+`isBaseAttack` / `isWeaponSkill` out of the text ahead of the call, and nothing
+else — a guard it does not recognise falls back to "when the skill goes off",
+and if the skill has no cast rate the fight never fires it and the output says
+so by name.
+
+### Resources are a second kind of cooldown
+
+Instead of waiting for a timer you wait for income, and **both halves are in the
+data**. `props.costs` says a cast takes 10 Rage. The income was the part nothing
+read, and it was never missing — only unlooked-at:
+
+```js
+// Warrior_Rage, a ClassPassive with no damage and no cooldown
+function onInflictHit(hit) {
+  if( hit.isFirstHit && (hit.isBaseAttack || hit.isFinalCombo || hit.isWeaponSkill)
+      && !(hit.skill?.isSignature() ?? false) )
+    addAtb(owner, Attribute.Rage, vars.var1);       // vars.var1 = 1
+}
+```
+
+That is the **same shape** the reader already handled for `addStatus` — a hook,
+a guard naming events the fight counts, a call — and it was skipped only because
+the regex matched `addStatus|enforceStatus|setStatus` and never `addAtb`.
+`Warrior_InfiniteRage` needs no script at all: a `SelfEffect` step with
+`loop.tick: dur1` (= 3) carrying `GainAtb Rage 1`, gated `enableCond: InCombat`.
+Its own description says *"While in combat, you generate 1 Rage every 3s."*
+
+So the loop is complete and fully authored:
+
+| | from |
+|---|---|
+| cap | `MaxRage` = 20 on the Warrior unit, via the sheet |
+| starts empty | `Rage.flags` carries `NoAutoFill` |
+| income, per event | `Warrior_Rage`'s script: +1 on attack, combo finisher and weapon skill |
+| income, per second | `Warrior_InfiniteRage`: +1 every 3s in combat |
+| multiplier | `attribute.gainAtb` → `RageGainFactor`, 1 on the Warrior and doubled by `Warrior_BerserkStatus` |
+| spend | `Warrior_Rage_Strike`'s `props.costs` |
+| no in-combat decay | `Rage.regenAtbs` fires only at `timeOutsideCombat: 3` |
+| does not fund itself | the script's own `!isSignature()` |
+
+`Warrior_Rage_Strike` therefore casts every **~7s** on a real build rather than
+being reported unscoreable, and it is worth **+14%** on the Warrior. The two
+passives that feed it are the *mechanism*, so they are accounted for rather than
+listed as things the model failed to score — the same treatment `Priest_Rosary`
+already had.
+
+**A pool-gated skill is not charge-gated.** Running one through the charge
+machinery spends its single charge and then sets the next recovery to Infinity,
+so it fires once per fight; the pool is the gate, and the charge is not touched.
+
+**`isFirstHit` costs nothing to honour** — a gain is awarded per cast, not per
+target hit, which is what the simulation does anyway.
+
+**Still not modelled: Spark.** `Mage_SparkMaster` spends `s.getSparkCost()`, a
+compiled method, and **no Mage skill declares a cost in any column**. Income
+without a readable spend buys nothing, so Spark is not claimed as tracked.
+ComboPoint is the middle case: the cap is authored (`MaxComboPoint` 4, raised to
+5 by `Rogue_ComboMax`) but `Rogue_ComboPoints` awards through a local variable
+inside a helper function rather than a literal, and `Rogue_Sig_Finisher` spends
+`-getCp()`, so neither end is a number this reader will invent.
+
+**No cooldown, no cost and no rule still means unmodelled, not spammable.**
+Treating `Warrior_Rage_Strike` as castable every 1.4s tripled the Warrior's
+damage before any of this existed.
+
+### Rank and runes are two systems, and they do not overlap
+
+**Confirmed in game.** A weapon has **mastery levels**, earned with kills
+(`WeaponKills_PerSkillRankPoint` = 20, and 26 on an off-hand). Each of its
+skills — *passives included* — takes **two upgrades**, so a skill runs rank 1 →
+2 → 3 and `WeaponSkill_MaxRank` = 3 is that ceiling. A fully mastered weapon is
+every skill at rank 3, which is what `--rank` defaults to.
+
+A **class** skill does not rank. It offers three runes and you choose.
+
+The data separates them completely, which is worth stating because the two look
+alike in the sheet and one function resolves both:
+
+| | rows | rank-gated | rune-bearing |
+|---|---|---|---|
+| `WeaponSkill` | 68 | 56 | 0 |
+| `AttackCombo` | 33 | 31 | 0 |
+| `WeaponPassive` | 31 | 27 | 0 |
+| `Talent` | 88 | 46 | 0 |
+| `ClassSkill` | 26 | 0 | 24 |
+| `SignatureSkill` | 4 | 0 | 4 |
+
+**No row carries both.** So `minRank`/`maxRank` is always weapon mastery, except
+on a `Talent`, where it is the points in that node — a **different namespace**,
+capped at `props.talent.maxPoints` = 2. Resolving a talent at the weapon's rank
+asks a two-point node whether it is at rank 3, and every `minRank: 2` rider on
+it passes for free; the talent pass now uses the node's own rank.
 
 **`props.rankOverride`** restates props at a weapon-skill rank;
 `GA_Craft_Skill1` drops from a 16s cooldown to 12s at rank 2, and `--rank`
@@ -354,13 +593,13 @@ applies it.
 you held it. Summing all three overstated the skill twofold; full charge is
 assumed and stated in the audit.
 
-**`cond.mastery` steps are excluded.** Which rune is slotted is a build axis
-this model does not carry, so a rune-gated step is left out rather than granted.
-
-**Cooldowns cannot oversubscribe the clock.** If the sum of
-`occupancy / interval` exceeds 1, every active skill is scaled by `1/busy` and
-the output says so — a real rotation would drop its weakest skill rather than
-slow all of them, and this model has no priority order to do that with.
+**`cond.mastery` steps are gated on the slotted rune**, and the search chooses
+it. That choice has to be enumerated from what the build KNOWS, never from the
+resolved rotation: a skill only reaches the rotation once it already carries a
+damage effect, and a rune-gated step is exactly what can give it one — so
+asking the rotation which runes to offer meant a rune that makes a skill worth
+pressing could never be found. `Priest_FaithfulWinds` is the live case: it does
+nothing at all until `Priest_FaithfulWinds_M3` adds its damage step.
 
 ### Self-buffs, and why an enchant is worth anything
 
@@ -379,16 +618,70 @@ function onInflictHit(hit) {
 `Enchant_Zealot_Status` then carries `TAttribute_Flat CritChanceRating +6` with
 `props.status.maxStacks: 5` and `duration: 15` in ordinary data columns. So the
 model reads `addStatus(<self>, Skill.<X>)` out of the script — the link, and
-nothing else — resolves X, and applies its affixes **at full stacks**. A
-15-second buff refreshed by a 30%-per-attack proc does sit at its cap in
-sustained combat; a short fight would not reach it, and the audit says so.
-
-Only self-targets count: `owner`, `hit.source`, `dmg.source`. `addStatus(hit.target, …)`
-is a debuff on the enemy and must never be read as your own stat — the model
-checks the target and the status's `props.status.types` includes `Buff`.
+nothing else — resolves X, and applies its affixes at full stacks.
 
 Without this, every weapon-enchant socket came back empty, and the tool was
 implicitly claiming "no enchant is better than any enchant".
+
+**A script may bind the skill to a local first.** `Priest_Crusader` opens with
+`var Buff = Skill.Priest_Crusader_Status;` and then calls `addStatus(owner,
+Buff)`, so a reader that only matches `Skill.X` at the call site finds nothing
+and the ability disappears from the build without a word. Five Priest class
+cooldowns vanished that way; aliases are resolved before the call sites are
+matched, and anything still unreadable is now NAMED.
+
+**And a script is not the only path.** A `Status` step names the status it
+applies outright:
+
+```
+Priest_BlessingOfFervor.steps[] = { on: Hit, type: Status,
+                                    props: { status: { ref: …_Status } } }
+```
+
+That status is +10 Fervor for 15 seconds, and a script-only reader saw none of
+it. Who wears it is decided the way the column documents itself — "when a target
+is available (after a hit), defaults to it, otherwise applies to self" — with
+the status's own `Buff`/`Debuff` typing as the check that survives every row: a
+Buff never lands on the enemy. `Priest_BlessingOfFervor` applies its buff
+through an Area step whose `hitFilter` is `Allies|Self`, so "whoever was hit" is
+you.
+
+**Uptime, not 100%.** A buff on a cooldown is credited at
+`min(1, duration / cooldown)`. `Priest_BlessingOfFervor` is fifteen seconds on a
+hundred-and-twenty-second cooldown: 13%, not always-on. A buff with no cooldown
+behind it — the enchants, refreshed off a proc every few swings — keeps its full
+uptime, which is the case the old blanket assumption was actually written for.
+
+**Refused rather than counted.** `Priest_Crusader_Status` carries
+`maxStacks: 300` and affixes whose magnitude is a `mod.dynVal` injected by a
+script at runtime. Counting it at its cap would credit the build with +3000%
+damage, so a status whose payload is a script-set dynVal is reported unmodelled
+by name instead.
+
+### Damage over time
+
+**The game types its own statuses**, in `statusType.flags` — `DoT |
+CrowdControl | HardCC | HoT` — and that column went unread, so the model's
+structural test ("one of its steps carries `props.loop.tick`") had nothing to be
+checked against. They agree on **31 of the 33** statuses the game types as
+ticking; the two they disagree on (`GA_Demon_Skill2_Status`, `Trap`) would have
+been scored as a single lump and are now named. The CC flags do the other half:
+the 22 statuses typed `CrowdControl`/`HardCC` give a skill whose whole payload
+is a stun its own coverage bucket, instead of it reading as an unexplained
+blank. Crowd control is worth nothing here because the simulated foe does not
+act — which is the right answer, not a shortfall.
+
+A DoT is not scripted; it is an ordinary `skill` row. `props.status` marks it a
+status, `skill.duration` (or the `duration` on the step that applies it) is its
+lifetime, one of its steps carries `props.loop.tick`, and the effect on that
+step is the amount. `Sword_Swarm_Passive_Swarm` alone is ten ticks of
+`0.12*Strength + 0.12*Faith`, and the model used to report it as "its payload is
+a status or script effect".
+
+The fight applies them on the event their guard names, ticks them, and expires
+them. Re-application refreshes rather than stacks, which is the whole difference
+between a 10-second bleed on a 10-second cooldown and the same bleed on a
+40-second one.
 
 ## 10. Damage
 
@@ -422,13 +715,32 @@ expected = amount
 
 There is **no player global cooldown**. `getSkillRecoveryTime` occurs exactly
 once in 47342 functions, as `ent.Foe.getSkillRecoveryTime` (findex 6773), and
-only 13 of 962 skills carry `props.interruptStyle`. The actor is committed to
-one skill until its step DAG finishes, so occupancy is:
+only 13 of 962 skills carry `props.interruptStyle`. `Skill_RecoveryTime` sits in
+the constant sheet inside the SpawnTime/Aggro/Panic/PathSearch block, between
+`Skill_Pick_RetryCooldown` and `Skill_RecoveryTime_Boss`. So it is foe AI, and
+adding it to every player cast — which the model used to do — billed a level-25
+Priest 0.59 attacks a second for a chain whose own authored durations run at
+2.2. That single line was worth **×1.5 on total damage.**
+
+The actor is committed to the cast itself, and not to what it leaves behind:
 
 ```
-occupancy = max(step.delay + step.duration) + Skill_RecoveryTime * ratio
-            ratio = Attacks_RecoveryRatio (0.25) for attacks, 1 otherwise
+occupancy = max(skill.duration,
+                max over CAST steps of (step.delay + step.duration))
+            cast steps exclude Area / Aura / Summon / SkillObject / Status
 ```
+
+Both halves are needed. 40 of the 340 castable damage-bearing skills declare no
+`skill.duration` at all, and on 96 of them the steps already run longer than the
+authored duration. Excluding the lingering step types is what stops
+`Staff_Censer_Skill2` — an 0.35-second cast that leaves a 3-second area behind —
+from billing 4.20 seconds and eating a fifth of the clock on its own.
+
+**Numbers can hide in `vars`.** The columns typed `types@props@skillVal` — a
+step's `range` and `duration`, a loop's `tick` — hold either a number or a key
+into the skill's own `vars`. Reading those as zero silently deleted damage:
+`Priest_RadiantVerdict`'s rune-gated step runs for `dur2` = 8 seconds at one
+tick every 2, and a zero duration made that one tick instead of four.
 
 **No animation model is needed**, which is the single biggest scope risk this
 project does not have: the `anim` sheet has exactly two columns (id, comment)
@@ -436,18 +748,126 @@ with no timing data, only 1 of 962 skills sets `anim.duration`, and no
 `getAnimDuration` symbol exists in the bytecode. Every delay and duration in
 `steps` is explicit seconds.
 
-### The rotation
+### How many times a hit lands
 
-Cooldown skills on cooldown, base-attack chain in the gaps:
+One authored effect is not one hit. Three multipliers are fully in the data and
+none of them was being read:
 
-```
-dps = SUM_cooldowns(damage_i / max(cooldown_i / (1+CDR), occupancy_i))
-    + chainDamage/chainTime * max(0, 1 - SUM(occupancy_i / interval_i))
-```
+| where | what it does |
+|---|---|
+| `steps[].props.loop.tick` | replays the step every `tick` for its duration — `GS_Nova_Skill1` spins for 3s at 0.25 and lands **12** hits |
+| `steps[].props.area.targetCooldown` | caps how often the SAME target may be re-hit — `Priest_Prayer_Smite` ticks 15 times and touches you once |
+| `steps[].props.projectile.generation.count` | an `on: ProjectileHit` step fires once per projectile — `Staff_Censer_Combo` is **four** bolts, and its own description says so |
 
-The whole attack chain is one cycle, because you cannot press swing 3 without 1
-and 2. This is a priority list with no conditions — as much player model as can
-be justified without a measured occupancy log.
+With `loop.flags:SpreadEffects`, or on a `SelfEffect` step, the declared amount
+is the TOTAL rather than the per-tick amount — both are stated in the columns'
+own `documentation` strings, and the two rules are complements: 0 of the 32
+`SelfEffect` loop steps carry the flag, because they do not need it. Reading a
+`SelfEffect` DoT as per-tick would give `Bleed` 200% of the victim's maximum
+health.
+
+**Target count is NOT in the data.** The geometry is fully authored — shape
+(`Circle | Rect(width) | Cone(angle) | Donut(thickness)`), size from the step's
+`range`, height, and an expanding `rangeScale` — but nothing anywhere says how
+many enemies stand inside it. `unitGroup` describes spawn points and the
+`spawner` sheet is empty because placement is level data. So `--targets` is an
+input with a default of 1, only `Area` and `Aura` steps scale with it, and
+`props.hitCount` caps it where a row sets one. A `Mono` step carrying an area is
+treated as single-target: 80 rows do that and their own descriptions disagree
+with each other, so the reading that cannot flatter wins.
+
+### The rotation is a fight
+
+Throughput is not a steady state any more. `sim.mjs` plays out a fight of
+`--fight` seconds:
+
+- **priority** — at every decision point, press the ready skill with the highest
+  damage per second of commitment. The steady state instead assumed every
+  cooldown was used exactly on cooldown, and when they oversubscribed the clock
+  it slowed all of them down proportionally, which is the one thing no player
+  does.
+- **charges** — a skill opens with its whole bank and regains one per cooldown.
+  That is what a charge IS: the bytecode's event for a finished cooldown is
+  `onSkillGainCharge`, singular, and the one rune that hooks it glosses it as
+  "each time one of your WeaponSkills recovers its cooldown". So the sustained
+  rate stays `1/cooldown` and a charge buys `(charges − 1)` extra casts over the
+  fight — a sentence a steady state cannot say, which is why `props.charges` sat
+  in the profile unread.
+- **statuses tick and expire**, and re-applying one REFRESHES it, so the
+  overflow of a long debuff on a short cooldown is lost.
+- **the base-attack chain fills the gaps**, one link at a time, because you
+  cannot press swing 3 without 1 and 2.
+- **procs are events inside the fight.** By default each contributes its
+  expected fraction — which is the mean, exactly, without sampling. `--fights n`
+  rolls them with a seeded PRNG and reports the mean and the standard deviation
+  instead.
+
+The denominator is the fight length, not the moment of the last cast. Getting
+that wrong let a build with **no main-hand weapon at all** beat one holding a
+sword, because ending the fight early divided its damage by a shorter clock.
+
+### The fight holds state
+
+A cast is priced **at the moment it is cast**, against whatever is up. That is
+the difference between a priority list and a rotation, and without it two whole
+categories of decision are worth exactly nothing:
+
+- **A debuff on the target.** 37 debuff statuses carry stat affixes and a dozen
+  of them amplify damage — `GA_Demon_Skill1_Status` strips a quarter of the
+  target's Armor *and* MagicArmor, `Priest_BeaconOfHope_Status_Debuff` makes it
+  take 10% more. With a constant target these were free.
+- **A buff window.** A buff on a cooldown is not a small permanent bonus; it is
+  a window. Averaging `Priest_Judgment_Status` into the sheet at
+  `duration/cooldown` makes bursting inside it worth exactly as much as
+  bursting outside it.
+
+So self-buffs split in two. The ones with no cooldown behind them — a weapon
+enchant refreshed off a proc every few swings — go into the sheet, because they
+really are always on. The ones on a cooldown are handed to the fight, which
+puts them up when they are cast and expires them. The printed stat block still
+shows those at their uptime, because that *is* what a character averages; the
+fight does not read that sheet.
+
+Pricing is memoised on the **state signature**, not on the clock: a fight cycles
+through a handful of distinct (buffs up, debuffs up) combinations thousands of
+times, so this costs about 13% and not 13×.
+
+**A DoT snapshots.** Its per-tick value is fixed when it is applied and does not
+follow buffs that come and go while it ticks; a re-application re-snapshots.
+Nothing in the CDB states this either way — it is SimulationCraft's convention,
+where target debuffs snapshot at cast end and player buffs at impact, and it is
+in the audit as an assumption rather than a reading.
+
+### Choosing the order
+
+SimulationCraft's answer to dependency order is an **Action Priority List**: a
+human writes `actions+=/spell,if=buff.x.up&debuff.y.remains>2`, the engine walks
+it top to bottom every time the player can act, and casts the first available
+entry. Its wiki is explicit that there is *"no lookahead or optimization of
+action orderings"*. That works because a community writes and tunes the list per
+specialisation.
+
+Nobody writes those lists for this game, so the choice is between a greedy order
+that cannot see a setup cast and a short rollout that can. `--lookahead`
+(default 8s) scores each ready cast by what the next few seconds are worth if
+you press it, then falls back to priority order. On synthetic rotations where
+the right answer is arithmetic it is worth up to **+97%**: a setup that does no
+damage at all always loses a density comparison, and two cooldowns and one short
+window never line up by accident.
+
+**It is a heuristic, and a myopic one.** It maximises what lands inside the
+horizon while the cost of spending a long cooldown early falls outside it, and
+on two of the four classes that made the answer *worse* than plain priority
+order. So the fight is played **both ways and the better kept** — both are
+rotations the simulator can execute, so the higher of the two is a lower bound
+on what a player can reach, and the lower one never was. The output says which
+won.
+
+On the builds in this data, sequencing is worth **0–0.4%**, on 22 of about 90
+weapons. The player-facing debuffs are mostly movement slows, and the few damage
+amplifiers sit on cooldowns long relative to their windows. That is a fact about
+this game's numbers, not a limit of the method — the synthetic cases show the
+method finding a 2× when the data offers one.
 
 ### Reference targets
 
@@ -591,6 +1011,63 @@ Epic or Legendary version of a piece only exists as a roll.
 
 ---
 
+## 14. What the script readers take, and where to pick up
+
+Everything below is read out of hscript text. The rule throughout is the same
+and it is the one this project keeps relearning: **match a shape, evaluate what
+the build can answer, and REFUSE the rest by name.** Every reader here was
+first written too permissively and caught by a class sweep — a per-cast damage
+multiplier read as a permanent stat took a Mage to 6,000 dps, an unrecognised
+guard defaulting to "unconditional" took a Priest from 249 to 380, and pooling
+every dot that declares a total reached 44,000. Widen one of these and re-run
+`optimize` on all four classes before believing the result.
+
+| shape | read as | lives in |
+|---|---|---|
+| `addStatus(who, Skill.X)` | a status, and who wears it | `skills.statusesOf` |
+| `addStatus(t, X, hit.amount * vars.f)` | a POOL dot worth `f` of the hit | `POOL_LOCAL` / `ADD_STATUS_3` |
+| `addAtb/addResource(Atb, vars.n)` | resource income, on the events its guard names | `resourceGainsOf` |
+| `x.dmgMult += vars.n` (unguarded, on a status) | a `DamageModifier` affix | `DMG_MULT` |
+| `x.{dmgMult,critDmgMult,critChance,armorIgnore} += vars.n` | a SCOPED modifier | `talentModifiers` / `DMG_FIELD` |
+| `setDynVal(1, x.amount*vars.n); playStep(Steps.Heal)` | a healing share | `HEAL_SHARE` |
+| `reduceWeaponsCooldown(vars.n)` on a tick | `CooldownReduction`, via the dot's tick interval | `CD_PROC` |
+| `evalCost` → `val -= vars.n` under `hasMastery` | a rune cutting a cast's cost | `damage.costRelief` |
+| `x.dmgMult += vars.n` under `hasMastery` | a rune's damage bonus on its own skill | `damage.runeDamage` |
+
+**What a guard may say.** `rank >= N`, `hasTalent`, `hasMastery` and `critical`
+are all EVALUABLE — the build knows its rank, its talents, its runes, and the
+fight computes crit expectation. `totalHits == 1` is answerable too, because
+that is what `--targets` says. Everything else — `hasStatus`, `getStatusCount`,
+`healthRatio`, `isInCooldown` — is live state, and a call site guarded by one
+keeps its rate refused and named. `scopeOf` is the gatekeeper: it strips every
+predicate it understands and refuses if anything condition-shaped survives.
+
+### Where to pick up
+
+**The reader is only pointed at talents.** `talentModifiers` parses exactly the
+shapes the RUNES use, but it is invoked on talent ids alone. Pointing it at
+slotted runes — scoped to their own skill rather than globally — is the single
+highest-value next step; it picks up `Fury Pulse` and anything like it.
+
+**Unfinished on the Warrior**, all for stated reasons rather than for want of
+looking:
+
+| | why |
+|---|---|
+| Rage Shield | `Shield 0.05 × MaxHealth` on Hemorrhage. Needs `--goal ehp`/`sps` to mean anything |
+| Surge of Violence | "your NEXT Raging Smash is free and crits" — needs a per-cast register the fight does not carry |
+| Crippling Bloodloss, Second Wind, Fortitude | act on damage the enemy deals; the simulated foe does not act |
+| Execution, Into The Fray, Battle Momentum | gated on target health or enemy counts |
+| Melee Fever, Enduring Defenses, Hold On! | need kills, blocking, or a party |
+| Overwhelming Rage | **no script, no vars, no affix, no step.** Its text is the only statement of what it does, and the skill it modifies unlocks at level 30 |
+
+**The other three classes have not been audited node by node.** Priest, Rogue
+and Mage gained from the shared readers (+1.4%, +4.6%, 0%) because the generic
+patterns matched, not because anyone checked them against the game. The readers
+refuse what they cannot classify, so the exposure is under-reading rather than
+over-reading — but it is unverified, and the Warrior tree only became correct
+because it was walked one node at a time against a real character.
+
 ## Verified, assumed, absent
 
 **Verified from the bytecode** — the level curve, the rating conversion and that
@@ -605,16 +1082,28 @@ the absence of animation timing data, that item affixes have no RNG (findex
 |---|---|---|
 | Fervor multiplies damage by its own percentage | Its in-game description says so, but `DamageModifier.scaling` is **empty** and no attribute takes a scaling entry from Fervor except `DamageTakenModifier` (−0.5), `HealGivenMultiplier` (+1) and `ShieldPowerMultiplier` (+1). The offensive half is a code-only path. | disassemble `ent.Unit.computeDamage` (findex 4841) |
 | the two Masteries multiply matching-affinity damage | Same shape of hole. Currently **inert**: both are zero from every source in this build. | same |
-| `WeaponPower` = the weapon slot's share of the class primary budget | It has no scaling entry and no budget group, so the weapon must set it. `constant.WeaponPowerRatio`'s description — *"Percent of AP/SP scaling that are replaced by a flat amount coming from weapon"* — is consistent with this reading but does not confirm it. Every base attack scales off it. | disassemble the weapon-equip path |
+| `WeaponPower` = the MAIN-HAND weapon's share of the class primary budget | It has no scaling entry and no budget group, so the weapon must set it — 67 mentions across the whole CDB and three strings in the binary, none of them a setter. `constant.WeaponPowerRatio`'s description — *"Percent of AP/SP scaling that are replaced by a flat amount coming from weapon"* — is consistent but does not confirm it. Every base attack scales off it. It used to sum BOTH weapon slots, so equipping an arsenal raised every swing by 40% for a slot that grants no swings. | disassemble the weapon-equip path |
+| a cast costs only its own authored duration | `Skill_RecoveryTime` reads as foe AI from its position in the constant sheet and from `ent.Foe.getSkillRecoveryTime` being its only symbol, but bare `recoveryTime` / `get_recoveryTime` symbols exist and have not been placed. `ComboWindow` 0.6 and `AttackQueueTime` 0.4 are consistent with a chain that runs back to back. | disassemble the cast path |
+| how many enemies an area hits | Fully absent from the data — geometry is authored, population is not. `--targets` is an input, defaulting to 1. | measure in game |
+| a `Mono` step carrying an area does not cleave | 80 rows do it and their descriptions disagree; single-target is the reading that agrees with 87% of them and cannot flatter. | `forceMono` in the binary |
+| a re-applied status refreshes rather than stacks | `stackingPolicy` is authored on 11 of 250 status rows. | disassemble the status path |
 | `LinearRatio` behaves like `Flat` | No row in this build uses it. | wait for one, then check |
 
-**Absent entirely** — skill scripts (427 of 962 skills carry hscript bodies, so
-DoTs, procs, statuses, talents and conditional riders are all missing), items
-that grant a skill rather than stats (weapon enchants and Demon sigils score
-zero), per-swing variance (`WeaponAttack_RandomRange` = 0.1 exists but its only
-located read is a UI text path), party buffs (`Group_MaxPlayers` = 4),
-consumables (4 slots, 80 items with effect props), threat, and every non-combat
-slot.
+**Absent entirely** — most of what a skill script does. 427 of 962 skills carry
+hscript bodies, and four things are read out of the text because the data
+records them nowhere else: the status a skill applies (`addStatus`, through a
+local alias if it uses one), the event that applies it (`isWeaponSkill`,
+`isBaseAttack`, `isFinalCombo`), the roll that guards it
+(`checkProba(vars.chance)`), and `vars.chance` itself. Everything else is not: a
+magnitude passed as a third `addStatus` argument (`Warrior_Hemorrhage` bleeds
+for 35% of the hit that applied it), a `setDynVal` injection, a conditional
+rider. Those are named in the output rather than counted at zero in silence.
+
+Also absent: per-swing variance (`WeaponAttack_RandomRange` = 0.1 exists but its
+only located read is a UI text path), party buffs (`Group_MaxPlayers` = 4),
+consumables (4 slots, 80 items with effect props), threat, crowd control (a stun
+has no damage, no affix and no duration of its own — scoring it needs a fight
+model with a foe that acts), and every non-combat slot.
 
 **And the one that matters most:** none of this has been checked against the
 running game. Every formula was read statically out of `data.cdb` and
@@ -630,6 +1119,112 @@ Everything above this section was read statically out of `data.cdb` and
 has been compared with what a character sheet actually shows, and it corrected
 two things the static reading had wrong.
 
+### A whole character sheet
+
+A level-25 Warrior with **no equipment, no talents and nothing slotted**, read
+off the game's own sheet. The first reading that covers the entire sheet rather
+than one item, so it pins the level curve, the rounding rule and every derived
+stat at once — all 14 values now reproduce exactly, and the suite asserts them.
+
+| | Vit | Str | Dex | Faith | Int | Crit% | CritDmg | Dodge |
+|---|---|---|---|---|---|---|---|---|
+| game | 38 | 34 | 28 | 28 | 28 | 5.8 | 151.2 | 0.3 |
+
+It corrected two things.
+
+**`RoundUp` rounds; it does not ceil.** The raw curve values are 33.974, 28.091
+and 38.211 against a game showing 34, 28 and 38. Ceiling matches one of the
+three, flooring matches two, **rounding matches all three** and is the only rule
+that can. Ceiling put every primary a point high on a naked character, and
+because `CritChance` scales `+0.014` per Dexterity *and* per Faith, the error
+propagated into the derived stats too.
+
+**The printed sheet is the RESTING one.** Crit read 8.3% against the game's 5.8
+because `Warrior_BattleShout`'s +20 CritChance, on a 120-second cooldown, was
+averaged in at its 12.5% uptime. That average is a useful number and it is not
+a character sheet — anyone comparing the tool to their own was comparing against
+a different question. Both are computed now: `sheet` is what the game shows you
+standing still, `averaged` is what the fight sees, and survivability reads the
+latter because a defensive cooldown you press is real mitigation.
+
+Two skill tooltips from the same character confirm the coefficients:
+`Raging Smash` reads 55 against `1.6 × 34 = 54.4`, and `Surging Force` reads 23
+against `0.6 × 38 = 22.8`. Both are consistent with damage being **ceiled** for
+display; Raging Smash is the discriminator, since rounding would show 54.
+
+### The class-skill bar is a choice
+
+Every class declares **six** `ClassSkill` rows, at levels 3, 5, 10, 15, 20 and
+30 — so at the level-25 cap you have learned five, and **four fit on the bar**.
+Confirmed in game. That count is not in the data; it is `CLASS_SKILL_SLOTS` with
+a `--class-skills` override, the same treatment the 16 talent points get.
+
+Handing out all five was a free cooldown. The pool is now a decision the search
+makes and prints, exactly like which two weapon skills to slot.
+
+**Berserk is why it mattered.** Its description reads *"increase all damage done
+by 20% **and** Rage generated … by 1"*, and the model read only the Rage half —
+the +20% lives in an `onInflictDamageEval` one-liner and in a `CustomProperty`
+affix carrying a bare 20 with no target attribute. So Berserk looked like a Rage
+cooldown and the search dropped it from the bar. Reading an **unconditional**
+`x.dmgMult += vars.n` on a status as a `DamageModifier` affix fixes it, and
+Berserk is now taken over Battle Shout.
+
+Only unconditional ones. About sixty sites carry that shape and most sit inside
+a branch — `DS_Bladeleaf_Combo_Status` buffs only weapon skills,
+`Bow_Craft_AttackCombo_Status` only its own combo — and reading those as
+permanent stats took the Mage to 6,000 dps.
+
+### A pool dot banks BASE damage, and its ticks are multiplied live
+
+**Checked in game.** A bleed already ticking at 100 goes to **120** the moment
+Berserk is pressed, with no new critical strike. So the multiplier is not baked
+in when the pool is fed — the pool holds base damage and each tick is worth
+whatever is up when it lands.
+
+That is why `castOutput` divides `DamageModifier` back out when it feeds a pool,
+and the total is multiplied by the **averaged** sheet's `DamageModifier` at the
+end: the ticks are spread evenly across the bleed's life and a damage buff is up
+for a known fraction of the clock, so the average is exactly the right
+multiplier for a total banked without one.
+
+**And the buff is not baked in at application either.** Two readings from the
+game, one of them the awkward case:
+
+| | |
+|---|---|
+| hit 241 with no buff | bleed ticks **21**; pressing Berserk takes the same bleed to **26** |
+| Berserk first, hit 380 | bleed ticks **30**, and drops to **25** when Berserk expires |
+
+The first pins the coefficient: `241 × 0.35 / 4 ticks = 21.09`. The second pins
+the mechanism — `30 / 25 = 1.2` exactly, so a bleed created *inside* the window
+loses the bonus when the window ends. Nothing is banked; the pool holds base
+damage and the multiplier is always live, which is what this model does.
+
+One loose end: the second reading's absolutes come out about 10% under either
+prediction, which is the size of the gap you would expect if the hit number the
+game displays is itself already buffed. The model assumes it is, and divides
+`DamageModifier` back out before banking. A precise pair of numbers — one hit
+and its bleed tick, with no buffs up at all — would confirm it.
+
+### Hemorrhage pools; it does not refresh
+
+On record from the game, and **not yet implemented**, so it is written down here
+rather than half-applied:
+
+> A 200 crit banks `200 × 0.35 = 70` damage over 8 seconds, four ticks of 17.5.
+> Crit again for 100 two ticks later and the 35 still owed is **added** to the
+> new 35, redistributing 70 over a fresh 8 seconds.
+
+So the remainder is carried, not dropped — which is neither the `refresh` the
+model does nor the `stack` it refuses. Generalising it to every dot whose
+declared amount is a total takes the answer to **44,000 dps** on a Mage: those
+are applied on every swing, so a pool that never drops its overflow never
+bounds. Hemorrhage is bounded in game because it is gated on a critical strike,
+and the model cannot read Hemorrhage at all yet — its magnitude is a script
+argument. The rule waits for the applier whose rate makes it finite; `d.pooled`
+already marks which dots it will apply to.
+
 **The reading.** `Spear_Eruption` — "Gorgon Ratsay's Toothpick", Rare, Kobold
 faction, aptitudes `[Assassin, Cleric]` — on a level-10 instance, which with
 Rare's `+10 iLevelBonus` is effective level 11:
@@ -642,29 +1237,47 @@ Rare's `+10 iLevelBonus` is effective level 11:
 **What it settled.** All ten numbers fall out of three rules, and each rule is
 discriminated by at least one of them:
 
-1. **Every aptitude pays, and they sum.** Dexterity 18 is Assassin's primary
-   budget (36..648) and Faith 15 is Cleric's (30..540) — a 1.2 ratio that
-   matches the budgets exactly. Vitality is the sum of both MaxHealth budgets.
-   The static reading had assumed an item resolves to ONE aptitude, which would
-   have produced 18 *or* 15, never both.
-2. **They pay regardless of your class.** Your aptitude gates whether you can
-   equip the thing; once it is on you get everything it grants. That is why a
-   Rogue's tooltip shows +15 Faith.
-3. **Each aptitude's share is rounded on its own, then summed.** Rounding per
+1. **A tooltip shows every aptitude's reading, summed.** Dexterity 18 is
+   Assassin's primary budget (36..648) and Faith 15 is Cleric's (30..540) — a
+   1.2 ratio that matches the budgets exactly. Vitality is the sum of both
+   MaxHealth budgets. The two ratings are the clearest illustration of the
+   faction rule: Assassin reads Kobold as ArmorPenetration and Cleric reads it
+   as CritChance, so one Kobold `AssCle` spear shows both at 39, each at the
+   full `ratings` share rather than a split.
+2. **Each aptitude's share is rounded on its own, then summed.** Rounding per
    aptitude gives Vitality 16 + 20 = 36; summing first and rounding once gives
-   35. The sheet says 36.
-4. **The arsenal factor is 0.4 with a ceiling.** `ceil(v * 0.4)` is the only
+   35. The reading says 36.
+3. **The arsenal factor is 0.4 with a ceiling.** `ceil(v * 0.4)` is the only
    combination reproducing all five arsenal values; `round` gives 14 and 7,
    `floor` gives 14/7/15/15, and 0.5 is not close. The ceiling is why the
    arsenal *feels* halved.
 
-**And the two ratings from one item** are the clearest illustration of the
-faction rule: Assassin reads Kobold as ArmorPenetration, Cleric reads Kobold as
-CritChance, so a single Kobold `AssCle` spear grants both — 39 of each, each at
-the full `ratings` share rather than a split.
+**What it did NOT settle, and what a second reading corrected.** This is an item
+tooltip, and a tooltip has no wearer. Read as a character sheet it says a
+dual-class item pays both budgets — and that produced a level-25 Priest with 453
+Vitality, a near-full Intellect budget *and* a near-full Faith one, and a
+physical damage reduction of 40.3% for a class whose own `props.armorReduction`
+row says 0.25. A real level-25 character with decent gear sits at **193
+Vitality**. So the wearer takes one aptitude's half, and the tooltip's union is
+kept as an explicit `allAptitudes` mode — see [section 6](#6-what-an-item-is-worth)
+for the `atbRatio` sums that pin it.
 
-`test/run.mjs` asserts all ten values plus the Corrupted Gift's -20/+20 →
--8/+8, so a regression here fails the suite by name.
+`test/run.mjs` asserts all ten values in tooltip mode, the single-aptitude half
+a Rogue actually receives, the Corrupted Gift's -20/+20 → -8/+8, the four
+`atbRatio` group sums, and that a full set lands a Priest on its declared
+armour reduction — so a regression on any of them fails the suite by name.
+
+**The chain length, confirmed.** `Scepter_Flamie` swings **3 times and then the
+combo finisher** — four links, which is what its moveSet's `comboLength` says
+and not what its own item row lists. So the item row is incomplete and the game
+resolves the rest from the weapon type, and the two links filled in
+[section 9](#the-chains-length-is-authored) are the right ones. `DM_Multispin`
+is filled by the same rule and the same evidence (`DM_Base_Attack4` is the only
+chain-link row no weapon references), but it has **not** been observed.
+
+**Weapon mastery, confirmed.** A weapon levels with kills; each of its skills,
+passives included, takes two upgrades; so a skill is rank 1, 2 or 3 and a fully
+mastered weapon is every skill at 3. `--rank` defaults there.
 
 **Also confirmed by observation, not derivation:**
 

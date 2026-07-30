@@ -107,7 +107,10 @@ export function evaluate(cat, loadout, {
     const rarity = g.rarity ?? item.rarity;
     const stars = Math.min(g.stars ?? 0, cat.maxStars(item, rarity));
     cat.contribute(item, slot.id, {
-      ...opts, stars, rarity, flawless: !!g.flawless, level: g.level ?? null
+      ...opts, stars, rarity, flawless: !!g.flawless, level: g.level ?? null,
+      // Which of an item's generic aptitudes this instance rolled. Only craft
+      // jewellery names more than one; everything else ignores it.
+      generic: g.generic ?? null,
     }, mods);
   }
 

@@ -18,6 +18,7 @@ import { buildCatalog } from '../src/catalog.mjs';
 import { createEngine } from '../src/engine.mjs';
 import { emptyLoadout, illegalReason, pruneIllegal } from '../src/loadout.mjs';
 import { optimize } from '../src/optimize.mjs';
+import { simulate } from '../src/sim.mjs';
 
 let pass = 0;
 const failures = [];
@@ -283,18 +284,39 @@ group('checked against the game: Spear_Eruption');
     arsenal: { Vitality: 15, Dexterity: 8, Faith: 6, CritChanceRating: 16, ArmorPenetrationRating: 16 },
   };
 
+  // Those ten numbers are an ITEM TOOLTIP reading, and a tooltip has no wearer:
+  // it shows what the row grants across both classes that may equip it. That is
+  // the `allAptitudes` mode, and it still has to reproduce all ten exactly.
   for (const [slotId, want] of [['Slot_Weapon1', OBSERVED.mainHand], ['Slot_Weapon2', OBSERVED.arsenal]]) {
     const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
     cat.contribute({ ...spear, level: INSTANCE_LEVEL, iLevel: null }, slotId, {
-      aptitude: 'Assassin', charLevel: 25, stars: 0,
+      aptitude: 'Assassin', charLevel: 25, stars: 0, allAptitudes: true,
       rarity: 'Rare', armorReduction: cat.armorReductionFor('Assassin'),
     }, mods);
     for (const [atb, v] of Object.entries(want)) {
-      near(`${slotId} ${atb} matches the character sheet`, mods.flat.get(atb) ?? 0, v, 1e-9);
+      near(`${slotId} ${atb} matches the item tooltip`, mods.flat.get(atb) ?? 0, v, 1e-9);
     }
     // Nothing else should appear: no Strength, no Intellect, no Fervor.
     const extra = [...mods.flat.keys()].filter((k) => !(k in want));
-    ok(`${slotId} grants nothing the sheet does not show`, extra.length === 0, extra.join(', '));
+    ok(`${slotId} grants nothing the tooltip does not show`, extra.length === 0, extra.join(', '));
+  }
+
+  // What a WEARER gets is one aptitude's half of that. A Rogue takes the
+  // Assassin reading - Dexterity and ArmorPenetration - and none of the Cleric
+  // one, which is why the same spear is not worth twice a single-class spear.
+  {
+    const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
+    cat.contribute({ ...spear, level: INSTANCE_LEVEL, iLevel: null }, 'Slot_Weapon1', {
+      aptitude: 'Assassin', charLevel: 25, stars: 0,
+      rarity: 'Rare', armorReduction: cat.armorReductionFor('Assassin'),
+    }, mods);
+    near('a Rogue takes the Assassin primary', mods.flat.get('Dexterity') ?? 0, 18, 1e-9);
+    near('and the Assassin rating', mods.flat.get('ArmorPenetrationRating') ?? 0, 39, 1e-9);
+    ok('and none of the Cleric half', !mods.flat.get('Faith') && !mods.flat.get('CritChanceRating'),
+      `Faith ${mods.flat.get('Faith') ?? 0}, Crit ${mods.flat.get('CritChanceRating') ?? 0}`);
+    ok('so its Vitality is one share, not the sum of two',
+      (mods.flat.get('Vitality') ?? 0) < OBSERVED.mainHand.Vitality,
+      `${mods.flat.get('Vitality')} vs the tooltip's ${OBSERVED.mainHand.Vitality}`);
   }
 
   // The two aptitudes read the same faction differently, which is what produces
@@ -336,33 +358,95 @@ group('multi-aptitude items');
       return i.aptitudes.some((a) => classApts.has(a)) && i.aptitudes.some((a) => cat.isGeneric(a));
     }));
 
-  // Confirmed on the spear: all of them pay, so a two-rating item is real.
+  // The constant the whole rule rests on: one item per core slot sums to
+  // EXACTLY one budget in every stat group. If a patch moves these, the "one
+  // aptitude pays" reading has to be re-derived rather than assumed.
+  const CORE_SLOTS = ['Slot_Weapon1', 'Slot_Head', 'Slot_Shoulders', 'Slot_Chest', 'Slot_Back',
+    'Slot_Hands', 'Slot_Waist', 'Slot_Legs', 'Slot_Feet', 'Slot_Neck', 'Slot_FingerLeft', 'Slot_FingerRight'];
+  {
+    const totals = { primary: 0, vitality: 0, armor: 0, ratings: 0 };
+    for (const slotId of CORE_SLOTS) {
+      const sample = cat.items.find((i) => !i.isAugment && i.slots.includes(slotId) && i.aptitudes.length);
+      const r = cat.inherited(sample.type, (t) => t?.atbRatio) ?? {};
+      for (const k of Object.keys(totals)) totals[k] += r[k] ?? 0;
+    }
+    for (const [group, v] of Object.entries(totals)) {
+      near(`a full core set is exactly one ${group} budget`, v, 1, 1e-9);
+    }
+  }
+
+  // A dual-aptitude item pays the wearer the SAME as a single-aptitude one.
+  // Naming two aptitudes means "either class may wear this", not "both classes'
+  // budgets apply" - otherwise every shared piece would be twice any exclusive
+  // one for both of the classes that can use it.
   const slot = multi.slots.find((s) => cat.slotById.get(s)?.combat);
   const l = emptyLoadout(cat, 'Priest', 25);
   l.gear[slot] = { item: multi.id, rarity: multi.rarity, stars: 0 };
   const ev = engine.evaluate(l);
-  // Both aptitudes pay their MaxHealth share, so Vitality is the SUM of the two
-  // budgets - not one of them. Two aptitudes may well map the same faction to
-  // the same rating (Mace_Benediction is Crimson, and both Fighter and Cleric
-  // read Crimson as Fervor), so the rating COUNT is not the thing to assert;
-  // the Spear_Eruption case above covers two-different-ratings rigorously.
-  const single = emptyLoadout(cat, 'Priest', 25);
-  single.gear[slot] = { item: { ...multi, aptitudes: [multi.aptitudes[0]] }.id, rarity: multi.rarity, stars: 0 };
-  const oneApt = new Map();
-  cat.contribute({ ...multi, aptitudes: [multi.aptitudes[0]] }, slot,
-    { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: multi.rarity, armorReduction: 0.25 },
-    { flat: oneApt, addRatio: new Map(), mulRatio: new Map() });
-  const bothApt = new Map();
-  cat.contribute(multi, slot,
-    { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: multi.rarity, armorReduction: 0.25 },
-    { flat: bothApt, addRatio: new Map(), mulRatio: new Map() });
-  ok(`${multi.id} pays more with both aptitudes than with one`,
-    (bothApt.get('Vitality') ?? 0) > (oneApt.get('Vitality') ?? 0),
-    `${bothApt.get('Vitality')} vs ${oneApt.get('Vitality')} (${multi.aptitudes.join('+')})`);
+  const contributionOf = (item) => {
+    const flat = new Map();
+    cat.contribute(item, slot,
+      { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: multi.rarity, armorReduction: 0.25 },
+      { flat, addRatio: new Map(), mulRatio: new Map() });
+    return flat;
+  };
+  const bothApt = contributionOf(multi);
+  const clericOnly = contributionOf({ ...multi, aptitudes: ['Cleric'] });
+  ok(`${multi.id} pays a Priest the same with both aptitudes as with Cleric alone`,
+    (bothApt.get('Vitality') ?? 0) === (clericOnly.get('Vitality') ?? 0)
+      && (bothApt.get('Armor') ?? 0) === (clericOnly.get('Armor') ?? 0),
+    `${bothApt.get('Vitality')}/${bothApt.get('Armor')} vs ${clericOnly.get('Vitality')}/${clericOnly.get('Armor')} (${multi.aptitudes.join('+')})`);
+  ok('and it grants no primary belonging to the other class',
+    !['Strength', 'Dexterity', 'Intellect'].some((a) => bothApt.get(a)),
+    [...bothApt.entries()].map(([k, v]) => k + '=' + v).join(' '));
   ok('and it grants at least one rating', ratingsOf(ev.sheet).length > 0, ratingsOf(ev.sheet).join(','));
   ok('every stat a full-factor slot grants is a whole number',
     [...bothApt.values()].every((v) => Number.isInteger(v)),
     [...bothApt.entries()].map(([k, v]) => k + '=' + v).join(' '));
+
+  // The invariant that pins the rule end to end, and it holds for all four
+  // classes: a class declares the damage reduction it is meant to reach in full
+  // gear, and a level-appropriate Rare set has to land there. Paying two
+  // aptitudes doubled the armour budget and put a Priest at 40% when its own
+  // row says 25% - and, worse, put the Warrior at 58% when it says 40%.
+  for (const cls of cat.classes) {
+    const full = emptyLoadout(cat, cls.unit, 25);
+    for (const slotId of CORE_SLOTS) {
+      const options = cat.candidates(slotId, { aptitude: cls.aptitude, charLevel: 25 })
+        .filter((x) => x.item.aptitudes.includes(cls.aptitude));
+      // An item with no authored level drops at the character's level, which is
+      // what "a full set at 25" means.
+      const c = options.find((x) => x.item.level == null && x.item.iLevel == null && x.rarity === 'Rare')
+        ?? options[options.length - 1];
+      if (c) full.gear[slotId] = { item: c.item.id, rarity: c.rarity, stars: 0, generic: c.generic ?? null };
+    }
+    pruneIllegal(cat, full);
+    const sv = engine.evaluate(full).survivability;
+    const want = cdb.byId('aptitude').get(cls.aptitude).props.armorReduction;
+    ok(`a full set lands ${cls.unit} on its own declared armour reduction`,
+      Math.abs(sv.physReduction - want) < 0.04,
+      `${(sv.physReduction * 100).toFixed(1)}% vs the declared ${(want * 100).toFixed(0)}%`);
+  }
+
+  // Craft jewellery names several generic aptitudes and pays exactly one, so
+  // each is a separate candidate rather than a free multiplier.
+  {
+    const pendant = cat.itemById.get('Necklace_Z2RCraft');
+    ok('the four-generic craft necklace is still in the data',
+      pendant && cat.genericChoices(pendant).length === 4,
+      pendant ? pendant.aptitudes.join('+') : 'Necklace_Z2RCraft missing');
+    const variants = cat.candidates('Slot_Neck', { aptitude: 'Cleric', charLevel: 25 })
+      .filter((c) => c.item.id === 'Necklace_Z2RCraft');
+    ok('and it appears once per generic it can roll', variants.length === 4,
+      variants.map((v) => v.generic).join(', '));
+    const one = new Map();
+    cat.contribute(pendant, 'Slot_Neck',
+      { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: 'Rare', armorReduction: 0.25, generic: 'MaPen' },
+      { flat: one, addRatio: new Map(), mulRatio: new Map() });
+    ok('a chosen generic pays exactly one rating',
+      ratingsOf(one).length === 1 && (one.get('SpellPenetrationRating') ?? 0) > 0,
+      [...one.entries()].map(([k, v]) => k + '=' + v).join(' '));
+  }
 }
 
 function ratingsOf(sheet) {
@@ -381,8 +465,293 @@ group('drop rarity');
     !att.some((r) => (cat.rarityOrder.get(r.rarity) ?? 0) < (cat.rarityOrder.get('Rare') ?? 0)));
   ok('every non-authored rarity carries its drop chance',
     att.filter((r) => !r.authored).every((r) => r.chance > 0), JSON.stringify(att));
+  // Upgrade stars are a WEAPON mechanic. The game's own window text says so
+  // ("You can upgrade weapons to increase their Attributes and gain access to
+  // a unique effect"), and the twenty `<itemType>_Upgrade` skills exist for
+  // weapon itemTypes only. Reading rarity.props.gearUpgrades alone put three
+  // stars on every armour piece, which is 30 iLevel of stats no character can
+  // have.
+  const weapon = cat.items.find((i) => i.slots.includes('Slot_Weapon1') && cat.canUpgrade(i));
+  ok('a weapon can be upgraded', !!weapon, 'no upgradable mainhand found');
   ok('a better rarity allows more upgrade stars',
-    cat.maxStars(it, 'Legendary') > cat.maxStars(it, 'Rare'));
+    cat.maxStars(weapon, 'Legendary') > cat.maxStars(weapon, 'Rare'),
+    `${weapon?.id}: Legendary ${cat.maxStars(weapon, 'Legendary')} vs Rare ${cat.maxStars(weapon, 'Rare')}`);
+  ok('armour cannot be upgraded at any rarity',
+    cat.maxStars(it, 'Legendary') === 0 && cat.maxStars(it, 'Rare') === 0,
+    `${it.id}: ${cat.maxStars(it, 'Legendary')} / ${cat.maxStars(it, 'Rare')}`);
+  ok('every upgradable item is a weapon',
+    cat.items.filter((i) => !i.isAugment && cat.canUpgrade(i)).every((i) => i.chain.includes('Weapon')),
+    cat.items.filter((i) => !i.isAugment && cat.canUpgrade(i) && !i.chain.includes('Weapon'))
+      .map((i) => i.id).join(', '));
+  // The one explicit override in the data.
+  const starter = cat.itemById.get('Sword_Start');
+  ok('a PreventUpgrade weapon cannot be upgraded', starter && cat.maxStars(starter, 'Legendary') === 0,
+    starter ? String(cat.maxStars(starter, 'Legendary')) : 'Sword_Start missing');
+}
+
+// --- hit counts, areas and the fight ---------------------------------------
+// Everything in this group used to read as exactly one hit on exactly one
+// target, which is why the tool's dps sat at a third of what a meter shows.
+group('hit counts and areas');
+{
+  const engine = createEngine();
+
+  // A step that loops fires once per tick, over its own duration.
+  const spin = engine.combat.profile('GS_Nova_Skill1', 3);
+  const spinHits = spin.effects.filter((e) => e.kind === 'Damage').reduce((s, e) => s + e.hits, 0);
+  ok('a looping area counts every tick', spinHits > 10, `${spinHits} hits`);
+
+  // A projectile combo lands its effect once per projectile.
+  const bolts = engine.combat.profile('Staff_Censer_Combo', 3);
+  const bolt = bolts.effects.find((e) => e.kind === 'Damage' && e.scaling.length);
+  ok('a four-bolt combo counts four hits', bolt?.hits === 4, `${bolt?.hits} hits`);
+
+  // `area.targetCooldown` caps re-hits on the same target: Smite ticks fifteen
+  // times and may only touch a given enemy once.
+  const smite = engine.combat.profile('Priest_Prayer_Smite', 3);
+  const smiteHits = smite.effects.filter((e) => e.kind === 'Damage').reduce((s, e) => s + e.hits, 0);
+  ok('targetCooldown stops a sweep counting as fifteen hits', smiteHits === 1, `${smiteHits} hits`);
+
+  // A vars key in a numeric column must resolve, not read as zero.
+  ok('a duration given as a vars key resolves',
+    engine.combat.profile('Shield_Firebreath_Skill1', 3).occupancy > 3,
+    String(engine.combat.profile('Shield_Firebreath_Skill1', 3).occupancy));
+
+  // Only Area and Aura steps scale with the target count.
+  const sheetOf = (targets) => {
+    const eng = createEngine({ fight: { targets } });
+    const l = emptyLoadout(cat, 'Priest', 25);
+    l.gear.Slot_Weapon1 = { item: 'Staff_Censer', rarity: 'Rare', stars: 0 };
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { rank: 3 }).throughput.dps;
+  };
+  const one = sheetOf(1), three = sheetOf(3);
+  ok('more targets is more damage', three > one, `${one.toFixed(1)} -> ${three.toFixed(1)}`);
+  ok('but not linearly, because single-target lines do not scale',
+    three < one * 3, `${one.toFixed(1)} -> ${three.toFixed(1)}`);
+
+  // The arsenal grants no base-attack chain, so it must not raise WeaponPower.
+  const cls = cat.classes.find((c) => c.unit === 'Priest');
+  const base = { class: 'Priest', level: 25, gear: { Slot_Weapon1: { item: 'Staff_Censer', rarity: 'Rare', stars: 0 } }, augments: {} };
+  const withArsenal = { ...base, gear: { ...base.gear, Slot_Weapon2: { item: 'Staff_Censer', rarity: 'Rare', stars: 0 } } };
+  near('an arsenal weapon does not raise WeaponPower',
+    engine.combat.weaponPowerFor(cat, withArsenal, cls),
+    engine.combat.weaponPowerFor(cat, base, cls), 1e-9);
+}
+
+// --- the fight -------------------------------------------------------------
+group('the fight simulation');
+{
+  const engine = createEngine();
+  const rogue = emptyLoadout(cat, 'Rogue', 25);
+  rogue.gear.Slot_Weapon1 = { item: 'Daggers_Start', rarity: 'Rare', stars: 0 };
+  engine.plan.pruneSelection(rogue);
+
+  // A charge is a banked cast: it buys (charges - 1) extra casts over a fight
+  // and changes nothing about the sustained rate. Rogue_KnivesTempest is 2
+  // charges on a 30s cooldown, and its M1 rune makes that 3.
+  const castsIn = (seconds, rune) => {
+    const eng = createEngine({ fight: { seconds } });
+    const l = JSON.parse(JSON.stringify(rogue));
+    if (rune) l.runes = { Rogue_KnivesTempest: rune };
+    const line = eng.evaluate(l, { rank: 3 }).throughput.lines.find((x) => x.id === 'Rogue_KnivesTempest');
+    return line ? Math.round(seconds / line.interval) : 0;
+  };
+  const short2 = castsIn(30, null), short3 = castsIn(30, 'Rogue_KnivesTempest_M1');
+  ok('a charged skill opens the fight with its whole bank', short2 === 2, `${short2} casts in 30s`);
+  ok('and an extra charge is an extra cast', short3 === short2 + 1, `${short3} vs ${short2}`);
+  const long2 = castsIn(200, null), long3 = castsIn(200, 'Rogue_KnivesTempest_M1');
+  ok('over a long fight the extra charge is worth exactly one more cast',
+    long3 === long2 + 1, `${long3} vs ${long2}`);
+
+  // The denominator is the fight, not the moment of the last cast. Getting this
+  // wrong made a build with no main-hand weapon beat one holding a sword.
+  const naked = emptyLoadout(cat, 'Priest', 25);
+  const nakedDps = engine.evaluate(naked, { rank: 3 }).throughput.dps;
+  const armed = JSON.parse(JSON.stringify(naked));
+  armed.gear.Slot_Weapon1 = { item: 'Staff_Censer', rarity: 'Rare', stars: 0 };
+  engine.plan.pruneSelection(armed);
+  ok('holding a weapon beats holding nothing',
+    engine.evaluate(armed, { rank: 3 }).throughput.dps > nakedDps,
+    `${nakedDps.toFixed(1)} naked`);
+
+  // Rolling the procs must produce the same mean and a real spread.
+  const rolled = createEngine({ fight: { count: 200 } }).evaluate(armed, { rank: 3 }).throughput;
+  const flat = engine.evaluate(armed, { rank: 3 }).throughput;
+  ok('rolling the procs reproduces the expected-value mean',
+    Math.abs(rolled.dps - flat.dps) < flat.dps * 0.08,
+    `${flat.dps.toFixed(1)} expected vs ${rolled.dps.toFixed(1)} rolled`);
+  ok('and reports a spread rather than pretending there is none',
+    rolled.dpsSd > 0, String(rolled.dpsSd));
+}
+
+// --- dependency order ------------------------------------------------------
+// The two things a priority list cannot do, on synthetic rotations where the
+// right answer is arithmetic rather than opinion. SimulationCraft solves both
+// with a human-authored APL and explicitly does no search; nobody authors those
+// for this game, so a bounded rollout stands in for one.
+group('rotation dependency order');
+{
+  const AMP = {
+    status: 'Amp', duration: 4, stacks: 1,
+    affixes: [{ target: { attribute: 'DamageTakenModifier' }, ref: 'TAttribute_ARatio', val: 1 }],
+  };
+  const prof = (id, cooldown, occ) => ({
+    id, name: id, cooldown, occupancy: occ, charges: 1, isCombo: false, type: 'ClassSkill',
+  });
+  const cast = (p, state) => {
+    const amped = state && state.key.includes('!Amp');
+    if (p.id.startsWith('Nuke')) return { damage: amped ? 2000 : 1000, heal: 0, shield: 0 };
+    if (p.id === 'Swing') return { damage: 10, heal: 0, shield: 0 };
+    return { damage: 0, heal: 0, shield: 0 };   // the setup emits nothing at all
+  };
+  const dotOutput = () => ({ damage: 0, heal: 0 });
+  const run = (rotation, lookahead) => simulate({ rotation, cast, dotOutput, fight: 120, lookahead });
+
+  // 1. X debuffs the target so Y hits harder. Greedy sorts by damage per second
+  // of commitment, so the setup - which does no damage at all - always loses
+  // and its window is always wasted.
+  {
+    const rotation = {
+      active: [
+        { prof: prof('Setup', 12, 1), source: 't', applies: { self: [], target: [AMP] } },
+        { prof: prof('Nuke', 12, 1), source: 't', applies: { self: [], target: [] } },
+      ],
+      filler: [{ prof: prof('Swing', 0, 1), applies: { self: [], target: [] } }],
+      triggered: [], passive: [], dots: [], unmodelled: [], runes: [], rank: 3,
+    };
+    const greedy = run(rotation, 0);
+    const ahead = run(rotation, 8);
+    const perCast = (r) => r.lines.find((l) => l.id === 'Nuke')?.perCast.damage ?? 0;
+    near('greedy wastes the setup entirely', perCast(greedy), 1000, 1);
+    near('a lookahead casts the setup first', perCast(ahead), 2000, 1);
+    ok('and that is worth most of the build', ahead.dps > greedy.dps * 1.5,
+      `${greedy.dps.toFixed(1)} -> ${ahead.dps.toFixed(1)}`);
+  }
+
+  // 2. Two cooldowns and one window. Both should land inside it; greedy fires
+  // whichever is ready the moment it is ready and never lines them up.
+  {
+    const rotation = {
+      active: [
+        { prof: prof('Setup', 10, 1), source: 't', applies: { self: [], target: [{ ...AMP, duration: 5 }] } },
+        { prof: prof('NukeA', 10, 1), source: 't', applies: { self: [], target: [] } },
+        { prof: prof('NukeB', 10, 1), source: 't', applies: { self: [], target: [] } },
+      ],
+      filler: [{ prof: prof('Swing', 0, 1), applies: { self: [], target: [] } }],
+      triggered: [], passive: [], dots: [], unmodelled: [], runes: [], rank: 3,
+    };
+    const greedy = run(rotation, 0);
+    const ahead = run(rotation, 8);
+    const both = (r) => ['NukeA', 'NukeB'].every((id) =>
+      Math.abs((r.lines.find((l) => l.id === id)?.perCast.damage ?? 0) - 2000) < 1);
+    ok('greedy lands neither cooldown in the window', !both(greedy),
+      `${greedy.dps.toFixed(1)} dps`);
+    ok('a lookahead lands both', both(ahead), `${ahead.dps.toFixed(1)} dps`);
+  }
+
+  // The lookahead must never make the answer worse: it is a search over the
+  // same rotation, and 0 is one of the options it considers.
+  {
+    const rotation = {
+      active: [
+        { prof: prof('NukeA', 8, 1), source: 't', applies: { self: [], target: [] } },
+        { prof: prof('NukeB', 14, 1), source: 't', applies: { self: [], target: [] } },
+      ],
+      filler: [{ prof: prof('Swing', 0, 1), applies: { self: [], target: [] } }],
+      triggered: [], passive: [], dots: [], unmodelled: [], runes: [], rank: 3,
+    };
+    ok('with nothing to sequence, a lookahead changes nothing',
+      Math.abs(run(rotation, 8).dps - run(rotation, 0).dps) < 1e-6,
+      `${run(rotation, 0).dps.toFixed(3)} vs ${run(rotation, 8).dps.toFixed(3)}`);
+  }
+}
+
+// --- live state ------------------------------------------------------------
+group('the fight holds state');
+{
+  const engine = createEngine();
+  const build = {
+    class: 'Priest', level: 25, augments: {}, skills: {}, runes: {}, talents: {},
+    gear: { Slot_Weapon1: { item: 'Sword_Swarm', rarity: 'Legendary', stars: 5 } },
+  };
+  engine.plan.pruneSelection(build);
+  const rot = engine.plan.resolve(build, 3);
+
+  // `Sword_Swarm_Skill1` strips 40% of the target's MagicArmor for 10 seconds.
+  const debuffed = [...rot.active, ...rot.filler]
+    .flatMap((x) => x.applies?.target ?? []);
+  ok('a cast carries the debuff it puts on the target',
+    debuffed.some((d) => d.status === 'Sword_Swarm_Skill1_Status'),
+    debuffed.map((d) => d.status).join(', ') || '(none)');
+
+  // And it is worth something, which it was not while the target was a constant.
+  const withDebuff = engine.evaluate(build, { target: engine.combat.foe('boss', 25), rank: 3 })
+    .throughput.dps;
+  const blind = createEngine();
+  const inner = blind.plan.resolve;
+  blind.plan.resolve = (...a) => {
+    const r = inner(...a);
+    for (const x of [...r.active, ...r.filler, ...r.triggered]) {
+      if (x.applies) x.applies = { self: x.applies.self, target: [] };
+    }
+    return r;
+  };
+  const without = blind.evaluate(build, { target: blind.combat.foe('boss', 25), rank: 3 })
+    .throughput.dps;
+  ok('and stripping the target\'s armour raises the damage that follows it',
+    withDebuff > without, `${without.toFixed(2)} blind vs ${withDebuff.toFixed(2)} live`);
+}
+
+// --- damage over time ------------------------------------------------------
+group('statuses that tick');
+{
+  const engine = createEngine();
+  const l = emptyLoadout(cat, 'Priest', 25);
+  l.gear.Slot_Weapon1 = { item: 'Sword_Swarm', rarity: 'Rare', stars: 0 };
+  engine.plan.pruneSelection(l);
+  const rot = engine.plan.resolve(l, 3);
+
+  const swarm = rot.dots.find((d) => d.status === 'Sword_Swarm_Passive_Swarm');
+  ok('a damage aura applied by a script is found', !!swarm,
+    rot.dots.map((d) => d.status).join(', '));
+  ok('with its lifetime and tick out of the data',
+    swarm?.duration === 10 && swarm?.tick === 1, `${swarm?.duration}s / ${swarm?.tick}s`);
+  ok('and the event its guard names', swarm?.on === 'weapon-skill', String(swarm?.on));
+
+  const ev = engine.evaluate(l, { rank: 3 });
+  const line = ev.throughput.lines.find((x) => x.id === 'Sword_Swarm_Passive_Swarm');
+  ok('it ticks during the fight', !!line, ev.throughput.lines.map((x) => x.id).join(', '));
+  // Ten ticks of 0.12*(Strength + Faith), not one lump of ten times that.
+  const perTick = (line?.perCast.damage ?? 0) / 199;
+  const raw = 0.12 * ((ev.sheet.get('Strength') ?? 0) + (ev.sheet.get('Faith') ?? 0));
+  ok('at its per-tick amount, not its whole-lifetime amount',
+    perTick > raw * 0.2 && perTick < raw * 3,
+    `${perTick.toFixed(1)} per tick against a raw ${raw.toFixed(1)}`);
+
+  // A status is applied by an event; one whose event this model cannot price
+  // must be named, not silently dropped and not silently counted.
+  ok('a status nothing can trigger is reported rather than dropped',
+    rot.unmodelled.some((u) => u.id === 'Sword_Swarm_Passive_Poison'),
+    rot.unmodelled.map((u) => u.id).join(', '));
+
+  // A buff on a two-minute cooldown is not a permanent buff.
+  const fervor = engine.evaluate(l, { rank: 3 }).buffs
+    .find((b) => b.status === 'Priest_BlessingOfFervor_Status');
+  ok('a self-buff is credited at duration/cooldown, not at 100%',
+    fervor && fervor.uptime > 0 && fervor.uptime < 0.3,
+    fervor ? `uptime ${(fervor.uptime * 100).toFixed(0)}%` : 'buff not found');
+  ok('and it is a buff on YOU, not a debuff on the target',
+    fervor?.affixes.some((a) => a.target.attribute === 'Fervor'),
+    JSON.stringify(fervor?.affixes?.map((a) => a.target.attribute)));
+
+  // A status whose magnitude is injected by a script has no magnitude in the
+  // data, and must be refused rather than counted at its stack cap.
+  const crusader = engine.plan.statusesOf('Priest_Crusader', { rank: 3 });
+  ok('a dynVal-scaled status is refused, not counted at maxStacks 300',
+    crusader.unreadable.some((x) => x.status === 'Priest_Crusader_Status')
+      && !crusader.self.some((x) => x.status === 'Priest_Crusader_Status'),
+    JSON.stringify({ self: crusader.self.map((x) => x.status), no: crusader.unreadable.map((x) => x.status) }));
 }
 
 // --- the optimiser ---------------------------------------------------------
@@ -497,17 +866,26 @@ group('optimiser');
     dpsOn.throughput.dps > dpsOff.throughput.dps * 1.01,
     `${dpsOn.throughput.dps.toFixed(1)} vs ${dpsOff.throughput.dps.toFixed(1)}`);
 
-  // And with the skills modelled, the dps optimum should be led by PENETRATION
-  // rather than by the unverified Fervor multiplier. Before the rotation was
-  // modelled, base attacks were the only damage, Fervor was the only multiplier
-  // that touched them, and the search dressed a Priest entirely in Fervor gear.
-  // If this starts failing, the rotation has regressed to that state.
-  const pen = (a.evaluation.sheet.get('SpellPenetrationRating') ?? 0)
-    + (a.evaluation.sheet.get('ArmorPenetrationRating') ?? 0);
-  ok('the dps optimum is led by penetration, not by the Fervor assumption',
-    pen > (a.evaluation.sheet.get('FervorRating') ?? 0),
-    `penetration ${pen.toFixed(0)} vs Fervor ${(a.evaluation.sheet.get('FervorRating') ?? 0).toFixed(0)}`
-      + ' - skills may have stopped being scored');
+  // Before the rotation was modelled, base attacks were the only damage, Fervor
+  // was the only multiplier that touched them, and the search dressed a Priest
+  // entirely in Fervor gear. The guard against regressing to that used to be
+  // "penetration rating must exceed Fervor rating", which was a proxy - and it
+  // is a proxy that reads BACKWARDS. Fervor's assumed scope is `skills`, so a
+  // build whose damage comes from its rotation wants Fervor and a build that
+  // just swings wants penetration. The proxy therefore fails exactly when the
+  // rotation gets MORE prominent, which is the opposite of what it was watching
+  // for. So assert the thing itself: the skills have to carry a real share.
+  const byKind = (k) => a.evaluation.throughput.lines
+    .filter((l) => l.kind === k)
+    .reduce((s, l) => s + l.perCast.damage / l.interval, 0);
+  const fromSkills = byKind('active') + byKind('triggered');
+  const totalDamage = fromSkills + byKind('filler');
+  ok('skills carry a real share of the damage, not just the base-attack chain',
+    totalDamage > 0 && fromSkills / totalDamage > 0.25,
+    `skills ${fromSkills.toFixed(1)} of ${totalDamage.toFixed(1)} dps`);
+  ok('the rotation contains skills the character pressed',
+    a.evaluation.rotation.active.length > 0,
+    `active: ${a.evaluation.rotation.active.map((x) => x.prof.id).join(', ')}`);
 
   // Exclusions must actually exclude.
   const f = runOnce({ exclude: /^GM_/ });
@@ -611,17 +989,46 @@ group('triggered skills and self-buffs');
   const engine = createEngine();
   const target = engine.combat.foe('reference', 25);
 
-  // A resource-gated skill with no cooldown must NOT be treated as spammable.
+  // A resource-gated skill with no cooldown is not spammable and is not
+  // unscoreable either: it is castable exactly as often as its income allows.
   const rageStrike = engine.combat.profile('Warrior_Rage_Strike', 3);
   ok('Warrior_Rage_Strike has no cooldown', !(rageStrike.cooldown > 0), String(rageStrike.cooldown));
   ok('and it declares a resource cost', rageStrike.costs.length > 0, JSON.stringify(rageStrike.costs));
   const w = emptyLoadout(cat, 'Warrior', 25);
   const wOpt = optimize(engine, { loadout: w, goal: 'dps', target, rank: 3, restarts: 1 });
   const rot = wOpt.evaluation.rotation;
-  ok('a resource-gated skill is reported unmodelled rather than scored',
-    rot.unmodelled.some((u) => u.id === 'Warrior_Rage_Strike')
-      && !rot.active.some((x) => x.prof.id === 'Warrior_Rage_Strike'),
+  ok('a resource-gated skill is scored, not reported unmodelled',
+    rot.active.some((x) => x.prof.id === 'Warrior_Rage_Strike')
+      && !rot.unmodelled.some((u) => u.id === 'Warrior_Rage_Strike'),
     JSON.stringify(rot.unmodelled.map((u) => u.id)));
+
+  // ...and the passives that FEED the pool are the mechanism, so they must not
+  // also be listed as things the model could not score.
+  ok('the Rage passives are accounted for, not reported unscored',
+    !rot.unmodelled.some((u) => u.id === 'Warrior_Rage' || u.id === 'Warrior_InfiniteRage'),
+    JSON.stringify(rot.unmodelled.map((u) => u.id)));
+
+  // Its cast rate has to be the income rate, not the clock. Rage costs 10, and
+  // the Warrior makes 1 per attack, per combo finisher, per weapon skill, plus
+  // 1 every 3s from Infinite Rage - so it is single-digit seconds, never once a
+  // fight (which is what a cooldown-less skill run through the CHARGE
+  // machinery produced: one charge, then a next-recovery of Infinity).
+  const rsLine = wOpt.evaluation.throughput.lines.find((l) => l.id === 'Warrior_Rage_Strike');
+  ok('and its interval is set by income, not by a charge that never returns',
+    rsLine && rsLine.interval > 1 && rsLine.interval < 30,
+    rsLine ? `every ${rsLine.interval.toFixed(1)}s` : 'not in the rotation');
+
+  // The income itself, read off the two passives.
+  const gains = rot.resources.gains;
+  ok('the Rage passive is read as income on attacks, combos and weapon skills',
+    gains.some((g) => g.from === 'Warrior_Rage' && g.atb === 'Rage'
+      && ['attack', 'combo', 'weapon-skill'].every((e) => g.on.includes(e))),
+    JSON.stringify(gains.map((g) => [g.from, g.on])));
+  ok('Infinite Rage is read as income per unit time',
+    gains.some((g) => g.from === 'Warrior_InfiniteRage' && g.on === 'time' && g.every > 0),
+    JSON.stringify(gains.map((g) => [g.from, g.on, g.every])));
+  ok('the pool is capped by the sheet, not by a constant here',
+    (engine.evaluate(wOpt.loadout, { target, rank: 3 }).sheet.get('MaxRage') ?? 0) > 0);
 
   // Charge levels are mutually exclusive, not cumulative.
   const charged = engine.combat.profile('GA_Craft_Skill1', 3);
@@ -857,8 +1264,14 @@ group('talent links');
   for (const c of engine.cat.classes) {
     for (const n of T.treeFor(c.unit).nodes) { total++; if (T.readableValue(n.skill).readable) readable++; }
   }
-  ok('readable talent count is in the low twenties, not the high fifties',
-    readable > 20 && readable < 35, `${readable} of ${total} - if this jumped, texts.refs is being followed`);
+  // The bound moved from the low twenties to the low forties when the script
+  // readers landed - scoped damage modifiers, pool dots and healing shares are
+  // all genuinely readable now. It is still a canary: following `texts.refs`
+  // would take it past sixty, because thirteen Rogue talents reference one
+  // poison status and eleven Priest talents reference one Sunlight status, and
+  // crediting every mentioner counts each of those statuses a dozen times.
+  ok('readable talent count is in the low forties, not the high sixties',
+    readable > 30 && readable < 55, `${readable} of ${total} - if this jumped, texts.refs is being followed`);
 }
 
 
@@ -1036,6 +1449,426 @@ group('tier thresholds');
     ok(`${cls}: with ranks and the real thresholds, the budget is fully used`,
       a.unspent === 0, `${a.spent} of ${a.budget}`);
   }
+}
+
+// --- against a real character sheet ----------------------------------------
+// A level-25 Warrior with no equipment, no talents and nothing slotted, read
+// off the game's own character sheet. This is the second in-game reading the
+// project has and the first that covers the WHOLE sheet rather than one item,
+// so it pins the level curve, the rounding rule and every derived stat at once.
+group('checked against the game: naked level-25 Warrior');
+{
+  const eng = createEngine({ quiet: true });
+  const ev = eng.evaluate(emptyLoadout(eng.cat, 'Warrior', 25),
+    { target: eng.combat.foe('boss', 25), rank: 3 });
+  const SHEET = {
+    Vitality: 38, Strength: 34, Dexterity: 28, Faith: 28, Intellect: 28,
+    CritChance: 5.8, CritDamage: 151.2, ArmorPenetration: 0, SpellPenetration: 0,
+    Fervor: 0, BlockMitigation: 0, DodgeChance: 0.3, MagicMastery: 0, PhysicalMastery: 0,
+  };
+  for (const [atb, want] of Object.entries(SHEET)) {
+    const got = ev.sheet.get(atb);
+    ok(`sheet: ${atb} reads ${want}`, got != null && Math.abs(got - want) < 0.15,
+      `got ${got == null ? '(absent)' : got.toFixed(2)}`);
+  }
+
+  // The rounding rule those numbers settle. Raw curve values are 33.974,
+  // 28.091 and 38.211; the game shows 34, 28 and 38. Ceiling matches one,
+  // flooring matches two, rounding matches all three - so `RoundUp` rounds.
+  ok('RoundUp rounds rather than ceils',
+    Math.abs(ev.sheet.get('Dexterity') - 28) < 1e-9 && Math.abs(ev.sheet.get('Strength') - 34) < 1e-9);
+
+  // ...and the printed sheet is the RESTING one. A 120-second buff averaged in
+  // at its uptime is a fight statistic, not a character sheet: Battle Shout's
+  // +20 CritChance at 12.5% uptime is what made this read 8.3 instead of 5.8.
+  ok('the resting sheet carries no timed buff', Math.abs(ev.sheet.get('CritChance') - 5.8) < 0.15);
+  ok('...and the averaged sheet is reported alongside it, and differs',
+    ev.averaged && (ev.averaged.get('CritChance') ?? 0) > ev.sheet.get('CritChance'));
+
+  // Two skill tooltips from the same character.
+  near('Raging Smash is 1.6 x Strength', 1.6 * ev.sheet.get('Strength'), 54.4, 0.05);
+  near('Surging Force is 0.6 x Vitality', 0.6 * ev.sheet.get('Vitality'), 22.8, 0.05);
+}
+
+// --- the class-skill bar ---------------------------------------------------
+group('class skills are chosen, not given');
+{
+  const eng = createEngine({ quiet: true });
+  const T = eng.cdb.enumValues('skill', 'type');
+  // Every class declares six, at the same six levels.
+  for (const cls of ['Warrior', 'Rogue', 'Mage', 'Priest']) {
+    const rows = (eng.cdb.byId('unit').get(cls).skills ?? [])
+      .filter((s) => T[eng.cdb.byId('skill').get(s.skill ?? s.ref)?.type ?? -1] === 'ClassSkill');
+    ok(`${cls} declares six class skills`, rows.length === 6, String(rows.length));
+    ok(`${cls}: five of them are learned by level 25`,
+      rows.filter((s) => (s.level ?? 0) <= 25).length === 5);
+  }
+  // ...and only four are slotted, so the fifth is a real cost.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  eng.plan.pruneSelection(l);
+  const pool = eng.plan.pools(l).find((p) => p.key === 'class/ClassSkill');
+  ok('the bar is a pool of five with four slots', pool && pool.slots === 4 && pool.options.length === 5,
+    pool ? `${pool.slots}/${pool.options.length}` : 'no pool');
+  const rot = eng.plan.resolve(l, 3);
+  const inRot = new Set([...rot.active, ...rot.triggered, ...rot.passive].map((x) => x.prof.id));
+  ok('an unslotted class skill is not in the rotation',
+    pool.options.filter((id) => inRot.has(id)).length <= 4,
+    pool.options.filter((id) => inRot.has(id)).join(','));
+
+  // Berserk's damage half lives only in its script, and without it the search
+  // dropped the class's biggest damage cooldown from the bar.
+  const berserk = eng.plan.statusesOf('Warrior_Berserk', { rank: 3, runes: new Set(), talents: new Set() });
+  const dm = berserk.self.flatMap((b) => b.affixes).find((a) => a.target?.attribute === 'DamageModifier');
+  ok('Berserk reads its +20% damage, not just its Rage half', dm && Math.abs(dm.val - 20) < 1e-9,
+    JSON.stringify(berserk.self.flatMap((b) => b.affixes.map((a) => a.target.attribute))));
+  // ...and a CONDITIONAL script multiplier must not become a permanent stat.
+  const bladeleaf = eng.plan.statusesOf('DS_Bladeleaf_Combo', { rank: 3, runes: new Set(), talents: new Set() });
+  ok('a dmgMult inside a branch is refused',
+    !bladeleaf.self.flatMap((b) => b.affixes).some((a) => a.target?.attribute === 'DamageModifier'));
+}
+
+// --- scoped talent modifiers ------------------------------------------------
+// Most of the "increased damage" talents are one line of script with a guard,
+// and none of them is a stat: a sheet has one DamageModifier and cannot say
+// "+20% critical damage, but only on weapon skills". The refusals matter as
+// much as the readings - defaulting an unrecognised guard to "unconditional"
+// took the Priest from 249 to 380 dps.
+group('scoped talent modifiers');
+{
+  const eng = createEngine({ quiet: true });
+  const mod = (id, rank = 1) => eng.plan.talentModifiers(id, rank);
+  const one = (id, rank = 1) => mod(id, rank)[0] ?? null;
+
+  const sever = one('Warrior_Talent_Sever');
+  ok('Sever is +20% critical damage on weapon skills only',
+    sever && sever.field === 'critDmgMult' && sever.scope === 'weaponSkill' && Math.abs(sever.amount - 0.2) < 1e-9,
+    JSON.stringify(sever));
+  const maa = one('Warrior_Talent_MasterAtArms', 2);
+  ok('Master-at-arms is scoped to the attack chain, and scales with rank',
+    maa && maa.scope === 'attack' && Math.abs(maa.amount - 0.3) < 1e-9, JSON.stringify(maa));
+  const bl = one('Warrior_Talent_Bloodletting', 2);
+  ok('Bloodletting is scoped to bleed damage', bl && bl.scope === 'bleed', JSON.stringify(bl));
+  const mc = one('Warrior_Talent_MagicConduction', 2);
+  ok('Magic Conduction is magic damage against a bleeding target',
+    mc && mc.scope === 'magic' && mc.targetBleeding, JSON.stringify(mc));
+  // Two fields on consecutive lines: the second line's guard must not pick up
+  // the first line's assignment.
+  ok('Exposed Essence ignores BOTH armours, at 5% each and not 10% of one',
+    mod('Warrior_ExposedEssence', 1).length === 2
+    && mod('Warrior_ExposedEssence', 1).every((m) => Math.abs(m.amount - 0.05) < 1e-9),
+    JSON.stringify(mod('Warrior_ExposedEssence', 1)));
+
+  // A status-scoped bonus names its OWN status type. Reading any of them as
+  // "all damage" is how a flat +20% appeared on a class that has no bleed.
+  const ld = one('Rogue_Talent_LethalDose', 2);
+  ok('a Poison-scoped bonus is not read as global damage',
+    ld && ld.scope !== 'all' && /Poison/.test(ld.scope), JSON.stringify(ld));
+
+  // The refusals. These carry guards the reader cannot classify, so they must
+  // produce NOTHING rather than an unconditional bonus.
+  for (const id of ['Priest_Talent_PiercingLight', 'Priest_Talent_Radiance', 'Priest_Talent_Authority']) {
+    if (!eng.cdb.byId('skill').has(id)) continue;
+    ok(`${id} is refused rather than read as unconditional`, mod(id, 2).length === 0,
+      JSON.stringify(mod(id, 2)));
+  }
+
+  // ...and no talent anywhere may come out as a global bonus large enough to be
+  // a mis-read conditional. Nothing in this data legitimately grants one.
+  const T = eng.cdb.enumValues('skill', 'type');
+  const globals = [];
+  for (const s of eng.cdb.lines('skill')) {
+    if (T[s.type ?? -1] !== 'Talent') continue;
+    for (const m of mod(s.id, s.props?.talent?.maxPoints ?? 1)) {
+      if (m.scope === 'all' && !m.targetBleeding && m.amount >= 0.15) globals.push(`${s.id}:${m.field}=${m.amount}`);
+    }
+  }
+  ok('no talent reads as a large unconditional global bonus', globals.length === 0, globals.join(', '));
+}
+
+// --- pool dots -------------------------------------------------------------
+// Hemorrhage is the node the whole Warrior tree is built around, and the model
+// used to refuse it outright: "its magnitude is the third argument to
+// addStatus, computed by a script". True of the shape, false of the number -
+// `vars.damage` is 0.35 and sits in the row.
+group('pool dots');
+{
+  const eng = createEngine({ quiet: true });
+  const N = { rank: 3, runes: new Set(), talents: new Set() };
+  const dotOf = (id) => eng.plan.statusesOf(id, N).dots.find((d) => d.pool);
+
+  const hem = dotOf('Warrior_Hemorrhage');
+  ok('Hemorrhage is read as a pool dot', !!hem);
+  if (hem) {
+    near('...at 35% of the hit', hem.pool.fraction, 0.35);
+    ok('...off physical critical strikes', hem.pool.crit && hem.pool.physical && !hem.pool.magic);
+    ok('...excluding damage from other dots, so it cannot feed itself', hem.pool.excludesDot);
+    near('...over 8 seconds', hem.duration, 8);
+    near('...ticking every 2', hem.tick, 2);
+    ok('...and it pools rather than refreshing', hem.stacking === 'DurationBased', String(hem.stacking));
+  }
+
+  // Infused Wound is a SECOND, independent pool off magic crits.
+  const inf = dotOf('Warrior_Talent_InfusedWound');
+  ok('Infused Wound is a separate pool off magic crits',
+    inf && inf.pool.magic && !inf.pool.physical, JSON.stringify(inf?.pool ?? null));
+  ok('...and it is a different status, so the two add rather than replace',
+    inf && hem && inf.status !== hem.status);
+
+  // The stacking column is what bounds this. Guessing it from "the amount is a
+  // declared total" matched nearly every dot in the game.
+  let durationBased = 0;
+  for (const s of eng.cdb.lines('skill')) {
+    const p = s.props?.status?.stackingPolicy;
+    if (p != null && eng.cdb.enumValues('skill@props@status', 'stackingPolicy')[p] === 'DurationBased') durationBased++;
+  }
+  ok('only a handful of statuses pool', durationBased > 0 && durationBased <= 6, String(durationBased));
+
+  // End to end: the bleed is worth a share of the crit damage, and nothing else
+  // changes when the talent is not taken.
+  const build = (talents) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'GS_Nova', stars: 0 };
+    l.talents = talents;
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  };
+  const without = build({});
+  const withHem = build({ Warrior_Hemorrhage: 1 });
+  ok('taking Hemorrhage raises throughput', withHem.throughput.dps > without.throughput.dps,
+    `${without.throughput.dps.toFixed(1)} -> ${withHem.throughput.dps.toFixed(1)}`);
+  const line = withHem.throughput.lines.find((l) => l.id === 'Warrior_Hemorrhage_Status');
+  ok('...and it is reported as its own line', !!line, 'no Hemorrhage line');
+  ok('...worth less than the build that feeds it',
+    line && line.perCast.damage < withHem.throughput.dps * withHem.throughput.fight,
+    'the bleed cannot exceed the fight');
+  // A talent the tree is built around must not read as "nothing readable".
+  ok('the tree reports it as readable', eng.talents.readableValue('Warrior_Hemorrhage', 1).readable);
+}
+
+// --- the base-attack chain -------------------------------------------------
+// `moveSet.comboLength` is the authored length of a weapon's chain, and it went
+// unread for long enough that two weapons were swinging a chain shorter than
+// the game gives them. The combo finisher is what charges a Priest's prayers
+// and what every isFinalCombo guard rolls against, so a short chain fires all
+// of them too often - and short is the FLATTERING direction, which is the one
+// to assert against.
+group('the base-attack chain');
+{
+  const eng = createEngine({ quiet: true });
+  const T = eng.cdb.enumValues('skill', 'type');
+  const typeOf = (id) => T[eng.cdb.byId('skill').get(id)?.type ?? -1] ?? null;
+  const moveSets = eng.cdb.byId('moveSet');
+
+  let checked = 0, short = 0;
+  const shortNames = [];
+  for (const it of eng.cat.items) {
+    if (!it.moveSet) continue;
+    const want = moveSets.get(it.moveSet)?.comboLength ?? 0;
+    if (!want) continue;
+    const chain = eng.plan.baseChain(it);
+    if (!chain.links.length) continue;
+    checked++;
+    if (chain.links.length !== want) { short++; shortNames.push(`${it.id} ${chain.links.length}/${want}`); }
+  }
+  ok('every weapon with a moveSet was resolved', checked > 20, `${checked} checked`);
+  // Net_Basic is a capture net: comboLength 4, one Net_Capture step, and no
+  // chain rows anywhere that fit. It is the only weapon allowed to disagree.
+  ok('every weapon swings the chain its moveSet declares', short <= 1,
+    shortNames.join(', '));
+
+  // The two that needed filling, by name, so a patch that authors the missing
+  // links properly shows up here rather than silently.
+  const flamie = eng.cat.itemById.get('Scepter_Flamie');
+  if (flamie) {
+    const c = eng.plan.baseChain(flamie);
+    ok('Scepter_Flamie swings a 4-link chain', c.links.length === 4, c.links.join(','));
+    ok('...two of which its own item row omits', c.filled.length === 2,
+      c.filled.map((f) => f.skill).join(','));
+  }
+  const dm = eng.cat.itemById.get('DM_Multispin');
+  if (dm) {
+    const c = eng.plan.baseChain(dm);
+    ok('DM_Multispin swings a 5-link chain', c.links.length === 5, c.links.join(','));
+  }
+
+  // Order is part of the model: you cannot press swing 3 without 1 and 2, and
+  // the combo is always the finisher.
+  for (const id of ['Sword_Start', 'Scepter_Flamie', 'DM_Multispin', 'Bow_Craft']) {
+    const it = eng.cat.itemById.get(id);
+    if (!it) continue;
+    const links = eng.plan.baseChain(it).links;
+    ok(`${id}: the combo is last in the chain`,
+      links.length > 0 && COMBO_LAST(links, typeOf), links.map(typeOf).join(','));
+    ok(`${id}: the swings are in slot order`, SLOT_ORDER(links, typeOf), links.map(typeOf).join(','));
+  }
+  function COMBO_LAST(links, tp) {
+    return links.every((id, i) => (tp(id) === 'AttackCombo') === (i === links.length - 1));
+  }
+  // Non-decreasing, not strictly increasing: every staff declares two swings
+  // that are BOTH typed `Attack` (Staff_Base_Attack and Staff_Base_Attack2, and
+  // no Attack2 row exists for staffs at all), so a slot can legitimately hold
+  // more than one link and the item's own order decides between them.
+  function SLOT_ORDER(links, tp) {
+    const order = ['Attack', 'Attack2', 'Attack3', 'Attack4'];
+    const idx = links.slice(0, -1).map((id) => order.indexOf(tp(id)));
+    return idx.every((v, i) => v >= 0 && (i === 0 || v >= idx[i - 1]));
+  }
+}
+
+// --- guards the script states, beyond the event ----------------------------
+group('script guards');
+{
+  const eng = createEngine({ quiet: true });
+  const none = { runes: new Set(), talents: new Set() };
+  const has = (id, rank) => new Set(eng.plan.statusesOf(id, { rank, ...none }).all);
+
+  // `rank >= N` in a script is the weapon-skill rank, the same number --rank
+  // resolves everywhere else. Reading the event and ignoring the rank rider
+  // handed a rank-1 character an upgrade it has not earned.
+  ok('Sword_Swarm_Passive: its poison is rank 3 only',
+    !has('Sword_Swarm_Passive', 1).has('Sword_Swarm_Passive_Poison')
+    && has('Sword_Swarm_Passive', 3).has('Sword_Swarm_Passive_Poison'));
+  ok('Bow_Craft_Passive: its status is rank 3 only',
+    !has('Bow_Craft_Passive', 1).has('Bow_Craft_Passive_Status')
+    && has('Bow_Craft_Passive', 3).has('Bow_Craft_Passive_Status'));
+  // ...and the swarm itself is NOT rank-gated, so the gate must not be blanket.
+  ok('Sword_Swarm_Passive: the swarm itself is not rank-gated',
+    has('Sword_Swarm_Passive', 1).has('Sword_Swarm_Passive_Swarm'));
+
+  // A closed sibling branch takes its HEADER with it. Bow_BigGame_Passive marks
+  // its target in an `else if`, and the `if` above it asks hasStatus() - which
+  // is not a condition on the mark.
+  const bigGame = eng.plan.statusesOf('Bow_BigGame_Passive', { rank: 3, ...none });
+  ok('Bow_BigGame_Passive: the mark is not credited to the other branch\'s guard',
+    bigGame.all.includes('Bow_BigGame_Passive_Status'));
+
+  // And a guard the reader genuinely cannot evaluate refuses the rate rather
+  // than approximating it. DA_Water_Combo_PassiveRank3 rolls 0.35 per swing,
+  // but only once its own buff is max-stacked.
+  const l = emptyLoadout(eng.cat, 'Rogue', 25);
+  l.gear.Slot_Weapon1 = { item: 'DA_Water', stars: 0 };
+  eng.plan.pruneSelection(l);
+  const r3 = eng.plan.resolve(l, 3);
+  const r1 = eng.plan.resolve(l, 1);
+  ok('rankPassives: the rank-3 passive exists only at rank 3',
+    r3.unmodelled.concat(r3.triggered.map((x) => ({ id: x.prof.id })))
+      .some((x) => x.id === 'DA_Water_Combo_PassiveRank3')
+    && !r1.unmodelled.concat(r1.triggered.map((x) => ({ id: x.prof.id })))
+      .some((x) => x.id === 'DA_Water_Combo_PassiveRank3'));
+  ok('...and it is refused rather than scored at its bare vars.chance',
+    r3.unmodelled.some((x) => x.id === 'DA_Water_Combo_PassiveRank3' && x.kind === 'conditional'),
+    JSON.stringify(r3.unmodelled.find((x) => x.id === 'DA_Water_Combo_PassiveRank3') ?? null));
+}
+
+// --- rank and runes are two systems -----------------------------------------
+// Confirmed in game: a weapon levels with kills and each of its skills -
+// passives included - takes two upgrades, so a skill is rank 1..3 and a fully
+// mastered weapon is every skill at 3. A CLASS skill does not rank; it takes a
+// rune. The sheet keeps them completely apart, and one function resolves both,
+// so an overlap would silently mix two namespaces.
+group('mastery rank and runes');
+{
+  const T = cdb.enumValues('skill', 'type');
+  const RANKED = new Set(['WeaponSkill', 'AttackCombo', 'WeaponPassive', 'Talent']);
+  const RUNED = new Set(['ClassSkill', 'SignatureSkill']);
+  const rankGated = (s) => (s.steps ?? []).some((st) => st.cond?.minRank != null || st.cond?.maxRank != null
+      || st.cond?.equalRank != null)
+    || (s.affixes ?? []).some((a) => a.conds?.minRank != null || a.conds?.maxRank != null
+      || a.conds?.equalRank != null)
+    || (s.props?.rankOverride ?? []).length > 0
+    || (s.props?.rankPassives ?? []).length > 0;
+
+  let both = 0, rankedElsewhere = 0, runedElsewhere = 0, ranked = 0, runed = 0;
+  for (const s of cdb.lines('skill')) {
+    const t = T[s.type ?? -1] ?? '(none)';
+    const r = rankGated(s);
+    const m = (s.mastery ?? []).length > 0;
+    if (r && m) both++;
+    if (r) { ranked++; if (t !== '(none)' && !RANKED.has(t)) rankedElsewhere++; }
+    if (m) { runed++; if (!RUNED.has(t)) runedElsewhere++; }
+  }
+  ok('no skill is both rank-gated and rune-bearing', both === 0, `${both} are`);
+  ok('rank gates live on weapon skills, combos, passives and talents',
+    ranked > 100 && rankedElsewhere <= 1, `${rankedElsewhere} elsewhere of ${ranked}`);
+  ok('runes live only on class and signature skills',
+    runed > 20 && runedElsewhere === 0, `${runedElsewhere} elsewhere of ${runed}`);
+  ok('every rune-bearing skill offers exactly three',
+    cdb.lines('skill').every((s) => !(s.mastery ?? []).length || s.mastery.length === 3));
+
+  // Two upgrades per skill is the ceiling the constant states.
+  near('a skill has two upgrades above its base rank', K.weaponSkillMaxRank, 3);
+
+  // A talent's rank is a DIFFERENT namespace, capped by its own column, so
+  // resolving one at the weapon's rank would pass every minRank:2 rider free.
+  const caps = cdb.lines('skill')
+    .filter((s) => T[s.type ?? -1] === 'Talent')
+    .map((s) => s.props?.talent?.maxPoints ?? 1);
+  ok('a talent node holds at most two points, not three',
+    caps.length > 50 && Math.max(...caps) === 2, `max ${Math.max(...caps)}`);
+  ok('...and the weapon rank ceiling is higher than it', K.weaponSkillMaxRank > Math.max(...caps));
+}
+
+// --- how a modifier composes ------------------------------------------------
+// The `affix` sheet states this and nothing read it, so two code paths had
+// drifted into meaning different things by the same row.
+group('affix stacking');
+{
+  const A = ctx.affix;
+  ok('the four attribute affix refs are the ones the model knows',
+    ['TAttribute_Flat', 'TAttribute_ARatio', 'TAttribute_MRatio', 'TAttribute_MRatioMin']
+      .every((r) => A.kindOf(r)));
+  ok('a row the sheet does not type as an attribute affix is ignored',
+    A.kindOf('InventorySize_Flat') === null && A.kindOf('Invalid') === null);
+
+  // Multiplicative REPLACES and compounds: 0.6 means "you take 60% of what you
+  // would have", so reading it as (1 + 0.6) turns a 40% reduction into a 60%
+  // increase - which is what one of the two paths was doing.
+  near('MRatio compounds', A.composeMul('TAttribute_MRatio', 1, 0.6), 0.6);
+  near('MRatio compounds twice', A.composeMul('TAttribute_MRatio', 0.6, 0.5), 0.3);
+  // Min(base 1) takes the strongest and does NOT compound: two 30% slows are a
+  // 30% slow.
+  near('MRatioMin takes the strongest', A.composeMul('TAttribute_MRatioMin', 1, 0.7), 0.7);
+  near('MRatioMin does not compound', A.composeMul('TAttribute_MRatioMin', 0.7, 0.7), 0.7);
+  ok('the sheet still says so', ctx.affix.stacking.get('TAttribute_MRatioMin')?.case === 'Min'
+    && ctx.affix.stacking.get('TAttribute_MRatio')?.case === 'Multiplicative');
+
+  // A slot factor scales an additive value directly and blends a multiplier
+  // toward 1. Scaling 0.6 by the arsenal's 0.4 gives 0.24, which is a bigger
+  // reduction than the affix grants rather than a smaller one.
+  near('a flat affix scales directly', A.scaleValue('TAttribute_Flat', 20, 0.4), 8);
+  near('a multiplier blends toward 1', A.scaleValue('TAttribute_MRatio', 0.6, 0.4), 0.84);
+  near('...and at full weight is itself', A.scaleValue('TAttribute_MRatio', 0.6, 1), 0.6);
+}
+
+// --- what the game says a status IS ----------------------------------------
+group('status types');
+{
+  const eng = createEngine({ quiet: true });
+  const flagNames = eng.cdb.enumValues('statusType', 'flags');
+  const types = eng.cdb.byId('statusType');
+  const flagsOf = (id) => {
+    const r = types.get(id);
+    return r ? flagNames.filter((_, i) => ((r.flags ?? 0) >> i) & 1) : [];
+  };
+  ok('statusType still carries the DoT/CC flags this reads',
+    ['DoT', 'CrowdControl', 'HardCC', 'HoT'].every((f) => flagNames.includes(f)));
+  ok('Bleed is typed a DoT', flagsOf('Bleed').includes('DoT'));
+  ok('Stun is typed hard crowd control', flagsOf('Stun').includes('HardCC'));
+
+  // The authored flag and the model's structural test - "a step carries
+  // props.loop.tick" - must agree on the overwhelming majority, or one of the
+  // two is being read wrong.
+  let flagged = 0, agree = 0;
+  for (const s of eng.cdb.lines('skill')) {
+    const t = (s.props?.status?.types ?? []).map((x) => x.type);
+    if (!t.length) continue;
+    const f = new Set(t.flatMap(flagsOf));
+    if (!(f.has('DoT') || f.has('HoT'))) continue;
+    flagged++;
+    if ((s.steps ?? []).some((x) => x.props?.loop?.tick != null)) agree++;
+  }
+  ok('the DoT flag and a loop.tick agree on almost every status',
+    flagged > 20 && agree / flagged > 0.9, `${agree} of ${flagged}`);
 }
 
 // --- summary ---------------------------------------------------------------

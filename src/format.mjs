@@ -106,18 +106,27 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set(), indifferent
     }
     const it = cat.itemById.get(g.item);
     const rarity = g.rarity ?? it.rarity;
-    const eff = cat.effectiveLevel(it, { charLevel: loadout.level, stars: g.stars ?? 0, flawless: !!g.flawless, rarity });
+    // The SAME arithmetic the stats were computed with, or the table contradicts
+    // the sheet beside it: loadout.mjs clamps the stars to what the item can
+    // actually take and honours the instance level, and printing the unclamped
+    // request showed three stars and 30 iLevel that no stat ever got.
+    const stars = Math.min(g.stars ?? 0, cat.maxStars(it, rarity));
+    const eff = cat.effectiveLevel(it, {
+      charLevel: loadout.level, stars, flawless: !!g.flawless, rarity, level: g.level ?? null,
+    });
     const rolled = rarity !== it.rarity;
+    // Which generic this instance actually PAYS, not which one was asked for.
+    const paid = cat.payingAptitudes(it, cls.aptitude, g.generic).find((a) => cat.isGeneric(a)) ?? null;
     rows.push([
       short(slot.id),
       it.name === it.id ? it.id : `${it.name}`,
       rolled ? warn(rarity) : rarity,
-      g.stars ? '*'.repeat(g.stars) : '',
+      stars ? '*'.repeat(stars) : '',
       num(eff * 10),
       // Craft jewellery lists several alternative aptitudes; only one of them
       // is what you actually looted, so name which one this row assumes.
-      it.faction ?? dim('-'),
-      ratingGiven(cat, it, cls.aptitude, rarity) ?? dim('-'),
+      it.faction ?? (paid ? warn(paid) : dim('-')),
+      ratingGiven(cat, it, cls.aptitude, rarity, g.generic) ?? dim('-'),
       pinnedGear.has(slot.id) ? bold('pinned')
         : indifferent.has(slot.id) ? warn('no effect')
         : (rolled ? dim('rolled') : ''),
@@ -127,16 +136,15 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set(), indifferent
 }
 
 // Which secondary rating this piece pays out for this class - the cross of the
-// item's faction with the class's own atbScaling conditions.
-// EVERY paying aptitude contributes, so a dual-aptitude item can grant two
-// different ratings out of one faction: a Kobold Assassin+Cleric spear reads as
-// ArmorPen through Assassin and Crit through Cleric, and grants +39 of both.
-// Returning only the first would hide half of what the item does.
-export function ratingGiven(cat, item, aptitude, rarity = null) {
+// item's faction with the WEARER's own atbScaling conditions. One aptitude
+// pays, so a Kobold Assassin+Cleric spear reads as ArmorPen on a Rogue and as
+// Crit on a Priest, not as both on either. `generic` names which of a craft
+// jewel's several nameless aptitudes this instance rolled.
+export function ratingGiven(cat, item, aptitude, rarity = null, generic = null) {
   const rar = rarity ?? item.rarity;
   const aptitudes = cat.cdb.byId('aptitude');
   const found = [];
-  for (const aptId of cat.payingAptitudes(item, aptitude)) {
+  for (const aptId of cat.payingAptitudes(item, aptitude, generic)) {
     for (const e of aptitudes.get(aptId)?.atbScaling ?? []) {
       if ((e.statGroup ?? 0) !== 3) continue;
       const cd = e.conds ?? {};
@@ -162,15 +170,25 @@ export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {
     if (aug) {
       label = aug.name === aug.id ? aug.id : aug.name;
       effect = affixSummary(aug.affixes);
+      if (s.type === 'AugmentDemonSigil') {
+        // A sigil is a free tier-4 talent, and most of those talents declare no
+        // affix, no effect and no status - so the objective cannot tell one
+        // from another and the socket stayed empty until the search learnt to
+        // prefer any sigil over none. Say which of those two this is.
+        const tree = engine.talents.treeFor(loadout.class);
+        const granted = (aug.skills ?? []).filter((sk) => tree.byId.has(sk));
+        const readable = granted.filter((sk) => engine.talents.readableValue(sk, 1).readable);
+        effect = readable.length
+          ? dim('grants ' + readable.map((sk) => tree.byId.get(sk).name).join(', '))
+          : warn('a free tier-4 talent this model cannot score - taken because free beats empty');
+      }
     } else {
       // An empty socket has two very different meanings, and conflating them is
       // how a tool misleads: "nothing here beats nothing" versus "I cannot put a
       // number on any of these". Say which.
       // An augment is scoreable if it carries a stat affix, or if a skill it
       // grants resolves to a self-buff status - which is exactly how a weapon
-      // enchant comes to be worth anything. A talent that merely declares a
-      // damage effect does NOT count: without a trigger rate the model cannot
-      // value it, and the DemonSigil talents do not even declare that much.
+      // enchant comes to be worth anything.
       const options = cat.augmentCandidates(s.type);
       const scoreable = options.filter((o) => (o.affixes ?? []).some((a) => a.target?.attribute)
         || (o.skills ?? []).some((sk) => engine.plan.selfBuffsOf(sk).length));
@@ -226,19 +244,73 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = 
       p.label,
       `${chosen.length}/${p.options.length}`,
       chosen.map((id) => bold(name(id))).join(', '),
-      dropped.length ? dim('not taken: ' + dropped.map(name).join(', ')) : '',
+      // A main-hand passive is granted rather than chosen, so it is not in the
+      // pool - but leaving it off the line makes a three-skill weapon read
+      // "2/2" and look like the model lost one.
+      [dropped.length ? 'not taken: ' + dropped.map(name).join(', ') : '',
+        (p.alsoGranted ?? []).length ? 'always on: ' + p.alsoGranted.map(name).join(', ') : '',
+      ].filter(Boolean).map(dim).join('   '),
       pinnedSkills.has(p.key) ? bold('pinned') : '',
     ]);
   }
   const out = [table(['POOL', 'SLOTS', 'TAKEN', '', ''], rows)];
 
-  // Anything real that the model knows it is not scoring, named.
+  // Anything real that the model knows it is not scoring, named - and grouped
+  // by WHY, because "contributes zero" is true of a teleport and of missing
+  // damage alike and useful about neither. A reader needs to know which of
+  // these is a gap and which is the right answer.
   const un = ev?.throughput?.unmodelled ?? [];
   if (un.length) {
+    const KINDS = [
+      // NOT "so zero is correct". A rune turns a teleport into a resource
+      // generator or a damage amplifier, and the search picks the rune - so the
+      // claim is only ever about the build in front of you.
+      ['utility', 'movement only, with the rune you slotted - nothing here to score'],
+      ['rune', 'there is a rune choice here this model cannot rank - the options are below'],
+      ['resource', 'gated by a pool nothing in this build declares readable income for'],
+      ['no rate', 'the amount is in the data; nothing says how often it lands'],
+      // The guard reader looked at the script and REFUSED, which is a different
+      // statement from never having looked.
+      ['conditional', 'it procs, but only while something this reader cannot evaluate holds'],
+      ['gated off', 'its script gates it on a rank or a talent this build does not have'],
+      ['chain', 'the weapon\'s base-attack chain is shorter than its moveSet declares'],
+      ['crowd control', 'a stun, root or slow - worth nothing while the simulated foe does not act'],
+      ['status', 'its payload is a status that declares nothing readable'],
+      ['debuff', 'it only debuffs the target, and nothing it debuffs changes damage'],
+      ['script magnitude', 'the amount is computed by a script from the hit that applied it'],
+      ['script', 'everything it does lives in its hscript body'],
+      ['nothing declared', 'no effect, no affix and no status anywhere in the row'],
+    ];
+    const byKind = new Map();
+    for (const u of un) {
+      const k = u.kind ?? 'script';
+      if (!byKind.has(k)) byKind.set(k, []);
+      byKind.get(k).push(u);
+    }
     out.push('');
-    out.push(warn(`not modelled in this build (${un.length}) - these contribute zero:`));
-    for (const u of un.slice(0, 10)) out.push('  ' + u.id.padEnd(34) + dim(u.why));
-    if (un.length > 10) out.push(dim(`  ... and ${un.length - 10} more`));
+    out.push(warn(`not scored in this build (${un.length}), by cause:`));
+    for (const [kind, blurb] of KINDS) {
+      const list = byKind.get(kind);
+      if (!list?.length) continue;
+      out.push('  ' + bold(kind) + dim(`  ${blurb}`));
+      for (const u of list.slice(0, 8)) {
+        const label = u.name && u.name !== u.id ? `${u.name} (${u.id})` : u.id;
+        out.push('    ' + label);
+        // A rune the model cannot rank is a decision the user still has to
+        // make, so the promise is printed rather than summarised away - and it
+        // is printed whether or not one is slotted, because the search leaves
+        // the socket empty precisely when it cannot tell the options apart.
+        for (const r of u.runePromises ?? []) {
+          out.push('      ' + (r.slotted ? warn('slotted ') : dim('offers  ')) + dim(`${r.name}: ${r.desc}`));
+        }
+      }
+      if (list.length > 8) out.push(dim(`    ... and ${list.length - 8} more`));
+      byKind.delete(kind);
+    }
+    for (const [kind, list] of byKind) {
+      out.push('  ' + bold(kind));
+      for (const u of list) out.push('    ' + u.id + dim('  ' + u.why));
+    }
   }
   return out.join('\n');
 }
@@ -281,6 +353,9 @@ export function talentBlock(engine, loadout, alloc, cov) {
 export function throughputBlock(engine, ev, { goal }) {
   const t = ev.throughput;
   const s = ev.survivability;
+  const spread = t.fights > 1 && t.dpsSd > 0
+    ? dim(`mean of ${t.fights} fights, sd ${num(t.dpsSd, 1)} (${pct(t.dpsSd / Math.max(t.dps, 1e-9), 1)})`)
+    : dim(`one ${t.fight}s fight, procs at their expected rate`);
   const lines = [
     table(
       ['METRIC', 'VALUE', ''],
@@ -290,15 +365,34 @@ export function throughputBlock(engine, ev, { goal }) {
         ['shielding / s', num(t.sps, 1), goal === 'sps' ? bold('<- goal') : ''],
         ['effective HP', num(s.ehp, 0), goal === 'ehp' ? bold('<- goal') : ''],
         ['  physical / magical', `${num(s.ehpPhysical, 0)} / ${num(s.ehpMagical, 0)}`, dim(`reduction ${pct(s.physReduction)} / ${pct(s.magicReduction)}`)],
-        ['rotation occupancy', pct(t.busy), dim(`${pct(t.idle)} left for the base-attack chain`)],
+        ['time on cooldowns', pct(t.busy), dim(`${pct(t.fillerShare)} swinging, ${pct(t.idle)} idle`)],
+        ['fight', `${t.fight}s`, spread],
       ],
       { align: [null, 'r'] }
     ),
     '',
     bold('ROTATION') + dim(`   attacks ${t.attackRate.toFixed(2)}/s, combos ${t.comboRate.toFixed(2)}/s`)
+      + (t.rotationSearched
+        ? dim(`\n  played both ways over a ${t.rotationSearched.lookahead}s lookahead and kept the better: `
+          + `priority order ${num(t.rotationSearched.greedy, 1)}, sequenced `
+          + `${num(t.rotationSearched.sequenced, 1)}`
+          + (t.rotationSearched.won === 'sequenced'
+            ? ` - sequencing wins by ${signedPct(t.rotationSearched.sequenced / Math.max(t.rotationSearched.greedy, 1e-9) - 1, 1)}`
+            : ' - nothing here rewards ordering, so priority order stands'))
+        : dim('\n  priority: highest damage per second of commitment, cooldowns and charges permitting'))
       + (t.oversubscribed
-        ? '\n' + warn('  cooldowns alone exceed the clock, so every one is scaled to fit and nothing is left '
-          + 'for the base-attack chain. A real rotation would drop the weakest skill instead.')
+        ? '\n' + warn('  the cooldowns fill the whole clock, so the base-attack chain never runs. '
+          + 'That is a legal rotation, not an error - but it means the filler is worth nothing here.')
+        : '')
+      // A link the weapon's own item row does not list is not a detail: the
+      // combo finisher is what charges prayers and what every isFinalCombo
+      // guard rolls against, so the chain's LENGTH sets those rates. Say when
+      // it had to be recovered from the weapon type.
+      + ((ev?.rotation?.chain?.filled ?? []).length
+        ? dim(`\n  chain is ${ev.rotation.chain.links.length} links, per moveSet `
+          + `${ev.rotation.chain.moveSet}; ${ev.rotation.chain.filled.length} of them `
+          + `(${ev.rotation.chain.filled.map((f) => f.skill).join(', ')}) come from the weapon `
+          + 'type because this weapon\'s own row omits them')
         : ''),
     table(
       ['  SKILL', 'KIND', 'PER CAST', 'EVERY', 'SHARE', ''],
@@ -307,14 +401,16 @@ export function throughputBlock(engine, ev, { goal }) {
         .sort((a, b) => (b.perCast.damage + b.perCast.heal) / b.interval - (a.perCast.damage + a.perCast.heal) / a.interval)
         .map((l) => [
           '  ' + (l.name === l.id ? l.id : `${l.name}`),
-          l.kind === 'triggered' ? warn(l.kind) : dim(l.kind),
+          l.kind === 'triggered' ? warn(l.kind) : l.kind === 'over time' ? warn(l.kind) : dim(l.kind),
           num(l.perCast.damage + l.perCast.heal + l.perCast.shield, 1),
           Number.isFinite(l.interval) ? l.interval.toFixed(2) + 's' : '-',
-          l.kind === 'triggered' ? '' : pct(l.share, 0),
+          l.kind === 'active' || l.kind === 'filler' ? pct(l.share, 0) : '',
           l.why ? dim(l.why) : '',
         ]),
       { align: [null, null, 'r', 'r', 'r'] }
     ),
+    dim('  PER CAST is one cast for a skill and one swing-cycle for the chain; for a status it is'
+      + '\n  everything it ticked over the whole fight, and EVERY is the fight length.'),
   ];
   return lines.join('\n');
 }
@@ -336,27 +432,38 @@ export function short(slotId) {
 // coin flip, and saying so is worth more than presenting it as advice.
 export function runeBlock(engine, loadout, ev) {
   const T = engine.talents;
-  const pools = T.runePools(ev.rotation);
+  const pools = T.runePools(loadout);
   if (!pools.length) return dim('  (no equipped skill offers a rune choice)');
+  const what = (r) => [
+    r.gatesSteps.steps ? `${r.gatesSteps.steps} gated step(s)` : null,
+    r.gatesSteps.excluded ? `${r.gatesSteps.excluded} suppressed step(s)` : null,
+    r.gatesAffixes ? `${r.gatesAffixes} gated affix(es)` : null,
+    r.overrides.length ? `overrides ${r.overrides.join(', ')}` : null,
+    // What the SCRIPT readers get out of it - a cost change, a resource, a
+    // damage multiplier - which the data-path counts above know nothing about.
+    // Without this the column said "nothing this model can read" beside three
+    // runes the model was demonstrably reading.
+    ...(r.scripted ?? []),
+  ].filter(Boolean).join('; ');
   const rows = [];
   for (const p of pools) {
     const chosen = loadout.runes?.[p.skill] ?? null;
-    const readable = p.options.filter((r) => r.gatesSteps.steps > 0 || r.overrides.length);
+    const readable = p.options.filter((r) => r.readable);
     const pick = p.options.find((r) => r.id === chosen);
     rows.push([
       '  ' + p.name,
       pick ? bold(pick.name) : dim('(none)'),
       `${readable.length}/${p.options.length}`,
-      pick && (pick.gatesSteps.steps > 0 || pick.overrides.length)
-        ? dim([pick.gatesSteps.steps ? `${pick.gatesSteps.steps} gated step(s)` : null,
-          pick.overrides.length ? `overrides ${pick.overrides.join(', ')}` : null].filter(Boolean).join('; '))
-        : warn('nothing this model can read'),
+      pick ? (pick.readable ? dim(what(pick)) : warn('nothing this model can read')) : dim(''),
     ]);
   }
   return [
     bold('RUNES'),
     table(['  SKILL', 'SLOTTED', 'READABLE', 'WHAT IT CHANGES'], rows),
-    dim('  READABLE counts how many of the three gate a step or override a prop. Where it is 0,'
-      + '\n  the pick is a tie broken arbitrarily - the rune may still do something in game.'),
+    dim('  READABLE counts how many of the three gate a step, suppress one, gate a stat affix or'
+      + '\n  override a prop. Where it is 0, the pick is a tie broken arbitrarily - the rune may'
+      + '\n  still do something in game. The pool is every skill this build KNOWS, not only the ones'
+      + '\n  the model can already score, because a rune-gated step is what gives some of them their'
+      + '\n  damage in the first place.'),
   ].join('\n');
 }

@@ -175,7 +175,10 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       && !(c?.maxRank != null && rank > c.maxRank)
       && !(c?.equalRank != null && rank !== c.equalRank);
     const affixes = (s?.affixes ?? []).filter((a) => a.target?.attribute && inRank(a.conds));
-    const buffs = plan.selfBuffsOf(skillId);
+    // At the node's OWN rank, not at 1. A talent that holds two points states
+    // its second rank in a `minRank: 2` affix row on the status it grants, and
+    // resolving that status at rank 1 made the second point buy nothing.
+    const buffs = plan.selfBuffsOf(skillId, { rank });
     // Two data links hand a talent something it does not declare itself, and
     // one tempting third that must NOT be followed.
     //
@@ -211,11 +214,40 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       for (const eff of gp?.effects ?? []) effects.push(eff);
       for (const a of (skills.get(g)?.affixes ?? [])) if (a.target?.attribute && inRank(a.conds)) affixes.push(a);
     }
+    // A pool dot is readable now: `Warrior_Hemorrhage` declares `vars.damage`
+    // 0.35 and hands it to `addStatus` as a share of the crit that applied it.
+    // It shows up as neither an affix nor a buff nor an effect of its own, so
+    // without this the tree still reported the node the whole Warrior tree is
+    // built around as "nothing readable".
+    const dots = plan.statusesOf(skillId, { rank }).dots.filter((d) => d.pool);
+    // Scoped damage modifiers, which are not affixes and not effects - "+20%
+    // critical damage on weapon skills" is neither - so without this the tree
+    // still printed "nothing readable" beside a node the fight was scoring.
+    const mods = plan.talentModifiers(skillId, rank);
+    // ...and resource income, which is a value like any other: Seasoned
+    // Soldier's Rage per physical critical strike is what pays for a Raging
+    // Smash, and the tree printed "nothing readable" beside it.
+    const gains = plan.resourceGainsOf(skillId, { rank });
+    const FIELD = {
+      dmgMult: 'damage', critDmgMult: 'crit damage', critChance: 'crit chance',
+      armorIgnore: 'armour ignored', magicArmorIgnore: 'magic armour ignored',
+      healShare: 'of it healed back',
+    };
+    const SCOPE = { attack: 'on attacks', weaponSkill: 'on weapon skills', magic: 'on magic', bleed: 'on bleeds', all: '' };
+    const modLabel = mods.length
+      ? [...new Set(mods.map((m) => `${m.amount > 0 ? '+' : ''}${Math.round(m.amount * 100)}% `
+        + `${FIELD[m.field] ?? m.field} ${SCOPE[m.scope] ?? m.scope}`.trim()
+        + (m.targetBleeding ? ' vs bleeding' : '')))].join(', ')
+      : '';
     v = {
-      affixes, buffs, effects, granted,
-      readable: affixes.length > 0 || buffs.length > 0 || effects.length > 0,
+      affixes, buffs, effects, granted, dots, mods, gains,
+      readable: affixes.length > 0 || buffs.length > 0 || effects.length > 0
+        || dots.length > 0 || mods.length > 0 || gains.length > 0,
       kind: affixes.length ? 'affix' : buffs.length ? 'status'
-        : granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : 'none',
+        : dots.length ? `${Math.round(dots[0].pool.fraction * 100)}% of `
+          + `${dots[0].pool.magic ? 'magic' : 'physical'} crits as a bleed`
+          : modLabel || (gains.length ? gains.map((g) => `+${g.amount} ${g.atb}${g.critGated ? ' per crit' : ''}`).join(', ') : '')
+            || (granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : 'none'),
       // `props.talent.maxPoints` caps how many points a node takes. It is 2 on
       // 48 of the 88 nodes - every tier-2, and two thirds of tier 3 - so "one
       // point per node" was wrong for more than half the tree.
@@ -285,7 +317,7 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
    * points OR out of readable nodes - it does NOT spend the remainder on nodes
    * it cannot value, because that would be inventing a recommendation.
    */
-  function suggest(unitId, { level, points = null, granted = new Set() } = {}) {
+  function suggest(unitId, { level, points = null, granted = new Set(), value = null } = {}) {
     const tree = treeFor(unitId);
     const budget = pointsAt(level, points);
     const perBranch = new Map();
@@ -302,10 +334,18 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       for (const e of v.effects) w += Math.abs(e.baseVal ?? 0) + e.scaling.reduce((s, x) => s + Math.abs(x.ratio) * 50, 0);
       return w;
     };
-    const pointWeight = (id, atRank) => {
-      const here = magnitude(readableValue(id, atRank));
-      const before = atRank > 1 ? magnitude(readableValue(id, atRank - 1)) : 0;
-      return here - before;
+    // `value(nodeId, rank, ranksSoFar)` lets a caller rank a point by the real
+    // objective instead of by the size of the numbers on it. The magnitude
+    // heuristic cannot tell +6 CooldownReduction from +6 MagicMastery, and for
+    // a dps build those are worth very different things. It stays as the
+    // tiebreak, because the objective is flat across every node the model
+    // cannot read and something has to order those.
+    const heuristicWeight = (id, atRank) => magnitude(readableValue(id, atRank))
+      - (atRank > 1 ? magnitude(readableValue(id, atRank - 1)) : 0);
+    const pointWeight = (id, atRank, ranks) => {
+      const heuristic = heuristicWeight(id, atRank);
+      if (!value) return { score: heuristic, heuristic };
+      return { score: value(id, atRank, ranks), heuristic };
     };
 
     // An allocation is a rank per node, not a set of nodes. `perBranch` counts
@@ -331,12 +371,20 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     if (rootNode && !ranks.has(rootNode.skill) && spent < budget) addPoint(rootNode, 1);
 
     // Readable value still unclaimed in a branch: what a gate point is buying.
+    // Always the heuristic, never the objective - `promise` has to compare
+    // branches by what is LEFT in them, and evaluating a build for every
+    // unbought point in every branch on every iteration is not worth it. It
+    // calls `heuristicWeight` directly rather than `pointWeight`, because
+    // going through the latter would run the objective hook and throw the
+    // answer away - about six full evaluations per point, for nothing.
     const promise = (branchIndex) => tree.nodes
       .filter((n) => n.branchIndex === branchIndex)
       .reduce((sum, n) => {
         const at = ranks.get(n.skill) ?? 0;
         let rest = 0;
-        for (let r = at + 1; r <= maxPointsOf(n.skill); r++) rest += Math.max(0, pointWeight(n.skill, r));
+        for (let r = at + 1; r <= maxPointsOf(n.skill); r++) {
+          rest += Math.max(0, heuristicWeight(n.skill, r));
+        }
         return sum + rest;
       }, 0);
 
@@ -351,13 +399,16 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
         if (granted.has(n.skill)) continue;
         if (at >= maxPointsOf(n.skill)) continue;
         if (at === 0 && cumulative(n.branchIndex) < tierThreshold(n.tier)) continue;
-        legal.push({ n, next: at + 1, w: pointWeight(n.skill, at + 1) });
+        const w = pointWeight(n.skill, at + 1, ranks);
+        legal.push({ n, next: at + 1, w: w.score, h: w.heuristic });
       }
       if (!legal.length) break;
 
       legal.sort((a, b) => {
         const d = b.w - a.w;
         if (Math.abs(d) > 1e-9) return d;
+        const h = b.h - a.h;
+        if (Math.abs(h) > 1e-9) return h;
         const p = promise(b.n.branchIndex) - promise(a.n.branchIndex);
         if (Math.abs(p) > 1e-9) return p;
         if (a.n.tier !== b.n.tier) return a.n.tier - b.n.tier;
@@ -367,7 +418,7 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       const best = legal[0];
       // Nothing readable is reachable and nothing is locked behind what is
       // left: stop rather than spend the tail at random.
-      if (best.w <= 0 && promise(best.n.branchIndex) <= 0) break;
+      if (best.w <= 0 && best.h <= 0 && promise(best.n.branchIndex) <= 0) break;
       addPoint(best.n, best.next);
     }
 
@@ -402,28 +453,117 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
   }
   // --- runes ----------------------------------------------------------------
   // A rune (the game calls them skill masteries) is one of three per skill, and
-  // it modifies its skill two ways, both readable:
+  // it modifies its skill in FOUR readable ways, not the two an earlier reading
+  // of this file counted:
   //
   //   * `steps[].cond.mastery` names a rune; that step exists only when the
-  //     rune is slotted. 19 steps are gated this way across 17 runes, and 6 of
-  //     them carry damage effects.
-  //   * `mastery[].props` overrides the skill's own props. Only `charges` and
-  //     `cooldown` appear, and both change throughput directly.
+  //     rune is slotted.
+  //   * `steps[].cond.masteryExclude` is the mirror image: the step exists only
+  //     while that rune is NOT slotted.
+  //   * `mastery[].props` overrides the skill's own props - `charges` and
+  //     `cooldown`, both of which change throughput directly.
+  //   * `affixes[].conds.mastery` gates a stat affix. Five runes are readable
+  //     ONLY this way, and every one of them sits on a `*_Status` row rather
+  //     than on the skill that owns the rune, which is why counting per skill
+  //     missed them.
+  //
+  // The gates are not local either: three of the 19 gated steps live on a
+  // `*_Status` skill while the rune that gates them is declared on the ability
+  // that applies the status. So every count here is taken over the WHOLE sheet
+  // and keyed by mastery id, never by "the skill this rune belongs to".
   //
   // Everything else a rune does lives in its description and in game code.
-  function runesFor(skillId) {
-    return (skills.get(skillId)?.mastery ?? []).map((m) => ({
-      id: m.id,
-      name: m.text?.name ?? m.id,
-      desc: m.text?.desc ?? '',
-      props: m.props ?? {},
-      vars: m.vars ?? {},
-      // What the model can actually read out of it.
-      gatesSteps: gatedSteps(skillId, m.id),
-      overrides: Object.keys(m.props ?? {}),
-    }));
+
+  // masteryId -> what the data says it changes, computed once over every row.
+  const runeIndex = (() => {
+    const idx = new Map();
+    const touch = (id) => {
+      let e = idx.get(id);
+      if (!e) { e = { gatedSteps: 0, gatedStepsWithEffects: 0, excludedSteps: 0, gatedAffixes: 0, overrides: [] }; idx.set(id, e); }
+      return e;
+    };
+    const owner = new Map();
+    for (const s of cdb.lines('skill')) {
+      for (const m of s.mastery ?? []) {
+        owner.set(m.id, s.id);
+        const e = touch(m.id);
+        e.overrides = Object.keys(m.props ?? {});
+      }
+    }
+    for (const s of cdb.lines('skill')) {
+      for (const st of s.steps ?? []) {
+        if (st.cond?.mastery) {
+          const e = touch(st.cond.mastery);
+          e.gatedSteps++;
+          if ((st.effects ?? []).length) e.gatedStepsWithEffects++;
+        }
+        if (st.cond?.masteryExclude) touch(st.cond.masteryExclude).excludedSteps++;
+      }
+      for (const a of s.affixes ?? []) {
+        if (a.conds?.mastery && a.target?.attribute) touch(a.conds.mastery).gatedAffixes++;
+      }
+    }
+    for (const [id, e] of idx) {
+      e.owner = owner.get(id) ?? null;
+      e.readable = e.gatedSteps > 0 || e.excludedSteps > 0 || e.gatedAffixes > 0 || e.overrides.length > 0;
+    }
+    return idx;
+  })();
+
+  const EMPTY_RUNE = { gatedSteps: 0, gatedStepsWithEffects: 0, excludedSteps: 0, gatedAffixes: 0, overrides: [], readable: false };
+  const runeFacts = (masteryId) => runeIndex.get(masteryId) ?? EMPTY_RUNE;
+
+  /**
+   * Does the model read anything out of the SCRIPT for this rune?
+   *
+   * `runeFacts` only counts the data paths - a gated step, a gated affix, a
+   * prop override - and that was the whole story until the script readers
+   * landed. Now `Scent of Battle` changes a cost, `Juggernaut` grants Rage and
+   * `Concentrated Impact` adds 40% damage, and the column still printed
+   * "nothing this model can read" beside all three. Asked the honest way: price
+   * the skill with the rune and without it, and see whether anything moved.
+   */
+  function scriptReads(skillId, runeId) {
+    const off = combat.profile(skillId, 3, new Set());
+    const on = combat.profile(skillId, 3, new Set([runeId]));
+    const what = [];
+    const cost = (p) => (p?.costs ?? []).map((c) => c.atb + c.amount).join(',');
+    if (cost(off) !== cost(on)) what.push('changes its cost');
+    if ((on?.runeDamage ?? []).length > (off?.runeDamage ?? []).length) {
+      const d = on.runeDamage[on.runeDamage.length - 1];
+      what.push(`+${Math.round(d.amount * 100)}% damage${d.singleTarget ? ' at one target' : ''}`);
+    }
+    const gains = plan.resourceGainsOf(skillId, { rank: 3, runes: new Set([runeId]) });
+    const base = plan.resourceGainsOf(skillId, { rank: 3, runes: new Set() });
+    if (gains.length > base.length) {
+      const g = gains[gains.length - 1];
+      what.push(`+${g.amount} ${g.atb}`);
+    }
+    return what;
   }
 
+  function runesFor(skillId) {
+    return (skills.get(skillId)?.mastery ?? []).map((m) => {
+      const f = runeFacts(m.id);
+      const scripted = scriptReads(skillId, m.id);
+      return {
+        scripted,
+        id: m.id,
+        name: m.text?.name ?? m.id,
+        desc: m.text?.desc ?? '',
+        props: m.props ?? {},
+        vars: m.vars ?? {},
+        // What the model can actually read out of it.
+        gatesSteps: { steps: f.gatedSteps, withEffects: f.gatedStepsWithEffects, excluded: f.excludedSteps },
+        gatesAffixes: f.gatedAffixes,
+        overrides: f.overrides,
+        readable: f.readable || scripted.length > 0,
+      };
+    });
+  }
+
+  // Kept for callers that want the per-skill figure; the whole-sheet one is
+  // `runeFacts`, and that is what every count uses.
   function gatedSteps(skillId, masteryId) {
     const s = skills.get(skillId);
     let n = 0, withEffects = 0;
@@ -435,24 +575,118 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     return { steps: n, withEffects };
   }
 
-  /** Every skill in this rotation that offers a rune choice. */
-  function runePools(rotation) {
+  /**
+   * The live rune census. Hardcoding these numbers is how the output came to
+   * claim "17 of 84" when the data said 26 - so nothing here is a literal.
+   */
+  function runeCoverage() {
+    let skillsWithRunes = 0, total = 0;
+    const gates = new Set(), excludes = new Set(), overrides = new Set(), affixes = new Set();
+    for (const s of cdb.lines('skill')) {
+      const ms = s.mastery ?? [];
+      if (!ms.length) continue;
+      skillsWithRunes++;
+      for (const m of ms) {
+        total++;
+        const f = runeFacts(m.id);
+        if (f.gatedSteps) gates.add(m.id);
+        if (f.excludedSteps) excludes.add(m.id);
+        if (f.overrides.length) overrides.add(m.id);
+        if (f.gatedAffixes) affixes.add(m.id);
+      }
+    }
+    const readable = new Set([...gates, ...excludes, ...overrides, ...affixes]);
+    return {
+      skillsWithRunes, total,
+      gatesSteps: gates.size,
+      excludesSteps: excludes.size,
+      overridesProps: overrides.size,
+      gatesAffixes: affixes.size,
+      readable: readable.size,
+      overrideKeys: [...new Set([...runeIndex.values()].flatMap((e) => e.overrides))].sort(),
+    };
+  }
+
+  /**
+   * Every skill this build can press that offers a rune choice.
+   *
+   * This deliberately does NOT read the resolved rotation. A skill only reaches
+   * the rotation once its profile already carries a Damage/Heal/Shield effect,
+   * and a rune-gated step is exactly what can ADD that effect - so asking the
+   * rotation which runes to offer meant a rune that would make a skill worth
+   * pressing could never be found. The pool comes from what is EQUIPPED and
+   * SLOTTED instead, which is what the player is actually choosing between.
+   */
+  function runePools(loadoutOrRotation) {
+    const ids = loadoutOrRotation?.gear
+      ? runableSkillIds(loadoutOrRotation)
+      : [...(loadoutOrRotation?.active ?? []), ...(loadoutOrRotation?.triggered ?? []),
+        ...(loadoutOrRotation?.filler ?? []), ...(loadoutOrRotation?.passive ?? [])].map((e) => e.prof.id);
     const out = [];
     const seen = new Set();
-    for (const entry of [...rotation.active, ...rotation.triggered, ...rotation.filler, ...(rotation.passive ?? [])]) {
-      const id = entry.prof.id;
+    for (const id of ids) {
       if (seen.has(id)) continue;
       seen.add(id);
       const runes = runesFor(id);
       if (runes.length < 2) continue;
-      out.push({ key: `rune/${id}`, skill: id, name: entry.prof.name, options: runes, slots: 1 });
+      out.push({
+        key: `rune/${id}`, skill: id,
+        name: skills.get(id)?.texts?.name ?? id,
+        options: runes, slots: 1,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Every skill id a loadout grants, before the rotation decides which of them
+   * it can put a cast rate on. Runes attach to skills you KNOW, not to skills
+   * the model happens to be able to score.
+   */
+  function runableSkillIds(loadout) {
+    const out = [];
+    const push = (id) => { if (id) out.push(id); };
+
+    // A class skill has an unlock level and the data states it. Offering runes
+    // on a skill the character has not learned let the search slot and score
+    // one - `Mage_ChronoReset` unlocks at 20, `Rogue_Darkness` at 24 - which is
+    // advice for a character that does not exist yet.
+    const unit = cdb.byId('unit').get(loadout.class);
+    for (const s of unit?.skills ?? []) {
+      if ((s.level ?? 0) > loadout.level) continue;
+      push(s.skill ?? s.ref);
+    }
+
+    for (const slot of cat.combatSlots()) {
+      const g = loadout.gear[slot.id];
+      if (!g?.item) continue;
+      const item = cat.itemById.get(g.item);
+      if (!item) continue;
+      // The arsenal hands you only what you slotted; every other slot hands you
+      // everything it carries.
+      const chosen = loadout.skills?.[slot.id];
+      const from = slot.id === 'Slot_Weapon2' && chosen?.length ? chosen : item.skills;
+      for (const id of from ?? []) push(id);
+      for (const s of cat.inherited(item.type, (t) => t?.skills) ?? []) push(s.skill ?? s.ref);
+      for (const type of cat.socketsFor(item)) {
+        const augId = loadout.augments?.[`${slot.id}/${type}`];
+        for (const id of (augId ? cat.itemById.get(augId)?.skills : null) ?? []) push(id);
+      }
+    }
+    for (const list of Object.values(loadout.skills ?? {})) for (const id of list) push(id);
+    // A talent can grant a skill, and a granted skill can carry runes.
+    for (const id of Object.keys(loadout.talents ?? {})) {
+      push(id);
+      for (const g of readableValue(id, loadout.talents[id]).granted) push(g);
     }
     return out;
   }
 
   return {
+    /** The scoped damage modifiers a node confers at the rank it holds. */
+    modifiersOf: (id, rank) => plan.talentModifiers(id, rank),
     treeFor, readableValue, illegalAllocation, suggest, coverage, pointsAt,
-    runesFor, runePools, gatedSteps,
+    runesFor, runePools, gatedSteps, runeFacts, runeCoverage, runableSkillIds,
     thresholds, unlockLevel, branchNames,
     defaultPointsAtCap: DEFAULT_POINTS_AT_CAP,
   };

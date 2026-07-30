@@ -141,6 +141,71 @@ export function buildAttributeTable(cdb) {
   return { attrs, byId, order };
 }
 
+// --- how a modifier composes with another of its kind ----------------------
+
+/**
+ * The `affix` sheet says how each modifier stacks, in a column nothing read.
+ * `affix.stack` is an `AffixStacking` custom type:
+ *
+ *   TAttribute_Flat       (none)            additive
+ *   TAttribute_ARatio     (none)            additive, into the modAdd sum
+ *   TAttribute_MRatio     Multiplicative    the multiplier COMPOUNDS, and it
+ *                                           REPLACES rather than adds: a
+ *                                           DamageTakenModifier of 0.6 means
+ *                                           "you take 60% of what you would",
+ *                                           i.e. a 40% reduction
+ *   TAttribute_MRatioMin  Min(base: 1)      the STRONGEST applies and they do
+ *                                           NOT compound - two 30% slows are a
+ *                                           30% slow, not 51%
+ *
+ * Two readings were wrong before this was read. `catalog.applyAffixes` composed
+ * a multiplicative affix as `cur * (1 + v)` while `engine.applyAffix` composed
+ * the same ref as `cur * v`, so the same row meant different things depending on
+ * whether it arrived on an item or in a status; and `MRatioMin` was treated as
+ * `MRatio` everywhere, which compounds eight slow rows that the sheet says take
+ * the minimum. Neither is live today - no equippable or augment carries a
+ * multiplicative affix and every MRatioMin row targets MoveSpeedFactor, which
+ * nothing here scores - so this changes no number. It stops the day one is
+ * authored from being a silent factor-of-two.
+ */
+export function buildAffixRules(cdb) {
+  const stacking = new Map();
+  for (const a of cdb.lines('affix')) {
+    stacking.set(a.id, a.stack ? cdb.custom('AffixStacking', a.stack) : null);
+  }
+
+  // Which of the three modifier accumulators a row feeds. Only these four of
+  // the twelve `affix` rows target an attribute at all; the rest are inventory
+  // size, craft chances and internal markers.
+  const KIND = {
+    TAttribute_Flat: 'flat',
+    TAttribute_ARatio: 'addRatio',
+    TAttribute_MRatio: 'mulRatio',
+    TAttribute_MRatioMin: 'mulRatio',
+  };
+
+  /** Fold one multiplicative value into whatever is already there. */
+  function composeMul(ref, current, value) {
+    const st = stacking.get(ref);
+    if (st?.case === 'Min') return Math.min(current, value);
+    if (st?.case === 'Max') return Math.max(current, value);
+    return current * value;             // Multiplicative, and the default
+  }
+
+  /**
+   * Scale a modifier by a slot factor (the arsenal's 0.4) or an uptime.
+   * An additive value scales directly; a MULTIPLIER cannot - scaling 0.6 by 0.4
+   * gives 0.24, which is a far bigger reduction than the affix grants. What a
+   * fractional share of a multiplier means is a blend toward 1.
+   */
+  function scaleValue(ref, value, factor) {
+    if (factor === 1) return value;
+    return KIND[ref] === 'mulRatio' ? 1 + (value - 1) * factor : value * factor;
+  }
+
+  return { stacking, kindOf: (ref) => KIND[ref] ?? null, composeMul, scaleValue };
+}
+
 // --- constants -------------------------------------------------------------
 
 export function loadConstants(cdb) {
@@ -202,7 +267,19 @@ export function computeSheet(ctx, { base, mods, level }) {
     const mMul = mulRatio.get(a.id) ?? 1;
 
     let v = (stored + scaled + f) * mAdd * mMul;
-    if (a.roundUp) v = Math.ceil(v - 1e-9);
+    // `RoundUp` is the flag's NAME, not its behaviour on this path. Checked
+    // against a real level-25 Warrior with no equipment and no talents, where
+    // the level curve is the only thing feeding these:
+    //
+    //   raw 33.974 -> game 34    ceil 34   round 34   floor 33
+    //   raw 28.091 -> game 28    ceil 29   round 28   floor 28
+    //   raw 38.211 -> game 38    ceil 39   round 38   floor 38
+    //
+    // Ceiling matches one of the three, flooring matches two, ROUNDING matches
+    // all three - and it is the only rule that can. Ceiling put every primary
+    // one point high on a naked character, which then fed CritChance through
+    // its 0.014-per-Dexterity-and-Faith scaling and moved the derived stats too.
+    if (a.roundUp) v = Math.round(v);
     if (!a.negativeAllowed && v < 0) v = 0;
     out.set(a.id, v);
   }
@@ -283,5 +360,6 @@ export function buildContext(cdb) {
     if (v == null) throw new Error(`constant ${k} missing from data.cdb - the game changed shape`);
   }
   const attrTable = buildAttributeTable(cdb);
-  return { cdb, consts, attrTable };
+  const affix = buildAffixRules(cdb);
+  return { cdb, consts, attrTable, affix };
 }
