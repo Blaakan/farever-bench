@@ -231,7 +231,11 @@ function commonSetup(args) {
     : null;
   const goal = String(args.flags.goal ?? 'dps');
   if (!GOALS.includes(goal)) die(`--goal must be one of ${GOALS.join(', ')}`);
-  const targetName = String(args.flags.target ?? 'reference');
+  // Default to a boss rather than to `Armor_ExpectedReduction`. Every named boss
+  // and every world elite sits at 0.40 reduction while that constant is 0.25,
+  // which understates penetration by nearly half against the content anyone
+  // actually gears for. See `bench targets`.
+  const targetName = String(args.flags.target ?? 'boss');
   const rank = args.flags.rank ? Number(args.flags.rank) : engine.ctx.consts.weaponSkillMaxRank;
   const mix = args.flags.mix != null ? Number(args.flags.mix) : 0.5;
   const exPattern = args.flags['include-all'] ? null
@@ -499,6 +503,66 @@ const commands = {
     ].join('\n'));
   },
 
+  targets(args) {
+    const s = commonSetup(args);
+    const { combat } = s.engine;
+    const [a, b] = s.engine.ctx.consts.resistFormula;
+    // Damage that gets through, at a given penetration.
+    const through = (armor, pen) => {
+      const r = armor * (1 - pen / 100);
+      return 1 - r / (r + a + b * s.level);
+    };
+
+    console.log(f.header(s.engine, VERSION) + '\n');
+    console.log(`What the world resists at level ${s.level}, and what penetration buys against it.\n`);
+    console.log(f.table(
+      ['TARGET', 'UNIT', 'PHYS', 'MAG', 'ARMOUR', 'NO PEN', '25% PEN', '50% PEN', 'GAIN @50%'],
+      combat.foes.map((n) => {
+        const t = combat.foe(n, s.level);
+        const base = through(t.armor, 0);
+        return [
+          n, t.name.replace(/^[^(]*\(|\)$/g, ''),
+          f.pct(t.physReduction, 0), f.pct(t.magicReduction, 0), f.num(t.armor, 0),
+          f.pct(base), f.pct(through(t.armor, 25)), f.pct(through(t.armor, 50)),
+          t.armor > 0 ? f.signedPct(through(t.armor, 50) / base - 1, 1) : f.dim('-'),
+        ];
+      }), { align: [null, null, 'r', 'r', 'r', 'r', 'r', 'r', 'r'] }));
+
+    console.log(f.dim(`\n  ${combat.targetsByUnit.size} units resolve an armour intent through inheritance, ` +
+      'so --target also\n  accepts any unit id directly.'));
+
+    console.log('\n' + f.bold('WHERE THESE COME FROM'));
+    console.log([
+      '  `unit.stats[].specScaling.armorReduction` and `.magicReduction`. Foes',
+      '  express armour as a target damage REDUCTION, exactly the way the four',
+      '  classes do, and resistForReduction turns that intent into a number. 27',
+      '  units declare one and the rest inherit it, so nothing here is invented.',
+      '',
+      '  The ladder the world is built on:',
+      '',
+      '    W_Assassin 0.20  <  W_Base_Small / D_Base_Small 0.25  <  W_Base 0.30',
+      '      <  W_Base_Big / W_Base_Unique / D_Base_Big 0.35  <  W_Base_Elite 0.40',
+      '      =  every named boss (Ratsar, Mokshi, Crabgantua, Phrixes, Cleodora,',
+      '         MunsterChuck, Ulserous, DemonSuperElite)',
+      '',
+      f.bold('  Two things follow, and both matter for gearing:'),
+      '',
+      '  * Physical and magical reduction are EQUAL on every real foe. Only the',
+      '    dev punching bags split them (PunchingBagArmor 0.5/0, PunchingBagMagicRes',
+      '    0/0.5). So ArmorPenetration and SpellPenetration are worth the same',
+      '    against everything currently in the game - which one you want is decided',
+      '    by your class and your gear\'s faction, never by the fight.',
+      '',
+      `  * Armor_ExpectedReduction (${s.engine.cdb.constant('Armor_ExpectedReduction')}) is well below what you actually fight, so`,
+      '    it understates penetration by nearly half against a boss. That is why',
+      '    the default target is a boss and not that constant.',
+      '',
+      f.dim('  Not modelled: unitType.props.resistance is an affinity-level resistance'),
+      f.dim('  hook and only Bee uses it (Honey), so it is inert. Foe level is taken'),
+      f.dim('  from --level; zone rows carry levels 1..25 if you want a specific one.'),
+    ].join('\n'));
+  },
+
   audit(args) {
     const { engine } = commonSetup(args);
     console.log(f.header(engine, VERSION) + '\n');
@@ -518,6 +582,7 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
   bench classes    the playable classes and what they scale off
   bench slots      the slots, their stat share, and which augments they host
   bench rarity     which rarities each slot can reach, and how that is derived
+  bench targets    what the world actually resists, and what penetration buys
   bench audit      every assumption and gap in the model
 
 Common flags
@@ -525,7 +590,8 @@ Common flags
   --level <n>             default: the game's MaxLevel
   --goal <g>              dps | hps | sps | ehp | mixed (default dps)
   --weight <g>=<n>        blend goals, e.g. --weight dps=1 --weight ehp=0.25
-  --target <t>            dummy | reference | armoured  (default reference)
+  --target <t>            dummy | small | trash | big | elite | boss | dungeon
+                          | reference | any unit id     (default boss)
   --stars <n|max>         upgrade stars to assume       (default max)
   --rarity <list>         restrict to e.g. Rare,Epic
   --rank <n>              weapon-skill rank 1-3        (default max)

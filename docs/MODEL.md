@@ -679,3 +679,58 @@ To reproduce a reading yourself, pin the instance level:
 ```bash
 bench sheet --class Rogue --level 25 --pin 'weapon1=Spear_Eruption^10*0'
 ```
+
+---
+
+## 13. What the world actually resists
+
+Penetration is worthless without knowing what it is penetrating, and the answer
+is fully in the data: foes express armour the same way the four classes do, as a
+target damage **reduction**, in
+`unit.stats[].specScaling.armorReduction` and `.magicReduction`. Feeding that
+through `resistForReduction` and back returns exactly the stated fraction at zero
+penetration, so a target is completely described by two numbers - and both are
+authored, not invented here.
+
+27 units declare an intent and the rest inherit it up the `unit.inherit` chain,
+which resolves for 420 units. The ladder the world is built on:
+
+| tier | reduction | who |
+|---|---|---|
+| `W_Assassin` | 0.20 | world assassins |
+| `W_Base_Small`, `D_Base_Small`, `W_Assassin_U` | 0.25 | small mobs |
+| `W_Base` | 0.30 | world trash |
+| `W_Base_Big`, `W_Base_Unique`, `D_Base_Big` | 0.35 | big and unique mobs, dungeon mobs |
+| `W_Base_Elite` | 0.40 | world elites |
+| named bosses | 0.40 | Ratsar, Mokshi, Crabgantua, Phrixes, Cleodora, MunsterChuck, Ulserous, DemonSuperElite |
+| `Dummy`, `PunchingBag` | 0 | dev targets |
+| `PunchingBagArmor` / `PunchingBagMagicRes` | 0.5 / 0 and 0 / 0.5 | dev targets, the only split ones |
+
+Two consequences, and both change how you gear.
+
+**Physical and magical reduction are equal on every real foe.** Only the dev
+punching bags split them. So `ArmorPenetration` and `SpellPenetration` are worth
+exactly the same against everything currently in the game: which one you want is
+decided by your class and your gear's faction, never by the fight. The test suite
+asserts this, so a patch that starts splitting them fails by name - and that is
+precisely when a gearing tool needs to be told.
+
+**`Armor_ExpectedReduction` is softer than what you fight.** At level 25:
+
+| target | reduction | armour | damage through | at 50% pen | gain |
+|---|---|---|---|---|---|
+| `reference` (the constant) | 0.25 | 962 | 75.0% | 85.7% | **+14.3%** |
+| `trash` | 0.30 | 1236 | 70.0% | 82.4% | +17.6% |
+| `big` / `dungeon` | 0.35 | 1553 | 65.0% | 78.8% | +21.2% |
+| `elite` / `boss` | 0.40 | 1923 | 60.0% | 75.0% | **+25.0%** |
+
+Penetration is worth nearly twice as much against a boss as against the
+designers' reference constant, which is why the default `--target` is `boss` and
+not `reference`. `--target` also accepts any unit id whose intent resolves.
+
+**Not modelled.** `unitType.props.resistance` is an affinity-level resistance
+hook and only `Bee` uses it (`Honey`), so it is inert today - and since every
+magic sub-school is empty (§4), an affinity resistance would have nothing to
+attach to anyway. Foe level comes from `--level`; the 125 `zone` rows carry
+levels 1..25 if a specific one matters. And `specScaling.playerCount` scales boss
+health and add counts with party size, which the model does not carry.

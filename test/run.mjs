@@ -679,12 +679,53 @@ group('reference targets');
 
   const onDummy = engine.evaluate(build, { target: engine.combat.foe('dummy', 25) });
   const onRef = engine.evaluate(build, { target: engine.combat.foe('reference', 25) });
-  const onArmoured = engine.evaluate(build, { target: engine.combat.foe('armoured', 25) });
+  const onArmoured = engine.evaluate(build, { target: engine.combat.foe('boss', 25) });
   ok('a mitigating target lowers damage', onDummy.throughput.dps > onRef.throughput.dps);
   ok('more armour lowers it further', onRef.throughput.dps > onArmoured.throughput.dps);
   ok('the dummy really has no mitigation', engine.combat.foe('dummy', 25).armor === 0);
   ok('a build does some damage at all', onDummy.throughput.dps > 0);
   ok('the rotation is not empty', onDummy.throughput.lines.length > 0);
+
+  // Foe armour is derived from the units' own declared reduction intent
+  // (unit.stats[].specScaling.armorReduction), not from a table in this repo.
+  // The ladder must keep its shape, or the penetration numbers move silently.
+  const red = (n) => engine.combat.foe(n, 25).physReduction;
+  ok('the archetype ladder is ordered small < trash < big <= elite',
+    red('small') < red('trash') && red('trash') < red('big') && red('big') <= red('elite'),
+    [red('small'), red('trash'), red('big'), red('elite')].join(' < '));
+  ok('a named boss matches the elite tier', red('boss') === red('elite'),
+    `${red('boss')} vs ${red('elite')}`);
+  ok('Armor_ExpectedReduction is softer than what you actually fight',
+    engine.combat.foe('reference', 25).physReduction < red('boss'),
+    `${engine.combat.foe('reference', 25).physReduction} vs ${red('boss')}`);
+
+  // Physical and magical reduction are EQUAL on every real foe, which is why
+  // ArmorPenetration and SpellPenetration are interchangeable in value. If a
+  // patch splits them, penetration choice starts depending on the fight - and
+  // that is exactly when this tool needs to be told.
+  let split = 0;
+  for (const [id, i] of engine.combat.targetsByUnit) {
+    if (/Dummy|PunchingBag/.test(id)) continue;      // dev targets deliberately split
+    if (i.phys == null || i.mag == null) continue;
+    if (i.phys !== i.mag) split++;
+  }
+  ok('no real foe splits physical and magical reduction', split === 0,
+    `${split} units do - penetration is no longer target-independent`);
+  ok('a real unit id works as a target', engine.combat.foe('Ratsar', 25).armor > 0);
+  ok('most units resolve an intent through inheritance', engine.combat.targetsByUnit.size > 100,
+    String(engine.combat.targetsByUnit.size));
+
+  // Penetration is worth more against a harder target - the whole reason the
+  // default moved off the constant.
+  const gain = (n) => {
+    const t = engine.combat.foe(n, 25);
+    const [a, b] = K.resistFormula;
+    const at = (pen) => { const r = t.armor * (1 - pen / 100); return 1 - r / (r + a + b * 25); };
+    return at(50) / at(0) - 1;
+  };
+  ok('50% penetration is worth more against a boss than against the constant',
+    gain('boss') > gain('reference') * 1.5,
+    `${(gain('boss') * 100).toFixed(1)}% vs ${(gain('reference') * 100).toFixed(1)}%`);
 }
 
 // --- reporting -------------------------------------------------------------

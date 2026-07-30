@@ -179,21 +179,99 @@ export function buildCombat(cdb, ctx) {
   // formula returns exactly that fraction at zero penetration. The default
   // comes from the game's own `Armor_ExpectedReduction` constant, so it is the
   // designers' reference and not one this tool invented.
+  // Foes express armour the same way classes do: as a target damage REDUCTION,
+  // in `unit.stats[].specScaling.armorReduction` / `.magicReduction`. Feeding
+  // that through resistForReduction and back returns exactly the fraction at
+  // zero penetration, so a target is fully described by two numbers - and those
+  // numbers are in the data, not invented here.
+  //
+  // 27 units declare one. They form an archetype ladder that most of the world
+  // inherits from:
+  //
+  //   W_Assassin 0.20  <  W_Base_Small / D_Base_Small 0.25  <  W_Base 0.30
+  //     <  W_Base_Big / W_Base_Unique / D_Base_Big 0.35  <  W_Base_Elite 0.40
+  //     =  every named boss (Crabgantua, Mokshi, Ratsar, Phrixes, Cleodora,
+  //        MunsterChuck, Ulserous, DemonSuperElite)
+  //
+  // Two things worth knowing, both straight out of that table:
+  //
+  //   * Physical and magical reduction are EQUAL on every real foe. Only the
+  //     dev punching bags split them (PunchingBagArmor is 0.5/0, PunchingBagMagicRes
+  //     is 0/0.5). So ArmorPenetration and SpellPenetration are worth the same
+  //     against everything currently in the game; which one you want is decided
+  //     by your class and your gear's faction, not by what you are fighting.
+  //   * `Armor_ExpectedReduction` (0.25) is well below what you actually fight.
+  //     At level 25, 50% penetration is worth +14% damage against 0.25 and +25%
+  //     against a 0.40 boss, so a reference target understates penetration by
+  //     nearly half against the content that matters.
+  const units = cdb.byId('unit');
+  function unitChain(id) {
+    const o = [];
+    for (let c = units.get(id); c;) { o.push(c); const p = (c.inherit ?? [])[0]?.ref; c = p ? units.get(p) : null; }
+    return o;
+  }
+
+  // The nearest declaration up the inheritance chain, which is how a mob that
+  // declares nothing still has armour.
+  function armourIntent(unitId) {
+    let phys = null, mag = null;
+    for (const c of unitChain(unitId)) {
+      for (const s of c.stats ?? []) {
+        if (s.attribute === 'Armor' && phys == null && s.specScaling?.armorReduction != null) phys = s.specScaling.armorReduction;
+        if (s.attribute === 'MagicArmor' && mag == null && s.specScaling?.magicReduction != null) mag = s.specScaling.magicReduction;
+      }
+    }
+    return { phys, mag };
+  }
+
+  // Every unit whose intent is declared or inherited, so `--target <unitId>`
+  // works for anything in the world.
+  const targetsByUnit = new Map();
+  for (const u of cdb.lines('unit')) {
+    const i = armourIntent(u.id);
+    if (i.phys == null && i.mag == null) continue;
+    targetsByUnit.set(u.id, i);
+  }
+
   const expected = cdb.constant('Armor_ExpectedReduction');
-  const FOES = {
-    dummy: { name: 'dummy (no mitigation)', physReduction: 0, magicReduction: 0 },
-    reference: { name: `reference (Armor_ExpectedReduction ${expected})`, physReduction: expected, magicReduction: expected },
-    armoured: { name: 'armoured (2x reference)', physReduction: Math.min(0.9, expected * 2), magicReduction: Math.min(0.9, expected * 2) },
+  // Named shortcuts, each pointing at a real archetype unit rather than a made-up
+  // number. `reference` stays because it is the designers' own constant, but it
+  // is now clearly the odd one out.
+  const NAMED = {
+    dummy: { unit: 'Dummy', label: 'training dummy, no mitigation' },
+    reference: { phys: expected, mag: expected, label: `Armor_ExpectedReduction ${expected}` },
+    trash: { unit: 'W_Base', label: 'world trash' },
+    small: { unit: 'W_Base_Small', label: 'small world mob' },
+    big: { unit: 'W_Base_Big', label: 'big world mob' },
+    elite: { unit: 'W_Base_Elite', label: 'world elite' },
+    boss: { unit: 'Ratsar', label: 'named boss' },
+    dungeon: { unit: 'D_Base_Big', label: 'dungeon mob' },
   };
 
   function foe(name, level) {
-    const f = FOES[name];
-    if (!f) throw new Error(`unknown target "${name}". Known: ${Object.keys(FOES).join(', ')}`);
+    let phys, mag, label;
+    const named = NAMED[name];
+    if (named?.unit) {
+      const i = armourIntent(named.unit);
+      phys = i.phys ?? 0; mag = i.mag ?? 0;
+      label = `${named.label} (${named.unit}: ${phys}/${mag})`;
+    } else if (named) {
+      phys = named.phys; mag = named.mag;
+      label = `${name} (${named.label})`;
+    } else if (targetsByUnit.has(name)) {
+      const i = targetsByUnit.get(name);
+      phys = i.phys ?? 0; mag = i.mag ?? 0;
+      label = `${name} (${phys}/${mag})`;
+    } else {
+      throw new Error(
+        `unknown target "${name}". Named: ${Object.keys(NAMED).join(', ')}. ` +
+        'Any unit id with a declared armour intent also works - see `bench targets`.'
+      );
+    }
     return {
-      ...f,
-      level,
-      armor: resistForReduction(level, f.physReduction, ctx.consts.resistFormula),
-      magicArmor: resistForReduction(level, f.magicReduction, ctx.consts.resistFormula),
+      name: label, physReduction: phys, magicReduction: mag, level,
+      armor: resistForReduction(level, phys, ctx.consts.resistFormula),
+      magicArmor: resistForReduction(level, mag, ctx.consts.resistFormula),
     };
   }
 
@@ -426,9 +504,16 @@ export function buildCombat(cdb, ctx) {
     { severity: 'unmodelled', what: 'skill scripts, statuses beyond self-buffs, and DoTs',
       why: '427 of 962 skills carry hscript bodies this build does not execute. Self-buffs named by an ' +
            'addStatus(owner, Skill.X) call are resolved; everything else in a script is not.' },
+    { severity: 'info', what: 'physical and magical reduction are equal on every real foe',
+      why: 'Only the dev punching bags split them, so ArmorPenetration and SpellPenetration are worth the ' +
+           'same against everything currently in the game. Which one you want is decided by your class and ' +
+           'your gear\'s faction, not by the target.' },
     { severity: 'unmodelled', what: 'per-swing damage variance',
       why: 'WeaponAttack_RandomRange = 0.1 exists but its only located read is a UI text path, so casts are treated as deterministic.' },
   ];
 
-  return { profile, foe, foes: Object.keys(FOES), castOutput, throughput, survivability, affinityOf, weaponPowerFor, audit };
+  return {
+    profile, foe, foes: Object.keys(NAMED), namedTargets: NAMED, targetsByUnit, armourIntent,
+    castOutput, throughput, survivability, affinityOf, weaponPowerFor, audit,
+  };
 }
