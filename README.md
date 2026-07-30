@@ -53,6 +53,7 @@ produced it, and a list of the assumptions still in the model.
 | `items` | every item legal in a slot for a class |
 | `classes` | the four playable classes and what they scale off |
 | `slots` | the slots, their share of the stat budget, and which augments they host |
+| `rarity` | which rarities each slot can reach, and how that is derived |
 | `audit` | every assumption and gap in the model |
 
 ### Pinning
@@ -128,7 +129,7 @@ You need [Node.js](https://nodejs.org/) 18+ and a copy of Farever.
 ```bash
 git clone https://github.com/<you>/farever-bench
 cd farever-bench
-node test/run.mjs                  # 191 checks against your own game data
+node test/run.mjs                  # 226 checks against your own game data
 node bin/bench.mjs optimize --class Warrior
 ```
 

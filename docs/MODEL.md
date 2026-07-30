@@ -557,6 +557,25 @@ off by default because it triples the search space and turns a definite answer
 into a probabilistic one — the right trade when the question is *"what should I
 chase"*, not *"what should I wear"*.
 
+And how high a roll can go is **not declared anywhere**. The seven columns
+typed on rarity are an item own rarity, conds.minRarity, per-rarity atbRatio
+overrides, icons, recipe models, enchant materials and scrap quantities;
+lootTable carries no rarity at all; there is no RarityKind custom type; and
+WeaponRarityChances_Low is an empty stub with only a 0-10 level range in it. So
+the ceiling is a content decision in code. Two derivations stand in for it, and
+both move on their own when the data does:
+
+* weapon slots take the highest rarity flagged AllowRandomWeaponDrop - the one
+  thing in the database that names the weapon/non-weapon split at all. That is
+  Legendary.
+* every other slot takes the highest rarity actually AUTHORED on a stat-bearing
+  item that fits it. Requiring an aptitude keeps shop cosmetics such as
+  Head_Shop, which are Epic and grant nothing, from raising it. That is Rare
+  today, and it becomes Epic by itself the day a patch authors an Epic chest.
+
+bench rarity prints both alongside the raw table, so a patch that moves either
+is visible rather than silently absorbed, and --rarity-cap overrides them.
+
 Level bands, from the sheet:
 
 | rarity | L1–10 | L11–30 | L31–49 | L50+ | iLevel bonus | max stars |

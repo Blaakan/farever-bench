@@ -126,23 +126,25 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set() } = {}) {
 
 // Which secondary rating this piece pays out for this class - the cross of the
 // item's faction with the class's own atbScaling conditions.
+// EVERY paying aptitude contributes, so a dual-aptitude item can grant two
+// different ratings out of one faction: a Kobold Assassin+Cleric spear reads as
+// ArmorPen through Assassin and Crit through Cleric, and grants +39 of both.
+// Returning only the first would hide half of what the item does.
 export function ratingGiven(cat, item, aptitude, rarity = null) {
-  // Every paying aptitude contributes, so a dual-aptitude item can grant two
-  // different ratings out of the same faction - a Kobold AssCle spear gives a
-  // Rogue ArmorPen and a Priest Crit, and gives both to nobody, because only
-  // one aptitude is ever yours.
   const rar = rarity ?? item.rarity;
   const aptitudes = cat.cdb.byId('aptitude');
+  const found = [];
   for (const aptId of cat.payingAptitudes(item, aptitude)) {
     for (const e of aptitudes.get(aptId)?.atbScaling ?? []) {
       if ((e.statGroup ?? 0) !== 3) continue;
       const cd = e.conds ?? {};
       if (cd.minRarity != null && (cat.rarityOrder.get(rar) ?? -1) < (cat.rarityOrder.get(cd.minRarity) ?? 0)) continue;
-      if ((cd.factions ?? []).length && !cd.factions.some((f) => f.ref === item.faction)) continue;
-      return e.endAtb.replace('Rating', '');
+      if ((cd.factions ?? []).length && !cd.factions.some((x) => x.ref === item.faction)) continue;
+      const name = e.endAtb.replace('Rating', '');
+      if (!found.includes(name)) found.push(name);
     }
   }
-  return null;
+  return found.length ? found.join('+') : null;
 }
 
 export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {

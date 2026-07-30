@@ -240,8 +240,11 @@ function commonSetup(args) {
   if (exPattern) {
     try { exclude = new RegExp(exPattern); } catch (e) { die(`--exclude is not a valid regex: ${e.message}`); }
   }
+  const rarityCap = typeof args.flags[`rarity-cap`] === 'string'
+    ? resolve(args.flags[`rarity-cap`], engine.cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
+    : null;
   return {
-    engine, level, stars, rarities, goal, targetName, rank, mix, exclude,
+    engine, level, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap,
     // On by default: rarity is rolled at drop, so a Rare-authored chest that can
     // land Epic or Legendary should be on the table. --no-rarity-roll pins every
     // item to the rarity the CDB authors it at.
@@ -302,7 +305,7 @@ const commands = {
     const slot = resolve(args.flags.slot, slotIds, 'slot');
     const list = s.engine.cat.candidates(slot, {
       aptitude: cls.aptitude, charLevel: s.level,
-      rarities: s.rarities, exclude: s.exclude, rarityRoll: s.rarityRoll,
+      rarities: s.rarities, exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
     });
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${cls.unit} ${s.level} - ${f.short(slot)} - ${list.length} legal ` +
@@ -382,7 +385,7 @@ const commands = {
     const res = optimize(s.engine, {
       loadout, ...pins, goal: s.goal, weights: s.weights, target,
       rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
-      exclude: s.exclude, rarityRoll: s.rarityRoll, pinnedSkills: pins.pinnedSkills,
+      exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap, pinnedSkills: pins.pinnedSkills,
       allowEmpty: !args.flags['no-empty'], restarts,
       onProgress: process.stderr.isTTY ? (n) => process.stderr.write(`\r  ${n} evaluations...`) : null,
     });
@@ -444,6 +447,58 @@ const commands = {
     }
   },
 
+  rarity(args) {
+    const s = commonSetup(args);
+    const { cat } = s.engine;
+    console.log(f.header(s.engine, VERSION) + '\n');
+
+    console.log(f.bold('WHAT THE DATA SAYS'));
+    console.log(f.table(
+      ['RARITY', 'FLAGS', 'iLVL', 'MAX UPG', ...['1-10', '11-30', '31-49', '50+'].map((b) => 'drop ' + b)],
+      s.engine.cdb.lines('rarity').map((r) => [
+        r.id,
+        cat.cdb.flagNames('rarity', 'flags', r.flags).join(',') || f.dim('-'),
+        r.props?.iLevelBonus != null ? '+' + r.props.iLevelBonus : f.dim('-'),
+        r.props?.gearUpgrades ?? f.dim('-'),
+        ...[[1, 10], [11, 30], [31, 49], [50, 10000]].map(([lo, hi]) => {
+          const b = (r.props?.generationChance ?? []).find((x) => x.minLevel === lo && x.maxLevel === hi);
+          return b ? (b.chance ? f.pct(b.chance, 0) : f.dim('0')) : f.dim('-');
+        }),
+      ]), { align: [null, null, 'r', 'r', 'r', 'r', 'r', 'r'] }));
+
+    console.log('\n' + f.bold('CEILING PER SLOT') + f.dim(`   at level ${s.level}`));
+    console.log(f.table(['SLOT', 'KIND', 'CEILING', 'REACHABLE HERE', 'DERIVED FROM'],
+      cat.combatSlots().map((slot) => {
+        const c = cat.rarityCeiling(slot.id);
+        const sample = cat.candidates(slot.id, {
+          aptitude: cat.classes[0].aptitude, charLevel: s.level, rarityRoll: true, exclude: s.exclude,
+        });
+        const seen = [...new Set(sample.map((x) => x.rarity))]
+          .sort((a, b) => (cat.rarityOrder.get(a) ?? 0) - (cat.rarityOrder.get(b) ?? 0));
+        const above = seen.filter((r) => (cat.rarityOrder.get(r) ?? 0) > (cat.rarityOrder.get(c.rarity) ?? 0));
+        return [f.short(slot.id), cat.isWeaponSlot(slot.id) ? 'weapon' : 'gear',
+          f.bold(c.rarity),
+          seen.map((r) => (above.includes(r) ? f.warn(r + '*') : r)).join(', '),
+          f.dim(c.why)];
+      })));
+
+    console.log('\n' + f.warn('WHAT THE DATA DOES NOT SAY'));
+    console.log([
+      '  No column anywhere declares a rarity ceiling. The seven columns typed on',
+      '  `rarity` are: item.rarity, aptitude@atbScaling.conds.minRarity,',
+      '  itemType@props@rarities.rarity, itemType@defaultIcons.rarity,',
+      '  job@recipeModels.rarity, and two constant sub-columns for enchant',
+      '  materials and scrap quantities. `lootTable` carries no rarity at all, and',
+      '  there is no RarityKind custom type. `WeaponRarityChances_Low` exists as a',
+      '  constant but is an empty stub with only a 0-10 level range in it.',
+      '',
+      '  So the ceiling is a content decision in code, and the two rules above',
+      '  stand in for it. Both move on their own: the weapon ceiling follows the',
+      '  AllowRandomWeaponDrop flag, and the gear ceiling rises by itself the day',
+      '  a patch authors an Epic chest. Override either with --rarity-cap.',
+    ].join('\n'));
+  },
+
   audit(args) {
     const { engine } = commonSetup(args);
     console.log(f.header(engine, VERSION) + '\n');
@@ -462,6 +517,7 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
   bench items      list every item legal in a slot for a class
   bench classes    the playable classes and what they scale off
   bench slots      the slots, their stat share, and which augments they host
+  bench rarity     which rarities each slot can reach, and how that is derived
   bench audit      every assumption and gap in the model
 
 Common flags
@@ -473,6 +529,8 @@ Common flags
   --stars <n|max>         upgrade stars to assume       (default max)
   --rarity <list>         restrict to e.g. Rare,Epic
   --rank <n>              weapon-skill rank 1-3        (default max)
+  --rarity-cap <r>        highest rarity a roll may reach (default: derived
+                          per slot - see )
   --no-rarity-roll        pin every item to the rarity the CDB authors it at
                           (by default rarity is treated as rolled at drop, so
                           Epic and Legendary versions are on the table)

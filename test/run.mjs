@@ -698,6 +698,65 @@ group('honesty');
     !!engine.meta.cdbSha && engine.meta.cdbSha.length === 64);
 }
 
+
+// --- rarity ceilings -------------------------------------------------------
+// Equipment stops at Rare while weapons reach Legendary. The CDB never says so,
+// so both halves are derived - and the derivations must keep producing what the
+// game currently does, or say so loudly when a patch moves them.
+group('rarity ceilings');
+{
+  const weaponSlots = cat.combatSlots().filter((s) => cat.isWeaponSlot(s.id));
+  const gearSlots = cat.combatSlots().filter((s) => !cat.isWeaponSlot(s.id));
+  ok('the weapon slots are the three weapon slots', weaponSlots.length === 3,
+    weaponSlots.map((s) => s.id).join(','));
+  ok('and every other combat slot is gear', gearSlots.length > 8, String(gearSlots.length));
+
+  for (const s of weaponSlots) {
+    ok(`${s.id} reaches Legendary`, cat.rarityCeiling(s.id).rarity === 'Legendary',
+      cat.rarityCeiling(s.id).rarity);
+  }
+  for (const s of gearSlots) {
+    ok(`${s.id} stops at Rare`, cat.rarityCeiling(s.id).rarity === 'Rare',
+      `${cat.rarityCeiling(s.id).rarity} - if a patch authored Epic gear this is the expected change`);
+  }
+
+  // The weapon half must come from the flag, not from a list in the code.
+  const flagged = cdb.lines('rarity').filter((r) => cdb.flagNames('rarity', 'flags', r.flags).includes('AllowRandomWeaponDrop'));
+  ok('AllowRandomWeaponDrop is set on exactly the non-Common rarities',
+    flagged.length === cdb.lines('rarity').length - 1 && !flagged.some((r) => r.id === 'Common'),
+    flagged.map((r) => r.id).join(','));
+
+  // A gear roll must not produce Epic; a weapon roll must.
+  const chestRolls = cat.attainableRarities(cat.itemById.get('Chest_RManfish_Cle'), 25, 'Slot_Chest');
+  ok('a Rare chest cannot roll Epic', !chestRolls.some((r) => r.rarity === 'Epic'),
+    chestRolls.map((r) => r.rarity).join(','));
+  const spearRolls = cat.attainableRarities(cat.itemById.get('Spear_Eruption'), 25, 'Slot_Weapon1');
+  ok('a Rare weapon can roll Epic and Legendary',
+    ['Epic', 'Legendary'].every((x) => spearRolls.some((r) => r.rarity === x)),
+    spearRolls.map((r) => r.rarity).join(','));
+
+  // An explicit cap overrides both.
+  const capped = cat.attainableRarities(cat.itemById.get('Spear_Eruption'), 25, 'Slot_Weapon1', 'Rare');
+  ok('--rarity-cap Rare stops a weapon at Rare', !capped.some((r) => r.rarity === 'Epic'),
+    capped.map((r) => r.rarity).join(','));
+
+  // And the optimiser must respect it end to end.
+  const engine = createEngine();
+  const target = engine.combat.foe('reference', 25);
+  const res = optimize(engine, {
+    loadout: emptyLoadout(cat, 'Priest', 25), goal: 'dps', target, rank: 3,
+    restarts: 1, rarityRoll: true, exclude: /^GM_/,
+  });
+  for (const [slotId, g] of Object.entries(res.loadout.gear)) {
+    const ceil = cat.rarityCeiling(slotId).rarity;
+    const authored = cat.itemById.get(g.item).rarity;
+    ok(`${slotId} respects its ceiling`,
+      (cat.rarityOrder.get(g.rarity ?? authored) ?? 0) <= Math.max(
+        cat.rarityOrder.get(ceil) ?? 0, cat.rarityOrder.get(authored) ?? 0),
+      `${g.rarity} on a ${ceil}-capped slot`);
+  }
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

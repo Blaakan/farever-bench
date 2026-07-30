@@ -178,16 +178,81 @@ export function buildCatalog(cdb, ctx) {
   // CDB-Rare sword can be sitting in your bag as Legendary. So the unit a tool
   // ranks is (item, rarity), and for gear you do not own yet the right answer
   // is a distribution rather than a point.
-  function attainableRarities(item, charLevel) {
+  //
+  // How high it can go is NOT declared anywhere in the CDB. The seven columns
+  // that touch `rarity` are an item's own rarity, `conds.minRarity`, per-rarity
+  // atbRatio overrides, icons, enchant materials, scrap quantities and recipe
+  // models; `lootTable` carries no rarity at all. So the ceiling is a content
+  // decision living in code, and today equipment stops at Rare while weapons
+  // reach Legendary. Two derivations stand in for it, and both move on their
+  // own when the data does:
+  //
+  //   * `rarity.flags.AllowRandomWeaponDrop` is the one thing in the database
+  //     that names the weapon/non-weapon split. It is set on Uncommon, Rare,
+  //     Epic and Legendary and clear on Common, so it reads as "a random WEAPON
+  //     drop may produce this" - which is the weapon ceiling, read rather than
+  //     hardcoded.
+  //   * For every other slot, the ceiling is the highest rarity actually
+  //     AUTHORED on a stat-bearing item that fits it. Shop cosmetics such as
+  //     Head_Shop are Epic and grant nothing, so requiring an aptitude keeps
+  //     them from raising it. That yields Rare today and becomes Epic by itself
+  //     the day a patch authors an Epic chest.
+  //
+  // `bench rarity` prints both alongside the raw data, so a patch that moves
+  // either one is visible rather than silently absorbed.
+  const allowWeaponDropBit = cdb.enumValues('rarity', 'flags').indexOf('AllowRandomWeaponDrop');
+  if (allowWeaponDropBit < 0) throw new Error('rarity.flags has no AllowRandomWeaponDrop - the game changed shape');
+
+  const isWeaponSlot = (slotId) => {
+    const s = slotById.get(slotId);
+    return !!s && s.types.some((t) => chain(t).includes('Weapon'));
+  };
+
+  const ceilingCache = new Map();
+  function rarityCeiling(slotId) {
+    let hit = ceilingCache.get(slotId);
+    if (hit) return hit;
+    if (isWeaponSlot(slotId)) {
+      const allowed = cdb.lines('rarity').filter((r) => ((r.flags ?? 0) >> allowWeaponDropBit) & 1);
+      hit = {
+        rarity: allowed[allowed.length - 1]?.id ?? 'Rare',
+        why: 'highest rarity flagged AllowRandomWeaponDrop',
+        derived: true,
+      };
+    } else {
+      let best = null;
+      for (const it of items) {
+        if (it.isAugment || !it.slots.includes(slotId)) continue;
+        if (!it.aptitudes.length) continue;
+        if ((rarityOrder.get(it.rarity) ?? 0) > (rarityOrder.get(best) ?? -1)) best = it.rarity;
+      }
+      hit = {
+        rarity: best ?? 'Rare',
+        why: 'highest rarity authored on a stat-bearing item for this slot',
+        derived: true,
+      };
+    }
+    ceilingCache.set(slotId, hit);
+    return hit;
+  }
+
+  /** @param ceiling a rarity id no roll may exceed; defaults to rarityCeiling() */
+  function attainableRarities(item, charLevel, slotId = null, ceiling = null) {
     const floor = rarityOrder.get(item.rarity) ?? 0;
+    const capId = ceiling ?? (slotId ? rarityCeiling(slotId).rarity : null);
+    const cap = capId != null ? (rarityOrder.get(capId) ?? Infinity) : Infinity;
     const out = [];
     for (const r of cdb.lines('rarity')) {
-      if ((rarityOrder.get(r.id) ?? 0) < floor) continue;
+      const rank = rarityOrder.get(r.id) ?? 0;
+      if (rank < floor) continue;
       const band = (r.props?.generationChance ?? [])
         .find((b) => charLevel >= b.minLevel && charLevel <= b.maxLevel);
       const chance = band?.chance ?? 0;
-      if (r.id === item.rarity) out.push({ rarity: r.id, chance: chance || null, authored: true });
-      else if (chance > 0) out.push({ rarity: r.id, chance, authored: false });
+      // An item's own authored rarity is always attainable - it is what the row
+      // says the thing IS - even if it sits above the ceiling.
+      if (r.id === item.rarity) { out.push({ rarity: r.id, chance: chance || null, authored: true }); continue; }
+      if (rank > cap) continue;
+      if (chance > 0) out.push({ rarity: r.id, chance, authored: false });
     }
     return out;
   }
@@ -374,7 +439,7 @@ export function buildCatalog(cdb, ctx) {
     chain, inherited, socketsFor, augmentTypes,
     effectiveLevel, maxStars, usableBy, payingAptitudes,
     contribute, applyAffixes, armorReductionFor,
-    rarityOrder, isGeneric, attainableRarities,
+    rarityOrder, isGeneric, attainableRarities, rarityCeiling, isWeaponSlot,
     allowsOffhand, handednessOf,
 
     combatSlots: () => slots.filter((s) => s.combat),
@@ -387,7 +452,7 @@ export function buildCatalog(cdb, ctx) {
     // multiplies the search space by about three and turns a definite answer
     // into a probabilistic one, which is the right trade only when the
     // question is "what should I chase" rather than "what should I wear".
-    candidates(slotId, { aptitude, charLevel, rarities = null, exclude = null, rarityRoll = false } = {}) {
+    candidates(slotId, { aptitude, charLevel, rarities = null, exclude = null, rarityRoll = false, rarityCap = null } = {}) {
       const out = [];
       for (const it of items) {
         if (it.isAugment) continue;
@@ -397,7 +462,7 @@ export function buildCatalog(cdb, ctx) {
         if (exclude && exclude.test(it.id)) continue;
 
         const rarityVariants = rarityRoll
-          ? attainableRarities(it, charLevel)
+          ? attainableRarities(it, charLevel, slotId, rarityCap)
           : [{ rarity: it.rarity, chance: null, authored: true }];
         for (const v of rarityVariants) {
           if (rarities && !rarities.has(v.rarity)) continue;

@@ -111,7 +111,7 @@ export function optimize(engine, spec) {
     }
     const list = cat.candidates(slotId, {
       aptitude: cls.aptitude, charLevel: spec.loadout.level,
-      rarities, exclude: spec.exclude, rarityRoll: spec.rarityRoll,
+      rarities, exclude: spec.exclude, rarityRoll: spec.rarityRoll, rarityCap: spec.rarityCap,
     }).map((c) => ({
       item: c.item.id,
       rarity: c.rarity,
@@ -317,7 +317,7 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
   const rows = [];
   const cands = cat.candidates(slotId, {
     aptitude: cls.aptitude, charLevel: loadout.level, rarities,
-    exclude: spec.exclude, rarityRoll: spec.rarityRoll,
+    exclude: spec.exclude, rarityRoll: spec.rarityRoll, rarityCap: spec.rarityCap,
   });
   for (const cand of cands) {
     const it = cand.item;
