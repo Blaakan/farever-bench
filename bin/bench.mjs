@@ -639,9 +639,11 @@ const commands = {
 
     console.log(f.bold("RULES") + f.dim("   every one of them out of the data"));
     console.log([
-      "  tier thresholds  " + JSON.stringify(T.thresholds) + "   points needed IN THAT BRANCH per tier",
+      "  tier thresholds  " + T.thresholds.map((v, i) => "t" + i + "=" + v).join("  "),
+      "                   points needed AT LOWER TIERS in that branch, root included",
       "  unlock level     " + T.unlockLevel,
       "  points at cap    " + T.defaultPointsAtCap + "   (observed - no constant declares the rate)",
+      "  points per node  1 or 2 - props.talent.maxPoints, and it is 2 on 48 of 88",
       "  DemonSigil       grants one tier-4 talent outright: costs no point, and does",
       "                   not count toward its branch thresholds",
     ].join("\n"));

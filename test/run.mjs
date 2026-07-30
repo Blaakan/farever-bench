@@ -956,6 +956,88 @@ group('talent ranks');
     `sheet says ${cdr}, rows are ${JSON.stringify(rows)}`);
 }
 
+
+// --- tier thresholds, confirmed in game ------------------------------------
+// The rule, observed rather than derived:
+//   tier 0  from the start
+//   tier 1  every branch, once tier 0 holds 1 point
+//   tier 2  that branch, once tier 1 and below hold 2 cumulative
+//   tier 3  that branch, once tier 2 and below hold 4 cumulative
+//   tier 4  that branch, once tier 3 and below hold 8 cumulative
+// So Talents_TierThresholds is indexed BY TIER, all five entries used, and the
+// root counts toward every branch. An earlier reading shifted it by one; these
+// tests exist so that cannot come back.
+group('tier thresholds');
+{
+  const engine = createEngine();
+  const T = engine.talents;
+  const sk = cdb.byId('skill');
+  const tree = T.treeFor('Priest');
+  const root = tree.nodes.find((n) => n.tier === 0);
+  const tier4 = tree.nodes.find((n) => n.tier === 4 && n.branch === 'Left');
+
+  // Build an allocation: 1 in the root, then N points spread over one branch's
+  // tiers 1..3, optionally taking that branch's tier-4 node.
+  const build = (t1, t2, t3, withTier4) => {
+    const r = { [root.skill]: 1 };
+    const fill = (tier, pts) => {
+      let left = pts;
+      for (const n of tree.nodes.filter((x) => x.tier === tier && x.branch === 'Left')) {
+        const cap = sk.get(n.skill)?.props?.talent?.maxPoints ?? 1;
+        const take = Math.min(cap, left);
+        if (take > 0) { r[n.skill] = take; left -= take; }
+      }
+    };
+    fill(1, t1); fill(2, t2); fill(3, t3);
+    if (withTier4) r[tier4.skill] = 1;
+    return r;
+  };
+  const check = (a) => T.illegalAllocation('Priest', a, { level: 25, points: 16 });
+
+  ok('the thresholds array is read by tier, unshifted',
+    JSON.stringify(T.thresholds) === JSON.stringify([0, 1, 2, 4, 8]),
+    JSON.stringify(T.thresholds));
+
+  // The two allocations verified in game.
+  ok('root + 1 + 2 + 4 opens tier 4', check(build(1, 2, 4, true)) === null,
+    check(build(1, 2, 4, true)) ?? '');
+  ok('root + 1 + 3 + 3 opens tier 4', check(build(1, 3, 3, true)) === null,
+    check(build(1, 3, 3, true)) ?? '');
+
+  // One point short must not.
+  ok('root + 1 + 2 + 3 does NOT open tier 4 (7 cumulative)',
+    check(build(1, 2, 3, true)) !== null);
+  ok('and the refusal names tier 4 and the number needed',
+    /tier 4 and needs 8/.test(check(build(1, 2, 3, true)) ?? ''),
+    check(build(1, 2, 3, true)) ?? '');
+
+  // Every tier's own boundary.
+  ok('tier 2 needs 2 cumulative, so skipping tier 1 is refused',
+    /tier 2 and needs 2/.test(check(build(0, 2, 0, false)) ?? ''),
+    check(build(0, 2, 0, false)) ?? '');
+  ok('tier 3 needs 4 cumulative',
+    /tier 3 and needs 4/.test(check(build(1, 1, 4, false)) ?? ''),
+    check(build(1, 1, 4, false)) ?? '');
+
+  // The root counts toward every branch - without that, tier 2 could never be
+  // reached, since a branch holds exactly one tier-1 node worth one point.
+  const noRoot = build(1, 2, 0, false);
+  delete noRoot[root.skill];
+  ok('without the root, tier 2 is unreachable', check(noRoot) !== null, check(noRoot) ?? '');
+  ok('a branch holds exactly one tier-1 node',
+    tree.nodes.filter((n) => n.tier === 1 && n.branch === 'Left').length === 1);
+
+  // And the allocator obeys its own rule.
+  for (const cls of ['Warrior', 'Rogue', 'Mage', 'Priest']) {
+    const a = T.suggest(cls, { level: 25 });
+    ok(`${cls}: the suggested allocation is legal`,
+      T.illegalAllocation(cls, a.ranks, { level: 25, points: a.budget }) === null,
+      T.illegalAllocation(cls, a.ranks, { level: 25, points: a.budget }) ?? '');
+    ok(`${cls}: with ranks and the real thresholds, the budget is fully used`,
+      a.unspent === 0, `${a.spent} of ${a.budget}`);
+  }
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

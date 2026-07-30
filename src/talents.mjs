@@ -97,25 +97,29 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     return level < unlockLevel ? 0 : DEFAULT_POINTS_AT_CAP;
   }
 
-  // Tier N is gated on tierThreshold(N) points already spent in that branch.
+  // Tier N opens when the points ALREADY SPENT AT LOWER TIERS reach
+  // `thresholds[N]`, counting the root plus that branch. Confirmed in game:
   //
-  // UNRESOLVED, and worth saying so. The implementation indexes from tier 1 -
-  // [0,1,2,4,8] read as "tier 1 free, tier 2 needs 1, tier 3 needs 2, tier 4
-  // needs 4". The original argument for that was that thresholds[tier] would
-  // make tier 4 cost 8 points in a branch holding only 7 NODES, i.e. be
-  // unreachable. That argument is dead: 48 of the 88 nodes hold two points, so
-  // a branch holds ELEVEN points (1 + 2+2 + 1+2+2 + 1) and 8 is perfectly
-  // reachable.
+  //   tier 0  available from the start
+  //   tier 1  every branch, once tier 0 holds 1 point
+  //   tier 2  that branch, once tier 1 and below hold 2 cumulative
+  //   tier 3  that branch, once tier 2 and below hold 4 cumulative
+  //   tier 4  that branch, once tier 3 and below hold 8 cumulative
   //
-  // So both readings are now internally consistent, and the other one matches
-  // the constant's own wording more literally while using all five entries:
-  // tier 1 needs 1 (the root, if the root counts toward a branch), tier 2 needs
-  // 2, tier 3 needs 4, tier 4 needs 8. This reading is kept because it is what
-  // the tool has been checked against, but it rests on nothing now and is one
-  // in-game observation away from being settled: note the point total in a
-  // branch at the moment its tier-4 node becomes clickable.
-  const tierThreshold = (tier) => (tier <= 0 ? 0 : (thresholds[tier - 1] ?? 0));
-
+  // So the array is indexed BY TIER - [0,1,2,4,8] read straight - and all five
+  // entries are used. An earlier reading here shifted it by one on the grounds
+  // that 8 points could not fit in a seven-node branch; that was wrong twice
+  // over, because 48 of the 88 nodes hold two points, so a branch holds eleven.
+  //
+  // The ROOT counts toward every branch. It has to: a tier-1 node is worth one
+  // point and every branch has exactly one, so tier 2 could never reach its
+  // threshold of 2 from same-branch points alone. Tier 1 needing "tier 0 to
+  // hold 1 point" says the same thing from the other side.
+  //
+  // Checked against two real allocations that both open tier 4:
+  //   1 - 1 - 2 - 4  (root, tier1, tier2, tier3) = 8
+  //   1 - 1 - 3 - 3                              = 8
+  const tierThreshold = (tier) => (tier <= 0 ? 0 : (thresholds[tier] ?? 0));
   // --- the tree -------------------------------------------------------------
   const treeCache = new Map();
   function treeFor(unitId) {
@@ -254,17 +258,24 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
 
     // Thresholds are denominated in points in that branch, so replay the
     // allocation point by point in tier order and check each one as it lands.
+    // The root's points count toward every branch, so they are tracked apart
+    // and added in rather than living in one branch's tally.
     const perBranch = new Map();
+    let rootPoints = 0;
+    const cumulative = (b) => (perBranch.get(b) ?? 0) + rootPoints;
     const inOrder = entries
       .map(([id, rank]) => ({ n: tree.byId.get(id), rank, granted: granted.has(id) }))
       .sort((a, b) => a.n.tier - b.n.tier);
     for (const { n, rank, granted: free } of inOrder) {
-      const have = perBranch.get(n.branchIndex) ?? 0;
+      const have = cumulative(n.branchIndex);
       const need = tierThreshold(n.tier);
       if (n.tier > 0 && have < need) {
-        return `${n.name} is tier ${n.tier} and needs ${need} points in ${n.branch}, but only ${have} are there`;
+        return `${n.name} is tier ${n.tier} and needs ${need} points at lower tiers in ${n.branch}, `
+          + `but only ${have} are there`;
       }
-      if (!free) perBranch.set(n.branchIndex, have + rank);
+      if (free) continue;
+      if (n.tier === 0) rootPoints += rank;
+      else perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + rank);
     }
     return null;
   }
@@ -303,10 +314,15 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     for (const id of granted) ranks.set(id, 1);
     const blind = [];
 
+    // The root's point counts toward every branch's threshold, so it is held
+    // separately and added in by `cumulative`.
+    let rootPoints = 0;
+    const cumulative = (b) => (perBranch.get(b) ?? 0) + rootPoints;
     const addPoint = (n, atRank) => {
       ranks.set(n.skill, atRank);
       if (atRank === 1 && !readableValue(n.skill, 1).readable) blind.push(n.skill);
-      perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + 1);
+      if (n.tier === 0) rootPoints += 1;
+      else perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + 1);
       spent++;
     };
 
@@ -334,7 +350,7 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
         // where the thresholds would allow one - confirmed in game.
         if (granted.has(n.skill)) continue;
         if (at >= maxPointsOf(n.skill)) continue;
-        if (at === 0 && (perBranch.get(n.branchIndex) ?? 0) < tierThreshold(n.tier)) continue;
+        if (at === 0 && cumulative(n.branchIndex) < tierThreshold(n.tier)) continue;
         legal.push({ n, next: at + 1, w: pointWeight(n.skill, at + 1) });
       }
       if (!legal.length) break;
