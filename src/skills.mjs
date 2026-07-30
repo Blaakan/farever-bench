@@ -207,6 +207,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat) {
    * `UnlockLevel_Arsenal` describes.
    */
   function resolve(loadout, rank) {
+    const runes = new Set(Object.values(loadout.runes ?? {}).flat().filter(Boolean));
     const sel = loadout.skills ?? defaultSelection(loadout);
     const filler = [];
     const active = [];
@@ -218,7 +219,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat) {
     const push = (bucket, id, extra = {}) => {
       if (seen.has(id)) return;
       seen.add(id);
-      const prof = combat.profile(id, rank);
+      const prof = combat.profile(id, rank, runes);
       if (!prof) return;
       const carries = prof.effects.some((e) => ['Damage', 'Heal', 'Shield'].includes(e.kind));
       if (!carries) {
@@ -279,7 +280,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat) {
       }
       for (const id of subSkillsFor(chosen, all)) push(active, id, { source: p.key, followUp: true });
       for (const id of orphanSubSkills(all, chosen)) {
-        const prof = combat.profile(id, rank);
+        const prof = combat.profile(id, rank, runes);
         if (prof?.effects.some((e) => e.kind === 'Damage')) {
           unmodelled.push({ id, why: 'a WeaponSubSkill with no discoverable trigger' });
         }
@@ -346,7 +347,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat) {
     // stacking rating buffs - so those go to `passive` instead of being dropped.
     function pushTriggered(id, source, extra = {}) {
       if (seen.has(id)) return;
-      const prof = combat.profile(id, rank);
+      const prof = combat.profile(id, rank, runes);
       if (!prof) return;
       seen.add(id);
 
@@ -369,7 +370,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat) {
       }
     }
 
-    return { filler, active, triggered, passive, unmodelled, selection: sel };
+    return { filler, active, triggered, passive, unmodelled, selection: sel, runes: [...runes] };
   }
 
   /**

@@ -28,7 +28,7 @@ export function emptyLoadout(cat, unitId, level) {
   // `skills` holds the choices a weapon or a class mechanic forces: two of the
   // three a weapon offers, three prayers out of three, and so on. Keyed the
   // same way sockets are, by what forced the choice.
-  return { class: cls.unit, level, gear: {}, augments: {}, skills: {} };
+  return { class: cls.unit, level, gear: {}, augments: {}, skills: {}, runes: {}, talents: [] };
 }
 
 export function classOf(cat, loadout) {

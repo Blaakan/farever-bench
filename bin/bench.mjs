@@ -354,6 +354,7 @@ const commands = {
     }
     if (s.engine.plan.pools(loadout).length) {
       console.log(f.bold('SKILLS'));
+
       console.log(f.skillsBlock(s.engine, loadout, ev, { pinnedSkills: pins.pinnedSkills }) + '\n');
     }
     console.log(f.sheetBlock(s.engine, ev, { level: s.level }));
@@ -585,6 +586,66 @@ const commands = {
     ].join('\n'));
   },
 
+  talents(args) {
+    const s = commonSetup(args);
+    const T = s.engine.talents;
+    const want = typeof args.flags.class === "string"
+      ? resolve(args.flags.class, s.engine.cat.classes.flatMap((c) => [c.unit, c.aptitude]), "class")
+      : null;
+    console.log(f.header(s.engine, VERSION) + "\n");
+
+    const classes = want
+      ? s.engine.cat.classes.filter((c) => c.unit === want || c.aptitude === want)
+      : s.engine.cat.classes;
+    for (const c of classes) {
+      const tree = T.treeFor(c.unit);
+      const readable = tree.nodes.filter((n) => T.readableValue(n.skill).readable);
+      console.log(f.bold(c.unit + " - " + tree.nodes.length + " nodes, " + readable.length +
+        " this model can read, " + T.pointsAt(s.level) + " points at level " + s.level));
+      console.log(f.table(["  TIER", "BRANCH", "TALENT", "READS AS", "WHAT"],
+        tree.nodes.map((n) => {
+          const v = T.readableValue(n.skill);
+          return ["  " + n.tier, n.branch, n.name,
+            v.readable ? f.bold(v.kind) : f.dim("nothing"),
+            v.affixes.length ? f.affixSummary(v.affixes)
+              : v.buffs.length ? v.buffs.map((x) => x.name + " x" + x.stacks).join(", ")
+              : v.effects.length ? v.effects.map((x) => x.kind).join(", ")
+              : f.dim("no affix, no effect, no status")];
+        })));
+      console.log("");
+    }
+
+    console.log(f.bold("RULES") + f.dim("   every one of them out of the data"));
+    console.log([
+      "  tier thresholds  " + JSON.stringify(T.thresholds) + "   points needed IN THAT BRANCH per tier",
+      "  unlock level     " + T.unlockLevel,
+      "  points at cap    " + T.defaultPointsAtCap + "   (observed - no constant declares the rate)",
+      "  DemonSigil       grants one tier-4 talent outright: costs no point, and does",
+      "                   not count toward its branch thresholds",
+    ].join("\n"));
+
+    console.log("\n" + f.warn("WHY THIS IS MOSTLY STRUCTURE"));
+    const all = s.engine.cat.classes.flatMap((c) => T.treeFor(c.unit).nodes);
+    const rd = all.filter((n) => T.readableValue(n.skill).readable);
+    console.log([
+      "  " + rd.length + " of " + all.length + " talent nodes declare something a data-driven model can",
+      "  read - a stat affix, a self-buff status, or a damage effect. The other",
+      "  " + (all.length - rd.length) + " declare NOTHING: no affix, no effect, no status, and mostly no",
+      "  script either. Their behaviour lives in game code keyed on the talent",
+      "  being slotted.",
+      "",
+      "  So the optimiser allocates points over the readable nodes and STOPS. It",
+      "  does not spend the remainder on nodes it cannot tell apart, because a",
+      "  build assembled that way would look authoritative and be arbitrary. The",
+      "  unspent points are reported rather than quietly filled.",
+      "",
+      f.bold("  Runes are the same shape.") + " 28 skills offer three each. Only 17 of the 84",
+      "  gate a step (cond.mastery) or override a prop (charges, cooldown), and",
+      "  those the model applies exactly. The rest promise things in their own",
+      "  description that live in code.",
+    ].join("\n"));
+  },
+
   audit(args) {
     const { engine } = commonSetup(args);
     console.log(f.header(engine, VERSION) + '\n');
@@ -605,6 +666,7 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
   bench slots      the slots, their stat share, and which augments they host
   bench rarity     which rarities each slot can reach, and how that is derived
   bench targets    what the world actually resists, and what penetration buys
+  bench talents    the talent trees and runes, and how much of them is readable
   bench audit      every assumption and gap in the model
 
 Common flags

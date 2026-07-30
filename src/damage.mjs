@@ -91,8 +91,12 @@ export function buildCombat(cdb, ctx) {
   // Flatten a skill into the shape the objective needs. Rank gates on effects
   // and steps are resolved against the weapon-skill rank the caller assumes.
   const profileCache = new Map();
-  function profile(skillId, rank) {
-    const key = skillId + '@' + rank;
+  // `runes` is the set of slotted mastery ids. A rune does two readable things:
+  // it enables the steps whose `cond.mastery` names it, and it overrides props
+  // (only `charges` and `cooldown` appear). Everything else a rune's text
+  // promises lives in game code.
+  function profile(skillId, rank, runes = null) {
+    const key = skillId + '@' + rank + (runes && runes.size ? '@' + [...runes].sort().join('+') : '');
     let p = profileCache.get(key);
     if (p) return p;
     const s = skills.get(skillId);
@@ -107,6 +111,13 @@ export function buildCombat(cdb, ctx) {
     let props = s.props ?? {};
     for (const ov of (s.props?.rankOverride ?? []).slice().sort((a, b) => (a.minRank ?? 0) - (b.minRank ?? 0))) {
       if ((ov.minRank ?? 0) <= rank) props = { ...props, ...(ov.props ?? {}) };
+    }
+    // A slotted rune's props win over the skill's own.
+    const slotted = [];
+    for (const m of s.mastery ?? []) {
+      if (!runes?.has(m.id)) continue;
+      slotted.push(m.id);
+      props = { ...props, ...(m.props ?? {}) };
     }
     // `cond.castHoldStep` is a charge level, and the steps carrying it are
     // MUTUALLY EXCLUSIVE - Rampage declares Hit1/Hit2/Hit3 at 2.5x, 4x and 6x
@@ -126,9 +137,9 @@ export function buildCombat(cdb, ctx) {
       if (c.maxRank != null && rank > c.maxRank) continue;
       if (c.equalRank != null && rank !== c.equalRank) continue;
       if (typeof c.castHoldStep === 'number' && c.castHoldStep !== maxHold) continue;
-      // Rune-gated. Which rune is slotted is a build axis this model does not
-      // carry, so the step is left out rather than granted for free.
-      if (c.mastery) continue;
+      // Rune-gated: the step exists only while that rune is slotted.
+      if (c.mastery && !runes?.has(c.mastery)) continue;
+      if (c.masteryExclude && runes?.has(c.masteryExclude)) continue;
       for (const e of st.effects ?? []) {
         const kind = effectNames[e.effect ?? -1] ?? null;
         if (!kind) continue;
@@ -168,6 +179,10 @@ export function buildCombat(cdb, ctx) {
       hasScript: !!s.script,
       isFiller: FILLER_TYPES.has(typeName),
       isCombo: COMBO_TYPES.has(typeName),
+      runes: slotted,
+      // `charges` lets a skill bank casts, which is throughput the cooldown
+      // alone does not describe.
+      charges: props.charges ?? 1,
     };
     profileCache.set(key, p);
     return p;
@@ -496,6 +511,10 @@ export function buildCombat(cdb, ctx) {
       why: 'Both have empty scaling and are zero from every source in this build, so the assumption is currently inert.' },
     { severity: 'unverified', what: 'WeaponPower = the weapon slot\'s share of the class primary budget',
       why: 'WeaponPower has no scaling entry and no budget group. Every base attack scales off it, so absolute damage depends on this.' },
+    { severity: 'unmodelled', what: 'most of what a rune or a talent does',
+      why: '66 of the 88 talent nodes declare no affix, no effect and no status at all, and only 17 of the ' +
+           '84 runes gate a step or override a prop. The rest live in game code keyed on being slotted, so ' +
+           'they are structurally visible and numerically invisible. `bench talents` reports the split.' },
     { severity: 'assumption', what: 'charged skills are evaluated at full charge',
       why: 'Steps gated on cond.castHoldStep are mutually exclusive charge levels; the highest is used.' },
     { severity: 'unmodelled', what: 'runes (skill masteries) and talents',

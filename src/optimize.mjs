@@ -80,6 +80,7 @@ export function optimize(engine, spec) {
   const pinnedAug = spec.pinnedAug ?? new Set();
   // Skill pools the user chose by hand.
   const pinnedSkills = spec.pinnedSkills ?? new Set();
+  const pinnedRunes = spec.pinnedRunes ?? new Set();
 
   // The reference used to normalise a weighted blend: the seed as given, so
   // the numbers a user reads are relative to where they started.
@@ -145,7 +146,9 @@ export function optimize(engine, spec) {
       return g ? `${s.id}=${g.item}/${g.rarity ?? ''}:${g.stars ?? 0}${g.flawless ? 'f' : ''}` : '';
     }).join('|')
       + '#' + Object.entries(loadout.augments).filter(([, v]) => v).sort().map(([k, v]) => k + '=' + v).join('|')
-      + '$' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + '=' + v.join('+')).join('|');
+      + '$' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + '=' + v.join('+')).join('|')
+      + '&' + Object.entries(loadout.runes ?? {}).filter(([, x]) => x).sort().join('|')
+      + '%' + (loadout.talents ?? []).slice().sort().join('|');
     let v = evalCache.get(key);
     if (v === undefined) {
       const ev = engine.evaluate(loadout, { target, rank, mix });
@@ -200,6 +203,8 @@ export function optimize(engine, spec) {
       gear: { ...l.gear },
       augments: { ...l.augments },
       skills: Object.fromEntries(Object.entries(l.skills ?? {}).map(([k, v]) => [k, v.slice()])),
+      runes: { ...(l.runes ?? {}) },
+      talents: (l.talents ?? []).slice(),
     };
   }
 
@@ -280,6 +285,29 @@ export function optimize(engine, spec) {
         }
       }
 
+      // Then runes: one of three per skill you have. Only 17 of the 84 gate a
+      // step or override a prop, so most comparisons tie and the tiebreak
+      // settles them - which is the honest outcome rather than a hidden
+      // preference. `bench talents` says which ones are inert.
+      if (!pinnedRunes.size) {
+        const pools = engine.talents.runePools(engine.evaluate(cur, { target, rank, mix }).rotation);
+        for (const pool of shuffled(pools, rand)) {
+          let bestPick = cur.runes[pool.skill] ?? null;
+          let bestScore = best;
+          for (const pick of [...pool.options.map((r) => r.id), null]) {
+            const trial = clone(cur);
+            if (pick) trial.runes[pool.skill] = pick; else delete trial.runes[pool.skill];
+            const got = scoreOf(trial);
+            if (better(got, bestScore)) { bestScore = got; bestPick = pick; }
+          }
+          if (better(bestScore, best)) {
+            if (bestPick) cur.runes[pool.skill] = bestPick; else delete cur.runes[pool.skill];
+            best = bestScore;
+            improved = true;
+          }
+        }
+      }
+
       // Then augments, against whatever gear now exists.
       for (const sock of shuffled(socketsOf(cat, cur), rand)) {
         if (pinnedAug.has(sock.key)) continue;
@@ -327,6 +355,24 @@ export function optimize(engine, spec) {
     if (!winner || better(got.score, winner.score)) winner = got;
   }
 
+  // Talents last. They do not interact with the gear the way skills do, and 66
+  // of the 88 nodes declare nothing a model can read, so a greedy legal
+  // allocation over the 22 that do is as much as can be justified - spending
+  // the rest on nodes it cannot tell apart would be inventing a recommendation.
+  // `granted` is the tier-4 talent a DemonSigil hands over for free.
+  if (!spec.pinnedTalents) {
+    const granted = new Set();
+    for (const [key, augId] of Object.entries(winner.loadout.augments ?? {})) {
+      if (!key.endsWith('/AugmentDemonSigil') || !augId) continue;
+      for (const sk of cat.itemById.get(augId)?.skills ?? []) granted.add(sk);
+    }
+    const alloc = engine.talents.suggest(winner.loadout.class, {
+      level: winner.loadout.level, points: spec.talentPoints ?? null, granted,
+    });
+    winner.loadout.talents = alloc.picked;
+    winner.talentAlloc = { ...alloc, granted: [...granted] };
+  }
+
   const finalEval = engine.evaluate(winner.loadout, { target, rank, mix });
   return {
     loadout: winner.loadout,
@@ -334,6 +380,9 @@ export function optimize(engine, spec) {
     indifferent: indifferentSlots(winner.loadout, winner.score),
     evaluation: finalEval,
     reference: refEval,
+    talentAlloc: winner.talentAlloc ?? null,
+    talentCoverage: engine.talents.coverage(winner.loadout.class, winner.loadout.talents ?? [],
+      { granted: new Set(winner.talentAlloc?.granted ?? []) }),
     evaluations: counter,
     trace,
     goal, weights,

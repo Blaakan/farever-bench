@@ -16,6 +16,7 @@ import { buildContext, baseStats, auditModel } from './model.mjs';
 import { buildCatalog } from './catalog.mjs';
 import { buildCombat } from './damage.mjs';
 import { buildSkillPlan } from './skills.mjs';
+import { buildTalentPlan } from './talents.mjs';
 import { evaluate as evaluateLoadout, classOf, socketsOf } from './loadout.mjs';
 
 export const GOALS = ['dps', 'hps', 'sps', 'ehp', 'mixed'];
@@ -35,6 +36,7 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
   const cat = buildCatalog(cdb, ctx);
   const combat = buildCombat(cdb, ctx);
   const plan = buildSkillPlan(cdb, ctx, cat, combat);
+  const talents = buildTalentPlan(cdb, ctx, cat, combat, plan);
   const opts = { assume: { ...DEFAULT_ASSUME, ...assume } };
   if (!FERVOR_SCOPES.includes(opts.assume.fervorScope)) {
     throw new Error(`fervorScope must be one of ${FERVOR_SCOPES.join(', ')}`);
@@ -57,7 +59,9 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
       + '|' + (loadout.gear.Slot_Weapon2?.item ?? '-')
       + '|' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + ':' + v.join('+')).join(';')
       + '|' + cat.combatSlots().map((s) => loadout.gear[s.id]?.item ?? '').join(',')
-      + '|' + Object.entries(loadout.augments ?? {}).filter(([, v]) => v).sort().join(',');
+      + '|' + Object.entries(loadout.augments ?? {}).filter(([, v]) => v).sort().join(',')
+      + '|' + Object.values(loadout.runes ?? {}).flat().filter(Boolean).sort().join(',')
+      + '|' + (loadout.talents ?? []).slice().sort().join(',');
     let r = rotationCache.get(key);
     if (!r) { r = plan.resolve(loadout, rank); rotationCache.set(key, r); }
     return r;
@@ -86,6 +90,17 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
         if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, a.val ?? 0);
       }
     }
+    // Talents you have allocated. Only 22 of the 88 nodes declare anything a
+    // model can read; the rest are structurally present and numerically
+    // invisible, which `bench talents` reports rather than hides.
+    for (const id of loadout.talents ?? []) {
+      const v = talents.readableValue(id);
+      for (const a of v.affixes) if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, a.val ?? 0);
+      for (const b of v.buffs) {
+        for (const a of b.affixes) if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, (a.val ?? 0) * b.stacks);
+      }
+    }
+
     const buffs = plan.selfBuffs(rot);
     for (const b of buffs) {
       for (const a of b.affixes) {
@@ -171,7 +186,7 @@ export function createEngine({ game, assume = {}, quiet = false } = {}) {
   ];
 
   return {
-    cdb, ctx, cat, combat, plan, opts, audit,
+    cdb, ctx, cat, combat, plan, talents, opts, audit,
     baseStatsFor, evaluate, makeScorer, socketsOf: (l) => socketsOf(cat, l),
     meta: cdb.meta,
   };
