@@ -953,15 +953,48 @@ Coordinate ascent with exhaustive per-slot enumeration: walk the free
 decisions, and for each one try every legal option with everything else held
 fixed, keeping the best. Stop when a full pass changes nothing.
 
-Fast enough to be exhaustive: a slot has 2–27 candidates, a build has ~15 slots
-and up to ~10 sockets, and convergence takes 3–5 passes. About 3000 distinct
-loadouts, well under a second.
+A slot has 2–27 candidates, a build has ~15 slots and up to ~10 sockets, and
+convergence takes 3–9 passes. Around 20,000 distinct loadouts and a few seconds.
 
 Gear is optimised before augments in every pass, because gear decides which
 sockets exist. Coordinate ascent finds a *local* optimum and the interactions
 here are real, so the search restarts from several seeds (`--restarts`) and
 keeps the best. Restarts use a seeded PRNG — never `Math.random` — so a build
 you share can be re-derived.
+
+Three things had to be added before it found what it was walking past, and all
+three are the same mistake in different places: **a decision was being scored
+against a build that had not been allowed to answer it.**
+
+**The tree the gear is fitted to.** Talents are allocated inside the loop, and
+the in-pass allocation is a cheap heuristic that ranks a point by the size of
+the numbers on it. That heuristic counted affixes, buffs and effects and nothing
+else — a fair reading of the Priest tree and a blind one on the Warrior's, which
+is almost entirely scoped modifiers and pool dots. Hemorrhage, the root the whole
+class is built around, weighed exactly zero, and the heuristic allocation landed
+**28 dps** below what ranking by the real objective picks. Every gear comparison
+in every pass was made against that tree, and the objective allocation used to
+arrive once, after the last restart, when nothing could respond to it. Now the
+tree is re-cut against the objective whenever the ascent converges, and the loop
+carries on if that moved anything.
+
+**The allocation itself.** A greedy that walks tiers in order cannot revisit a
+decision, and thresholds mean the first four points in a branch decide which
+seven nodes are even reachable. So points are moved one at a time — out of where
+they are, into anywhere legal — until none improves.
+
+**Which rating you are building for.** Penetration has *increasing* returns:
+damage through armour is `K / (R(1−p) + K)`, so each point is worth more than the
+last. A build in crit gear loses by swapping one slot to penetration even when
+swapping all nine wins, and every single-slot step between the two sets is
+downhill. Random restarts do not find that and coordinate ascent cannot walk to
+it, so the seeds now include **one per secondary rating the class can wear**,
+with every armour slot filled by a piece that pays it. Weapons are left out: a
+weapon is chosen for its kit, not its faction, and theming those slots seeded a
+shield into the offhand and forbade every two-hander for the whole restart.
+
+And a sigil is scored with the talent it grants. It carries nothing else, so
+comparing two sigils by the score of the trial compared two identical builds.
 
 ## Drop rarity
 
@@ -1030,6 +1063,8 @@ every dot that declares a total reached 44,000. Widen one of these and re-run
 | `x.dmgMult += vars.n` (unguarded, on a status) | a `DamageModifier` affix | `DMG_MULT` |
 | `x.{dmgMult,critDmgMult,critChance,armorIgnore} += vars.n` | a SCOPED modifier | `talentModifiers` / `DMG_FIELD` |
 | `setDynVal(1, x.amount*vars.n); playStep(Steps.Heal)` | a healing share | `HEAL_SHARE` |
+| `setDynVal(1, <number>); playStep(Steps.X)` | the amount step `X`'s `dynVal` effect was missing | `damage.scriptDynVals` |
+| `setDynVal(1, owner.maxHealth*vars.n); playStep(Steps.X)` | the same, as scaling on `MaxHealth` | `damage.scriptDynVals` |
 | `reduceWeaponsCooldown(vars.n)` on a tick | `CooldownReduction`, via the dot's tick interval | `CD_PROC` |
 | `evalCost` → `val -= vars.n` under `hasMastery` | a rune cutting a cast's cost | `damage.costRelief` |
 | `x.dmgMult += vars.n` under `hasMastery` | a rune's damage bonus on its own skill | `damage.runeDamage` |
@@ -1042,24 +1077,68 @@ that is what `--targets` says. Everything else — `hasStatus`, `getStatusCount`
 keeps its rate refused and named. `scopeOf` is the gatekeeper: it strips every
 predicate it understands and refuses if anything condition-shaped survives.
 
-### Where to pick up
+**Three more, because a guard is not always a condition.**
 
-**The reader is only pointed at talents.** `talentModifiers` parses exactly the
-shapes the RUNES use, but it is invoked on talent ids alone. Pointing it at
-slotted runes — scoped to their own skill rather than globally — is the single
-highest-value next step; it picks up `Fury Pulse` and anything like it.
+`x.kind == Y` reads three different ways and only one of them is a question:
+
+| | |
+|---|---|
+| `s.kind == Steps.Area` | a dispatch on which step of this skill's own cast fired. The step always runs, so this is not a condition at all. |
+| `s.kind == Unit.Summon_Bee` | who was hit; already refused by the "hands it elsewhere" test. |
+| `s.kind == Skill.<status>` | a **dependency**. The handler fires when something else applies that status. |
+
+The third went unread, so the guard evaluated to "unconditional" and the payload
+was credited whole. `Warrior_Talent_HoldTheLine` is the case: +6% damage and −6%
+damage taken *while `Warrior_Talent_RageShield_Status` is up*, and Rage Shield is
+a separate node in a different branch that the build may simply not have taken.
+That was 22 dps for a talent whose own text says "while ::ref2_name:: is
+active". It is answered rather than refused, because the loadout knows: a
+whole-sheet index says who applies each status, and where **every** applier is a
+talent node the allocation is the complete list. Anything else stays unknown and
+is left alone — `Priest_Talent_PotentFortitude` waits on the Shield prayer, which
+is not a node, so it keeps its credit. Four nodes across three trees have this
+shape.
+
+`dmg.isStatusType(Bleed)` is **not** the live-state question the refusal list is
+aimed at. It says which damage event this is, exactly the way `isBaseAttack`
+does; `hasStatus`, `hasStatusType` and `hasStatusMaxStacked` are the ones that
+ask what is up right now. So a roll guarded by it rides the bleed's **own
+ticks**, and `Warrior_Talent_CrackingBlood` was otherwise going to be read at the
+base-attack rate — several times too fast — if it had been read at all. Two
+skills in the sheet have this shape and both are Warrior talents.
+
+`setDynVal(n, …); playStep(Steps.X)` names both the slot and the amount for an
+effect that declares neither. Fourteen sites do it; three of them hand it a
+number the data carries (a literal, `vars.x`, or `owner.maxHealth * vars.x`) and
+the rest hand it a share of a hit, a share of **current** health, or a script
+local accumulated over the cast. Those keep their zero and stay named. What the
+three buy: `Last Stand` heals 35% of MaxHealth, `Fury Pulse` generates its Rage,
+and both runes previously read as doing nothing at all.
+
+### Where to pick up
 
 **Unfinished on the Warrior**, all for stated reasons rather than for want of
 looking:
 
 | | why |
 |---|---|
-| Rage Shield | `Shield 0.05 × MaxHealth` on Hemorrhage. Needs `--goal ehp`/`sps` to mean anything |
-| Surge of Violence | "your NEXT Raging Smash is free and crits" — needs a per-cast register the fight does not carry |
+| Rage Shield | `Shield 0.05 × MaxHealth`, applied whenever a Hemorrhage-type status lands. The applier's own guard is `!hasStatus(owner, …)`, an internal marker whose duration is not in the data, so there is no rate to put on it. It is not inert in the model even so: **Hold the Line reads it**, and that dependency is now the difference between a Right-branch build worth +23 dps and one worth nothing |
+| Surge of Violence | "your NEXT Raging Smash is free and crits" — needs a per-cast register the fight does not carry. Worth roughly 1.7%: about one Raging Smash in five, which is a guaranteed crit and 9 Rage back |
 | Crippling Bloodloss, Second Wind, Fortitude | act on damage the enemy deals; the simulated foe does not act |
-| Execution, Into The Fray, Battle Momentum | gated on target health or enemy counts |
+| Execution, Into The Fray | gated on target health or on enemy counts the fight does not track per cast |
+| Battle Momentum | `totalHits >= 3` is answerable from `--targets`, but the count reaches the guard through a script local assigned in a different handler, so the number is not read |
 | Melee Fever, Enduring Defenses, Hold On! | need kills, blocking, or a party |
 | Overwhelming Rage | **no script, no vars, no affix, no step.** Its text is the only statement of what it does, and the skill it modifies unlocks at level 30 |
+
+**What the Warrior tree now reads**, for contrast, because the list above is
+short only because the list below got long: Hemorrhage and Infused Wound as pool
+dots, Bloodletting / Exsanguination / Sever / Master-at-arms / Bruise / Magic
+Conduction as scoped modifiers, Exposed Essence as penetration, Seasoned Soldier
+as Rage income, Red Tempo as cooldown earned back per bleed tick, Cracking Blood
+as a roll against each of those ticks, Bloodfeast as a share of the bleed healed
+back, Hold the Line once Rage Shield is in, and Fighting Spirit / Rash Soul /
+Zealous Warrior off ordinary affix rows. Sixteen of sixteen points land on
+something the model can value.
 
 **The other three classes have not been audited node by node.** Priest, Rogue
 and Mage gained from the shared readers (+1.4%, +4.6%, 0%) because the generic

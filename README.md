@@ -181,7 +181,7 @@ You need [Node.js](https://nodejs.org/) 18+ and a copy of Farever.
 ```bash
 git clone https://github.com/<you>/farever-bench
 cd farever-bench
-node test/run.mjs                  # 344 checks against your own game data
+node test/run.mjs                  # 473 checks against your own game data
 node bin/bench.mjs optimize --class Warrior
 ```
 
@@ -278,10 +278,26 @@ audit` prints this list with every result.
   list of shapes and where each is read.
 
 - **Talents and runes are structure more than value.** The trees are allocated
-  and validated against the real rules, but 63 of the 88 nodes and 53 of the 84
-  runes declare nothing a data-driven model can read. `bench talents` counts
+  and validated against the real rules, but most of the 88 nodes and most of the
+  84 runes declare nothing a data-driven model can read. `bench talents` counts
   what is readable, live. A Demon sigil grants a tier-4 talent outright; the
   search takes one because free beats empty, and says the pick is not scoreable.
+
+  **The Warrior is the exception, because it was walked node by node.** All
+  sixteen points land on something the model values: two pool bleeds, six scoped
+  modifiers, penetration against a bleeding target, Rage income per critical
+  strike, cooldown earned back per bleed tick, and a proc rolled against each of
+  those ticks. What is left is named with its reason — a "next cast is free"
+  register the fight does not carry, and four nodes that need a foe that hits
+  back. The other three classes have the shared readers and have not been
+  audited that way, so their exposure is under-reading rather than over-reading.
+
+  **A node can depend on another node, and it says so in script.** Hold the Line
+  is +6% damage *while Rage Shield is up*, and Rage Shield is a different branch
+  you may not have taken. Four nodes across three trees have that shape and all
+  four were being credited unconditionally; they are resolved against the
+  allocation now, and a build that cannot arm one is told which one it is
+  missing.
 - **Resources: Rage yes, Spark no, ComboPoints halfway.** A resource is a second
   kind of cooldown — you wait for income instead of a timer — and for the
   Warrior both halves are authored. `MaxRage` is 20 and `NoAutoFill` says you

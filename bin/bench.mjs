@@ -785,15 +785,35 @@ const commands = {
       const readable = tree.nodes.filter((n) => T.readableValue(n.skill).readable);
       console.log(f.bold(c.unit + " - " + tree.nodes.length + " nodes, " + readable.length +
         " this model can read, " + T.pointsAt(s.level) + " points at level " + s.level));
+      // Which nodes are the PREREQUISITE for another one. A node that reads as
+      // nothing on its own is not necessarily a dead point: Rage Shield's whole
+      // value in this model is that Hold the Line waits on the status it
+      // applies, and printing "nothing" beside it without saying so is the
+      // table telling you to skip the node the branch is built on.
+      const neededBy = new Map();
+      for (const n of tree.nodes) {
+        const alone = T.readableValue(n.skill, 1, { have: new Set([n.skill]) });
+        for (const d of alone.needs ?? []) {
+          const owner = tree.nodes.find((x) => T.readableValue(x.skill, 1).granted?.includes(d.needs))
+            ?? tree.nodes.find((x) => d.needs.startsWith(x.skill));
+          if (!owner) continue;
+          if (!neededBy.has(owner.skill)) neededBy.set(owner.skill, []);
+          neededBy.get(owner.skill).push(n.name);
+          n.waitsOn = owner.name;
+        }
+      }
       console.log(f.table(["  TIER", "BRANCH", "TALENT", "READS AS", "WHAT"],
         tree.nodes.map((n) => {
           const v = T.readableValue(n.skill);
+          const wanted = neededBy.get(n.skill);
           return ["  " + n.tier, n.branch, n.name,
             v.readable ? f.bold(v.kind) : f.dim("nothing"),
-            v.affixes.length ? f.affixSummary(v.affixes)
+            (n.waitsOn ? f.dim(`only while ${n.waitsOn} is up; `) : '')
+            + (wanted ? f.dim(`${wanted.join(' and ')} need${wanted.length > 1 ? '' : 's'} it; `) : '')
+            + (v.affixes.length ? f.affixSummary(v.affixes)
               : v.buffs.length ? v.buffs.map((x) => x.name + " x" + x.stacks).join(", ")
-              : v.effects.length ? v.effects.map((x) => x.kind).join(", ")
-              : f.dim("no affix, no effect, no status")];
+                : v.effects.length ? v.effects.map((x) => x.kind).join(", ")
+                  : f.dim("no affix, no effect, no status"))];
         })));
       console.log("");
     }

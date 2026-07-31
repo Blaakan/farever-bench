@@ -1871,6 +1871,127 @@ group('status types');
     flagged > 20 && agree / flagged > 0.9, `${agree} of ${flagged}`);
 }
 
+// --- a talent that depends on another talent --------------------------------
+// Four nodes across three trees do nothing at all unless a second node is
+// taken, and they say so in script rather than in a column: the handler fires
+// on `s.kind == <that status>`. The guard reader had no case for a status
+// identity, so it evaluated to "unconditional" and Hold the Line was credited
+// +6% damage and -6% damage taken whether or not Rage Shield was allocated.
+group('a talent that needs another talent');
+{
+  const eng = createEngine({ quiet: true });
+  const HTL = 'Warrior_Talent_HoldTheLine';
+  const SHIELD = 'Warrior_Talent_RageShield';
+  const alone = eng.talents.readableValue(HTL, 2, { have: new Set([HTL]) });
+  const paired = eng.talents.readableValue(HTL, 2, { have: new Set([HTL, SHIELD]) });
+  ok('Hold the Line grants nothing without Rage Shield',
+    alone.buffs.length === 0 && !alone.readable, JSON.stringify(alone.buffs));
+  ok('...and says which node it is waiting for',
+    alone.needs.length === 1 && alone.needs[0].needs === 'Warrior_Talent_RageShield_Status',
+    JSON.stringify(alone.needs));
+  ok('...and grants its buff once Rage Shield is taken',
+    paired.buffs.length === 1
+    && paired.buffs[0].affixes.some((a) => a.target?.attribute === 'DamageModifier'),
+    JSON.stringify(paired.buffs));
+
+  // `.kind ==` is not one thing. Against `Steps.X` it dispatches on which step
+  // of the skill's own cast fired - the step always runs - and refusing those
+  // would delete real readings.
+  const halos = eng.plan.statusesOf('Halos_Demon_Skill1', { rank: 3, talents: new Set() });
+  ok('a step-identity comparison is not read as a dependency',
+    halos.all.includes('Halos_Demon_Skill1_Shield'), JSON.stringify(halos.all));
+
+  // Only a status whose appliers are ALL talent nodes can be ruled out: the
+  // allocation is the complete list of those. `Priest_Prayer_Shield` is a
+  // prayer, so Potent Fortitude stays credited rather than being refused on a
+  // question the loadout cannot answer.
+  const pf = eng.talents.readableValue('Priest_Talent_PotentFortitude', 1,
+    { have: new Set(['Priest_Talent_PotentFortitude']) });
+  ok('a dependency on something that is not a talent node stays unknown, not refused',
+    pf.buffs.length > 0, JSON.stringify(pf.needs));
+}
+
+// --- an amount a script injects --------------------------------------------
+// A `dynVal` effect declares no amount; the number arrives at runtime. Three of
+// the fourteen sites in the sheet hand it something the data does carry, and
+// two of those are Warrior runes that read as blanks without this.
+group('script-injected amounts');
+{
+  const eng = createEngine({ quiet: true });
+  const eff = (id, runes) => eng.combat.profile(id, 3, runes ? new Set(runes) : null)?.effects ?? [];
+  const heal = (list) => list.find((x) => x.kind === 'Heal');
+  ok('Ignore Pain heals nothing without Last Stand',
+    heal(eff('Warrior_IgnorePain'))?.scaling.length === 0
+    && heal(eff('Warrior_IgnorePain'))?.hasDynVal === true);
+  const ls = heal(eff('Warrior_IgnorePain', ['Warrior_IgnorePain_M2']));
+  ok('...and 35% of MaxHealth with it',
+    ls && ls.scaling.length === 1 && ls.scaling[0].atb === 'MaxHealth'
+    && Math.abs(ls.scaling[0].ratio - 0.35) < 1e-9, JSON.stringify(ls));
+  const rage = (runes) => eff('Warrior_SurgingForce', runes).find((x) => x.kind === 'GainAtb');
+  ok('Surging Force generates no Rage without Fury Pulse',
+    rage(null)?.baseVal === 0 && rage(null)?.hasDynVal === true);
+  ok('...and 1 Rage with it',
+    Math.abs((rage(['Warrior_SurgingForce_M2'])?.baseVal ?? 0) - 1) < 1e-9);
+
+  // The refusals. A share of the hit, a share of CURRENT health and a script
+  // local accumulated over the cast are not numbers this has.
+  ok('a share of current health is refused',
+    heal(eff('Warrior_BerserkStatus', ['Warrior_Berserk_M2']))?.hasDynVal === true);
+  ok('an injection behind a script-tracked cooldown is refused',
+    heal(eff('Axe_Boomerang_Skill_Passive'))?.hasDynVal === true);
+}
+
+// --- a proc that rides a bleed tick ----------------------------------------
+// `dmg.isStatusType(Hemorage)` says which damage EVENT this is, the way
+// `isBaseAttack` does - not what is up right now. So the roll rides the bleed's
+// own ticks, and reading it as a base-attack proc would have given it a rate
+// several times too fast.
+group('a proc on a bleed tick');
+{
+  const eng = createEngine({ quiet: true });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.talents = { Warrior_Hemorrhage: 1, Warrior_Talent_CrackingBlood: 1 };
+  const rot = eng.plan.resolve(l, 3);
+  const cb = rot.triggered.find((t) => t.prof.id === 'Warrior_Talent_CrackingBlood');
+  ok('Cracking Blood rolls on a bleed tick, not on a swing',
+    cb && cb.rule.kind === 'per-dot-tick' && Math.abs(cb.rule.chance - 0.35) < 1e-9,
+    JSON.stringify(cb?.rule));
+  // Two skills in the sheet have this shape and both are Warrior talents. If a
+  // patch adds more, this reader wants looking at again.
+  let shaped = 0;
+  for (const s of eng.cdb.lines('skill')) {
+    if (typeof s.vars?.chance !== 'number' || !s.script) continue;
+    const body = String(s.script).replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+    const at = body.search(/checkProba\s*\(\s*vars\.chance/);
+    if (at < 0) continue;
+    if (/\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(?:Bleed|Hemorage)\s*\)/.test(body.slice(0, at))) shaped++;
+  }
+  ok('only the two known skills roll against a bleed tick', shaped === 2, String(shaped));
+}
+
+// --- the tree the gear is fitted to -----------------------------------------
+// The allocation heuristic ranks a point by the size of the numbers on it, and
+// it used to count affixes, buffs and effects only - which is most of the
+// Priest tree and almost none of the Warrior's. Hemorrhage, the root the whole
+// class is built around, weighed exactly zero.
+group('the talent heuristic sees the whole tree');
+{
+  const eng = createEngine({ quiet: true });
+  const weigh = (id, rank = 1) => {
+    const v = eng.talents.readableValue(id, rank);
+    return { mods: v.mods.length, dots: v.dots.length, gains: v.gains.length };
+  };
+  const h = weigh('Warrior_Hemorrhage');
+  ok('Hemorrhage declares a pool dot the allocation can weigh', h.dots === 1, JSON.stringify(h));
+  ok('Sever declares a scoped modifier', weigh('Warrior_Talent_Sever').mods === 1);
+  ok('Seasoned Soldier declares resource income',
+    weigh('Warrior_Talent_SeasonedSoldier').gains === 1);
+  const alloc = eng.talents.suggest('Warrior', { level: 25 });
+  ok('a Warrior allocation spends every point on something readable',
+    alloc.spent === alloc.budget && alloc.blind.length === 0,
+    `${alloc.spent}/${alloc.budget}, blind ${alloc.blind.join(',')}`);
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

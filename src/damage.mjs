@@ -1061,9 +1061,11 @@ export function buildCombat(cdb, ctx) {
            'addStatus as a third argument) and its status is DurationBased with unlimited stacks, so no ' +
            'damage is ever dropped. The total is therefore the share of the crit damage the fight already ' +
            'computes, without tracking individual bleed instances. What that loses is the TAIL - whatever ' +
-           'the last application had not ticked when the fight ended - and what it does not yet model is ' +
-           'the interactions ON the ticks: Red Tempo\'s cooldown reduction per tick, Cracking Blood\'s ' +
-           'proc per tick, and Magic Conduction\'s debuff while the target bleeds.' },
+           'the last application had not ticked when the fight ended. The interactions ON the ticks are ' +
+           'modelled: the fight tracks when a pool dot is up and when it ticks even though its total ' +
+           'needs no schedule, so Red Tempo earns its cooldown back per tick and Cracking Blood rolls ' +
+           'against each one. What is still assumed is Magic Conduction\'s and Exposed Essence\'s ' +
+           '"while the target is bleeding", which are credited whole rather than at the bleed\'s uptime.' },
     { severity: 'info', what: 'physical and magical reduction are equal on every real foe',
       why: 'Only the dev punching bags split them, so ArmorPenetration and SpellPenetration are worth the ' +
            'same against everything currently in the game. Which one you want is decided by your class and ' +
