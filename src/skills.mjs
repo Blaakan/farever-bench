@@ -1364,6 +1364,21 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // is at rank 3, and every `minRank: 2` rider on it passes for free.
     for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
       noteDots(id, statusesOf(id, { runes, rank: nodeRank, talents }), { source: 'talent' });
+      // ...and a talent that carries a damage step of its OWN, played on an
+      // event rather than cast. `Cracking Blood` has one step - 0.15x Faith +
+      // 0.15x Intellect of Magic - and its script plays it on a 35% roll every
+      // time a bleed ticks. It went through no bucket at all: the talent pass
+      // collected only what ticks, so a node the tree printed as "effect" was
+      // worth exactly zero in the fight it was printed beside.
+      //
+      // Only where the rule is one the fight raises. A talent is not cast, so a
+      // roll with no event named has no rate and stays unscored.
+      const tp = combat.profile(id, nodeRank, runes);
+      if (!tp?.effects.some((x) => ['Damage', 'Heal', 'Shield'].includes(x.kind)
+        && (x.baseVal || x.scaling.length))) continue;
+      const rule = triggerRule(id, tp, {}, { rank, runes, talents });
+      if (rule?.kind !== 'per-dot-tick') continue;
+      triggered.push({ prof: tp, source: 'talent', rule });
     }
 
     // A skill that IS the mechanism behind a trigger rule the model applied is
@@ -1495,9 +1510,30 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // as one guard would refuse a rate the roll does not actually depend on.
       const at = full.search(/checkProba\s*\(\s*vars\.chance/);
       const script = at >= 0 ? enclosingBlock(full.slice(0, at)) : full;
+      // A roll that rides a DOT'S OWN TICKS, not a swing. `Cracking Blood`
+      // guards on `dmg.isStatusType(StatusType.Hemorage)`, so the event is the
+      // bleed hurting the target - which happens every `tick` seconds while it
+      // is up, a rate this fight knows and nothing like the base-attack rate the
+      // fallback at the bottom would otherwise have given it.
+      //
+      // `dmg.isStatusType(X)` is NOT the live-state question the refusal list
+      // is aimed at. It asks which damage event this is, exactly the way
+      // `isBaseAttack` does - `hasStatus`, `hasStatusType` and
+      // `hasStatusMaxStacked` are the ones that ask what is up right now. So it
+      // is stripped before the guard is judged, and only where it names a bleed
+      // the fight actually runs. Two skills in the sheet have this shape and
+      // both are Warrior talents.
+      const BLEED_EVENT = /\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(Bleed|Hemorage)\s*\)/;
+      const onDotTick = BLEED_EVENT.test(script);
       // ...and the rest of that guard decides whether the rate applies at all.
-      const g = guardOf(script, opts);
+      const g = guardOf(onDotTick ? script.replace(BLEED_EVENT, ' ') : script, opts);
       if (!g.fires) return { kind: 'never', why: g.why };
+      if (!g.unread && onDotTick) {
+        return {
+          kind: 'per-dot-tick', chance,
+          why: `vars.chance = ${chance} on every tick of a bleed`,
+        };
+      }
       if (g.unread) {
         return {
           kind: 'conditional',

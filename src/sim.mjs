@@ -226,8 +226,12 @@ function runFight(spec) {
   // that instead of tracking individual bleed instances. Hemorrhage is the case:
   // 35% of every physical critical strike, excluding damage from other dots so
   // a bleed cannot feed itself.
+  // Its TOTAL needs no schedule, but things ride its ticks - `Cracking Blood`
+  // rolls 35% every time the bleed hurts the target - so the fight tracks when
+  // it is up and when it ticks even though the damage is settled at the end.
+  // Feeding it refreshes its life, which is what a `DurationBased` status does.
   const poolDots = (rotation.dots ?? []).filter((d) => d.pool)
-    .map((d) => ({ ...d, fed: 0, damage: 0, heal: 0 }));
+    .map((d) => ({ ...d, fed: 0, damage: 0, heal: 0, ticks: 0, expires: -1, nextTick: 0 }));
   const dots = (rotation.dots ?? []).filter((d) => !d.pool).map((d) => ({
     ...d, out: dotOutput(d, bare), damage: 0, heal: 0, ticks: 0, credit: 0,
   })).filter((d) => d.out.damage || d.out.heal);
@@ -269,7 +273,8 @@ function runFight(spec) {
       // neither a swing nor a combo - collapsing every rule to those two put it
       // on the base-attack rate and read it several times too fast.
       on: tr.rule.kind === 'per-parent-cast' ? 'parent'
-        : tr.rule.kind === 'per-combo' ? 'combo' : 'attack',
+        : tr.rule.kind === 'per-combo' ? 'combo'
+          : tr.rule.kind === 'per-dot-tick' ? 'dot-tick' : 'attack',
       parent: tr.rule.parent ?? null,
       chance: (tr.rule.chance ?? 1) / Math.max(1, tr.rule.divisor ?? 1),
       fires: 0, damage: 0, heal: 0, shield: 0,
@@ -422,7 +427,7 @@ function runFight(spec) {
     for (const a of actives) { a.casts = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
     for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; }
-    for (const p of poolDots) { p.fed = 0; p.damage = 0; p.heal = 0; }
+    for (const p of poolDots) { p.fed = 0; p.damage = 0; p.heal = 0; p.ticks = 0; p.expires = -1; p.nextTick = 0; }
 
     // A skill opens the fight with its full bank of charges - that is exactly
     // what a charge is - and regains one per cooldown thereafter.
@@ -471,12 +476,18 @@ function runFight(spec) {
 
 
     // Feed the pool dots from whatever this cast landed as a critical strike.
-    const feedPools = (out) => {
+    // Feeding one also (re)applies it, which is what starts and refreshes its
+    // tick schedule - the total does not need that, but anything riding the
+    // ticks does.
+    const feedPools = (out, at) => {
       for (const p of poolDots) {
         const src = p.pool.magic ? (out.critMagic ?? 0)
           : p.pool.physical ? (out.critPhysical ?? 0)
             : (out.critPhysical ?? 0) + (out.critMagic ?? 0);
-        if (src > 0) p.fed += src;
+        if (!(src > 0)) continue;
+        p.fed += src;
+        if (p.expires <= at) p.nextTick = at + p.tick;
+        p.expires = at + (Number.isFinite(p.duration) ? p.duration : fight);
       }
     };
 
@@ -494,6 +505,32 @@ function runFight(spec) {
           st.nextTick += d.tick;
         }
         if (st.expires <= until) live.delete(d);
+      }
+      // A pool dot's own ticks. Its damage is settled at the end from what fed
+      // it, so nothing is credited here - but the tick is an EVENT, and a proc
+      // guarded on `isStatusType(Bleed)` rides it rather than riding a swing.
+      for (const p of poolDots) {
+        if (!(p.tick > 0)) continue;
+        while (p.nextTick <= Math.min(until, p.expires) && p.nextTick <= fight) {
+          p.ticks++;
+          fireDotTick();
+          p.nextTick += p.tick;
+        }
+      }
+    };
+    // What a bleed tick sets off. Deterministic runs credit the expected
+    // fraction of a fire, rolled ones roll - the same treatment every other
+    // proc gets, and priced against whatever is up at the time.
+    const fireDotTick = () => {
+      for (const g of triggers) {
+        if (g.on !== 'dot-tick') continue;
+        const share = rand ? (rand() < g.chance ? 1 : 0) : g.chance;
+        if (!share) continue;
+        const out = cast(g.prof, now);
+        g.fires += share;
+        g.damage += out.damage * share;
+        g.heal += out.heal * share;
+        g.shield += out.shield * share;
       }
     };
 
@@ -570,8 +607,10 @@ function runFight(spec) {
       // Procs ride the same events. Deterministic runs credit the expected
       // fraction of a fire; rolled ones roll. Priced against live state too.
       for (const g of triggers) {
-        const fires = g.on === 'parent' ? (wasCast && g.parent === skillId)
-          : g.on === 'attack' ? attack : combo;
+        // A dot-tick proc is raised by `tickTo`, not by a cast or a swing.
+        const fires = g.on === 'dot-tick' ? false
+          : g.on === 'parent' ? (wasCast && g.parent === skillId)
+            : g.on === 'attack' ? attack : combo;
         if (!fires) continue;
         const share = rand ? (rand() < g.chance ? 1 : 0) : g.chance;
         if (!share) continue;
@@ -644,7 +683,7 @@ function runFight(spec) {
         // Rage, Mage_RayOfSpark returns a share of MaxSpark - which is authored
         // in ordinary columns and needs the sheet, so it arrives with the cast.
         for (const g of out.gains ?? []) earn(g.atb, g.amount);
-        feedPools(out);
+        feedPools(out, t);
         setUp(a.applies, t);
         applyDots(a.prof.id, t, {
           cast: true,
@@ -683,7 +722,7 @@ function runFight(spec) {
       link.damage = (link.damage ?? 0) + swingOut.damage;
       link.heal = (link.heal ?? 0) + swingOut.heal;
       link.shield = (link.shield ?? 0) + swingOut.shield;
-      feedPools(swingOut);
+      feedPools(swingOut, t);
       setUp(link.applies, t);
       applyDots(link.prof.id, t, { attack: !link.prof.isCombo, combo: link.prof.isCombo });
       const end = t + link.occupancy;
@@ -748,8 +787,9 @@ function runFight(spec) {
     }
     for (const p of poolDots) {
       damage += p.damage; heal += p.heal ?? 0;
-      const e = acc.pool.get(p) ?? { damage: 0, fed: 0, heal: 0 };
-      e.damage += p.damage; e.fed += p.fed; e.heal += p.heal ?? 0; acc.pool.set(p, e);
+      const e = acc.pool.get(p) ?? { damage: 0, fed: 0, heal: 0, ticks: 0 };
+      e.damage += p.damage; e.fed += p.fed; e.heal += p.heal ?? 0; e.ticks += p.ticks ?? 0;
+      acc.pool.set(p, e);
     }
     for (const g of triggers) {
       damage += g.damage; heal += g.heal; shield += g.shield;
@@ -830,7 +870,8 @@ function runFight(spec) {
       perCast: { damage: e.damage / rolls, heal: (e.heal ?? 0) / rolls, shield: 0 },
       interval: elapsed, share: 0,
       why: Math.round(p.pool.fraction * 100) + '% of ' + Math.round(e.fed / rolls) + ' '
-        + (p.pool.magic ? 'magic' : 'physical') + ' critical damage, pooled by ' + p.fromName,
+        + (p.pool.magic ? 'magic' : 'physical') + ' critical damage, pooled by ' + p.fromName
+        + (e.ticks ? `, ticking ${Math.round(e.ticks / rolls)} times` : ''),
     });
   }
   lines.push(...triggeredLines);

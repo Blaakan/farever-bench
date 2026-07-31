@@ -32,6 +32,11 @@
 // ---------------------------------------------------------------------------
 
 import { socketsOf, pruneIllegal, illegalReason } from './loadout.mjs';
+// A pure data function that happens to live next to the printer: which secondary
+// rating a piece pays THIS class, out of the cross of its faction with the
+// wearer's own aptitude. The search needs it for the same reason the output
+// prints it - see `themeSeeds`.
+import { ratingGiven } from './format.mjs';
 
 // A tiny deterministic PRNG. Restarts must be reproducible: a build a user
 // shares has to be re-derivable, so nothing here touches Math.random.
@@ -193,6 +198,59 @@ export function optimize(engine, spec) {
     });
     loadout.talents = alloc.ranks;
     return { ...alloc, granted: [...granted] };
+  }
+
+  /**
+   * Coordinate ascent on the ALLOCATION itself: move one point from where it is
+   * to somewhere it is worth more, keep the move if the objective agrees, and
+   * repeat until nothing moves.
+   *
+   * A greedy that walks tiers in order cannot revisit a decision, and on a tree
+   * with thresholds it does not get a second chance: taking a tier-1 node opens
+   * a branch, so the first few points decide which seven nodes are even
+   * reachable. On the Warrior that showed up as one point in the wrong place
+   * being worth 3% - the branch spends four points to open tier 3 and the
+   * greedy had already committed them elsewhere.
+   *
+   * Every candidate is checked against the real rules before it is scored, so
+   * nothing here can produce an allocation a character could not have.
+   */
+  function refineTalents(loadout, granted) {
+    if (spec.pinnedTalents) return false;
+    const tree = engine.talents.treeFor(loadout.class);
+    const points = engine.talents.pointsAt(loadout.level, spec.talentPoints ?? null);
+    if (!points) return false;
+    let best = scoreOf(loadout);
+    let moved = false;
+    for (let round = 0; round < 6; round++) {
+      let bestMove = null;
+      const ranks = { ...(loadout.talents ?? {}) };
+      const held = Object.keys(ranks).filter((id) => !granted.has(id));
+      for (const from of held) {
+        for (const node of tree.nodes) {
+          if (granted.has(node.skill)) continue;
+          if (node.skill === from) continue;
+          const trial = { ...ranks };
+          if ((trial[from] ?? 0) <= 1) delete trial[from]; else trial[from] -= 1;
+          trial[node.skill] = (trial[node.skill] ?? 0) + 1;
+          if (engine.talents.illegalAllocation(loadout.class, trial, {
+            level: loadout.level, points, granted,
+          })) continue;
+          const probe = clone(loadout);
+          probe.talents = trial;
+          let got;
+          try { got = scoreOf(probe); } catch { continue; }
+          if (better(got, best) && (!bestMove || better(got, bestMove.score))) {
+            bestMove = { ranks: trial, score: got };
+          }
+        }
+      }
+      if (!bestMove) break;
+      loadout.talents = bestMove.ranks;
+      best = bestMove.score;
+      moved = true;
+    }
+    return moved;
   }
 
   let counter = 0;
@@ -399,6 +457,18 @@ export function optimize(engine, spec) {
           const trial = clone(cur);
           if (pick) trial.augments[sock.key] = pick;
           else delete trial.augments[sock.key];
+          // A SIGIL is not scored by what it carries - it carries nothing. It
+          // grants a tier-4 talent, and the node arrives in `loadout.talents`
+          // only on the next allocation, so comparing two sigils by the score
+          // of the trial compared two identical builds and every sigil tied.
+          // The grant costs no point, so putting it straight into the trial is
+          // the exact comparison: `Infused Wound` is a second bleed and the
+          // ones next to it declare nothing, which is a difference the search
+          // could not see and now can.
+          if (sock.type === 'AugmentDemonSigil') {
+            for (const g of grantedTalents(cur)) delete trial.talents[g];
+            for (const g of grantedTalents(trial)) trial.talents[g] = 1;
+          }
           const s = scoreOf(trial);
           if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
         }
@@ -413,25 +483,123 @@ export function optimize(engine, spec) {
       // Sigils are augments, and a sigil changes which tier-4 node is already
       // yours - which changes what the remaining 16 points should buy. So the
       // tree is re-allocated after the augment pass, not before it.
+      //
+      // KEPT ONLY IF IT WINS. The in-pass allocation is the cheap heuristic
+      // one, and it used to be written over whatever was there and the new
+      // score taken whether or not it was better - so a pass could lower the
+      // build and the loop would carry on from the lower one. It also meant the
+      // objective-ranked allocation the search finishes with could not be
+      // polished: re-entering the loop threw it away on the first pass.
       const before = best;
+      const heldRanks = { ...(cur.talents ?? {}) };
+      const hadRanks = Object.keys(heldRanks).length > 0;
       allocateTalents(cur);
-      best = scoreOf(cur);
-      if (better(best, before)) improved = true;
+      const after = scoreOf(cur);
+      if (better(after, before) || !hadRanks) {
+        best = after;
+        if (better(after, before)) improved = true;
+      } else {
+        cur.talents = heldRanks;
+      }
 
-      if (!improved) return { loadout: cur, score: best, passes: pass + 1 };
+      if (!improved) {
+        // Nothing else moves - so now re-cut the tree against the REAL
+        // objective, and if that moves the build, let the loop carry on so the
+        // gear can answer.
+        //
+        // This is the difference between a search and a two-stage guess. The
+        // cheap heuristic ranks a point by the size of the numbers on it, which
+        // on the Warrior tree lands 28 dps below what the objective picks - and
+        // every gear comparison the ascent made was made against that tree. It
+        // used to be re-cut once, after all the restarts, at which point
+        // nothing could respond to it. One objective allocation per convergence
+        // is a few hundred cached evaluations, and it is what makes the search
+        // find the penetration build it had been walking past.
+        const held = { ...(cur.talents ?? {}) };
+        const alloc = allocateTalents(cur, { byObjective: true });
+        if (alloc) {
+          const after2 = scoreOf(cur);
+          if (better(after2, best)) { best = after2; continue; }
+          cur.talents = held;
+        }
+        return { loadout: cur, score: best, passes: pass + 1 };
+      }
     }
     return { loadout: cur, score: best, passes: maxPasses };
   }
 
+  /**
+   * One seed per secondary rating the class can wear, with every free slot
+   * filled by the best piece that pays it.
+   *
+   * A random restart cannot find these, and coordinate ascent cannot walk to
+   * them: penetration has INCREASING returns. Damage through armour is
+   * `K / (R(1 - p) + K)`, so each point of ArmorPenetration is worth more than
+   * the last, and a build wearing crit gear loses by swapping one slot to
+   * penetration even when swapping all nine wins. The Warrior is the live case
+   * - a crit set and a penetration set differ by 3% and every single-slot step
+   * between them is downhill.
+   *
+   * Faction is what decides this, which is why the answer is not a stat weight:
+   * the same Manfish chest pays a Warrior ArmorPenetration and a Priest Fervor,
+   * so "which rating do I build for" is a decision about which factions to
+   * wear. Seeding one coherent set per rating asks that question directly, and
+   * it costs a handful of deterministic restarts rather than a search.
+   */
+  function themeSeeds() {
+    const best = new Map();  // rating -> Map(slotId -> candidate)
+    // ARMOUR AND JEWELLERY ONLY. A weapon is chosen for the kit it grants, not
+    // for its faction, and theming the weapon slots picked the highest-level
+    // piece that happened to pay the right rating - a sword over the great axe
+    // the class actually wants, and a shield in the offhand, which then forbids
+    // every two-hander for the whole restart. The theme is about which
+    // secondary rating the SET pays; the weapon is a separate question and the
+    // ascent asks it first anyway.
+    const themable = freeSlots.filter((id) => !/^Slot_(Weapon1|Weapon2|OffhandWeapon)$/.test(id));
+    for (const slotId of themable) {
+      const level = (c) => {
+        const item = cat.itemById.get(c.item);
+        try {
+          return cat.effectiveLevel(item, {
+            charLevel: spec.loadout.level, stars: c.stars ?? 0, rarity: c.rarity ?? null,
+          });
+        } catch { return 0; }
+      };
+      for (const c of candidates.get(slotId) ?? []) {
+        if (!c) continue;
+        const item = cat.itemById.get(c.item);
+        if (!item) continue;
+        let rating;
+        try { rating = ratingGiven(cat, item, cls.aptitude, c.rarity, c.generic); } catch { continue; }
+        if (!rating) continue;
+        if (!best.has(rating)) best.set(rating, new Map());
+        const m = best.get(rating);
+        const cur = m.get(slotId);
+        if (!cur || level(c) > level(cur)) m.set(slotId, c);
+      }
+    }
+    return [...best.entries()].map(([rating, picks]) => ({ rating, picks }));
+  }
+
   // Restart 0 starts from the seed as the user gave it; later restarts start
-  // from a random legal fill, which is what escapes a local optimum.
+  // from a random legal fill, which is what escapes a local optimum, and the
+  // last few start from a coherent rating theme, which is what escapes the one
+  // random fills cannot.
   let winner = null;
   const trace = [];
-  for (let r = 0; r < Math.max(1, restarts); r++) {
+  const themes = themeSeeds();
+  const total = Math.max(1, restarts) + themes.length;
+  for (let r = 0; r < total; r++) {
+    const theme = r >= Math.max(1, restarts) ? themes[r - Math.max(1, restarts)] : null;
     const rand = rng(0x9e3779b9 + r * 2654435761);
     let seed = clone(spec.loadout);
     engine.plan.pruneSelection(seed);
-    if (r > 0) {
+    if (theme) {
+      for (const [slotId, pick] of theme.picks) {
+        seed.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars, generic: pick.generic };
+      }
+      pruneAugments(seed);
+    } else if (r > 0) {
       for (const slotId of freeSlots) {
         const list = candidates.get(slotId).filter(Boolean);
         if (!list.length) continue;
@@ -441,7 +609,7 @@ export function optimize(engine, spec) {
       pruneAugments(seed);
     }
     const got = ascend(seed, rand);
-    trace.push({ restart: r, score: got.score.score, passes: got.passes });
+    trace.push({ restart: theme ? theme.rating : r, score: got.score.score, passes: got.passes });
     if (!winner || better(got.score, winner.score)) winner = got;
   }
 
@@ -452,8 +620,52 @@ export function optimize(engine, spec) {
   // `promise` continue to order those - the search does not invent a
   // preference it does not have.
   const scoreBeforeObjectiveTalents = winner.score.score;
+  const heuristicRanks = { ...(winner.loadout.talents ?? {}) };
   winner.talentAlloc = allocateTalents(winner.loadout, { byObjective: true });
-  if (winner.talentAlloc) winner.score = scoreOf(winner.loadout);
+  if (winner.talentAlloc) {
+    const after = scoreOf(winner.loadout);
+    // A greedy is a greedy either way round. Ranking by the objective is a
+    // better ordering on average and not a guaranteed one, so the allocation it
+    // produces has to WIN to be kept - otherwise the last thing the search does
+    // is throw away a build it had already found.
+    if (better(after, winner.score)) winner.score = after;
+    else { winner.loadout.talents = heuristicRanks; winner.talentAlloc = null; }
+  }
+
+  // Then move the points around. A greedy over a tree with tier thresholds
+  // commits its first four points to a branch before it can see what the branch
+  // holds, and it never revisits them; one point in the wrong place was worth 3%
+  // on the Warrior. This is the same coordinate ascent the gear gets, applied to
+  // the allocation, and every candidate is checked against the real rules.
+  if (refineTalents(winner.loadout, new Set(winner.talentAlloc?.granted ?? grantedTalents(winner.loadout)))) {
+    winner.score = scoreOf(winner.loadout);
+  }
+
+  // ...and the gear has to be allowed to answer. Coordinate ascent may not stop
+  // on the pass that moved something big: the tree has just been re-cut against
+  // the real objective, and the sixteen points it holds decide what the ratings
+  // on your gear are worth. So the loop is re-entered from the build that came
+  // out - one more ascent from a good starting point, not another restart - and
+  // kept only if it improves.
+  for (let round = 0; round < 3; round++) {
+    const polished = ascend(clone(winner.loadout), rng(0x9e3779b9));
+    let cur = better(polished.score, winner.score)
+      ? { ...winner, loadout: polished.loadout, score: polished.score } : null;
+    const base = cur ?? winner;
+    const ranks = { ...(base.loadout.talents ?? {}) };
+    const alloc = allocateTalents(base.loadout, { byObjective: true });
+    if (alloc) {
+      const after = scoreOf(base.loadout);
+      if (better(after, base.score)) { base.score = after; base.talentAlloc = alloc; cur = base; }
+      else base.loadout.talents = ranks;
+    }
+    if (refineTalents(base.loadout, new Set(base.talentAlloc?.granted ?? grantedTalents(base.loadout)))) {
+      const after = scoreOf(base.loadout);
+      if (better(after, base.score)) { base.score = after; cur = base; }
+    }
+    if (!cur) break;
+    winner = cur;
+  }
 
   const finalEval = engine.evaluate(winner.loadout, { target, rank, mix });
 

@@ -185,6 +185,83 @@ export function buildCombat(cdb, ctx) {
     return hit;
   }
 
+  /**
+   * The amount a script INJECTS into an effect that declares `dynVal`.
+   *
+   * A `dynVal` effect carries no baseVal and no scaling - the number arrives at
+   * runtime - so it reads as zero, which is right for most of them and wrong
+   * for the ones whose number is sitting in `vars` two lines up:
+   *
+   *   // Warrior_IgnorePain, "Last Stand"        vars.var2 = 0.35
+   *   if (hasMastery(Mastery.Warrior_IgnorePain_M2)) {
+   *     setDynVal(1, owner.maxHealth * vars.var2);
+   *     playStep(Steps.SelfHeal, owner);
+   *   }
+   *
+   * `Steps.SelfHeal` is a step of this skill with `id: "SelfHeal"` and a Heal
+   * effect whose `dynVal` is 1, so the pair names both the slot and the amount.
+   *
+   * Fourteen sites in the sheet do this and only three are numbers. The rest
+   * are a share of a hit (`dmg.amount * vars.x`, which `HEAL_SHARE` reads where
+   * it can), a share of CURRENT health, or a script local accumulated over the
+   * cast - none of which is a number this has. Those keep their zero, and the
+   * effect stays flagged `hasDynVal` so the coverage report can name it.
+   */
+  const dynFillCache = new Map();
+  function scriptDynVals(s, runes) {
+    if (!s?.script) return null;
+    const key = s.id + '@' + (runes?.size ? [...runes].sort().join('+') : '');
+    let hit = dynFillCache.get(key);
+    if (hit !== undefined) return hit;
+    hit = null;
+    const body = String(s.script).replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+    const RE = /setDynVal\s*\(\s*(\d+)\s*,\s*([^;]+?)\)\s*;\s*playStep\s*\(\s*Steps\.([A-Za-z0-9_]+)/g;
+    for (const m of body.matchAll(RE)) {
+      const before = body.slice(0, m.index);
+      const line = before.slice(before.lastIndexOf('function'));
+      // A rune-gated injection only lands when that rune is slotted. An
+      // unguarded one always lands.
+      const rune = /hasMastery\s*\(\s*(?:Mastery\.)?([A-Za-z0-9_]+)/.exec(line)?.[1];
+      if (rune && !runes?.has(rune)) continue;
+      // Everything else in the guard has to be something that is not a
+      // condition. `hit.stepId == Steps.Area` is a dispatch on which step of
+      // this cast fired, and the step always fires; anything else - a status,
+      // a health ratio - is live state and the injection is refused.
+      const rest = line
+        .replace(/function\s+on\w+\s*\([^)]*\)/g, ' ')
+        .replace(/hasMastery\s*\([^)]*\)/g, ' ')
+        .replace(/\w+(?:\.\w+)*\.(?:stepId|kind)\s*==\s*Steps\.\w+/g, ' ')
+        .replace(/setDynVal\s*\([^;]*\)\s*;?/g, ' ')
+        .replace(/playStep\s*\([^;]*\)\s*;?/g, ' ')
+        .replace(/\b(?:if|hit|dmg|ctx|var|owner|s)\b/g, ' ')
+        .replace(/[\s{}()&|!,;.=+]/g, '');
+      if (rest.length) continue;
+      const expr = m[2].replace(/\s+/g, ' ').trim();
+      const varOf = (t) => {
+        if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+        const v = /^vars\.([A-Za-z0-9_]+)$/.exec(t);
+        if (!v) return null;
+        const n = s.vars?.[v[1]] ?? (s.mastery ?? []).find((x) => x.id === rune)?.vars?.[v[1]];
+        return typeof n === 'number' ? n : null;
+      };
+      let fill = null;
+      const flat = varOf(expr);
+      if (flat != null) fill = { baseVal: flat };
+      else {
+        // `owner.maxHealth * vars.x` - a share of a stat the sheet carries, so
+        // it becomes ordinary scaling. `owner.health` is NOT that: it is what
+        // is left right now, which no sheet knows.
+        const mh = /^(?:owner\.maxHealth\s*\*\s*(vars\.\w+)|(vars\.\w+)\s*\*\s*owner\.maxHealth)$/.exec(expr);
+        const r = mh ? varOf(mh[1] ?? mh[2]) : null;
+        if (r != null) fill = { scaling: [{ atb: 'MaxHealth', ratio: r }] };
+      }
+      if (!fill) continue;
+      (hit ??= new Map()).set(m[3] + '#' + m[1], fill);
+    }
+    dynFillCache.set(key, hit);
+    return hit;
+  }
+
   // Loop flags, from `skill@steps@props@loop.flags`.
   const LOOP_SPREAD = 1;      // the declared amount is the TOTAL, divided over the ticks
   const LOOP_DIRECT_START = 2; // the first tick lands at t=0 rather than after one interval
@@ -348,6 +425,8 @@ export function buildCombat(cdb, ctx) {
 
     const effects = [];
     const statusRefs = [];
+    // Amounts a script hands to a `dynVal` effect, keyed by the step it plays.
+    const dynFills = scriptDynVals(s, runes);
     for (const st of s.steps ?? []) {
       if (!stepLives(st)) continue;
 
@@ -371,6 +450,11 @@ export function buildCombat(cdb, ctx) {
           if (cc.equalRank != null && rank !== cc.equalRank) continue;
           if (sc.atb) scaling.push({ atb: sc.atb, ratio: num(sc.ratio) });
         }
+        // A script may have filled this effect's `dynVal` with a number the
+        // data does carry - the rune that grants it, and the `vars` key beside
+        // the call. `Last Stand` heals `0.35 x MaxHealth` and read zero.
+        const fill = (e.dynVal ?? 0) !== 0 && st.id ? dynFills?.get(st.id + '#' + e.dynVal) : null;
+        if (fill?.scaling) for (const sc of fill.scaling) scaling.push(sc);
         effects.push({
           kind,
           // WHICH attribute a GainAtb feeds. This was dropped, so the eight
@@ -380,7 +464,7 @@ export function buildCombat(cdb, ctx) {
           // Rage, which is a fully authored income rate that nothing collected.
           atb: e.target?.atb ?? null,
           affinity: e.affinity ?? null,
-          baseVal: num(e.baseVal),
+          baseVal: num(e.baseVal) + (fill?.baseVal ?? 0),
           scaling,
           // How many times this lands on ONE target per cast: loop ticks times
           // projectiles, unless the loop declares its amount as a total.
@@ -403,7 +487,9 @@ export function buildCombat(cdb, ctx) {
           // `Priest_Talent_BurningRays_Status` has no baseVal and no scaling at
           // all, only dynVal. Reading baseVal+scaling scores those zero, which
           // is right, but they must be NAMED rather than silently dropped.
-          hasDynVal: (e.dynVal ?? 0) !== 0,
+          // Unless the injection itself was readable, in which case it is no
+          // longer a gap and no longer belongs in the coverage report.
+          hasDynVal: (e.dynVal ?? 0) !== 0 && !fill,
           scaleWithStacks: !!((e.flags ?? 0) & 1),
         });
       }

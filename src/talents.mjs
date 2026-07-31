@@ -342,11 +342,28 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     // points is two separate decisions, and the second is worth the DIFFERENCE
     // between its two rank rows - Sharp Mind is +3 CooldownReduction for the
     // first point and +3 more for the second, not +6 and not +9.
+    // Everything a node declares, on one rough scale, so the walk has an order.
+    //
+    // It used to count affixes, buffs and effects and NOTHING ELSE, which is a
+    // fair reading of the Priest tree and a blind one on the Warrior's: that
+    // tree is almost entirely scoped modifiers and pool dots, so Hemorrhage -
+    // the root the whole class is built around - and every "+20% damage on
+    // bleeds" node beside it weighed exactly zero. The heuristic is what orders
+    // the allocation on every pass of the search, and the gear is fitted to
+    // whatever it produces, so a blind ordering is not a cosmetic problem: the
+    // Warrior's gear was being chosen against a tree picked at random.
+    //
+    // The scale is the one the effect term already sets - a coefficient of 0.2
+    // counts 10 - and it is a tiebreak, not a valuation. The final allocation
+    // ranks every point by the real objective.
     const magnitude = (v) => {
       let w = 0;
       for (const a of v.affixes) w += Math.abs(a.val ?? 0);
       for (const b of v.buffs) for (const a of b.affixes) w += Math.abs(a.val ?? 0) * (b.stacks ?? 1);
       for (const e of v.effects) w += Math.abs(e.baseVal ?? 0) + e.scaling.reduce((s, x) => s + Math.abs(x.ratio) * 50, 0);
+      for (const m of v.mods) w += Math.abs(m.amount ?? 0) * 50;
+      for (const d of v.dots) w += Math.abs(d.pool?.fraction ?? 0) * 50;
+      for (const g of v.gains) w += Math.abs(g.amount ?? 0) * 5;
       return w;
     };
     // `value(nodeId, rank, ranksSoFar)` lets a caller rank a point by the real
@@ -547,6 +564,24 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     if ((on?.runeDamage ?? []).length > (off?.runeDamage ?? []).length) {
       const d = on.runeDamage[on.runeDamage.length - 1];
       what.push(`+${Math.round(d.amount * 100)}% damage${d.singleTarget ? ' at one target' : ''}`);
+    }
+    // An effect the rune fills in. A `dynVal` effect declares no amount at all -
+    // the number arrives from a script - so the same step reads as a blank
+    // without the rune and as a real heal or a real resource gain with it:
+    // `Last Stand` is `0.35 x MaxHealth` and `Fury Pulse` is 1 Rage, both
+    // sitting in `vars` beside a `setDynVal` the profile now resolves.
+    const sig = (x) => `${x.kind}:${x.atb ?? ''}:${x.baseVal}:`
+      + x.scaling.map((s) => s.atb + '*' + s.ratio).join('+');
+    const before = new Set((off?.effects ?? []).map(sig));
+    for (const x of on?.effects ?? []) {
+      if (before.has(sig(x))) continue;
+      const amount = x.scaling.length
+        ? x.scaling.map((s) => `${Math.round(s.ratio * 100)}% of ${s.atb}`).join(' + ')
+        : String(+x.baseVal.toFixed(2));
+      if (x.kind === 'GainAtb') what.push(`+${amount} ${x.atb}`);
+      else if (x.kind === 'Heal') what.push(`heals ${amount}`);
+      else if (x.kind === 'Shield') what.push(`shields ${amount}`);
+      else if (x.kind === 'Damage') what.push(`adds ${amount} damage`);
     }
     const gains = plan.resourceGainsOf(skillId, { rank: 3, runes: new Set([runeId]) });
     const base = plan.resourceGainsOf(skillId, { rank: 3, runes: new Set() });

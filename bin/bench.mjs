@@ -587,9 +587,15 @@ const commands = {
       console.log(f.dim(`pinned: ${[...pins.pinnedGear].map(f.short).join(', ') || '-'}` +
         (pins.pinnedAug.size ? `   sockets: ${[...pins.pinnedAug].map((k) => k.replace(/Slot_|Augment/g, '')).join(', ')}` : '')));
     }
+    // The seeds are not all random. After `--restarts` random ones, the search
+    // starts once from each secondary rating the class can wear, with every
+    // armour slot filled by a piece that pays it - see `themeSeeds`. Saying
+    // which seed won is the interesting half: "the ArmorPenetration set" is a
+    // statement about the build, and "restart 2" is not.
+    const won = res.trace.reduce((b, x) => (x.score > b.score ? x : b)).restart;
     console.log(f.dim(`${res.evaluations} distinct loadouts evaluated in ${((Date.now() - t0) / 1000).toFixed(1)}s ` +
-      `over ${restarts} restart${restarts === 1 ? '' : 's'} (best score from restart ` +
-      `${res.trace.reduce((b, x) => (x.score > b.score ? x : b)).restart})`));
+      `over ${res.trace.length} seeds (${restarts} random, ${res.trace.length - restarts} themed by rating) - ` +
+      `best from ${typeof won === 'number' ? `restart ${won}` : `the ${won} set`}`));
     console.log('');
     console.log(f.gearBlock(s.engine, res.loadout, {
       pinnedGear: pins.pinnedGear, indifferent: new Set(res.indifferent),
