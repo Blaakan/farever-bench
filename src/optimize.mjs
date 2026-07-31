@@ -134,7 +134,15 @@ export function optimize(engine, spec) {
     if (allowEmpty || slotId === 'Slot_OffhandWeapon') list.push(null);
     candidates.set(slotId, list);
   }
-  if (offhandPinnedFull && !candidates.get('Slot_Weapon1')?.some(Boolean)) {
+  // "You pinned a shield and now nothing one-handed is left to put in the other
+  // hand" - which is only a question when the mainhand is still being CHOSEN.
+  // Pinning both hands took this branch too, because a pinned slot has no
+  // candidate list at all and `undefined?.some()` is falsy: pinning a legal
+  // one-hander and a shield together was refused by name, on the grounds that
+  // no legal one-hander existed. The genuinely illegal pairing - a two-hander
+  // and a shield - is caught above, where both are known.
+  if (offhandPinnedFull && candidates.has('Slot_Weapon1')
+    && !candidates.get('Slot_Weapon1').some(Boolean)) {
     throw new Error('the pinned offhand leaves no legal one-handed mainhand for this class and level');
   }
 

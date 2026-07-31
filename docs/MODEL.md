@@ -1053,9 +1053,35 @@ already established elsewhere in this document:
   per core slot ([§6](#6-what-an-item-is-worth)), which is what makes one budget
   a *complete set* rather than an arbitrary amount.
 
-So `full` is a perfect set and `crit` is the same set with the whole ratings
-budget in one place. One budget is split across whichever ratings your factions
-pay, so the three rating rows a class shows are one 100%, not three.
+**Every stat sits at the same fraction of its OWN budget, and one is raised.**
+
+| | |
+|---|---|
+| `zero` | nothing — the level curve and the weapon |
+| `mid` | every stat at half a full set of it |
+| `full` | every stat at a full set of it |
+| `crit`, `armorpen`, `spellpen`, `fervor`, `strength`, `dexterity`, `intellect`, `faith`, `vitality`, `armor` | `mid`, with that one at a full set |
+
+The shape is what makes the set useful: `crit` minus `mid` is *"half a budget
+more CritChance and nothing else moved"*. The first version of this instead
+poured the whole ratings budget into one rating and left the others empty, so a
+"crit" corner also had **no penetration** — and a difference with two causes
+measures neither of them.
+
+**Everything except `zero` is deliberately unattainable, and says so.** Four
+ratings at half a budget each is two budgets; gear delivers one. That is what a
+probe is: it holds nine stats still and moves the tenth, which no real set can
+do, and it is the only way to read one stat's effect without the rest of the
+build answering back. The output prints the overshoot rather than letting a
+probe read as a build.
+
+Two further reasons a corner may be unreachable, both named in the same place:
+an item pays the WEARER's aptitude, so a Warrior gets Strength and never Faith;
+and `conds.factions` on the Fighter's rating rows lists no faction at all for
+SpellPenetration. Peaking either is still worth doing — it answers whether a
+weapon's kit scales off a stat its class never gets — and a peaked primary
+redirects the class's *own* primary budget rather than inventing another, so the
+magnitude stays comparable.
 
 **1.0 is the designers' unit, not the ceiling.** A maxed build runs above it: a
 Legendary roll puts an item's effective level above the character's, augments add
@@ -1064,17 +1090,10 @@ second weapon. A level-25 Warrior the optimiser dressed reads 469
 ArmorPenetrationRating against the 380 one budget delivers, so `--profile-scale
 1.25` brackets it from the other side.
 
-**A corner gear cannot reach is still worth probing, and says so.** An item pays
-the WEARER's aptitude, so a Warrior gets Strength and never Faith, and
-`conds.factions` on the Fighter's rating rows lists no faction at all for
-SpellPenetration. Those profiles are marked as probes rather than builds — but
-they answer a real question, which is whether a weapon's kit scales off a stat
-its class never gets.
-
 ### What it measured
 
 `bench weapons --across` runs every mainhand at six corners. On this data, above
-the naked corner:
+the bare corner:
 
 | | |
 |---|---|
@@ -1083,7 +1102,7 @@ the naked corner:
 | talents | 3–4 different sets across six corners |
 | runes | 2–4 different sets |
 
-Naked is the one corner that reorders the top — `GS_Nova` wins with no gear on
+`zero` is the one corner that reorders the top — `GS_Nova` wins with no gear on
 and `GA_Craft` wins everywhere else — which is worth knowing and is not a
 surprise: with no ratings at all, a weapon's raw coefficients are the whole
 story.

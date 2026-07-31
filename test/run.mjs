@@ -2019,29 +2019,44 @@ group('stat profiles');
   ok('the vitality budget is delivered as Vitality, not as MaxHealth',
     b.vitality.atb === 'Vitality' && b.vitality.amount < 200, JSON.stringify(b.vitality));
 
-  ok('naked injects nothing', P.resolve('naked', 'Warrior', 25).inject.size === 0);
+  ok('zero injects nothing', P.resolve('zero', 'Warrior', 25).inject.size === 0);
+  const mid = P.resolve('mid', 'Warrior', 25);
   const full = P.resolve('full', 'Warrior', 25);
   const crit = P.resolve('crit', 'Warrior', 25);
-  const sum = (m) => [...m].filter(([a]) => a.endsWith('Rating')).reduce((s, [, v]) => s + v, 0);
-  ok('splitting the ratings budget and concentrating it spend the same total',
-    Math.abs(sum(full.inject) - sum(crit.inject)) < 1e-6,
-    `${sum(full.inject).toFixed(1)} vs ${sum(crit.inject).toFixed(1)}`);
-  ok('...and concentrating it puts all of it in one rating',
-    crit.inject.size === 4 && Math.abs(crit.inject.get('CritChanceRating') - b.ratings[0].amount) < 1e-6);
-  ok('half is half of every group',
-    Math.abs(P.resolve('half', 'Warrior', 25).inject.get('Strength') - b.primary.amount / 2) < 1e-6);
+
+  // The shape: every stat at the same fraction of ITS OWN full-set budget, so
+  // one peak profile minus `mid` moves exactly one stat.
+  ok('mid is half of every stat',
+    Math.abs(mid.inject.get('Strength') - b.primary.amount / 2) < 1e-6
+    && Math.abs(mid.inject.get('CritChanceRating') - b.ratings[0].amount / 2) < 1e-6
+    && Math.abs(mid.inject.get('Armor') - b.armor.amount / 2) < 1e-6,
+    JSON.stringify([...mid.inject]));
+  ok('full is all of every stat',
+    Math.abs(full.inject.get('Strength') - b.primary.amount) < 1e-6
+    && Math.abs(full.inject.get('CritChanceRating') - b.ratings[0].amount) < 1e-6);
+  ok('a peak profile raises exactly one stat and leaves the rest at mid', (() => {
+    for (const [atb, v] of crit.inject) {
+      const want = atb === 'CritChanceRating' ? b.ratings[0].amount : mid.inject.get(atb);
+      if (Math.abs(v - want) > 1e-6) return false;
+    }
+    return crit.inject.size === mid.inject.size;
+  })(), JSON.stringify([...crit.inject]));
+  ok('...including the ratings no faction pays this class, so they can be probed',
+    mid.inject.has('SpellPenetrationRating'), JSON.stringify([...mid.inject.keys()]));
   ok('--profile-scale multiplies the whole set',
     Math.abs(P.resolve('full', 'Warrior', 25, 2).inject.get('Strength') - b.primary.amount * 2) < 1e-6);
 
-  // A corner gear cannot reach is still worth probing, and must SAY so.
-  ok('a rating no faction pays this class is flagged as a probe',
-    P.resolve('spellpen', 'Warrior', 25).notes.length === 1,
-    JSON.stringify(P.resolve('spellpen', 'Warrior', 25).notes));
+  // A corner no real set can deliver must SAY so rather than read as a build.
+  ok('holding every stat still while moving one is flagged as a probe',
+    crit.notes.some((n) => /full budgets/.test(n)), JSON.stringify(crit.notes));
+  ok('a rating no faction pays this class is named',
+    P.resolve('spellpen', 'Warrior', 25).notes.some((n) => /no faction/.test(n)));
   ok('...and so is another class\'s primary',
-    P.resolve('faith', 'Warrior', 25).notes.length === 1);
-  ok('the class\'s own rating and primary are NOT flagged',
-    P.resolve('armorpen', 'Warrior', 25).notes.length === 0
-    && P.resolve('strength', 'Warrior', 25).notes.length === 0);
+    P.resolve('faith', 'Warrior', 25).notes.some((n) => /not attainable/.test(n)));
+  ok('a peaked primary redirects the SAME budget rather than inventing one',
+    Math.abs(P.resolve('faith', 'Warrior', 25).inject.get('Faith') - b.primary.amount) < 1e-6);
+  ok('zero flags nothing, because nothing is unattainable about no gear',
+    P.resolve('zero', 'Warrior', 25).notes.length === 0);
   ok('an unknown profile fails by name', (() => {
     try { P.resolve('nope', 'Warrior', 25); return false; } catch (e) { return /unknown profile/.test(e.message); }
   })());
@@ -2056,12 +2071,33 @@ group('stat profiles');
     geared.sheet.get('ArmorPenetrationRating') > bare.sheet.get('ArmorPenetrationRating') + 300
     && geared.throughput.dps > bare.throughput.dps,
     `${bare.sheet.get('ArmorPenetrationRating').toFixed(0)} -> ${geared.sheet.get('ArmorPenetrationRating').toFixed(0)}`);
-  // Penetration has increasing returns, which is the whole reason the corners
-  // exist: concentrating a budget beats splitting it.
-  const split = eng.evaluate({ ...l, profile: 'full' }, { target: eng.combat.foe('boss', 25), rank: 3 });
-  ok('concentrating the ratings budget into penetration beats splitting it',
-    geared.throughput.dps > split.throughput.dps,
-    `${geared.throughput.dps.toFixed(1)} vs ${split.throughput.dps.toFixed(1)}`);
+  // A peak profile moves ONE stat off `mid`, so the pair isolates it. That is
+  // the whole reason the set has this shape rather than the old one, where a
+  // "crit" corner also had no penetration and a difference had two causes.
+  const atMid = eng.evaluate({ ...l, profile: 'mid' }, { target: eng.combat.foe('boss', 25), rank: 3 });
+  for (const [id, atb] of [['crit', 'CritChanceRating'], ['armorpen', 'ArmorPenetrationRating']]) {
+    const peaked = eng.evaluate({ ...l, profile: id }, { target: eng.combat.foe('boss', 25), rank: 3 });
+    let moved = 0;
+    for (const [k, v] of peaked.sheet) {
+      const was = atMid.sheet.get(k) ?? 0;
+      if (Math.abs(v - was) > 1e-6 && k.endsWith('Rating')) moved++;
+    }
+    ok(`${id} moves exactly one rating off mid`, moved === 1, `${moved} ratings moved`);
+    ok(`...and moves it upward`, peaked.sheet.get(atb) > atMid.sheet.get(atb));
+  }
+
+  // Penetration has INCREASING returns - each point is worth more than the last
+  // - which is why the gear search needs rating-themed seeds and why coordinate
+  // ascent cannot walk from a crit set to a penetration one. Tested where the
+  // claim actually lives, in the mitigation curve, rather than through a pair
+  // of profiles that happen to differ in more than one way.
+  const through = (pen) => 1 - damageReduction({
+    resist: 1923, penetrationPct: pen, attackerLevel: 25, formula: eng.ctx.consts.resistFormula,
+  });
+  const step = (pen) => through(pen + 10) - through(pen);
+  ok('each point of penetration is worth more than the last',
+    step(0) < step(20) && step(20) < step(40) && step(40) < step(60),
+    [0, 20, 40, 60].map((p) => step(p).toFixed(4)).join(' < '));
 }
 
 // --- a buff window prices only itself ---------------------------------------

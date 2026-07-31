@@ -127,15 +127,23 @@ AND WHETHER IT SURVIVES THE DICE  - procs rolled rather than averaged
   identically and the difference is exact rather than significant.
 
 AND WHETHER IT TRANSFERS  - the same rotation at other stat corners
-  naked      94.3 ->  94.7   +0.43%  holds
-  half      202.2 -> 200.8   -0.73%  LOSES to the derived order
-  full      329.8 -> 332.4   +0.78%  holds
-  crit      338.6 -> 341.2   +0.78%  holds
+  zero       93.8 ->  93.5   -0.35%  LOSES to the derived order
+  mid       243.8 -> 245.6   +0.75%  holds
+  full      486.0 -> 484.5   -0.29%  LOSES to the derived order
+  crit      271.2 -> 270.6   -0.23%  LOSES to the derived order
+  armorpen  272.3 -> 273.9   +0.60%  holds   (tuned here)
+  fervor    261.4 -> 263.5   +0.81%  holds
 ```
 
 `--validate` rolls the procs instead of averaging them, and says outright when a
 difference is inside the spread. `--across` re-runs the rotation at other stat
 corners: one that only wins where it was tuned is a rotation for that corner.
+
+That last table is the useful kind of disappointing. This rotation holds at three
+corners and *loses* at three, all by fractions of a percent — which says the
++0.5% it was tuned for is close to the noise floor of the ordering decision
+itself, not a durable property of the weapon. Take it as a rotation for
+penetration gear, not as the Warrior's rotation.
 
 **On the size of the number.** +0.5% is small, and honestly so. The mechanics
 worth sequencing around in this game — Ram Veil's five-stack consume, the
@@ -156,6 +164,25 @@ to exactly 1.0 per stat group over one item per core slot, so one budget *is* a
 complete set, and `budget(level, start, end)` is the same curve every other
 number here comes off.
 
+Every stat sits at the same fraction of **its own** full-set budget, and one of
+them is raised to the top:
+
+| | |
+|---|---|
+| `zero` | no gear at all — the level curve and the weapon |
+| `mid` | every stat at half of a full set of it |
+| `full` | every stat at a full set of it |
+| `crit`, `armorpen`, `spellpen`, `fervor` | `mid`, with that rating at a full set |
+| `strength`, `dexterity`, `intellect`, `faith` | `mid`, with that primary at a full set |
+| `vitality`, `armor` | `mid`, with that one at a full set |
+
+So `crit` minus `mid` is exactly *"half a budget more CritChance, nothing else
+moved"* — the comparison that isolates a stat. Everything except `zero` is
+**deliberately unattainable and says so**: four ratings at half a budget each is
+two budgets and gear delivers one. That is what a probe is for. It holds nine
+stats still and moves the tenth, which no real set can do, and it is the only way
+to read one stat's effect without the rest of the build answering back.
+
 ```bash
 bench profiles --class Warrior          # what a full set delivers, per group
 bench weapons  --class Warrior --profile armorpen
@@ -170,7 +197,7 @@ bench weapons  --class Warrior --across  # and how much the answer moves
 ```
 
 `--across` answers the question the decomposition rests on, and on this data the
-answer is encouraging: above the naked corner the **weapon ranking barely moves**
+answer is encouraging: above the bare corner the **weapon ranking barely moves**
 (mean shift 0.3–0.6 places out of 13) and the **skill choice does not move at
 all**. Talents and runes do — three or four different sets across six corners —
 which is exactly what you would expect from nodes that trade crit against
@@ -297,7 +324,7 @@ You need [Node.js](https://nodejs.org/) 18+ and a copy of Farever.
 ```bash
 git clone https://github.com/<you>/farever-bench
 cd farever-bench
-node test/run.mjs                  # 500 checks against your own game data
+node test/run.mjs                  # 507 checks against your own game data
 node bin/bench.mjs optimize --class Warrior
 ```
 

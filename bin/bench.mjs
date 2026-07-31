@@ -1395,7 +1395,7 @@ const commands = {
     if (s.profile && args.flags.across !== undefined) {
       const others = typeof args.flags.across === 'string'
         ? args.flags.across.split(',').map((x) => resolve(x.trim(), s.engine.profiles.list().map((p) => p.id), 'profile'))
-        : ['naked', 'half', 'full', 'crit', 'armorpen', 'fervor'];
+        : ['zero', 'mid', 'full', 'crit', 'armorpen', 'fervor'];
       console.log('\n' + f.bold('AND WHETHER IT TRANSFERS')
         + f.dim('  - the same rotation, re-evaluated at other stat corners'));
       const rows = [];
@@ -1511,7 +1511,7 @@ const commands = {
     // one decision and the gear search runs afterwards with them fixed.
     const across = typeof args.flags.across === 'string'
       ? args.flags.across.split(',').map((x) => resolve(x.trim(), s.engine.profiles.list().map((p) => p.id), 'profile'))
-      : (args.flags.across === true ? ['naked', 'half', 'full', 'crit', 'armorpen', 'fervor'] : null);
+      : (args.flags.across === true ? ['zero', 'mid', 'full', 'crit', 'armorpen', 'fervor'] : null);
     if (across) return compareAcrossProfiles(s, args, across);
     if (!s.profile) {
       die('bench weapons needs a --profile, so every weapon is compared at the same stats.\n'
