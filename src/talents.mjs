@@ -165,8 +165,16 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
   function maxPointsOf(skillId) {
     return skills.get(skillId)?.props?.talent?.maxPoints ?? 1;
   }
-  function readableValue(skillId, rank = 1) {
-    const key = skillId + '@' + rank;
+  /**
+   * `have` is the rest of the allocation, and it is not optional decoration:
+   * four nodes across three trees do nothing at all unless another node is
+   * taken. `Warrior_Talent_HoldTheLine` reads "while ::ref2_name:: is active"
+   * and its script fires on `s.kind == Warrior_Talent_RageShield_Status`, so a
+   * build without Rage Shield gets nothing - and without this it was scored
+   * +6% damage and -6% damage taken regardless.
+   */
+  function readableValue(skillId, rank = 1, { have = null } = {}) {
+    const key = skillId + '@' + rank + (have?.size ? '%' + [...have].sort().join('+') : '');
     let v = valueCache.get(key);
     if (v) return v;
     const s = skills.get(skillId);
@@ -178,7 +186,8 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     // At the node's OWN rank, not at 1. A talent that holds two points states
     // its second rank in a `minRank: 2` affix row on the status it grants, and
     // resolving that status at rank 1 made the second point buy nothing.
-    const buffs = plan.selfBuffsOf(skillId, { rank });
+    const statuses = plan.statusesOf(skillId, { rank, talents: have });
+    const buffs = statuses.self;
     // Two data links hand a talent something it does not declare itself, and
     // one tempting third that must NOT be followed.
     //
@@ -219,7 +228,7 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     // It shows up as neither an affix nor a buff nor an effect of its own, so
     // without this the tree still reported the node the whole Warrior tree is
     // built around as "nothing readable".
-    const dots = plan.statusesOf(skillId, { rank }).dots.filter((d) => d.pool);
+    const dots = statuses.dots.filter((d) => d.pool);
     // Scoped damage modifiers, which are not affixes and not effects - "+20%
     // critical damage on weapon skills" is neither - so without this the tree
     // still printed "nothing readable" beside a node the fight was scoring.
@@ -239,15 +248,21 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
         + `${FIELD[m.field] ?? m.field} ${SCOPE[m.scope] ?? m.scope}`.trim()
         + (m.targetBleeding ? ' vs bleeding' : '')))].join(', ')
       : '';
+    // What this node WOULD have given if another one were taken. Kept out of
+    // `readable` - it is worth nothing in this build - but carried so the
+    // output can say why rather than printing a blank beside a node whose text
+    // plainly promises something.
+    const needs = statuses.unmetDeps ?? [];
     v = {
-      affixes, buffs, effects, granted, dots, mods, gains,
+      affixes, buffs, effects, granted, dots, mods, gains, needs,
       readable: affixes.length > 0 || buffs.length > 0 || effects.length > 0
         || dots.length > 0 || mods.length > 0 || gains.length > 0,
       kind: affixes.length ? 'affix' : buffs.length ? 'status'
         : dots.length ? `${Math.round(dots[0].pool.fraction * 100)}% of `
           + `${dots[0].pool.magic ? 'magic' : 'physical'} crits as a bleed`
           : modLabel || (gains.length ? gains.map((g) => `+${g.amount} ${g.atb}${g.critGated ? ' per crit' : ''}`).join(', ') : '')
-            || (granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : 'none'),
+            || (granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : '')
+            || (needs.length ? `nothing without ${needs[0].needsName}` : 'none'),
       // `props.talent.maxPoints` caps how many points a node takes. It is 2 on
       // 48 of the 88 nodes - every tier-2, and two thirds of tier 3 - so "one
       // point per node" was wrong for more than half the tree.

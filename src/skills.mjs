@@ -289,6 +289,31 @@ const UNREAD_COND = /\b(hasStatusMaxStacked|hasStatusApplied|hasStatusType|hasSt
 const cmpOk = (a, op, b) => (op === '>=' ? a >= b : op === '<=' ? a <= b
   : op === '==' ? a === b : op === '!=' ? a !== b : op === '>' ? a > b : a < b);
 
+// `s.kind == <X>` - "this handler fires for THAT thing", and which thing
+// decides whether the guard is a condition at all.
+//
+//   s.kind == Steps.Area       a step of the skill's own cast. The step always
+//                              runs, so this is a dispatch, not a condition.
+//   s.kind == Unit.Summon_Bee  a check on who was hit; already refused by the
+//                              `elsewhere` test.
+//   s.kind == Skill.<Status>   A DEPENDENCY. `onReceiveStatus(s) { if (s.kind
+//                              == Shield) addStatus(owner, Buff); }` fires only
+//                              when something ELSE applies that status.
+//
+// The third one went unread, so the guard evaluated to "unconditional" and the
+// payload was credited whole. `Warrior_Talent_HoldTheLine` is the case:
+// +6% damage and -6% damage taken while `Warrior_Talent_RageShield_Status` is
+// up - and Rage Shield is a separate talent, in a different branch, that the
+// build may simply not have taken. A build without it was being handed 22 dps
+// for a node whose own text says "while ::ref2_name:: is active".
+//
+// Four talents across three classes have this shape and every one of them
+// depends on another node of the SAME tree: Hold the Line on Rage Shield,
+// Atrophic Poison and Crippling Poison on Lethal Poison, Potent Fortitude on
+// the Priest's Shield prayer. So it is answerable - the loadout says what it
+// has - and it is answered rather than refused.
+const STATUS_DEP = /\b\w+(?:\.\w+)*\.kind\s*==\s*(?:Skill\.)?([A-Za-z0-9_]+)/g;
+
 /**
  * Everything in `scope` that decides whether the call fires, split into what
  * the model can answer and what it cannot.
@@ -422,6 +447,87 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const r = statusTypes.get(typeId);
     return r ? new Set(statusFlagNames.filter((_, i) => ((r.flags ?? 0) >> i) & 1)) : new Set();
   };
+
+  // Who applies which status, over the whole sheet. Both paths: a `Status` step
+  // naming a ref, and an `addStatus` call site in a script (through the local
+  // alias the scripts use). Built once, and only ever asked the one question a
+  // guard needs answered - "is there anything in this build that puts X up?".
+  //
+  // A status nothing applies is not a dependency this can rule on: the applier
+  // may well be in game code. So an unknown answer leaves the guard alone, and
+  // only a status whose appliers are all NAMED and all ABSENT kills the branch.
+  const statusAppliers = (() => {
+    const idx = new Map();
+    const add = (statusId, by) => {
+      if (!statusId || !skills.has(statusId)) return;
+      let e = idx.get(statusId);
+      if (!e) { e = new Set(); idx.set(statusId, e); }
+      e.add(by);
+    };
+    for (const s of cdb.lines('skill')) {
+      for (const st of s.steps ?? []) {
+        if (st.props?.status?.ref) add(st.props.status.ref, s.id);
+        for (const e of st.effects ?? []) if (e.status) add(e.status, s.id);
+      }
+      if (!s.script) continue;
+      const body = liveScript(s.script);
+      const alias = new Map();
+      SKILL_ALIAS.lastIndex = 0;
+      for (let m; (m = SKILL_ALIAS.exec(body));) alias.set(m[1], m[2]);
+      ADD_STATUS.lastIndex = 0;
+      for (let m; (m = ADD_STATUS.exec(body));) {
+        add(skills.has(m[2]) ? m[2] : alias.get(m[2]), s.id);
+      }
+    }
+    return idx;
+  })();
+
+  /**
+   * The statuses a guard says must already be up (or must just have landed) for
+   * the call it guards to fire, resolved through the script's own aliases.
+   *
+   * `Steps.X` and `Unit.X` are excluded by construction: only a name that
+   * resolves to a real skill row is a status, and `Steps.Area` is not one.
+   */
+  function statusDepsOf(guard, alias) {
+    const out = [];
+    STATUS_DEP.lastIndex = 0;
+    for (let m; (m = STATUS_DEP.exec(guard));) {
+      const id = skills.has(m[1]) ? m[1] : alias?.get(m[1]);
+      if (id && skills.has(id) && !out.includes(id)) out.push(id);
+    }
+    return out;
+  }
+
+  /**
+   * Can this build put that status up? `null` where the model cannot tell -
+   * nothing in the sheet applies it, or the caller did not say what it has.
+   */
+  function canApply(statusId, { talents = null, runes = null, own = null } = {}) {
+    const by = statusAppliers.get(statusId);
+    if (!by || !by.size) return null;
+    if (!talents && !runes) return null;
+    for (const owner of by) {
+      if (own === owner) return true;
+      if (talents?.has(owner) || runes?.has(owner)) return true;
+    }
+    // Only a set of appliers the loadout can definitively rule OUT is a `no`.
+    // Every applier being a talent node is that case: the allocation is the
+    // complete list of the ones you have.
+    return [...by].every((owner) => isTalentNode(owner)) ? false : null;
+  }
+
+  // Every skill id that appears as a node in any class's talent tree, so
+  // `canApply` can tell "you did not take that talent" from "the applier is
+  // something this reader has not accounted for".
+  const talentNodeIds = (() => {
+    const s = new Set();
+    for (const u of cdb.lines('unit')) {
+      for (const tr of u.talentTrees ?? []) for (const x of tr.talents ?? []) if (x.skill) s.add(x.skill);
+    }
+    return s;
+  })();
+  const isTalentNode = (id) => talentNodeIds.has(id);
 
   // How many of a thing you have at a given level: count the unlock levels at
   // or below it. The list IS the slot count.
@@ -1443,6 +1549,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
 
     const s = skills.get(skillId);
     const found = new Map(); // statusId -> { to, trigger, appliedDuration, scriptMagnitude }
+    // Statuses this skill would apply if the build had the thing that arms it.
+    // Reported rather than silently dropped: "Hold the Line does nothing here"
+    // is a fact about the allocation, and the reason belongs next to it.
+    const unmetDeps = [];
     const note = (statusId, to, trigger = { on: 'cast', chance: 1, why: 'applied by the cast itself' },
       appliedDuration = null, scriptMagnitude = false) => {
       if (!statusId || found.has(statusId)) return;
@@ -1546,6 +1656,23 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // the character has not earned.
         const g = guardOf(guard, { rank, runes, talents });
         if (!g.fires) continue;
+        // ...and so does the OTHER half of that guard: what it fires ON. A
+        // handler that runs when a named status lands is dead in a build that
+        // never applies that status, and `Warrior_Talent_HoldTheLine` was being
+        // credited its whole payload for a Rage Shield it may not have taken.
+        // Only a status the loadout can definitively rule out kills the branch.
+        let deadDep = null;
+        for (const dep of statusDepsOf(guard, alias)) {
+          if (canApply(dep, { talents, runes, own: skillId }) === false) { deadDep = dep; break; }
+        }
+        if (deadDep) {
+          unmetDeps.push({
+            from: skillId, status: resolved, needs: deadDep,
+            name: skills.get(resolved)?.texts?.name ?? resolved,
+            needsName: skills.get(deadDep)?.texts?.name ?? deadDep,
+          });
+          continue;
+        }
         const elsewhere = /Unit\.Summon_|targetUnit\.kind|isAlly|onPlayerAllies|getPartyHeroes/.test(guard);
         const to = elsewhere ? 'Elsewhere'
           : SELF_TARGETS.has(who) ? 'Self'
@@ -1762,7 +1889,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // one-shot Shield or Heal rather than an affix or a tick. Those still have
     // to be nameable, or the coverage report says "declares no status" about a
     // skill that plainly declares one.
-    hit = { self, onTarget, unreadable, dots, all: [...found.keys()], flaggedDot, flaggedCC, missingTick };
+    hit = {
+      self, onTarget, unreadable, dots, all: [...found.keys()],
+      flaggedDot, flaggedCC, missingTick, unmetDeps,
+    };
     statusCache.set(key, hit);
     return hit;
   }

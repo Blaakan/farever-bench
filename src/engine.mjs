@@ -188,8 +188,14 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // uptime is not in the data and counting it whole would make an emergency
     // button a passive. Those are refused and named.
     const talentBuffGaps = [];
+    // The rest of the allocation, because a node can depend on one: Hold the
+    // Line is worth nothing without Rage Shield, and reading it in isolation
+    // handed a build 22 dps for a talent it had not enabled.
+    const allocated = new Set(Object.keys(loadout.talents ?? {}));
+    const talentDepGaps = [];
     for (const [id, rank] of Object.entries(loadout.talents ?? {})) {
-      const v = talents.readableValue(id, rank);
+      const v = talents.readableValue(id, rank, { have: allocated });
+      for (const n of v.needs ?? []) talentDepGaps.push({ ...n, from: id });
       for (const a of v.affixes) applyAffix(a);
       for (const b of v.buffs) {
         const src = combat.profile(b.from, rank, new Set(rot.runes ?? []));
@@ -200,6 +206,77 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         }
         for (const a of b.affixes) applyAffix(a, b.stacks);
       }
+    }
+
+    // Scoped damage modifiers the allocated talents confer. These are not stats
+    // - "+20% critical damage on weapon skills" cannot be written on a sheet -
+    // so they travel to the fight separately and are applied where their scope
+    // says. `targetBleeding` ones are credited whole: the model only reaches
+    // them when a pool dot is running, and a bleed re-applied off every crit is
+    // up essentially all of the time. That is an assumption and it is in the
+    // audit.
+    //
+    // THIS RUNS BEFORE THE SHEET IS BUILT, and it has to. One of these routes
+    // its value onto the sheet rather than into the fight - `Red Tempo` earns
+    // cooldown back per bleed tick, which is a rate and therefore a
+    // CooldownReduction - and this pass used to sit after both
+    // `evaluateLoadout` calls, so that `addFlat` wrote into a map nothing read
+    // again. The talent was scored, printed with a value, and worth exactly
+    // zero: two points in it moved the Warrior's dps by 0.00.
+    const mods = {
+      critDamageByType: {}, critChanceByType: {}, damageByAffinity: {},
+      armorIgnore: {}, bleed: {}, cooldown: {},
+    };
+    // Modifiers whose scope this fight does not separate. Named, not dropped.
+    const unreadMods = [];
+    for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
+      for (const mod of talents.modifiersOf(id, nodeRank)) {
+        const add = (bag, key) => { bag[key] = (bag[key] ?? 0) + mod.amount; };
+        // Routing is EXPLICIT, with no default. A scope this does not recognise
+        // is dropped, not folded into "everything": `Rogue_Talent_LethalDose`
+        // scopes its +20% to Poison damage, and the model has no poison pool to
+        // put it on, so it must contribute nothing rather than +20% globally.
+        const type = mod.scope === 'attack' ? 'Attack'
+          : mod.scope === 'weaponSkill' ? 'WeaponSkill' : null;
+        if (mod.field === 'healShare' && mod.scope === 'bleed') add(mods.bleed, 'healShare');
+        else if (mod.scope === 'bleed' && mod.field !== 'cooldownPerTick') add(mods.bleed, mod.field);
+        else if (mod.field === 'critDmgMult' && type) add(mods.critDamageByType, type);
+        else if (mod.field === 'critChance' && type) add(mods.critChanceByType, type);
+        else if (mod.field === 'dmgMult' && mod.scope === 'physical') add(mods.damageByAffinity, 'Physical');
+        else if (mod.field === 'dmgMult' && mod.scope === 'magic') add(mods.damageByAffinity, 'Magic');
+        else if (mod.field === 'dmgMult' && type) add(mods.damageByAffinity, type);
+        else if (mod.field === 'dmgMult' && mod.scope === 'all') add(mods.damageByAffinity, 'all');
+        // Cooldown reduction earned per bleed tick. The bleed's own tick
+        // interval turns "a 12% chance for one second" into a rate: at one tick
+        // every two seconds that is 0.06 seconds of cooldown back per second.
+        // A flat second off a cooldown of length C, arriving at a steady r
+        // seconds per second, finishes that cooldown in C/(1+r) - which is
+        // exactly what a CooldownReduction of 100r does, so the rate converts.
+        //
+        // WHICH cooldowns is in the call, not in the description alone:
+        // `reduceWeaponsCooldown` is the weapon-skill-only form, and Red Tempo's
+        // own text says "the cooldown of all your [WeaponSkill]s". Putting it on
+        // the sheet's global CooldownReduction would have sped up Charge,
+        // Berserk and Surging Force as well, so it is carried as a scoped bonus
+        // and the fight applies it only to the skills it names.
+        //
+        // It is credited only while a bleed is actually running. A build with
+        // no pool dot earns nothing from it, which is correct and is why this
+        // reads the resolved rotation rather than the talent alone.
+        else if (mod.field === 'cooldownPerTick' && mod.scope === 'bleed') {
+          const tickInterval = (rot.dots ?? []).find((d) => d.pool)?.tick ?? 0;
+          if (tickInterval > 0) add(mods.cooldown, 'weaponSkill');
+          else unreadMods.push(mod);
+        } else if (mod.field === 'armorIgnore') add(mods.armorIgnore, 'Physical');
+        else if (mod.field === 'magicArmorIgnore') add(mods.armorIgnore, 'Magic');
+        else unreadMods.push(mod);
+      }
+    }
+    // The bleed's tick interval is what turns seconds-per-proc into a rate, and
+    // it is only known once the rotation is resolved.
+    if (mods.cooldown.weaponSkill) {
+      const tickInterval = (rot.dots ?? []).find((d) => d.pool)?.tick ?? 0;
+      mods.cooldown.weaponSkill /= tickInterval;
     }
 
     // Self-buffs, at the uptime the fight actually supports rather than at a
@@ -283,57 +360,6 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       restatCache.set(key, hit);
       return hit;
     }
-    // Scoped damage modifiers the allocated talents confer. These are not stats
-    // - "+20% critical damage on weapon skills" cannot be written on a sheet -
-    // so they travel to the fight separately and are applied where their scope
-    // says. `targetBleeding` ones are credited whole: the model only reaches
-    // them when a pool dot is running, and a bleed re-applied off every crit is
-    // up essentially all of the time. That is an assumption and it is in the
-    // audit.
-    const mods = {
-      critDamageByType: {}, critChanceByType: {}, damageByAffinity: {},
-      armorIgnore: {}, bleed: {},
-    };
-    // Modifiers whose scope this fight does not separate. Named, not dropped.
-    const unreadMods = [];
-    const modsFrom = [];
-    for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
-      for (const mod of talents.modifiersOf(id, nodeRank)) {
-        modsFrom.push(mod);
-        const add = (bag, key) => { bag[key] = (bag[key] ?? 0) + mod.amount; };
-        // Routing is EXPLICIT, with no default. A scope this does not recognise
-        // is dropped, not folded into "everything": `Rogue_Talent_LethalDose`
-        // scopes its +20% to Poison damage, and the model has no poison pool to
-        // put it on, so it must contribute nothing rather than +20% globally.
-        const type = mod.scope === 'attack' ? 'Attack'
-          : mod.scope === 'weaponSkill' ? 'WeaponSkill' : null;
-        if (mod.field === 'healShare' && mod.scope === 'bleed') add(mods.bleed, 'healShare');
-        else if (mod.scope === 'bleed') add(mods.bleed, mod.field);
-        else if (mod.field === 'critDmgMult' && type) add(mods.critDamageByType, type);
-        else if (mod.field === 'critChance' && type) add(mods.critChanceByType, type);
-        else if (mod.field === 'dmgMult' && mod.scope === 'physical') add(mods.damageByAffinity, 'Physical');
-        else if (mod.field === 'dmgMult' && mod.scope === 'magic') add(mods.damageByAffinity, 'Magic');
-        else if (mod.field === 'dmgMult' && type) add(mods.damageByAffinity, type);
-        else if (mod.field === 'dmgMult' && mod.scope === 'all') add(mods.damageByAffinity, 'all');
-        // Cooldown reduction earned per bleed tick. The bleed's own tick
-        // interval turns "a 12% chance for one second" into a rate: at one tick
-        // every two seconds that is 0.06 seconds of cooldown back per second,
-        // i.e. 6 points of CooldownReduction, which IS a sheet stat - so it
-        // goes on the sheet and every cooldown in the fight sees it.
-        //
-        // It is credited only while a bleed is actually running. A build with
-        // no pool dot earns nothing from it, which is correct and is why this
-        // reads the resolved rotation rather than the talent alone.
-        else if (mod.field === 'cooldownPerTick' && mod.scope === 'bleed') {
-          const tickInterval = (rot.dots ?? []).find((d) => d.pool)?.tick ?? 0;
-          if (tickInterval > 0) addFlat('CooldownReduction', (mod.amount / tickInterval) * 100);
-          else unreadMods.push(mod);
-        } else if (mod.field === 'armorIgnore') add(mods.armorIgnore, 'Physical');
-        else if (mod.field === 'magicArmorIgnore') add(mods.armorIgnore, 'Magic');
-        else unreadMods.push(mod);
-      }
-    }
-
     const tp = combat.throughput(rot, combatBase.sheet, tgt, opts,
       { restat, timedBuffs: timed, averagedSheet: averaged.sheet, mods });
     // Survivability is what you average over a fight, so it reads the averaged
@@ -353,10 +379,15 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         source: g.slot,
         why: `the effect ${g.stars} upgrade star${g.stars === 1 ? '' : 's'} unlock is a script proc, not an affix`,
       })),
+      ...talentDepGaps.map((g) => ({
+        id: g.from,
+        source: 'talent',
+        why: `its effect lands only while ${g.needsName} is up, and nothing in this build applies that`,
+      })),
     ];
     for (const u of unreadMods) {
       extraGaps.push({
-        id: u.from, source: talent,
+        id: u.from, source: 'talent',
         why: `it modifies ${u.field} for ${u.scope} damage, which is a category this fight does not separate`,
       });
     }

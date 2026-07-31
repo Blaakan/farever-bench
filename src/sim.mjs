@@ -74,7 +74,7 @@ export function simulate(spec) {
 
 function runFight(spec) {
   const {
-    rotation, cast, dotOutput, cdr = 1, fight = 200, fights = 1,
+    rotation, cast, dotOutput, cdr = 1, cdrWeaponSkill = null, fight = 200, fights = 1,
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0,
   } = spec;
@@ -162,12 +162,18 @@ function runFight(spec) {
   // everything else worth. Those are kept, marked, and the lookahead is what
   // decides whether pressing one pays.
   const bare = makeState();
+  // A weapon skill's cooldown can run faster than everything else's: `Red
+  // Tempo` gives a second back per bleed tick and its own text says "the
+  // cooldown of all your [WeaponSkill]s". A single sheet-wide CooldownReduction
+  // cannot say that, so the divisor is per skill.
+  const isWeaponSkill = (prof) => prof.type === 'WeaponSkill' || prof.type === 'WeaponSubSkill';
+  const cdrFor = (prof) => (cdrWeaponSkill != null && isWeaponSkill(prof) ? cdrWeaponSkill : cdr);
   const actives = [];
   for (const { prof, source, applies } of rotation.active) {
     const out = cast(prof, bare);
     const setsUp = (applies?.self?.length ?? 0) + (applies?.target?.length ?? 0);
     if (!out.damage && !out.heal && !out.shield && !setsUp) continue;
-    const cooldown = Math.max(prof.cooldown / cdr, 0);
+    const cooldown = Math.max(prof.cooldown / cdrFor(prof), 0);
     actives.push({
       prof, source, out, applies,
       cooldown,

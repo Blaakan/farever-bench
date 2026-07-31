@@ -782,6 +782,13 @@ export function buildCombat(cdb, ctx) {
    */
   function throughput(rotation, sheet, target, opts, live = null) {
     const cdr = 1 + (sheet.get('CooldownReduction') ?? 0) / 100;
+    // Cooldown earned back by an EVENT rather than carried as a stat, and only
+    // for the skills the event names. `Red Tempo` cuts a second off your weapon
+    // skills on a 12% roll per bleed tick, which at one tick every two seconds
+    // is 0.06 seconds per second - the same arithmetic as 6 points of
+    // CooldownReduction, but applying to WeaponSkills alone. The sheet has one
+    // CooldownReduction and cannot say that, so it rides alongside.
+    const cdrWeaponSkill = cdr + (live?.mods?.cooldown?.weaponSkill ?? 0);
     const restat = live?.restat ?? (() => sheet);
     // A cast is priced AT THE MOMENT IT IS CAST, against whatever is up. That is
     // the whole difference between a priority list and a rotation: with a fixed
@@ -864,7 +871,7 @@ export function buildCombat(cdb, ctx) {
       * (1 + bleedCrit * ((sheet.get('CritDamage') ?? 100) / 100 - 1));
 
     return simulate({
-      rotation, cast, dotOutput, cdr, resources, poolMultiplier,
+      rotation, cast, dotOutput, cdr, cdrWeaponSkill, resources, poolMultiplier,
       poolHealShare: bleedMods.healShare ?? 0,
       critChance: Math.min(1, Math.max(0, (sheet.get('CritChance') ?? 0) / 100)),
       timedBuffs: live?.timedBuffs ?? [],
