@@ -66,14 +66,14 @@ const SHEET_ORDER = [
  * beside it or it is not comparable to anything.
  */
 export function profileBlock(profile) {
-  const inject = [...profile.inject]
-    .map(([atb, v]) => `${atb} ${v.toFixed(0)}`).join('   ');
+  const pinned = [...profile.force]
+    .map(([atb, v]) => (atb === profile.peakAtb ? bold(`${atb} ${v}`) : `${atb} ${v}`))
+    .join('   ');
   const lines = [
-    bold(`profile: ${profile.label}`) + dim(`  - ${profile.desc}`)
-    + (profile.scale !== 1 ? dim(`  x${profile.scale} of a full set`) : ''),
-    dim('  ' + (inject || 'nothing - base stats and the level curve only')),
+    bold(`profile: ${profile.label}`) + dim(`  - ${profile.desc}`),
+    dim('  pinned: ') + pinned,
   ];
-  for (const n of profile.notes) lines.push(warn('  ! ' + n));
+  for (const n of profile.notes) lines.push(dim('  ! ' + n));
   return lines.join('\n');
 }
 

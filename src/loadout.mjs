@@ -83,6 +83,7 @@ export function socketsOf(cat, loadout) {
 // accumulator, so a caller can show where a number came from.
 export function evaluate(cat, loadout, {
   baseStatsFor, injectFlat = null, injectAddRatio = null, injectMulRatio = null,
+  force = null,
 }) {
   const cls = classOf(cat, loadout);
   const armorReduction = cat.armorReductionFor(cls.aptitude);
@@ -141,7 +142,7 @@ export function evaluate(cat, loadout, {
   }
 
   const base = baseStatsFor(cls.unit, loadout.level);
-  const sheet = computeSheet(cat.ctx, { base, mods, level: loadout.level });
+  const sheet = computeSheet(cat.ctx, { base, mods, level: loadout.level, force });
   return { sheet, mods, cls, armorReduction };
 }
 

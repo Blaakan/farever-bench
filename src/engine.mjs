@@ -117,8 +117,13 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // it is what grants the skills and sets WeaponPower, and it is the thing
     // being compared. See profiles.mjs for where the numbers come from.
     const profile = loadout.profile
-      ? profiles.resolve(loadout.profile, loadout.class, loadout.level, loadout.profileScale ?? 1) : null;
-    if (profile) for (const [atb, v] of profile.inject) addFlat(atb, v);
+      ? profiles.resolve(loadout.profile, loadout.class, loadout.level, loadout.profileValues ?? {}) : null;
+    // PINNED, not added. The profile's numbers replace whatever the level curve
+    // and the gear produce, so two weapons are compared on the kit they grant
+    // rather than on which is the better stat stick. It rides every sheet this
+    // function builds - the base, the averaged one, and every re-price during
+    // the fight - or a buff window would quietly escape the rig.
+    const force = profile?.force ?? null;
 
     for (const p of rot.passive ?? []) {
       for (const a of p.affixes ?? []) {
@@ -325,7 +330,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
 
     // The sheet the FIGHT starts from: everything permanent, nothing timed.
     const combatBase = evaluateLoadout(cat, loadout, {
-      baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio,
+      baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio, force,
     });
     // Snapshot the three accumulators HERE, while they still hold only the
     // permanent layer. The averaged sheet below folds every timed buff into
@@ -353,7 +358,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     const resting = combatBase;
     for (const b of timed) for (const a of b.affixes) applyAffix(a, b.stacks, b.uptime);
     const averaged = evaluateLoadout(cat, loadout, {
-      baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio,
+      baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio, force,
     });
     const r = { ...resting, averaged: averaged.sheet };
 
@@ -379,7 +384,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       };
       for (const b of active) for (const a of b.affixes) put(a, b.stacks ?? 1);
       hit = evaluateLoadout(cat, loadout, {
-        baseStatsFor, injectFlat: f2, injectAddRatio: a2, injectMulRatio: m2,
+        baseStatsFor, injectFlat: f2, injectAddRatio: a2, injectMulRatio: m2, force,
       }).sheet;
       restatCache.set(key, hit);
       return hit;

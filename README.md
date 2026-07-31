@@ -139,11 +139,34 @@ AND WHETHER IT TRANSFERS  - the same rotation at other stat corners
 difference is inside the spread. `--across` re-runs the rotation at other stat
 corners: one that only wins where it was tuned is a rotation for that corner.
 
-That last table is the useful kind of disappointing. This rotation holds at three
-corners and *loses* at three, all by fractions of a percent — which says the
-+0.5% it was tuned for is close to the noise floor of the ordering decision
-itself, not a durable property of the weapon. Take it as a rotation for
-penetration gear, not as the Warrior's rotation.
+### Does a stat repartition change the rotation?
+
+`--across-search` asks the stronger version of that question: search a **fresh**
+rotation at every corner with the kit held fixed — so the only thing that moved is
+the stats — then cross-evaluate every rotation at every corner.
+
+```
+CORNER    DERIVED  SEARCHED   GAIN  THE ROTATION IT WANTS
+mid          85.6      86.1  0.61%  Rampage[holding.Surging Force] > Raging Smash[debuff.Tear Reality.up] > ...
+strength    155.1     156.4  0.83%  Surging Force > Tear Reality > Rampage[debuff.Tear Reality.up] > ...
+crit         87.7      88.9  1.29%  Rampage[debuff.Tear Reality.up & holding.Charge] > Tear Reality > ...
+
+AND WHAT IT COSTS TO CARRY ONE EVERYWHERE  - % below the best rotation for that corner
+  FOUND AT     mid  strength  vitality    crit  armorpen  fervor
+  mid        0.00%     0.10%     0.24%  -1.42%     0.00%   0.00%
+  strength  -0.11%     0.00%     0.08%  -0.56%    -0.11%  -0.11%
+  crit      -1.05%    -1.24%    -0.82%   0.00%    -1.05%  -1.07%
+
+  Carrying one rotation everywhere costs at most 0.56% if you pick the one found
+  at "strength".
+```
+
+**Yes, it changes — a little.** Each corner wants a visibly different list, and
+`crit` wants the most conditional one of all (it is the only corner that reached
+for a two-term condition). But the *cost* of ignoring that is bounded: one
+rotation carried everywhere loses at most 0.56%. Whether a distinct list per stat
+spread is worth writing down is then a decision with a number attached rather
+than a guess.
 
 **On the size of the number.** +0.5% is small, and honestly so. The mechanics
 worth sequencing around in this game — Ram Veil's five-stack consume, the
@@ -164,24 +187,31 @@ to exactly 1.0 per stat group over one item per core slot, so one budget *is* a
 complete set, and `budget(level, start, end)` is the same curve every other
 number here comes off.
 
-Every stat sits at the same fraction of **its own** full-set budget, and one of
-them is raised to the top:
+A profile **pins** every stat to a flat number — 50 everywhere, 100 on the one it
+names — and those values *replace* whatever the level curve and the gear would
+have produced.
 
 | | |
 |---|---|
-| `zero` | no gear at all — the level curve and the weapon |
-| `mid` | every stat at half of a full set of it |
-| `full` | every stat at a full set of it |
-| `crit`, `armorpen`, `spellpen`, `fervor` | `mid`, with that rating at a full set |
-| `strength`, `dexterity`, `intellect`, `faith` | `mid`, with that primary at a full set |
-| `vitality`, `armor` | `mid`, with that one at a full set |
+| `zero` | every stat pinned to 0 |
+| `mid` | every stat pinned to 50 |
+| `strength` `dexterity` `intellect` `faith` `vitality` `armor` `magicarmor` `crit` `armorpen` `spellpen` `fervor` | every stat pinned to 50, that one to 100 |
 
-So `crit` minus `mid` is exactly *"half a budget more CritChance, nothing else
-moved"* — the comparison that isolates a stat. Everything except `zero` is
-**deliberately unattainable and says so**: four ratings at half a budget each is
-two budgets and gear delivers one. That is what a probe is for. It holds nine
-stats still and moves the tenth, which no real set can do, and it is the only way
-to read one stat's effect without the rest of the build answering back.
+`--profile-base` and `--profile-peak` move both numbers.
+
+So `crit` minus `mid` is exactly *"+50 CritChanceRating and nothing else moved"* —
+the comparison that isolates a stat. **Forced, not added**, which is the point: a
+weapon that happens to be a better stat stick cannot win on that, so two weapons
+differ only in the kit they grant and the coefficients they scale by. The pinning
+happens inside the sheet's topological walk, so everything downstream follows —
+pin Dexterity and the CritChance that scales off it moves with it.
+
+The numbers are arbitrary and deliberately so. 50 is not half of anything; it is a
+fixed rig, the same for every weapon and every class. A profile denominated in
+budget fractions cannot do that job — a Warrior's full primary budget is 123.6 and
+a Rogue's is 148.3, so "half a budget" is a different number per class and carries
+the budget's own shape into the comparison. `bench profiles` prints the real
+budgets alongside, so you can see how far from a real character the rig sits.
 
 ```bash
 bench profiles --class Warrior          # what a full set delivers, per group
@@ -324,7 +354,7 @@ You need [Node.js](https://nodejs.org/) 18+ and a copy of Farever.
 ```bash
 git clone https://github.com/<you>/farever-bench
 cd farever-bench
-node test/run.mjs                  # 507 checks against your own game data
+node test/run.mjs                  # 503 checks against your own game data
 node bin/bench.mjs optimize --class Warrior
 ```
 

@@ -2019,71 +2019,59 @@ group('stat profiles');
   ok('the vitality budget is delivered as Vitality, not as MaxHealth',
     b.vitality.atb === 'Vitality' && b.vitality.amount < 200, JSON.stringify(b.vitality));
 
-  ok('zero injects nothing', P.resolve('zero', 'Warrior', 25).inject.size === 0);
+  // PINNED, NOT EARNED. A profile states its stats as flat numbers - 50
+  // everywhere, 100 on the one it names - and those REPLACE the level curve and
+  // the gear. Two weapons are then compared on the kit they grant rather than on
+  // which is the better stat stick, which a budget-denominated profile cannot
+  // do: a Warrior's primary budget is 123.6 and a Rogue's is 148.3, so
+  // "half a budget" carries the budget's own shape into the comparison.
   const mid = P.resolve('mid', 'Warrior', 25);
-  const full = P.resolve('full', 'Warrior', 25);
   const crit = P.resolve('crit', 'Warrior', 25);
-
-  // The shape: every stat at the same fraction of ITS OWN full-set budget, so
-  // one peak profile minus `mid` moves exactly one stat.
-  ok('mid is half of every stat',
-    Math.abs(mid.inject.get('Strength') - b.primary.amount / 2) < 1e-6
-    && Math.abs(mid.inject.get('CritChanceRating') - b.ratings[0].amount / 2) < 1e-6
-    && Math.abs(mid.inject.get('Armor') - b.armor.amount / 2) < 1e-6,
-    JSON.stringify([...mid.inject]));
-  ok('full is all of every stat',
-    Math.abs(full.inject.get('Strength') - b.primary.amount) < 1e-6
-    && Math.abs(full.inject.get('CritChanceRating') - b.ratings[0].amount) < 1e-6);
-  ok('a peak profile raises exactly one stat and leaves the rest at mid', (() => {
-    for (const [atb, v] of crit.inject) {
-      const want = atb === 'CritChanceRating' ? b.ratings[0].amount : mid.inject.get(atb);
-      if (Math.abs(v - want) > 1e-6) return false;
+  const zero = P.resolve('zero', 'Warrior', 25);
+  ok('zero pins every stat to 0', [...zero.force.values()].every((v) => v === 0));
+  ok('mid pins every stat to 50', [...mid.force.values()].every((v) => v === 50));
+  ok('a peak profile raises exactly one stat and leaves the rest at 50', (() => {
+    let peaked = 0;
+    for (const [atb, v] of crit.force) {
+      if (atb === 'CritChanceRating') { if (v !== 100) return false; peaked++; } else if (v !== 50) return false;
     }
-    return crit.inject.size === mid.inject.size;
-  })(), JSON.stringify([...crit.inject]));
-  ok('...including the ratings no faction pays this class, so they can be probed',
-    mid.inject.has('SpellPenetrationRating'), JSON.stringify([...mid.inject.keys()]));
-  ok('--profile-scale multiplies the whole set',
-    Math.abs(P.resolve('full', 'Warrior', 25, 2).inject.get('Strength') - b.primary.amount * 2) < 1e-6);
-
-  // A corner no real set can deliver must SAY so rather than read as a build.
-  ok('holding every stat still while moving one is flagged as a probe',
-    crit.notes.some((n) => /full budgets/.test(n)), JSON.stringify(crit.notes));
-  ok('a rating no faction pays this class is named',
-    P.resolve('spellpen', 'Warrior', 25).notes.some((n) => /no faction/.test(n)));
-  ok('...and so is another class\'s primary',
-    P.resolve('faith', 'Warrior', 25).notes.some((n) => /not attainable/.test(n)));
-  ok('a peaked primary redirects the SAME budget rather than inventing one',
-    Math.abs(P.resolve('faith', 'Warrior', 25).inject.get('Faith') - b.primary.amount) < 1e-6);
-  ok('zero flags nothing, because nothing is unattainable about no gear',
-    P.resolve('zero', 'Warrior', 25).notes.length === 0);
+    return peaked === 1;
+  })(), JSON.stringify([...crit.force]));
+  ok('the pinned set covers every stat the damage model reads',
+    ['Strength', 'Dexterity', 'Intellect', 'Faith', 'Vitality', 'Armor',
+      'CritChanceRating', 'ArmorPenetrationRating', 'SpellPenetrationRating', 'FervorRating']
+      .every((a) => mid.force.has(a)), [...mid.force.keys()].join(','));
+  ok('--profile-base and --profile-peak move both numbers', (() => {
+    const r = P.resolve('crit', 'Warrior', 25, { base: 20, peak: 200 });
+    return r.force.get('Strength') === 20 && r.force.get('CritChanceRating') === 200;
+  })());
   ok('an unknown profile fails by name', (() => {
     try { P.resolve('nope', 'Warrior', 25); return false; } catch (e) { return /unknown profile/.test(e.message); }
   })());
+  // A rig nobody can wear produces a dps nobody will see, and it must say so.
+  ok('every profile says its numbers are stated rather than earned',
+    P.list().every((p) => P.resolve(p.id, 'Warrior', 25).notes.length > 0));
 
-  // And it has to reach the sheet: a profile that resolves but does not apply
-  // would read as a naked character with a confident label on it.
+  // It has to reach the sheet, and DERIVED stats have to follow it: pin
+  // Dexterity and the CritChance that scales off it moves with it.
   const l = emptyLoadout(eng.cat, 'Warrior', 25);
   l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Rare', stars: 0 };
-  const bare = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
-  const geared = eng.evaluate({ ...l, profile: 'armorpen' }, { target: eng.combat.foe('boss', 25), rank: 3 });
-  ok('a profile reaches the sheet',
-    geared.sheet.get('ArmorPenetrationRating') > bare.sheet.get('ArmorPenetrationRating') + 300
-    && geared.throughput.dps > bare.throughput.dps,
-    `${bare.sheet.get('ArmorPenetrationRating').toFixed(0)} -> ${geared.sheet.get('ArmorPenetrationRating').toFixed(0)}`);
-  // A peak profile moves ONE stat off `mid`, so the pair isolates it. That is
-  // the whole reason the set has this shape rather than the old one, where a
-  // "crit" corner also had no penetration and a difference had two causes.
-  const atMid = eng.evaluate({ ...l, profile: 'mid' }, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const at = (p) => eng.evaluate({ ...l, profile: p }, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const evMid = at('mid');
+  ok('a profile pins the sheet exactly, whatever the weapon adds',
+    evMid.sheet.get('Strength') === 50 && evMid.sheet.get('CritChanceRating') === 50
+    && evMid.sheet.get('Armor') === 50,
+    [...P.pinned].map((a) => a + '=' + evMid.sheet.get(a)).join(' '));
+  const evDex = at('dexterity');
+  ok('...and everything derived from a pinned stat moves with it',
+    evDex.sheet.get('Dexterity') === 100 && evDex.sheet.get('CritChance') > evMid.sheet.get('CritChance'),
+    evMid.sheet.get('CritChance').toFixed(2) + ' -> ' + evDex.sheet.get('CritChance').toFixed(2));
   for (const [id, atb] of [['crit', 'CritChanceRating'], ['armorpen', 'ArmorPenetrationRating']]) {
-    const peaked = eng.evaluate({ ...l, profile: id }, { target: eng.combat.foe('boss', 25), rank: 3 });
+    const peaked = at(id);
     let moved = 0;
-    for (const [k, v] of peaked.sheet) {
-      const was = atMid.sheet.get(k) ?? 0;
-      if (Math.abs(v - was) > 1e-6 && k.endsWith('Rating')) moved++;
-    }
-    ok(`${id} moves exactly one rating off mid`, moved === 1, `${moved} ratings moved`);
-    ok(`...and moves it upward`, peaked.sheet.get(atb) > atMid.sheet.get(atb));
+    for (const a of P.pinned) if (peaked.sheet.get(a) !== evMid.sheet.get(a)) moved++;
+    ok(id + ' moves exactly one pinned stat off mid', moved === 1, String(moved) + ' moved');
+    ok('...and moves it upward', peaked.sheet.get(atb) > evMid.sheet.get(atb));
   }
 
   // Penetration has INCREASING returns - each point is worth more than the last

@@ -408,14 +408,19 @@ function commonSetup(args) {
     if (!raw) die('--profile needs a name; `bench profiles` lists them');
     profile = resolve(String(raw), engine.profiles.list().map((p) => p.id), 'profile');
   }
-  let profileScale = 1;
-  if (args.flags['profile-scale'] != null && args.flags['profile-scale'] !== true) {
-    profileScale = Number(args.flags['profile-scale']);
-    if (!Number.isFinite(profileScale) || profileScale < 0) die('--profile-scale needs a number, 1 being one full budget');
+  // The rig is hardcoded at 50/100 and both numbers are overridable, because
+  // "does the answer change at a different level of gear" is the next question
+  // anyone asks after "does it change with the repartition".
+  const profileValues = {};
+  for (const [flag, key] of [['profile-base', 'base'], ['profile-peak', 'peak']]) {
+    if (args.flags[flag] == null || args.flags[flag] === true) continue;
+    const v = Number(args.flags[flag]);
+    if (!Number.isFinite(v) || v < 0) die(`--${flag} needs a number of stat points, zero or more`);
+    profileValues[key] = v;
   }
   return {
     engine, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap, talentPoints,
-    saved, fight, numFlag, profile, profileScale,
+    saved, fight, numFlag, profile, profileValues,
     // A bare loadout carries its own level, and the foe, the rating->percent
     // conversions and the candidate list all have to agree with it. Reporting a
     // level-10 character against a level-25 foe mixed two levels in one page.
@@ -500,7 +505,7 @@ function compareAcrossProfiles(s, args, profileIds) {
       }
       const loadout = {
         ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {},
-        profile: p, profileScale: s.profileScale,
+        profile: p, profileValues: s.profileValues,
       };
       loadout.gear.Slot_Weapon1 = {
         item: c.item.id, rarity: c.rarity, generic: c.generic ?? null,
@@ -632,7 +637,7 @@ function sweepWeaponPairs(s, args, top) {
     tick(`${mainId} / ${arsId ?? '-'}`);
     const loadout = {
       ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {},
-      profile: s.profile, profileScale: s.profileScale,
+      profile: s.profile, profileValues: s.profileValues,
     };
     loadout.gear.Slot_Weapon1 = gearFor(mainId);
     if (arsId) loadout.gear.Slot_Weapon2 = gearFor(arsId);
@@ -680,7 +685,7 @@ function sweepWeaponPairs(s, args, top) {
 
   console.log(f.header(s.engine, VERSION) + '\n');
   console.log(`${f.bold(base.class + ' ' + s.level)} - every ORDERED weapon pair, by ${f.bold(s.goal)} vs ${target.name}`);
-  console.log(f.profileBlock(s.engine.profiles.resolve(s.profile, base.class, s.level, s.profileScale)));
+  console.log(f.profileBlock(s.engine.profiles.resolve(s.profile, base.class, s.level, s.profileValues)));
   console.log(f.dim(`${done} cells in ${((Date.now() - t0) / 1000).toFixed(1)}s   `
     + `top ${pool.length} of ${weapons.length} weapons paired both ways`
     + (weapons.length > pool.length
@@ -752,7 +757,7 @@ function sweepWeaponPairs(s, args, top) {
 function applyProfile(s, loadout, pins) {
   if (!s.profile) return pins;
   loadout.profile = s.profile;
-  loadout.profileScale = s.profileScale;
+  loadout.profileValues = s.profileValues;
   const weapons = new Set(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']);
   for (const slot of s.engine.cat.combatSlots()) {
     if (weapons.has(slot.id)) continue;
@@ -1385,6 +1390,83 @@ const commands = {
       }
     }
 
+    // --- does a stat repartition change the ROTATION? -----------------------
+    // Not "does this rotation still win elsewhere" - that is the weaker
+    // question below. This one searches a FRESH rotation at every corner with
+    // the kit held fixed, so the only thing that moved is the stats, and then
+    // cross-evaluates every rotation at every corner. If the lists come out the
+    // same, a rotation is a property of the weapon and the gear search can run
+    // afterwards with it fixed. If they differ, the answer is "it depends", and
+    // the matrix says how much it depends.
+    if (args.flags['across-search'] !== undefined) {
+      const corners = typeof args.flags['across-search'] === 'string'
+        ? args.flags['across-search'].split(',').map((x) => resolve(x.trim(), s.engine.profiles.list().map((p) => p.id), 'profile'))
+        : ['mid', 'strength', 'vitality', 'crit', 'armorpen', 'fervor'];
+      const t1 = Date.now();
+      let fights = 0;
+      const found = new Map();
+      for (const p of corners) {
+        const l2 = { ...best.kit.loadout, profile: p };
+        const ev2 = s.engine.evaluate(l2, { target, rank: s.rank, mix: s.mix });
+        const ids2 = ev2.throughput.lines.filter((x) => x.kind === 'active').map((x) => x.id);
+        const score2 = (apl2) => {
+          fights++;
+          try {
+            return scorer.scoreFrom(s.engine.evaluate(l2, {
+              target, rank: s.rank, mix: s.mix, policy: makePolicy(apl2),
+            }));
+          } catch { return -Infinity; }
+        };
+        if (process.stderr.isTTY) process.stderr.write(`\r  searching ${p}: ${fights} fights   `);
+        const got = searchApl({
+          score: score2, ids: ids2, vocabulary: vocabularyFor(ev2.rotation),
+          restarts, seed: 0x9e3779b9, startFrom: derivedApl(ids2),
+        });
+        found.set(p, { apl: got.apl, own: got.score, derived: scorer.scoreFrom(ev2) });
+      }
+      if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(50) + '\r');
+
+      console.log('\n' + f.bold('DOES THE STAT SPREAD CHANGE THE ROTATION?')
+        + f.dim(`  - a fresh search at each corner, kit held fixed, ${fights} fights in `
+          + `${((Date.now() - t1) / 1000).toFixed(1)}s`));
+      const sig = (apl) => apl.entries
+        .map((e) => skillName(e.skill) + (e.cond.kind === 'always' ? '' : `[${condLabel(e.cond, skillName)}]`))
+        .join(' > ');
+      console.log(f.table(['  CORNER', 'DERIVED', 'SEARCHED', 'GAIN', 'THE ROTATION IT WANTS'],
+        corners.map((p) => {
+          const g = found.get(p);
+          return ['  ' + p, g.derived.toFixed(1), g.own.toFixed(1),
+            ((g.own / g.derived - 1) * 100).toFixed(2) + '%', sig(g.apl)];
+        }), { align: [null, 'r', 'r', 'r'] }));
+
+      // The transfer matrix. Row = the rotation found at that corner, column =
+      // the corner it is being played at, cell = how far below that corner's
+      // OWN best it lands. A row of zeroes is a rotation that costs nothing to
+      // carry everywhere.
+      console.log('\n' + f.bold('AND WHAT IT COSTS TO CARRY ONE EVERYWHERE')
+        + f.dim('  - % below the best rotation for that corner'));
+      const cell = (from, to) => {
+        const l2 = { ...best.kit.loadout, profile: to };
+        try {
+          const v = scorer.scoreFrom(s.engine.evaluate(l2, {
+            target, rank: s.rank, mix: s.mix, policy: makePolicy(found.get(from).apl),
+          }));
+          return (v / found.get(to).own - 1) * 100;
+        } catch { return NaN; }
+      };
+      const worst = new Map();
+      const rows = corners.map((from) => {
+        const cells = corners.map((to) => cell(from, to));
+        worst.set(from, Math.min(...cells.filter(Number.isFinite)));
+        return ['  ' + from, ...cells.map((v) => (Number.isFinite(v) ? v.toFixed(2) + '%' : '-'))];
+      });
+      console.log(f.table(['  FOUND AT', ...corners], rows, { align: [null, ...corners.map(() => 'r')] }));
+      const best1 = [...worst.entries()].sort((a, b) => b[1] - a[1])[0];
+      console.log(f.dim(`\n  Carrying one rotation everywhere costs at most `
+        + `${Math.abs(best1[1]).toFixed(2)}% if you pick the one found at "${best1[0]}".\n`
+        + '  A distinct list per corner is only worth writing down if that number is one you care about.'));
+    }
+
     // --- does it transfer? --------------------------------------------------
     // The entire reason to search a POLICY rather than a sequence is that its
     // conditions are re-evaluated against whatever build wears it. That is a
@@ -1442,7 +1524,7 @@ const commands = {
         stars: s.stars, rank: s.rank, level: s.level, mix: s.mix, rarityRoll: s.rarityRoll,
         fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
         lookahead: s.fight.lookahead,
-        profile: s.profile, profileScale: s.profileScale,
+        profile: s.profile, profileValues: s.profileValues,
         pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills] },
         build: best.kit.loadout,
         // The rotation is part of the result, so it round-trips with the build.
@@ -1471,13 +1553,14 @@ const commands = {
       ? s.engine.cat.classes.filter((c) => c.unit === want || c.aptitude === want)
       : s.engine.cat.classes;
     console.log(f.dim(
-      'A profile stands IN PLACE OF the armour: a fixed, named corner of the stat space, so a\n'
-      + 'weapon or a rotation can be compared with nothing else moving. The weapon slots stay live.\n'
-      + 'Nothing here is invented - 1.0 of a group is exactly what `budget(level, start, end)` says a\n'
-      + 'complete set delivers, and itemType.atbRatio sums to exactly 1.0 per group over one item per\n'
-      + 'core slot. That is the designers\' unit and NOT the ceiling: a maxed build runs above it,\n'
-      + 'because a Legendary roll puts an item above your level, augments add on top, and the arsenal\n'
-      + 'contributes 0.4 of a second weapon. --profile-scale 1.25 brackets it from the other side.\n'));
+      'A profile PINS every stat to a flat number, replacing whatever the level curve and the\n'
+      + 'gear would have produced. Then a weapon or a rotation can be compared with nothing else\n'
+      + 'moving - two weapons differ only in the kit they grant and the coefficients they scale by,\n'
+      + 'not in which is the better stat stick. The weapon slots stay live; the armour is gone.\n'
+      + `The rig is ${'50'} everywhere and ${'100'} on the one stat a profile names, so `
+      + '`crit` minus `mid`\nis exactly "+50 CritChanceRating and nothing else moved". '
+      + '--profile-base and --profile-peak\nmove both numbers. The budgets below are context, not the source: they say what a real\n'
+      + 'set would deliver, so you can see how far from a real character the rig sits.\n'));
     for (const c of classes) {
       const b = s.engine.profiles.budgetsFor(c.unit, s.level);
       console.log(f.bold(`${c.unit} - what one full set delivers at level ${s.level}`));
@@ -1496,10 +1579,11 @@ const commands = {
       console.log('');
     }
     const rows = s.engine.profiles.list().map((p) => {
-      const r = s.engine.profiles.resolve(p.id, classes[0].unit, s.level);
-      return ['  ' + p.id, p.desc, r.notes.length ? f.warn('not attainable - a probe') : ''];
+      const r = s.engine.profiles.resolve(p.id, classes[0].unit, s.level, s.profileValues);
+      return ['  ' + p.id, p.desc,
+        r.peakAtb ? `${r.peakAtb} ${r.peak} vs ${r.base} elsewhere` : `all ${r.base}`];
     });
-    console.log(f.bold('PROFILES') + '\n' + f.table(['  NAME', 'WHAT IT IS', ''], rows));
+    console.log(f.bold('PROFILES') + '\n' + f.table(['  NAME', 'WHAT IT IS', 'PINS'], rows));
     console.log(f.dim(`\n  bench sheet --class ${classes[0].unit} --profile armorpen --pin weapon1=GA_Craft`
       + `\n  bench weapons --class ${classes[0].unit} --profile armorpen`));
   },
@@ -1555,7 +1639,7 @@ const commands = {
       if (process.stderr.isTTY) process.stderr.write(`\r  ${++n}/${weapons.length} ${c.item.id}      `);
       const loadout = {
         ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {},
-        profile: s.profile, profileScale: s.profileScale,
+        profile: s.profile, profileValues: s.profileValues,
       };
       loadout.gear.Slot_Weapon1 = {
         item: c.item.id, rarity: c.rarity, generic: c.generic ?? null,
@@ -1600,7 +1684,7 @@ const commands = {
 
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${f.bold(base.class + ' ' + s.level)} - every mainhand, ranked by ${f.bold(s.goal)} vs ${target.name}`);
-    console.log(f.profileBlock(s.engine.profiles.resolve(s.profile, base.class, s.level, s.profileScale)));
+    console.log(f.profileBlock(s.engine.profiles.resolve(s.profile, base.class, s.level, s.profileValues)));
     console.log(f.dim(`${weapons.length} weapons in ${((Date.now() - t0) / 1000).toFixed(1)}s   `
       + `weapon mastery: rank ${s.rank}   skills, talents and runes chosen per weapon   `
       + `arsenal: ${arsenal ? 'searched' : 'empty'}   no armour, no offhand, no augments`));
@@ -1684,20 +1768,26 @@ Searching a rotation
   --kit-restarts <n>      restarts for the kit search inside each round (3)
 
 Stat profiles
-  A profile stands IN PLACE OF the armour: a fixed, named corner of the stat
-  space, so a weapon - or later a rotation - can be compared with nothing else
-  moving. 1.0 of a stat group is exactly what the game's own budget curve says a
-  complete set delivers, so nothing here is invented. The weapon slots stay live.
+  A profile PINS every stat to a flat number, replacing whatever the level curve
+  and the gear would produce. Two weapons then differ only in the kit they grant
+  and the coefficients they scale by, not in which is the better stat stick. The
+  weapon slots stay live; the armour is gone. The rig is 50 everywhere and 100 on
+  the one stat a profile names, so "crit" minus "mid" is exactly +50
+  CritChanceRating and nothing else moved.
 
-  --profile <name>        naked | half | full | crit | armorpen | spellpen
-                          | fervor | strength | dexterity | intellect | faith
-  --profile-scale <n>     fraction of a full set (default 1). 1.0 is the
-                          designers' unit and not the ceiling - a maxed build
-                          runs nearer 1.25, because a Legendary roll puts an item
-                          above your level and augments add on top of the budget.
+  --profile <name>        zero | mid | strength | dexterity | intellect | faith
+                          | vitality | armor | magicarmor | crit | armorpen
+                          | spellpen | fervor
+  --profile-base <n>      what every stat is pinned to     (default 50)
+  --profile-peak <n>      what the named stat is pinned to (default 100)
   --across <p1,p2,...>    (bench weapons) run several corners and report how far
-                          the ranking moves between them. Bare --across uses
-                          naked,half,full,crit,armorpen,fervor.
+                          the ranking moves between them; (bench rotation)
+                          re-evaluate the ONE rotation found at other corners.
+  --across-search <list>  (bench rotation) the stronger question: search a FRESH
+                          rotation at every corner with the kit held fixed, then
+                          cross-evaluate every rotation at every corner. Answers
+                          "does a stat repartition change the rotation", and what
+                          carrying a single rotation everywhere costs.
   --no-arsenal            (bench weapons) leave the arsenal slot empty
 
 Common flags

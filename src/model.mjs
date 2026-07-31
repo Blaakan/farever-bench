@@ -235,7 +235,7 @@ export function loadConstants(cdb) {
  *                 as produced by the gear layer
  * @param level    character level, used by every Rating denominator
  */
-export function computeSheet(ctx, { base, mods, level }) {
+export function computeSheet(ctx, { base, mods, level, force = null }) {
   const { attrTable, consts } = ctx;
   const out = new Map();
   const flat = mods?.flat ?? new Map();
@@ -281,6 +281,16 @@ export function computeSheet(ctx, { base, mods, level }) {
     // its 0.014-per-Dexterity-and-Faith scaling and moved the derived stats too.
     if (a.roundUp) v = Math.round(v);
     if (!a.negativeAllowed && v < 0) v = 0;
+    // A forced value REPLACES everything - the level curve, the gear, the
+    // weapon. It is how a stat profile pins a stat to a stated number so two
+    // weapons can be compared on their kits rather than on their stat sticks.
+    //
+    // It happens INSIDE the topological walk, not afterwards, so everything
+    // downstream is computed from the forced number: pin Dexterity and the
+    // CritChance that scales off it moves with it. Overriding the finished
+    // sheet instead would leave every derived stat quietly disagreeing with
+    // the stat it derives from.
+    if (force?.has(a.id)) v = force.get(a.id);
     out.set(a.id, v);
   }
   return out;

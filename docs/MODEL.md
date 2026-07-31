@@ -1053,42 +1053,33 @@ already established elsewhere in this document:
   per core slot ([§6](#6-what-an-item-is-worth)), which is what makes one budget
   a *complete set* rather than an arbitrary amount.
 
-**Every stat sits at the same fraction of its OWN budget, and one is raised.**
+**Every stat is PINNED to a flat number, and one is raised.** `zero` pins
+everything to 0, `mid` to 50, and each named profile pins everything to 50 and
+its own stat to 100. `--profile-base` and `--profile-peak` move both numbers.
 
-| | |
-|---|---|
-| `zero` | nothing — the level curve and the weapon |
-| `mid` | every stat at half a full set of it |
-| `full` | every stat at a full set of it |
-| `crit`, `armorpen`, `spellpen`, `fervor`, `strength`, `dexterity`, `intellect`, `faith`, `vitality`, `armor` | `mid`, with that one at a full set |
+So `crit` minus `mid` is exactly *"+50 CritChanceRating and nothing else moved"* —
+the comparison that isolates a stat.
 
-The shape is what makes the set useful: `crit` minus `mid` is *"half a budget
-more CritChance and nothing else moved"*. The first version of this instead
-poured the whole ratings budget into one rating and left the others empty, so a
-"crit" corner also had **no penetration** — and a difference with two causes
-measures neither of them.
+**Forced, not added.** The values replace whatever the level curve, the gear and
+the weapon produce, so a weapon that happens to be a better stat stick cannot win
+on that: two weapons differ only in the kit they grant and the coefficients they
+scale by. `computeSheet` applies them *inside* its topological walk, so
+everything downstream is computed from the forced number — pin Dexterity and the
+CritChance that scales off it moves with it. Overriding the finished sheet
+instead would leave every derived stat quietly disagreeing with the stat it
+derives from.
 
-**Everything except `zero` is deliberately unattainable, and says so.** Four
-ratings at half a budget each is two budgets; gear delivers one. That is what a
-probe is: it holds nine stats still and moves the tenth, which no real set can
-do, and it is the only way to read one stat's effect without the rest of the
-build answering back. The output prints the overshoot rather than letting a
-probe read as a build.
+**The numbers are arbitrary, and that is the point.** 50 is not half of anything
+and it is not what any character wears; it is a fixed rig, the same for every
+weapon and every class. A profile denominated in budget fractions cannot do that
+job — a Warrior's full primary budget is 123.6 and a Rogue's is 148.3, so "half a
+budget" is a different number per class and carries the budget's own shape into
+the comparison. The budgets are still computed and printed beside the rig, so
+the distance from a real character is visible rather than hidden.
 
-Two further reasons a corner may be unreachable, both named in the same place:
-an item pays the WEARER's aptitude, so a Warrior gets Strength and never Faith;
-and `conds.factions` on the Fighter's rating rows lists no faction at all for
-SpellPenetration. Peaking either is still worth doing — it answers whether a
-weapon's kit scales off a stat its class never gets — and a peaked primary
-redirects the class's *own* primary budget rather than inventing another, so the
-magnitude stays comparable.
-
-**1.0 is the designers' unit, not the ceiling.** A maxed build runs above it: a
-Legendary roll puts an item's effective level above the character's, augments add
-on top of the budget rather than inside it, and the arsenal contributes 0.4 of a
-second weapon. A level-25 Warrior the optimiser dressed reads 469
-ArmorPenetrationRating against the 380 one budget delivers, so `--profile-scale
-1.25` brackets it from the other side.
+An earlier version of this file denominated the corners in budget fractions and
+poured the whole ratings budget into one rating, which meant a "crit" corner also
+had **no penetration** — a difference with two causes measures neither.
 
 ### What it measured
 
