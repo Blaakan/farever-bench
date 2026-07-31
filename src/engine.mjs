@@ -17,6 +17,7 @@ import { buildCatalog } from './catalog.mjs';
 import { buildCombat } from './damage.mjs';
 import { buildSkillPlan } from './skills.mjs';
 import { buildTalentPlan } from './talents.mjs';
+import { buildProfiles } from './profiles.mjs';
 import { evaluate as evaluateLoadout, classOf, socketsOf } from './loadout.mjs';
 
 export const GOALS = ['dps', 'hps', 'sps', 'ehp', 'mixed'];
@@ -38,6 +39,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
   const plan = buildSkillPlan(cdb, ctx, cat, combat,
     classSkillSlots != null ? { classSkillSlots } : {});
   const talents = buildTalentPlan(cdb, ctx, cat, combat, plan);
+  const profiles = buildProfiles(cdb, ctx, cat);
   const opts = {
     assume: { ...DEFAULT_ASSUME, ...assume },
     // The fight the numbers are computed over. 200 seconds because that is the
@@ -108,6 +110,15 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     const addRatio = new Map();
     const mulRatio = new Map();
     const addFlat = (atb, v) => inject.set(atb, (inject.get(atb) ?? 0) + v);
+
+    // A named stat profile stands IN PLACE OF the armour, so a rotation can be
+    // searched against a fixed corner of the stat space instead of against
+    // whatever the gear search happened to converge on. The weapon stays real:
+    // it is what grants the skills and sets WeaponPower, and it is the thing
+    // being compared. See profiles.mjs for where the numbers come from.
+    const profile = loadout.profile
+      ? profiles.resolve(loadout.profile, loadout.class, loadout.level, loadout.profileScale ?? 1) : null;
+    if (profile) for (const [atb, v] of profile.inject) addFlat(atb, v);
 
     for (const p of rot.passive ?? []) {
       for (const a of p.affixes ?? []) {
@@ -392,7 +403,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       });
     }
     if (extraGaps.length) tp.unmodelled = [...tp.unmodelled, ...extraGaps];
-    return { ...r, target: tgt, weaponPower, rotation: rot, buffs, throughput: tp, survivability: sv };
+    return { ...r, target: tgt, weaponPower, profile, rotation: rot, buffs, throughput: tp, survivability: sv };
   }
 
   /**
@@ -526,7 +537,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
   ];
 
   return {
-    cdb, ctx, cat, combat, plan, talents, opts, audit,
+    cdb, ctx, cat, combat, plan, talents, profiles, opts, audit,
     baseStatsFor, evaluate, makeScorer, socketsOf: (l) => socketsOf(cat, l),
     meta: cdb.meta,
   };

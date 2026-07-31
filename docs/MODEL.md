@@ -947,6 +947,65 @@ Fervor gear. With prayers, weapon skills, procs and enchants scored, the same
 search picks **SpellPenetration** across every slot and Fervor drops to noise.
 The rotation model, not the Fervor switch, was what made that answer wrong.
 
+## Stat profiles, and why they exist
+
+The best rotation depends on the weapon, the talents, the runes and the stats.
+The best gear depends on the rotation. Searched together that is one problem with
+two moving halves, and the gear half is the expensive one — twenty thousand
+loadouts, where a rotation search wants thousands of fights *per* loadout.
+
+A profile replaces the armour with a fixed, named stat sheet, so a weapon or a
+rotation can be compared with nothing else moving. The numbers are the ones
+already established elsewhere in this document:
+
+- `budget(level, start, end)` off `aptitude.atbScaling` for primary, vitality and
+  the ratings;
+- `resistForReduction(level, props.armorReduction)` for armour, because the
+  authored Armor columns are dead ([§3](#3-armor-is-design-intent-not-a-number));
+- and `itemType.atbRatio` summing to **exactly 1.0** per stat group over one item
+  per core slot ([§6](#6-what-an-item-is-worth)), which is what makes one budget
+  a *complete set* rather than an arbitrary amount.
+
+So `full` is a perfect set and `crit` is the same set with the whole ratings
+budget in one place. One budget is split across whichever ratings your factions
+pay, so the three rating rows a class shows are one 100%, not three.
+
+**1.0 is the designers' unit, not the ceiling.** A maxed build runs above it: a
+Legendary roll puts an item's effective level above the character's, augments add
+on top of the budget rather than inside it, and the arsenal contributes 0.4 of a
+second weapon. A level-25 Warrior the optimiser dressed reads 469
+ArmorPenetrationRating against the 380 one budget delivers, so `--profile-scale
+1.25` brackets it from the other side.
+
+**A corner gear cannot reach is still worth probing, and says so.** An item pays
+the WEARER's aptitude, so a Warrior gets Strength and never Faith, and
+`conds.factions` on the Fighter's rating rows lists no faction at all for
+SpellPenetration. Those profiles are marked as probes rather than builds — but
+they answer a real question, which is whether a weapon's kit scales off a stat
+its class never gets.
+
+### What it measured
+
+`bench weapons --across` runs every mainhand at six corners. On this data, above
+the naked corner:
+
+| | |
+|---|---|
+| weapon ranking | mean shift **0.3–0.6** places out of 13, worst 3 |
+| which two skills to slot | **identical at every corner**, on all eight weapons checked |
+| talents | 3–4 different sets across six corners |
+| runes | 2–4 different sets |
+
+Naked is the one corner that reorders the top — `GS_Nova` wins with no gear on
+and `GA_Craft` wins everywhere else — which is worth knowing and is not a
+surprise: with no ratings at all, a weapon's raw coefficients are the whole
+story.
+
+So the weapon and its skills are **one decision that does not depend on your
+gear**, and the tree and the runes are re-decided per stat corner. That is the
+shape a rotation search should be built to, and it is a measurement rather than
+an assumption.
+
 ## The search
 
 Coordinate ascent with exhaustive per-slot enumeration: walk the free

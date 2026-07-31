@@ -1992,6 +1992,77 @@ group('the talent heuristic sees the whole tree');
     `${alloc.spent}/${alloc.budget}, blind ${alloc.blind.join(',')}`);
 }
 
+// --- stat profiles ----------------------------------------------------------
+// A profile stands in place of the armour so a weapon or a rotation can be
+// compared at a fixed corner. Its numbers are not invented: 1.0 of a group is
+// exactly `budget(level, start, end)`, which is the same curve the gear layer
+// uses, and the atbRatio sums asserted above are what make that a FULL SET.
+group('stat profiles');
+{
+  const eng = createEngine({ quiet: true });
+  const P = eng.profiles;
+  const b = P.budgetsFor('Warrior', 25);
+
+  ok('a full set is one primary budget', b.primary?.atb === 'Strength' && Math.abs(b.primary.amount - 123.6) < 0.5,
+    JSON.stringify(b.primary));
+  ok('...one ratings budget, whichever rating your factions pay',
+    b.ratings.length === 3 && b.ratings.every((r) => Math.abs(r.amount - b.ratings[0].amount) < 1e-6),
+    b.ratings.map((r) => `${r.atb} ${r.amount.toFixed(1)}`).join(', '));
+  // Armor takes the runtime path, not the authored columns - the same rule the
+  // rest of the model follows, and the Fighter is where the two disagree.
+  const implied = resistForReduction(25, 0.4, eng.ctx.consts.resistFormula);
+  ok('armor comes from props.armorReduction, not from aptitude.atbScaling',
+    Math.abs(b.armor.amount - implied) < 1e-6, `${b.armor.amount.toFixed(1)} vs ${implied.toFixed(1)}`);
+  // Vitality states its budget in MaxHealth and delivers it as Vitality, so the
+  // conversion has to be looked up rather than assumed.
+  ok('the vitality budget is delivered as Vitality, not as MaxHealth',
+    b.vitality.atb === 'Vitality' && b.vitality.amount < 200, JSON.stringify(b.vitality));
+
+  ok('naked injects nothing', P.resolve('naked', 'Warrior', 25).inject.size === 0);
+  const full = P.resolve('full', 'Warrior', 25);
+  const crit = P.resolve('crit', 'Warrior', 25);
+  const sum = (m) => [...m].filter(([a]) => a.endsWith('Rating')).reduce((s, [, v]) => s + v, 0);
+  ok('splitting the ratings budget and concentrating it spend the same total',
+    Math.abs(sum(full.inject) - sum(crit.inject)) < 1e-6,
+    `${sum(full.inject).toFixed(1)} vs ${sum(crit.inject).toFixed(1)}`);
+  ok('...and concentrating it puts all of it in one rating',
+    crit.inject.size === 4 && Math.abs(crit.inject.get('CritChanceRating') - b.ratings[0].amount) < 1e-6);
+  ok('half is half of every group',
+    Math.abs(P.resolve('half', 'Warrior', 25).inject.get('Strength') - b.primary.amount / 2) < 1e-6);
+  ok('--profile-scale multiplies the whole set',
+    Math.abs(P.resolve('full', 'Warrior', 25, 2).inject.get('Strength') - b.primary.amount * 2) < 1e-6);
+
+  // A corner gear cannot reach is still worth probing, and must SAY so.
+  ok('a rating no faction pays this class is flagged as a probe',
+    P.resolve('spellpen', 'Warrior', 25).notes.length === 1,
+    JSON.stringify(P.resolve('spellpen', 'Warrior', 25).notes));
+  ok('...and so is another class\'s primary',
+    P.resolve('faith', 'Warrior', 25).notes.length === 1);
+  ok('the class\'s own rating and primary are NOT flagged',
+    P.resolve('armorpen', 'Warrior', 25).notes.length === 0
+    && P.resolve('strength', 'Warrior', 25).notes.length === 0);
+  ok('an unknown profile fails by name', (() => {
+    try { P.resolve('nope', 'Warrior', 25); return false; } catch (e) { return /unknown profile/.test(e.message); }
+  })());
+
+  // And it has to reach the sheet: a profile that resolves but does not apply
+  // would read as a naked character with a confident label on it.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Rare', stars: 0 };
+  const bare = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const geared = eng.evaluate({ ...l, profile: 'armorpen' }, { target: eng.combat.foe('boss', 25), rank: 3 });
+  ok('a profile reaches the sheet',
+    geared.sheet.get('ArmorPenetrationRating') > bare.sheet.get('ArmorPenetrationRating') + 300
+    && geared.throughput.dps > bare.throughput.dps,
+    `${bare.sheet.get('ArmorPenetrationRating').toFixed(0)} -> ${geared.sheet.get('ArmorPenetrationRating').toFixed(0)}`);
+  // Penetration has increasing returns, which is the whole reason the corners
+  // exist: concentrating a budget beats splitting it.
+  const split = eng.evaluate({ ...l, profile: 'full' }, { target: eng.combat.foe('boss', 25), rank: 3 });
+  ok('concentrating the ratings budget into penetration beats splitting it',
+    geared.throughput.dps > split.throughput.dps,
+    `${geared.throughput.dps.toFixed(1)} vs ${split.throughput.dps.toFixed(1)}`);
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

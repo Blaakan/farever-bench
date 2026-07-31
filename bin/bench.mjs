@@ -396,9 +396,23 @@ function commonSetup(args) {
   const rarityCap = typeof args.flags[`rarity-cap`] === 'string'
     ? resolve(args.flags[`rarity-cap`], engine.cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
     : null;
+  // A named stat profile stands in place of the armour, so a weapon or a
+  // rotation can be compared at a fixed corner of the stat space instead of
+  // against whatever the gear search converged on. See `bench profiles`.
+  let profile = null;
+  if (args.flags.profile != null || env.profile != null) {
+    const raw = args.flags.profile === true ? null : (args.flags.profile ?? env.profile);
+    if (!raw) die('--profile needs a name; `bench profiles` lists them');
+    profile = resolve(String(raw), engine.profiles.list().map((p) => p.id), 'profile');
+  }
+  let profileScale = 1;
+  if (args.flags['profile-scale'] != null && args.flags['profile-scale'] !== true) {
+    profileScale = Number(args.flags['profile-scale']);
+    if (!Number.isFinite(profileScale) || profileScale < 0) die('--profile-scale needs a number, 1 being one full budget');
+  }
   return {
     engine, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap, talentPoints,
-    saved, fight, numFlag,
+    saved, fight, numFlag, profile, profileScale,
     // A bare loadout carries its own level, and the foe, the rating->percent
     // conversions and the candidate list all have to agree with it. Reporting a
     // level-10 character against a level-25 foe mixed two levels in one page.
@@ -442,6 +456,151 @@ function loadBuild(args, engine, level, saved = null) {
 }
 
 // --- commands --------------------------------------------------------------
+
+/**
+ * Every weapon, at several stat corners, and how much the answer moves between
+ * them.
+ *
+ * This is the measurement the "search the rotation, then the gear" plan rests
+ * on. If the ranking and the kit hold across corners, a weapon and its skills
+ * are ONE decision that can be made once and held fixed while the gear is
+ * searched. If they do not, the two are coupled and have to be searched
+ * together - which is a far more expensive problem, and worth knowing before
+ * building for it rather than after.
+ */
+function compareAcrossProfiles(s, args, profileIds) {
+  const target = s.engine.combat.foe(s.targetName, s.level);
+  const base = loadBuild(args, s.engine, s.level, s.saved);
+  const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
+  const restarts = s.numFlag('restarts', 1, { integer: true });
+  const skills = s.engine.cdb.byId('skill');
+
+  const seen = new Set();
+  const weapons = [];
+  for (const c of s.engine.cat.candidates('Slot_Weapon1', {
+    aptitude: cls.aptitude, charLevel: s.level, rarities: s.rarities,
+    exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+  })) {
+    if (seen.has(c.item.id)) continue;
+    seen.add(c.item.id);
+    weapons.push(c);
+  }
+
+  const t0 = Date.now();
+  const byProfile = new Map();
+  let n = 0;
+  for (const p of profileIds) {
+    const rows = [];
+    for (const c of weapons) {
+      if (process.stderr.isTTY) {
+        process.stderr.write(`\r  ${++n}/${profileIds.length * weapons.length} ${p} ${c.item.id}      `);
+      }
+      const loadout = {
+        ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {},
+        profile: p, profileScale: s.profileScale,
+      };
+      loadout.gear.Slot_Weapon1 = {
+        item: c.item.id, rarity: c.rarity, generic: c.generic ?? null,
+        stars: s.stars === 'max' ? s.engine.cat.maxStars(c.item, c.rarity)
+          : Math.min(s.stars, s.engine.cat.maxStars(c.item, c.rarity)),
+      };
+      const pinnedGear = new Set(s.engine.cat.combatSlots().map((x) => x.id));
+      if (!args.flags['no-arsenal']) pinnedGear.delete('Slot_Weapon2');
+      try {
+        const r = optimize(s.engine, {
+          loadout, pinnedGear, pinnedAug: new Set(), goal: s.goal, weights: s.weights, target,
+          rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
+          exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+          talentPoints: s.talentPoints, allowEmpty: true, restarts,
+        });
+        rows.push({
+          id: c.item.id,
+          name: c.item.name ?? c.item.id,
+          score: r.score,
+          skills: (r.loadout.skills?.Slot_Weapon1 ?? []).slice().sort().join('+'),
+          talents: Object.keys(r.loadout.talents ?? {}).sort().join('+'),
+          runes: Object.entries(r.loadout.runes ?? {}).sort().map(([k, v]) => k + '=' + v).join(','),
+        });
+      } catch { /* a weapon this class cannot legally hold at this level */ }
+    }
+    rows.sort((a, b) => b.score - a.score);
+    byProfile.set(p, rows);
+  }
+  if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(60) + '\r');
+
+  console.log(f.header(s.engine, VERSION) + '\n');
+  console.log(`${f.bold(base.class + ' ' + s.level)} - every mainhand at ${profileIds.length} stat corners, `
+    + `by ${f.bold(s.goal)} vs ${target.name}`);
+  console.log(f.dim(`${weapons.length} weapons x ${profileIds.length} profiles in `
+    + `${((Date.now() - t0) / 1000).toFixed(1)}s   skills, talents and runes chosen per cell   `
+    + 'no armour, no offhand, no augments\n'));
+
+  // The reference ordering is the LAST corner asked for, so the columns read
+  // left to right toward the one the table is sorted by.
+  const ref = byProfile.get(profileIds[profileIds.length - 1]).map((r) => r.id);
+  const cell = (p, id) => {
+    const rows = byProfile.get(p);
+    const i = rows.findIndex((r) => r.id === id);
+    return i < 0 ? '-' : `#${i + 1} ${rows[i].score.toFixed(0)}`;
+  };
+  console.log(f.table(['WEAPON', ...profileIds],
+    ref.map((id) => [
+      byProfile.get(profileIds[0]).find((r) => r.id === id)?.name ?? id,
+      ...profileIds.map((p) => cell(p, id)),
+    ]), { align: [null, ...profileIds.map(() => 'r')] }));
+
+  console.log('\n' + f.bold('HOW FAR THE ORDER MOVES') + f.dim(` - against ${profileIds[profileIds.length - 1]}`));
+  console.log(f.table(['  PROFILE', 'WINNER', 'MEAN SHIFT', 'WORST'],
+    profileIds.map((p) => {
+      const rows = byProfile.get(p);
+      let worst = 0, sum = 0;
+      for (let i = 0; i < ref.length; i++) {
+        const j = rows.findIndex((r) => r.id === ref[i]);
+        if (j < 0) continue;
+        worst = Math.max(worst, Math.abs(i - j));
+        sum += Math.abs(i - j);
+      }
+      return ['  ' + p, rows[0]?.name ?? '-', (sum / Math.max(1, ref.length)).toFixed(2), String(worst)];
+    }), { align: [null, null, 'r', 'r'] }));
+
+  console.log('\n' + f.bold('AND WHETHER THE BUILD FOR ONE WEAPON MOVES WITH THE STATS'));
+  console.log(f.table(['  WEAPON', 'SKILLS', 'TALENTS', 'RUNES'],
+    ref.slice(0, 8).map((id) => {
+      const per = profileIds.map((p) => byProfile.get(p).find((r) => r.id === id)).filter(Boolean);
+      const distinct = (k) => new Set(per.map((r) => r[k])).size;
+      const say = (nn) => (nn === 1 ? f.dim('same') : f.warn(`${nn} different`));
+      return ['  ' + (byProfile.get(profileIds[0]).find((r) => r.id === id)?.name ?? id),
+        say(distinct('skills')), say(distinct('talents')), say(distinct('runes'))];
+    })));
+  console.log('\n' + f.dim(
+    'A column that reads `same` everywhere is a decision that does not depend on your gear,\n'
+    + 'so it can be made once and held fixed while the gear is searched. One that moves has to\n'
+    + 'be re-decided per stat corner - which is cheap, as long as you know it needs doing.'));
+}
+
+/**
+ * Attach a named stat profile to a loadout, and take the armour off.
+ *
+ * A profile REPLACES the gear - that is the whole point of it - so leaving
+ * armour on would double-count. The weapon slots stay live, because the weapon
+ * is what grants the skills, sets WeaponPower, and is usually the thing being
+ * compared; every other slot is pinned empty so no search can fill it.
+ */
+function applyProfile(s, loadout, pins) {
+  if (!s.profile) return pins;
+  loadout.profile = s.profile;
+  loadout.profileScale = s.profileScale;
+  const weapons = new Set(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']);
+  for (const slot of s.engine.cat.combatSlots()) {
+    if (weapons.has(slot.id)) continue;
+    delete loadout.gear[slot.id];
+    pins.pinnedGear.add(slot.id);
+  }
+  for (const k of Object.keys(loadout.augments ?? {})) {
+    if (!weapons.has(k.split('/')[0])) delete loadout.augments[k];
+  }
+  return pins;
+}
 
 const commands = {
   classes(args) {
@@ -501,10 +660,12 @@ const commands = {
   sheet(args) {
     const s = commonSetup(args);
     const loadout = loadBuild(args, s.engine, s.level, s.saved);
-    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved });
+    const pins = applyProfile(s, loadout,
+      applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
     const target = s.engine.combat.foe(s.targetName, s.level);
     const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix });
     console.log(f.header(s.engine, VERSION) + '\n');
+    if (ev.profile) console.log(f.profileBlock(ev.profile) + '\n');
     console.log(f.gearBlock(s.engine, loadout) + '\n');
     if (s.engine.socketsOf(loadout).length) {
       console.log(f.bold('AUGMENTS'));
@@ -554,7 +715,8 @@ const commands = {
   optimize(args) {
     const s = commonSetup(args);
     const loadout = loadBuild(args, s.engine, s.level, s.saved);
-    const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved });
+    const pins = applyProfile(s, loadout,
+      applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
     const target = s.engine.combat.foe(s.targetName, s.level);
     // Validated like every other number: `--restarts abc` used to make the
     // search loop run zero times and surface as a null dereference inside
@@ -869,6 +1031,175 @@ const commands = {
     ].join("\n"));
   },
 
+  profiles(args) {
+    const s = commonSetup(args);
+    const want = typeof args.flags.class === 'string'
+      ? resolve(args.flags.class, s.engine.cat.classes.flatMap((c) => [c.unit, c.aptitude]), 'class')
+      : null;
+    console.log(f.header(s.engine, VERSION) + '\n');
+    const classes = want
+      ? s.engine.cat.classes.filter((c) => c.unit === want || c.aptitude === want)
+      : s.engine.cat.classes;
+    console.log(f.dim(
+      'A profile stands IN PLACE OF the armour: a fixed, named corner of the stat space, so a\n'
+      + 'weapon or a rotation can be compared with nothing else moving. The weapon slots stay live.\n'
+      + 'Nothing here is invented - 1.0 of a group is exactly what `budget(level, start, end)` says a\n'
+      + 'complete set delivers, and itemType.atbRatio sums to exactly 1.0 per group over one item per\n'
+      + 'core slot. That is the designers\' unit and NOT the ceiling: a maxed build runs above it,\n'
+      + 'because a Legendary roll puts an item above your level, augments add on top, and the arsenal\n'
+      + 'contributes 0.4 of a second weapon. --profile-scale 1.25 brackets it from the other side.\n'));
+    for (const c of classes) {
+      const b = s.engine.profiles.budgetsFor(c.unit, s.level);
+      console.log(f.bold(`${c.unit} - what one full set delivers at level ${s.level}`));
+      const rows = [];
+      if (b.primary) rows.push(['  primary', b.primary.atb, b.primary.amount.toFixed(1), '']);
+      if (b.vitality) rows.push(['  vitality', b.vitality.atb, b.vitality.amount.toFixed(1), '']);
+      if (b.armor) rows.push(['  armor', b.armor.atb, b.armor.amount.toFixed(1), 'from props.armorReduction, not the authored columns']);
+      for (const r of b.ratings) {
+        rows.push(['  ratings', r.atb, r.amount.toFixed(1),
+          r.factions.length ? `factions ${r.factions.join('/')}` : '']);
+      }
+      console.log(f.table(['  GROUP', 'ATTRIBUTE', 'FULL SET', 'NOTE'], rows,
+        { align: [null, null, 'r'] }));
+      console.log(f.dim('  One budget is split across the ratings your factions give you, so the three\n'
+        + '  rating rows above are one 100%, not three.'));
+      console.log('');
+    }
+    const rows = s.engine.profiles.list().map((p) => {
+      const r = s.engine.profiles.resolve(p.id, classes[0].unit, s.level);
+      return ['  ' + p.id, p.desc, r.notes.length ? f.warn('not attainable - a probe') : ''];
+    });
+    console.log(f.bold('PROFILES') + '\n' + f.table(['  NAME', 'WHAT IT IS', ''], rows));
+    console.log(f.dim(`\n  bench sheet --class ${classes[0].unit} --profile armorpen --pin weapon1=GA_Craft`
+      + `\n  bench weapons --class ${classes[0].unit} --profile armorpen`));
+  },
+
+  weapons(args) {
+    const s = commonSetup(args);
+    // `--across` answers the question the whole decomposition rests on: does the
+    // ranking depend on the stats? If it does not, a weapon and its skills are
+    // one decision and the gear search runs afterwards with them fixed.
+    const across = typeof args.flags.across === 'string'
+      ? args.flags.across.split(',').map((x) => resolve(x.trim(), s.engine.profiles.list().map((p) => p.id), 'profile'))
+      : (args.flags.across === true ? ['naked', 'half', 'full', 'crit', 'armorpen', 'fervor'] : null);
+    if (across) return compareAcrossProfiles(s, args, across);
+    if (!s.profile) {
+      die('bench weapons needs a --profile, so every weapon is compared at the same stats.\n'
+        + '  Without one the answer is "whichever weapon the gear search happened to like".\n'
+        + '  `bench profiles` lists them; `--profile armorpen` is the usual place to start,\n'
+        + '  and `--across` runs several and reports how much the ranking moves between them.');
+    }
+    const target = s.engine.combat.foe(s.targetName, s.level);
+    const base = loadBuild(args, s.engine, s.level, s.saved);
+    const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
+    const restarts = s.numFlag('restarts', 1, { integer: true });
+    const arsenal = !args.flags['no-arsenal'];
+
+    // Every distinct mainhand this class can hold. Rarity is pinned to the
+    // authored one unless --rarity-roll asks otherwise, because a weapon
+    // comparison should not also be a comparison of how lucky the drop was.
+    const seen = new Set();
+    const weapons = [];
+    for (const c of s.engine.cat.candidates('Slot_Weapon1', {
+      aptitude: cls.aptitude, charLevel: s.level, rarities: s.rarities,
+      exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+    })) {
+      if (seen.has(c.item.id)) continue;
+      seen.add(c.item.id);
+      weapons.push(c);
+    }
+
+    const t0 = Date.now();
+    const rows = [];
+    let n = 0;
+    for (const c of weapons) {
+      if (process.stderr.isTTY) process.stderr.write(`\r  ${++n}/${weapons.length} ${c.item.id}      `);
+      const loadout = {
+        ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {},
+        profile: s.profile, profileScale: s.profileScale,
+      };
+      loadout.gear.Slot_Weapon1 = {
+        item: c.item.id, rarity: c.rarity, generic: c.generic ?? null,
+        stars: s.stars === 'max' ? s.engine.cat.maxStars(c.item, c.rarity)
+          : Math.min(s.stars, s.engine.cat.maxStars(c.item, c.rarity)),
+      };
+      // Everything except the mainhand is pinned: the profile is the armour,
+      // and the augment sockets are left empty so a weapon is compared on the
+      // kit it grants rather than on the enchants it can host.
+      const pinnedGear = new Set(s.engine.cat.combatSlots().map((x) => x.id));
+      if (arsenal) pinnedGear.delete('Slot_Weapon2');
+      const pinnedAug = new Set();
+      let res;
+      try {
+        res = optimize(s.engine, {
+          loadout, pinnedGear, pinnedAug, goal: s.goal, weights: s.weights, target,
+          rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
+          exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+          talentPoints: s.talentPoints, allowEmpty: true, restarts,
+        });
+      } catch (err) {
+        rows.push({ id: c.item.id, name: c.item.name ?? c.item.id, error: err.message });
+        continue;
+      }
+      const ev = res.evaluation;
+      // What the weapon grants, not only what was chosen: a pool of three that
+      // hands you two plus an always-on passive reads as one skill otherwise.
+      const pool = s.engine.plan.pools(res.loadout).find((p) => p.key === 'Slot_Weapon1');
+      rows.push({
+        id: c.item.id,
+        name: c.item.name ?? c.item.id,
+        type: s.engine.cat.handednessOf(c.item) ?? '',
+        score: res.score,
+        chain: ev.rotation.filler.length,
+        skills: (res.loadout.skills?.Slot_Weapon1 ?? []),
+        slots: pool ? `${res.loadout.skills?.Slot_Weapon1?.length ?? 0}/${pool.options?.length ?? 0}` : '',
+        arsenal: res.loadout.gear.Slot_Weapon2?.item ?? null,
+        gaps: (ev.throughput.unmodelled ?? []).filter((u) => u.source !== 'talent'),
+      });
+    }
+    if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(50) + '\r');
+
+    console.log(f.header(s.engine, VERSION) + '\n');
+    console.log(`${f.bold(base.class + ' ' + s.level)} - every mainhand, ranked by ${f.bold(s.goal)} vs ${target.name}`);
+    console.log(f.profileBlock(s.engine.profiles.resolve(s.profile, base.class, s.level, s.profileScale)));
+    console.log(f.dim(`${weapons.length} weapons in ${((Date.now() - t0) / 1000).toFixed(1)}s   `
+      + `weapon mastery: rank ${s.rank}   skills, talents and runes chosen per weapon   `
+      + `arsenal: ${arsenal ? 'searched' : 'empty'}   no armour, no offhand, no augments`));
+    console.log('');
+    rows.sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity));
+    const best = rows[0]?.score ?? 0;
+    console.log(f.table([s.goal.toUpperCase(), 'VS BEST', 'WEAPON', 'HANDS', 'CHAIN', 'SLOTS', 'SKILLS TAKEN', 'GAPS'],
+      rows.map((r) => (r.error
+        ? [f.warn('-'), '', r.name, '', '', '', f.warn(r.error), '']
+        : [r.score.toFixed(1), best > 0 ? ((r.score / best - 1) * 100).toFixed(1) + '%' : '',
+          r.name, r.type, String(r.chain), r.slots,
+          r.skills.map((x) => s.engine.cdb.byId('skill').get(x)?.texts?.name ?? x).join(', '),
+          r.gaps.length ? f.warn(String(r.gaps.length)) : ''])),
+      { align: ['r', 'r'] }));
+
+    const gaps = new Map();
+    for (const r of rows) {
+      for (const g of r.gaps ?? []) if (!gaps.has(g.id)) gaps.set(g.id, g.why);
+    }
+    if (gaps.size) {
+      console.log('\n' + f.bold(`NOT SCORED (${gaps.size})`) + f.dim(' - what these weapons declare that the model cannot price'));
+      const named = new Map();
+      for (const id of gaps.keys()) {
+        const nm = s.engine.cdb.byId('skill').get(id)?.texts?.name ?? id;
+        named.set(nm, (named.get(nm) ?? 0) + 1);
+      }
+      for (const [id, why] of gaps) {
+        // Five weapon types share the name "Weapon Upgraded" and they are five
+        // different rows, so the id goes in wherever the name does not identify.
+        const nm = s.engine.cdb.byId('skill').get(id)?.texts?.name ?? id;
+        const label = named.get(nm) > 1 || nm === id ? `${nm} (${id})` : nm;
+        console.log(`  ${label}  ${f.dim(why)}`);
+      }
+    }
+    console.log('\n' + f.dim('CHAIN is how many links the base-attack chain has. A weapon whose kit the model\n'
+      + 'cannot read scores low for a reason the GAPS column names, not because it is weak.'));
+  },
+
   audit(args) {
     const { engine } = commonSetup(args);
     console.log(f.header(engine, VERSION) + '\n');
@@ -890,7 +1221,26 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
   bench rarity     which rarities each slot can reach, and how that is derived
   bench targets    what the world actually resists, and what penetration buys
   bench talents    the talent trees and runes, and how much of them is readable
+  bench profiles   the stat corners a weapon or a rotation can be compared at
+  bench weapons    every mainhand, ranked at one of those corners
   bench audit      every assumption and gap in the model
+
+Stat profiles
+  A profile stands IN PLACE OF the armour: a fixed, named corner of the stat
+  space, so a weapon - or later a rotation - can be compared with nothing else
+  moving. 1.0 of a stat group is exactly what the game's own budget curve says a
+  complete set delivers, so nothing here is invented. The weapon slots stay live.
+
+  --profile <name>        naked | half | full | crit | armorpen | spellpen
+                          | fervor | strength | dexterity | intellect | faith
+  --profile-scale <n>     fraction of a full set (default 1). 1.0 is the
+                          designers' unit and not the ceiling - a maxed build
+                          runs nearer 1.25, because a Legendary roll puts an item
+                          above your level and augments add on top of the budget.
+  --across <p1,p2,...>    (bench weapons) run several corners and report how far
+                          the ranking moves between them. Bare --across uses
+                          naked,half,full,crit,armorpen,fervor.
+  --no-arsenal            (bench weapons) leave the arsenal slot empty
 
 Common flags
   --class <name>          Warrior | Rogue | Mage | Priest

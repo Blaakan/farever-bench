@@ -63,7 +63,46 @@ still in the model.
 | `rarity` | which rarities each slot can reach, and how that is derived |
 | `targets` | what the world actually resists, and what penetration buys |
 | `talents` | the talent trees and runes, and how much of them is readable |
+| `profiles` | the stat corners a weapon or a rotation can be compared at |
+| `weapons` | every mainhand, ranked at one of those corners |
 | `audit` | every assumption and gap in the model |
+
+### Comparing weapons without the gear in the way
+
+The best rotation depends on the weapon, the talents, the runes and the stats;
+the best gear depends on the rotation. Searched together that is one problem
+with two moving halves, and the gear half is the expensive one.
+
+A **stat profile** cuts it: a fixed, named corner of the stat space that stands
+in place of the armour. Nothing about it is invented — `itemType.atbRatio` sums
+to exactly 1.0 per stat group over one item per core slot, so one budget *is* a
+complete set, and `budget(level, start, end)` is the same curve every other
+number here comes off.
+
+```bash
+bench profiles --class Warrior          # what a full set delivers, per group
+bench weapons  --class Warrior --profile armorpen
+bench weapons  --class Warrior --across  # and how much the answer moves
+```
+
+```
+  DPS  VS BEST  WEAPON                          HANDS       CHAIN  SLOTS  SKILLS TAKEN
+376.1     0.0%  Judgement                       THWeapon    4      2/2    Rampage, Shockwave
+336.9   -10.4%  Martyr of Enripit               THWeapon    4      2/2    Wild Whirlwind, Outburst
+330.5   -12.1%  Amon Ram, the Creator           OHWeapon    4      1/1    Ram Veil
+```
+
+`--across` answers the question the decomposition rests on, and on this data the
+answer is encouraging: above the naked corner the **weapon ranking barely moves**
+(mean shift 0.3–0.6 places out of 13) and the **skill choice does not move at
+all**. Talents and runes do — three or four different sets across six corners —
+which is exactly what you would expect from nodes that trade crit against
+penetration. So a weapon and its two skills are one decision that can be made
+once; the tree and the runes are re-decided per corner, which is cheap.
+
+A profile also probes corners gear cannot reach — a Warrior in Faith gear — and
+says so rather than presenting a hypothetical as a build. That is how you find
+out whether a weapon's kit scales off a stat its class never gets.
 
 ### The fight
 
@@ -181,7 +220,7 @@ You need [Node.js](https://nodejs.org/) 18+ and a copy of Farever.
 ```bash
 git clone https://github.com/<you>/farever-bench
 cd farever-bench
-node test/run.mjs                  # 473 checks against your own game data
+node test/run.mjs                  # 488 checks against your own game data
 node bin/bench.mjs optimize --class Warrior
 ```
 

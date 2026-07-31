@@ -60,6 +60,23 @@ const SHEET_ORDER = [
   ['Support', ['HealGivenMultiplier', 'ShieldPowerMultiplier', 'CooldownReduction']],
 ];
 
+/**
+ * What stats a run was computed against, when they came from a profile rather
+ * than from gear. A number with no gear behind it needs the corner printed
+ * beside it or it is not comparable to anything.
+ */
+export function profileBlock(profile) {
+  const inject = [...profile.inject]
+    .map(([atb, v]) => `${atb} ${v.toFixed(0)}`).join('   ');
+  const lines = [
+    bold(`profile: ${profile.label}`) + dim(`  - ${profile.desc}`)
+    + (profile.scale !== 1 ? dim(`  x${profile.scale} of a full set`) : ''),
+    dim('  ' + (inject || 'nothing - base stats and the level curve only')),
+  ];
+  for (const n of profile.notes) lines.push(warn('  ! ' + n));
+  return lines.join('\n');
+}
+
 export function sheetBlock(engine, ev, { level }) {
   const { attrTable, consts } = engine.ctx;
   const out = [];
