@@ -19,6 +19,7 @@ import { createEngine } from '../src/engine.mjs';
 import { emptyLoadout, illegalReason, pruneIllegal } from '../src/loadout.mjs';
 import { optimize } from '../src/optimize.mjs';
 import { simulate } from '../src/sim.mjs';
+import { makePolicy, derivedApl, repairApl, searchApl, vocabularyFor } from '../src/rotation.mjs';
 
 let pass = 0;
 const failures = [];
@@ -2061,6 +2062,98 @@ group('stat profiles');
   ok('concentrating the ratings budget into penetration beats splitting it',
     geared.throughput.dps > split.throughput.dps,
     `${geared.throughput.dps.toFixed(1)} vs ${split.throughput.dps.toFixed(1)}`);
+}
+
+// --- a buff window prices only itself ---------------------------------------
+// The fight re-prices a cast while a buff is up. It used to build that sheet
+// from the accumulators AFTER the averaged sheet had folded every timed buff
+// into them at its uptime - so the moment any window opened, every OTHER timed
+// buff was credited on top of it. Pressing a button that does nothing for
+// damage at all was then worth 3.4%, which is how the rotation search found it:
+// it put `Ignore Pain` - zero damage, a DamageTakenModifier and nothing else -
+// at the top of the priority list.
+group('a buff window prices only itself');
+{
+  const eng = createEngine({ quiet: true, fight: { seconds: 200, targets: 1, lookahead: 0 } });
+  const target = eng.combat.foe('boss', 25);
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.profile = 'armorpen';
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+  l.skills['class/ClassSkill'] = ['Warrior_Charge', 'Warrior_IgnorePain', 'Warrior_BattleShout', 'Warrior_Berserk'];
+
+  const ev = eng.evaluate(l, { target, rank: 3 });
+  const ids = ev.throughput.lines.filter((x) => x.kind === 'active').map((x) => x.id);
+  ok('the probe build really does slot Ignore Pain', ids.includes('Warrior_IgnorePain'), ids.join(','));
+
+  const withIt = derivedApl(ids);
+  const without = { entries: withIt.entries.filter((x) => x.skill !== 'Warrior_IgnorePain'), excluded: [] };
+  const dps = (apl) => eng.evaluate(l, { target, rank: 3, policy: makePolicy(apl) }).throughput.dps;
+  const a = dps(withIt), b = dps(without);
+  // Ignore Pain carries one affix, `DamageTakenModifier` MRatio 0.6, and deals
+  // nothing. Pressing it can only COST damage - it spends half a second of a
+  // full clock - so a build that presses it must never out-damage one that does
+  // not. Any gain at all means a buff window is crediting something else.
+  ok('pressing a zero-damage defensive cooldown never raises dps',
+    a <= b + 1e-6, `with ${a.toFixed(2)} vs without ${b.toFixed(2)}`);
+  ok('...and costs about what the clock says it should',
+    (b - a) / b < 0.02, `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s every 50s of a 200s fight`);
+}
+
+// --- the rotation search ----------------------------------------------------
+// What is searched is a POLICY, not a sequence: an ordered list of
+// (skill, condition) that a player could follow, and that transfers across
+// builds because its conditions are re-evaluated rather than baked in.
+group('the rotation search');
+{
+  const eng = createEngine({ quiet: true, fight: { seconds: 200, targets: 1, lookahead: 0 } });
+  const target = eng.combat.foe('boss', 25);
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.profile = 'armorpen';
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+  l.gear.Slot_Weapon2 = { item: 'GA_Demon', rarity: 'Legendary', stars: 5 };
+  l.talents = { Warrior_Hemorrhage: 1, Warrior_Talent_Sever: 1 };
+  const ev = eng.evaluate(l, { target, rank: 3 });
+  const ids = ev.throughput.lines.filter((x) => x.kind === 'active').map((x) => x.id);
+
+  // Restart 0 starts from the derived order, so the search can never return
+  // something worse than what every other command already reported.
+  const derived = derivedApl(ids);
+  const asDerived = eng.evaluate(l, { target, rank: 3, policy: makePolicy(derived) }).throughput.dps;
+  ok('the derived order replayed as an APL reproduces the derived dps',
+    Math.abs(asDerived - ev.throughput.dps) / ev.throughput.dps < 1e-9,
+    `${asDerived.toFixed(3)} vs ${ev.throughput.dps.toFixed(3)}`);
+
+  // A vocabulary built from THIS build, not from the whole game.
+  const vocab = vocabularyFor(ev.rotation);
+  ok('the condition vocabulary is built from what this build can produce',
+    vocab.length > 4 && vocab.length < 200, String(vocab.length));
+  ok('...and always includes the unconditional one', vocab.some((c) => c.kind === 'always'));
+  ok('...and only names statuses this rotation applies', vocab.filter((c) => c.kind === 'buff' || c.kind === 'debuff')
+    .every((c) => eng.cdb.byId('skill').has(c.id)));
+
+  // The list is authoritative: a skill with no entry is never pressed.
+  const onlyOne = { entries: [derived.entries[0]], excluded: [] };
+  const single = eng.evaluate(l, { target, rank: 3, policy: makePolicy(onlyOne) }).throughput;
+  ok('a skill the list does not mention is never pressed',
+    single.lines.filter((x) => x.kind === 'active').length === 1,
+    single.lines.filter((x) => x.kind === 'active').map((x) => x.id).join(','));
+  // ...unless the caller asks for the fallback, which is what lets the KIT
+  // search change which skills exist without every change looking like a loss.
+  const withFallback = eng.evaluate(l, { target, rank: 3, policy: makePolicy(onlyOne, { appendUnlisted: true }) });
+  ok('...unless the caller asks for unlisted skills to fall through',
+    withFallback.throughput.lines.filter((x) => x.kind === 'active').length > 1);
+
+  const repaired = repairApl({ entries: [{ skill: 'Not_A_Skill', cond: { kind: 'always' } }], excluded: [] }, ids);
+  ok('repair drops skills the build no longer has and appends the ones it gained',
+    repaired.entries.length === ids.length
+    && repaired.entries.every((e) => ids.includes(e.skill)), JSON.stringify(repaired.entries.map((e) => e.skill)));
+
+  // And the search itself must not return something worse than it started from.
+  const score = (apl) => eng.evaluate(l, { target, rank: 3, policy: makePolicy(apl) }).throughput.dps;
+  const got = searchApl({ score, ids, vocabulary: vocab, restarts: 2, maxSteps: 6, startFrom: derived });
+  ok('the search never returns worse than the derived order',
+    got.score >= asDerived - 1e-6, `${got.score.toFixed(2)} vs ${asDerived.toFixed(2)}`);
+  ok('...and reports how many fights it took', got.evaluations > 50, String(got.evaluations));
 }
 
 // --- summary ---------------------------------------------------------------

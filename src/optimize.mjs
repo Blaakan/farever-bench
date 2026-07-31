@@ -79,6 +79,12 @@ export function optimize(engine, spec) {
     goal = 'dps', weights = null, target, rank = 1, mix = 0.5,
     rarities = null, stars = 'max', allowEmpty = true,
     restarts = 3, maxPasses = 12, onProgress = null,
+    // An authored rotation to score every candidate against, instead of the
+    // derived one. `bench rotation` alternates: search the kit with the best
+    // rotation held fixed, then search the rotation with the best kit held
+    // fixed. Without this the kit is always chosen against a rotation nobody
+    // ends up playing.
+    policy = null,
   } = spec;
 
   const pinnedGear = spec.pinnedGear ?? new Set();
@@ -267,7 +273,7 @@ export function optimize(engine, spec) {
       + '%' + Object.entries(loadout.talents ?? {}).sort().map(([k, v]) => k + ':' + v).join('|');
     let v = evalCache.get(key);
     if (v === undefined) {
-      const ev = engine.evaluate(loadout, { target, rank, mix });
+      const ev = engine.evaluate(loadout, { target, rank, mix, policy });
       // Ties are common and they are not noise: a shield's atbRatio is
       // `{armor: 0.337}` and nothing else, so for a dps goal every offhand -
       // and no offhand at all - scores identically, and whichever one a restart
@@ -629,7 +635,14 @@ export function optimize(engine, spec) {
     // produces has to WIN to be kept - otherwise the last thing the search does
     // is throw away a build it had already found.
     if (better(after, winner.score)) winner.score = after;
-    else { winner.loadout.talents = heuristicRanks; winner.talentAlloc = null; }
+    else {
+      // Put the heuristic allocation back - and re-derive its DESCRIPTOR too,
+      // not just its ranks. Leaving `talentAlloc` null here handed the printer
+      // a build with sixteen points spent and nothing to say about them.
+      winner.loadout.talents = heuristicRanks;
+      winner.talentAlloc = allocateTalents(winner.loadout);
+      winner.loadout.talents = heuristicRanks;
+    }
   }
 
   // Then move the points around. A greedy over a tree with tier thresholds
@@ -667,7 +680,7 @@ export function optimize(engine, spec) {
     winner = cur;
   }
 
-  const finalEval = engine.evaluate(winner.loadout, { target, rank, mix });
+  const finalEval = engine.evaluate(winner.loadout, { target, rank, mix, policy });
 
   return {
     loadout: winner.loadout,

@@ -52,6 +52,12 @@ function rng(seed) {
  * }
  */
 export function simulate(spec) {
+  // An AUTHORED rotation is played as authored. `policy` is a function the
+  // caller supplies that picks the cast, so the fight stops deriving an order
+  // and executes one instead - which is the only way to ask "is THIS rotation
+  // better than that one". Playing it against the derived orders as well would
+  // answer a different question and quietly report the better of the three.
+  if (spec.policy) return runFight({ ...spec, lookahead: 0 });
   // Play it both ways when a lookahead is asked for, and keep the better. See
   // the note above `rolls` for why: the rollout is myopic and can lose to plain
   // priority order, and a model that reports the worse of two rotations it can
@@ -76,7 +82,7 @@ function runFight(spec) {
   const {
     rotation, cast, dotOutput, cdr = 1, cdrWeaponSkill = null, fight = 200, fights = 1,
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
-    poolMultiplier = 1, poolHealShare = 0, critChance = 0,
+    poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
   } = spec;
   // Every metric here is a total over the fight length, so a non-positive one
   // is a division by zero and a sheet full of NaN. The CLI guards it; the
@@ -651,7 +657,23 @@ function runFight(spec) {
       // only way a cast that emits nothing itself can win, and the only way
       // holding a cooldown for a window can beat spending it now.
       let pressed = -1;
-      if (ready.length === 1 || (!lookahead && ready.length)) {
+      if (policy) {
+        // An authored order. The policy sees exactly what a player can: what is
+        // ready, what is up on them and on the target, what is in the pools,
+        // and how long until anything else comes back. It returns an index into
+        // `actives`, or -1 for "swing and keep them".
+        pressed = policy({
+          ready,
+          actives,
+          t,
+          buffs: upSelf,
+          debuffs: upFoe,
+          pools,
+          charges: (i) => state[i].charges,
+          remains: (i) => Math.max(0, state[i].nextCharge - t),
+        });
+        if (pressed >= 0 && !ready.includes(pressed)) pressed = -1;
+      } else if (ready.length === 1 || (!lookahead && ready.length)) {
         pressed = ready[0];
       } else if (ready.length) {
         let best = -Infinity;

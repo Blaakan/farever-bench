@@ -92,7 +92,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
   }
 
   /** Full evaluation: stat sheet, throughput, survivability, rotation lines. */
-  function evaluate(loadout, { target, rank = 1, mix = 0.5 } = {}) {
+  function evaluate(loadout, { target, rank = 1, mix = 0.5, policy = null } = {}) {
     const cls = classOf(cat, loadout);
     const tgt = target ?? combat.foe('reference', loadout.level);
     const weaponPower = combat.weaponPowerFor(cat, loadout, cls);
@@ -327,6 +327,19 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     const combatBase = evaluateLoadout(cat, loadout, {
       baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio,
     });
+    // Snapshot the three accumulators HERE, while they still hold only the
+    // permanent layer. The averaged sheet below folds every timed buff into
+    // these same maps at its uptime, and `restat` - which re-prices a cast
+    // while a buff is actually up - used to copy them at CALL time, i.e. after
+    // that mutation. So the moment any window opened, the fight priced casts
+    // against base + every timed buff at its uptime + the one that is up, and
+    // pressing a buff that does nothing for damage at all was worth 3.4%
+    // because it switched pricing onto the inflated sheet. The rotation search
+    // found it by putting `Ignore Pain` - zero damage, a DamageTakenModifier
+    // and nothing else - at the top of the priority list.
+    const baseFlat = new Map(inject);
+    const baseAddRatio = new Map(addRatio);
+    const baseMulRatio = new Map(mulRatio);
 
     // ...and the sheet averaged over the fight, with the timed buffs folded in
     // at their uptime. That is a useful number and it is NOT the character
@@ -355,7 +368,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       const key = active.map((b) => b.status + '#' + (b.stacks ?? 1)).sort().join('|');
       let hit = restatCache.get(key);
       if (hit) return hit;
-      const f2 = new Map(inject), a2 = new Map(addRatio), m2 = new Map(mulRatio);
+      const f2 = new Map(baseFlat), a2 = new Map(baseAddRatio), m2 = new Map(baseMulRatio);
       const put = (a, scale) => {
         const atb = a.target?.attribute;
         const kind = ctx.affix.kindOf(a.ref);
@@ -372,7 +385,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       return hit;
     }
     const tp = combat.throughput(rot, combatBase.sheet, tgt, opts,
-      { restat, timedBuffs: timed, averagedSheet: averaged.sheet, mods });
+      { restat, timedBuffs: timed, averagedSheet: averaged.sheet, mods, policy });
     // Survivability is what you average over a fight, so it reads the averaged
     // sheet - a defensive cooldown you press is real mitigation, just not
     // mitigation you are standing in right now.

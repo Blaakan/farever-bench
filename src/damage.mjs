@@ -965,6 +965,8 @@ export function buildCombat(cdb, ctx) {
       fights: opts.fights ?? 1,
       lookahead: opts.lookahead ?? 0,
       seed: opts.seed ?? 0x9e3779b9,
+      // An authored rotation, when one is being tested rather than derived.
+      policy: live?.policy ?? null,
     });
   }
 

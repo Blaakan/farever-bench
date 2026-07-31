@@ -16,6 +16,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { createEngine, GOALS, FERVOR_SCOPES } from '../src/engine.mjs';
 import { emptyLoadout, classOf } from '../src/loadout.mjs';
 import { optimize, rankSlot } from '../src/optimize.mjs';
+import {
+  makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel,
+} from '../src/rotation.mjs';
 import * as f from '../src/format.mjs';
 
 export const VERSION = '0.1.0';
@@ -579,6 +582,166 @@ function compareAcrossProfiles(s, args, profileIds) {
 }
 
 /**
+ * Every ORDERED pair of weapons: what goes in the main hand and what goes in
+ * the arsenal, both ways round.
+ *
+ * The pair is ordered and the model already says why: only the main hand grants
+ * a base-attack chain and a combo, while the arsenal grants two CHOSEN skills
+ * and `ceil(v * 0.4)` of its stats. So (A main, B arsenal) and (B main, A
+ * arsenal) are different builds with different rotations, and on this data they
+ * differ by up to 15% - which means a sweep that picks the arsenal greedily per
+ * mainhand is answering a smaller question than the one being asked.
+ *
+ * Both weapon slots are PINNED in every cell. What is searched is everything
+ * that hangs off them: the two main-hand skills, the two arsenal skills, four
+ * class skills out of five, the runes on each, and the sixteen talent points.
+ */
+function sweepWeaponPairs(s, args, top) {
+  const target = s.engine.combat.foe(s.targetName, s.level);
+  const base = loadBuild(args, s.engine, s.level, s.saved);
+  const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
+  const restarts = s.numFlag('restarts', 1, { integer: true });
+
+  const seen = new Set();
+  const weapons = [];
+  for (const c of s.engine.cat.candidates('Slot_Weapon1', {
+    aptitude: cls.aptitude, charLevel: s.level, rarities: s.rarities,
+    exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+  })) {
+    if (seen.has(c.item.id)) continue;
+    seen.add(c.item.id);
+    weapons.push(c);
+  }
+  const byId = new Map(weapons.map((w) => [w.item.id, w]));
+  const nameOf = (id) => byId.get(id)?.item?.name ?? id;
+  const gearFor = (id) => {
+    const c = byId.get(id);
+    return {
+      item: id, rarity: c.rarity, generic: c.generic ?? null,
+      stars: s.stars === 'max' ? s.engine.cat.maxStars(c.item, c.rarity)
+        : Math.min(s.stars, s.engine.cat.maxStars(c.item, c.rarity)),
+    };
+  };
+
+  let done = 0;
+  const tick = (label) => {
+    done++;
+    if (process.stderr.isTTY) process.stderr.write(`\r  ${done} ${label}                    `);
+  };
+  function cell(mainId, arsId) {
+    tick(`${mainId} / ${arsId ?? '-'}`);
+    const loadout = {
+      ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {},
+      profile: s.profile, profileScale: s.profileScale,
+    };
+    loadout.gear.Slot_Weapon1 = gearFor(mainId);
+    if (arsId) loadout.gear.Slot_Weapon2 = gearFor(arsId);
+    const pinnedGear = new Set(s.engine.cat.combatSlots().map((x) => x.id));
+    try {
+      const r = optimize(s.engine, {
+        loadout, pinnedGear, pinnedAug: new Set(), goal: s.goal, weights: s.weights, target,
+        rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
+        exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+        talentPoints: s.talentPoints, allowEmpty: true, restarts,
+      });
+      return {
+        dps: r.score,
+        mainSkills: r.loadout.skills?.Slot_Weapon1 ?? [],
+        arsSkills: r.loadout.skills?.Slot_Weapon2 ?? [],
+        classSkills: r.loadout.skills?.['class/ClassSkill'] ?? [],
+        talents: Object.keys(r.loadout.talents ?? {}).sort().join('+'),
+        runes: Object.entries(r.loadout.runes ?? {}).sort().map(([k, v]) => k + '=' + v).join(','),
+      };
+    } catch { return null; }
+  }
+
+  const t0 = Date.now();
+  // One cheap pass with an empty arsenal decides which weapons are worth
+  // pairing. A silent cap reads as "we tried everything", so the count of what
+  // was dropped is printed rather than assumed away.
+  const solo = [];
+  for (const w of weapons) {
+    const r = cell(w.item.id, null);
+    if (r) solo.push({ id: w.item.id, ...r });
+  }
+  solo.sort((a, b) => b.dps - a.dps);
+  const pool = solo.slice(0, Math.min(top, solo.length)).map((x) => x.id);
+
+  const grid = new Map();  // `${main}|${ars}` -> cell
+  for (const m of pool) {
+    grid.set(`${m}|`, solo.find((x) => x.id === m));
+    for (const a of pool) {
+      if (a === m) continue;
+      const r = cell(m, a);
+      if (r) grid.set(`${m}|${a}`, r);
+    }
+  }
+  if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(60) + '\r');
+
+  console.log(f.header(s.engine, VERSION) + '\n');
+  console.log(`${f.bold(base.class + ' ' + s.level)} - every ORDERED weapon pair, by ${f.bold(s.goal)} vs ${target.name}`);
+  console.log(f.profileBlock(s.engine.profiles.resolve(s.profile, base.class, s.level, s.profileScale)));
+  console.log(f.dim(`${done} cells in ${((Date.now() - t0) / 1000).toFixed(1)}s   `
+    + `top ${pool.length} of ${weapons.length} weapons paired both ways`
+    + (weapons.length > pool.length
+      ? `   ${weapons.length - pool.length} dropped after the solo pass (--top to change)` : '')
+    + `\nboth weapon slots pinned per cell; main-hand skills, arsenal skills, class skills, `
+    + 'runes and talents searched inside it'));
+  console.log('');
+
+  // The matrix. Rows are the main hand, columns the arsenal - which is the
+  // whole point, so the two triangles are not the same numbers.
+  console.log(f.bold('MAIN HAND (row) x ARSENAL (column)'));
+  console.log(f.table(['  MAIN', ...pool.map((a) => nameOf(a).slice(0, 11)), '(none)'],
+    pool.map((m) => ['  ' + nameOf(m).slice(0, 26),
+      ...pool.map((a) => (a === m ? f.dim('-') : (grid.get(`${m}|${a}`)?.dps.toFixed(0) ?? '-'))),
+      f.dim(grid.get(`${m}|`)?.dps.toFixed(0) ?? '-')]),
+    { align: [null, ...pool.map(() => 'r'), 'r'] }));
+
+  // The pairs themselves, and what each one chose - which is the substrate a
+  // rotation search runs over.
+  const ranked = [...grid.entries()]
+    .map(([k, v]) => ({ main: k.split('|')[0], ars: k.split('|')[1] || null, ...v }))
+    .sort((a, b) => b.dps - a.dps);
+  const skillName = (x) => s.engine.cdb.byId('skill').get(x)?.texts?.name ?? x;
+  console.log('\n' + f.bold('BEST PAIRINGS'));
+  console.log(f.table([s.goal.toUpperCase(), 'MAIN HAND', 'MAIN SKILLS', 'ARSENAL', 'ARSENAL SKILLS', 'CLASS SKILLS'],
+    ranked.slice(0, 12).map((r) => [
+      r.dps.toFixed(1), nameOf(r.main), r.mainSkills.map(skillName).join(', '),
+      r.ars ? nameOf(r.ars) : f.dim('(none)'), r.arsSkills.map(skillName).join(', '),
+      r.classSkills.map(skillName).join(', '),
+    ]), { align: ['r'] }));
+
+  console.log('\n' + f.bold('AND HOW MUCH THE ORDER MATTERS'));
+  const flips = [];
+  for (let i = 0; i < pool.length; i++) {
+    for (let j = i + 1; j < pool.length; j++) {
+      const ab = grid.get(`${pool[i]}|${pool[j]}`);
+      const ba = grid.get(`${pool[j]}|${pool[i]}`);
+      if (!ab || !ba) continue;
+      const hi = Math.max(ab.dps, ba.dps);
+      flips.push({
+        a: pool[i], b: pool[j], ab: ab.dps, ba: ba.dps,
+        gap: (Math.abs(ab.dps - ba.dps) / hi) * 100,
+        sameKit: ab.talents === ba.talents && ab.runes === ba.runes
+          && ab.classSkills.join('+') === ba.classSkills.join('+'),
+      });
+    }
+  }
+  flips.sort((a, b) => b.gap - a.gap);
+  console.log(f.table(['  WEAPON A', 'WEAPON B', 'A MAIN', 'B MAIN', 'GAP', 'SAME KIT?'],
+    flips.slice(0, 10).map((x) => ['  ' + nameOf(x.a).slice(0, 24), nameOf(x.b).slice(0, 24),
+      x.ab.toFixed(1), x.ba.toFixed(1), x.gap.toFixed(1) + '%',
+      x.sameKit ? f.dim('yes') : f.warn('no')]),
+    { align: [null, null, 'r', 'r', 'r'] }));
+  const mean = flips.reduce((t, x) => t + x.gap, 0) / Math.max(1, flips.length);
+  console.log(f.dim(`\n  mean ${mean.toFixed(1)}%, worst ${(flips[0]?.gap ?? 0).toFixed(1)}% - `
+    + 'so the pair is ordered, and a sweep that picks the arsenal greedily per mainhand\n'
+    + '  is answering a smaller question. SAME KIT? says whether the two orders even want the\n'
+    + '  same talents, runes and class skills; where it says no, they are different builds.'));
+}
+
+/**
  * Attach a named stat profile to a loadout, and take the armour off.
  *
  * A profile REPLACES the gear - that is the whole point of it - so leaving
@@ -1031,6 +1194,161 @@ const commands = {
     ].join("\n"));
   },
 
+  rotation(args) {
+    const s = commonSetup(args);
+    const loadout = loadBuild(args, s.engine, s.level, s.saved);
+    const pins = applyProfile(s, loadout,
+      applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
+    const target = s.engine.combat.foe(s.targetName, s.level);
+    if (!loadout.gear.Slot_Weapon1?.item) {
+      die('bench rotation needs a mainhand pinned - a rotation is FOR a weapon.\n'
+        + '  bench rotation --class Warrior --profile armorpen \\\n'
+        + '    --pin weapon1=GA_Craft --pin weapon2=GA_Demon');
+    }
+    // A rotation is searched at fixed stats for the same reason a weapon is: a
+    // rotation fitted to one gear set is a rotation for that gear set.
+    if (!s.profile) {
+      console.error(f.warn('note: no --profile, so the rotation is being searched against whatever gear is\n'
+        + '  pinned. That is a rotation for that build rather than for the weapon.'));
+    }
+    const restarts = s.numFlag('restarts', 12, { integer: true });
+    const rounds = s.numFlag('rounds', 3, { integer: true });
+    const scorer = s.engine.makeScorer({
+      goal: s.goal, weights: s.weights, target, rank: s.rank, mix: s.mix,
+      ref: s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix }),
+    });
+    const skillName = (x) => s.engine.cdb.byId('skill').get(x)?.texts?.name ?? x;
+
+    const kitSearch = (policy) => optimize(s.engine, {
+      loadout, ...pins, goal: s.goal, weights: s.weights, target,
+      rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
+      exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+      pinnedSkills: pins.pinnedSkills, talentPoints: s.talentPoints,
+      allowEmpty: !args.flags['no-empty'], restarts: s.numFlag('kit-restarts', 3, { integer: true }),
+      policy,
+    });
+
+    const t0 = Date.now();
+    let totalFights = 0;
+    // Round 0: the kit, against the rotation the model derives. That is where
+    // every other command stops.
+    let kit = kitSearch(null);
+    let derivedScore = kit.score;
+    let apl = null, aplScore = derivedScore, best = { kit, apl: null, score: derivedScore };
+    const log = [];
+
+    for (let round = 1; round <= rounds; round++) {
+      // --- search the rotation, kit fixed -----------------------------------
+      const ev = s.engine.evaluate(kit.loadout, { target, rank: s.rank, mix: s.mix });
+      const ids = ev.throughput.lines.filter((l) => l.kind === 'active').map((l) => l.id);
+      // ...in the order the model derives, so restart 0 reproduces it exactly
+      // and the search can only improve on what was already reported.
+      const seedApl = apl ? repairApl(apl, ids) : derivedApl(ids);
+      const vocabulary = vocabularyFor(ev.rotation);
+      const score = (candidate) => {
+        totalFights++;
+        try {
+          return scorer.scoreFrom(s.engine.evaluate(kit.loadout, {
+            target, rank: s.rank, mix: s.mix, policy: makePolicy(candidate),
+          }));
+        } catch { return -Infinity; }
+      };
+      const got = searchApl({
+        score, ids, vocabulary, restarts, seed: 0x9e3779b9 + round,
+        onProgress: process.stderr.isTTY
+          ? (p) => process.stderr.write(`\r  round ${round}: ${p.evaluations} fights, best ${p.best.toFixed(1)}   `)
+          : null,
+        startFrom: seedApl,
+      });
+      apl = got.apl;
+      aplScore = got.score;
+      log.push({ round, what: 'rotation', score: aplScore, fights: got.evaluations, vocab: vocabulary.length });
+      if (aplScore > best.score + 1e-9) best = { kit, apl, score: aplScore };
+
+      // --- then the kit again, this time answering to that rotation ---------
+      // `appendUnlisted` because the kit search moves underneath the list: a
+      // change that slots a NEW weapon skill would otherwise be judged with
+      // that skill never pressed, so every such change looks like a loss. An
+      // explicit drop still sticks.
+      const next = kitSearch(makePolicy(repairApl(apl, ids), { appendUnlisted: true }));
+      log.push({ round, what: 'kit', score: next.score });
+      if (next.score > best.score + 1e-9) { kit = next; best = { kit, apl, score: next.score }; }
+      else break;   // neither half moved; the loop has converged
+    }
+    if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(60) + '\r');
+
+    // --- report -------------------------------------------------------------
+    const finalEv = s.engine.evaluate(best.kit.loadout, {
+      target, rank: s.rank, mix: s.mix, policy: best.apl ? makePolicy(best.apl) : null,
+    });
+    console.log(f.header(s.engine, VERSION) + '\n');
+    console.log(`${f.bold(loadout.class + ' ' + s.level)} - searching for a rotation, maximising `
+      + `${f.bold(s.goal)} vs ${target.name}`);
+    if (finalEv.profile) console.log(f.profileBlock(finalEv.profile));
+    console.log(f.dim(`main hand ${f.short(loadout.gear.Slot_Weapon1.item)}`
+      + (loadout.gear.Slot_Weapon2?.item ? `   arsenal ${f.short(loadout.gear.Slot_Weapon2.item)}` : '')
+      + `\n${totalFights} simulated fights in ${((Date.now() - t0) / 1000).toFixed(1)}s over `
+      + `${rounds} round${rounds === 1 ? '' : 's'} of (rotation, then kit)`));
+    console.log('');
+
+    console.log(f.bold('ROTATION') + f.dim('  - walk it top to bottom, press the first line that is ready'));
+    console.log(f.table(['  #', 'SKILL', 'WHEN', 'PER CAST', 'EVERY'],
+      best.apl.entries.map((e, i) => {
+        const line = finalEv.throughput.lines.find((l) => l.id === e.skill);
+        return [`  ${i + 1}`, skillName(e.skill),
+          condLabel(e.cond, skillName) || f.dim('always'),
+          line ? (line.perCast.damage + line.perCast.heal + line.perCast.shield).toFixed(1) : f.dim('-'),
+          line ? line.interval.toFixed(2) + 's' : f.dim('never')];
+      }), { align: [null, null, null, 'r', 'r'] }));
+    const never = [...(best.apl.excluded ?? []),
+      ...best.apl.entries.filter((e) => !finalEv.throughput.lines.some((l) => l.id === e.skill)).map((e) => e.skill)];
+    if (never.length) {
+      console.log(f.dim(`  not pressed: ${[...new Set(never)].map(skillName).join(', ')}`
+        + ' - the search found the clock better spent elsewhere'));
+    }
+    console.log(f.dim('  anything not listed is never pressed; when no line matches, you swing.'));
+
+    console.log('\n' + f.bold('WHAT IT IS WORTH'));
+    console.log(f.table(['  ', s.goal.toUpperCase(), 'VS DERIVED'], [
+      ['  derived order (what every other command reports)', derivedScore.toFixed(1), ''],
+      ['  searched rotation', best.score.toFixed(1),
+        f.bold(((best.score / derivedScore - 1) * 100).toFixed(2) + '%')],
+    ], { align: [null, 'r', 'r'] }));
+    console.log(f.table(['  ROUND', 'SEARCHED', s.goal.toUpperCase(), 'FIGHTS'],
+      log.map((l) => ['  ' + l.round, l.what, l.score.toFixed(1), l.fights ? String(l.fights) : ''])
+      , { align: [null, null, 'r', 'r'] }));
+
+    console.log('\n' + f.talentBlock(s.engine, best.kit.loadout, best.kit.talentAlloc, best.kit.talentCoverage));
+    console.log('\n' + f.bold('SKILLS'));
+    console.log(f.skillsBlock(s.engine, best.kit.loadout, finalEv, { pinnedSkills: pins.pinnedSkills }));
+    console.log('\n' + f.runeBlock(s.engine, best.kit.loadout, finalEv));
+    if (typeof args.flags.json === 'string') {
+      writeFileSync(args.flags.json, JSON.stringify({
+        version: VERSION, cdbSha: s.engine.meta.cdbSha, bootSha: s.engine.meta.bootSha,
+        goal: s.goal, weights: s.weights, target: s.targetName, targetLabel: target.name,
+        fervorScope: s.engine.opts.assume.fervorScope,
+        stars: s.stars, rank: s.rank, level: s.level, mix: s.mix, rarityRoll: s.rarityRoll,
+        fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
+        lookahead: s.fight.lookahead,
+        profile: s.profile, profileScale: s.profileScale,
+        pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills] },
+        build: best.kit.loadout,
+        // The rotation is part of the result, so it round-trips with the build.
+        rotation: best.apl,
+        metrics: {
+          derived: derivedScore, searched: best.score,
+          dps: finalEv.throughput.dps, hps: finalEv.throughput.hps,
+          sps: finalEv.throughput.sps, ehp: finalEv.survivability.ehp,
+        },
+        sheet: Object.fromEntries(finalEv.sheet),
+        unmodelled: finalEv.throughput.unmodelled,
+        assumptions: s.engine.audit,
+      }, null, 2));
+      console.log(f.dim(`\nwrote ${args.flags.json}`));
+    }
+    console.log('\n' + f.auditBlock(s.engine));
+  },
+
   profiles(args) {
     const s = commonSetup(args);
     const want = typeof args.flags.class === 'string'
@@ -1087,7 +1405,16 @@ const commands = {
       die('bench weapons needs a --profile, so every weapon is compared at the same stats.\n'
         + '  Without one the answer is "whichever weapon the gear search happened to like".\n'
         + '  `bench profiles` lists them; `--profile armorpen` is the usual place to start,\n'
-        + '  and `--across` runs several and reports how much the ranking moves between them.');
+        + '  `--across` runs several and reports how much the ranking moves between them,\n'
+        + '  and `--pairs` sweeps every ORDERED (mainhand, arsenal) pair.');
+    }
+    // The arsenal is not a lesser copy of the mainhand: it grants two chosen
+    // skills and 0.4 of its stats, and no chain. So the pair is ordered, and
+    // --pairs is the sweep that treats it that way.
+    if (args.flags.pairs) {
+      const top = args.flags.top != null && args.flags.top !== true ? Number(args.flags.top) : 6;
+      if (!Number.isFinite(top) || top < 2) die('--top needs a number of weapons to pair, at least 2');
+      return sweepWeaponPairs(s, args, top);
     }
     const target = s.engine.combat.foe(s.targetName, s.level);
     const base = loadBuild(args, s.engine, s.level, s.saved);
@@ -1223,7 +1550,26 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
   bench talents    the talent trees and runes, and how much of them is readable
   bench profiles   the stat corners a weapon or a rotation can be compared at
   bench weapons    every mainhand, ranked at one of those corners
+  bench rotation   search for the rotation a weapon wants, and the kit with it
   bench audit      every assumption and gap in the model
+
+Searching a rotation
+  What is searched is a POLICY, not a sequence: an ordered list of (skill,
+  condition) that a player can follow, and that transfers across gear because
+  its conditions are re-evaluated rather than baked in. A sequence would be
+  optimal for one build against one fight, and would learn to dump every
+  cooldown before the bell.
+
+  bench rotation --class Warrior --profile armorpen \\
+    --pin weapon1=GA_Craft --pin weapon2=GA_Demon
+
+  --rounds <n>            rounds of (search the rotation, then search the kit
+                          against it). Default 3; it stops early when neither
+                          half moves.
+  --restarts <n>          random restarts per rotation search (default 12).
+                          Restart 0 always starts from the order the model
+                          derives, so the answer can never be worse than it.
+  --kit-restarts <n>      restarts for the kit search inside each round (3)
 
 Stat profiles
   A profile stands IN PLACE OF the armour: a fixed, named corner of the stat

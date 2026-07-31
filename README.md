@@ -220,7 +220,7 @@ You need [Node.js](https://nodejs.org/) 18+ and a copy of Farever.
 ```bash
 git clone https://github.com/<you>/farever-bench
 cd farever-bench
-node test/run.mjs                  # 488 checks against your own game data
+node test/run.mjs                  # 500 checks against your own game data
 node bin/bench.mjs optimize --class Warrior
 ```
 
