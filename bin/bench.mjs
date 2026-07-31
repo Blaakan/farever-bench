@@ -1244,6 +1244,12 @@ const commands = {
       // ...in the order the model derives, so restart 0 reproduces it exactly
       // and the search can only improve on what was already reported.
       const seedApl = apl ? repairApl(apl, ids) : derivedApl(ids);
+      // The reported list must never be null. The search can legitimately fail
+      // to beat the baseline - `derivedScore` is the better of plain priority
+      // order AND an 8-second rollout, and a rollout is not something an APL
+      // can express - so when that happens the honest answer is the derived
+      // order itself, printed as the list it is.
+      if (!best.apl) best.apl = seedApl;
       const vocabulary = vocabularyFor(ev.rotation);
       const score = (candidate) => {
         totalFights++;
@@ -1317,6 +1323,13 @@ const commands = {
       ['  searched rotation', best.score.toFixed(1),
         f.bold(((best.score / derivedScore - 1) * 100).toFixed(2) + '%')],
     ], { align: [null, 'r', 'r'] }));
+    if (best.score <= derivedScore + 1e-9) {
+      console.log(f.warn('  The search did not beat the baseline, so the list above IS the derived order.'));
+      console.log(f.dim(`  That baseline is the better of plain priority order and a ${s.fight.lookahead}s rollout,`
+        + '\n  and a rollout is not something a priority list can express - it re-simulates the next\n'
+        + '  few seconds before every cast. Where the rollout wins, an APL starts behind and may\n'
+        + '  not catch up. --lookahead 0 compares against plain priority order instead.'));
+    }
     console.log(f.table(['  ROUND', 'SEARCHED', s.goal.toUpperCase(), 'FIGHTS'],
       log.map((l) => ['  ' + l.round, l.what, l.score.toFixed(1), l.fights ? String(l.fights) : ''])
       , { align: [null, null, 'r', 'r'] }));
