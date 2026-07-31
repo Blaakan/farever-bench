@@ -947,6 +947,93 @@ Fervor gear. With prayers, weapon skills, procs and enchants scored, the same
 search picks **SpellPenetration** across every slot and Fervor drops to noise.
 The rotation model, not the Fervor switch, was what made that answer wrong.
 
+## Searching a rotation
+
+[`src/rotation.mjs`](../src/rotation.mjs). What is searched is a **policy**, not
+a sequence, and the distinction is the whole design:
+
+- A **sequence** is optimal for one build against one deterministic fight. It
+  transfers to nothing, and because a cooldown that never comes back before the
+  bell is free, it learns to dump everything in the last twenty seconds. Neither
+  is a rotation anyone can play.
+- A **policy** is an ordered list of `(skill, condition)`. At every moment the
+  player can act, walk it top to bottom and press the first line that is ready
+  and whose condition holds; otherwise swing. It is stationary — it cannot
+  exploit the end of the fight — and its conditions are re-evaluated against
+  whatever build wears it, so it transfers. It is also the object SimulationCraft
+  calls an APL, except that a community writes those by hand and nobody writes
+  them for this game.
+
+**A condition may only say what the fight already tracks**, because one it
+cannot evaluate is a rotation nobody can execute: `buff.X.up/.down`,
+`debuff.X.up/.down`, `rage>=n` at a threshold something actually costs,
+`ready.X` / `holding.X` against another skill, `charges>=n` against its own. Up
+to three ANDed. The vocabulary is built from what **this build** produces — one
+taken from the whole game would be mostly conditions that are never true, and
+each costs a fight to find that out.
+
+**A skill may appear more than once.** `Rampage if the armour is stripped` near
+the top and a bare `Rampage` below it is the commonest idiom in a real list, and
+a representation allowing one line per skill cannot express it at all. The
+search used it as soon as it could: `Raging Smash if rage>=18` above the window
+and `Raging Smash` again below it.
+
+**The search is iterated local search**, not random restarts. Moves are reorder,
+relocate, re-condition, conjoin, relax, drop and add; every third restart is a
+fresh random list and the rest are one to three random kicks away from the best
+found so far. That change mattered more than any other: climbing from random
+lists alone reached the best score in **1 restart out of 30**, because the basin
+around a sensible priority order is narrow and almost every random list falls
+into a worse one. With kicks it is **107 of 250**.
+
+Restart 0 always starts from the order the model derives, so the answer can
+never be worse than what every other command already reported. Ties break toward
+the simpler list — fewer lines first, then fewer terms per line — which is what
+keeps conditions that are quietly tautologies out of the output. `ready.X` on
+X's own line is always true and `rage>=9` is implied by a fight that only offers
+casts it can pay for; both survived until the tie-break counted terms, and both
+made the printed rotation look like it knew something it did not.
+
+**Rounds alternate**: search the rotation with the kit fixed, then the kit with
+the rotation fixed, until neither moves. The kit half lets unlisted skills fall
+through the policy, because otherwise every change that slots a new skill is
+judged with that skill never pressed and looks like a loss.
+
+### What it found, and what it found by accident
+
+For Judgement + Worldsplitter at the `armorpen` corner: **+0.49%**, 326,656
+simulated fights in 41 seconds. `--validate` re-rolls the procs rather than
+averaging them and says outright when a difference sits inside the spread;
+`--across` re-runs the rotation at other corners, where this one holds at five of
+six and loses 0.73% at `half`.
+
+The first run paid for the whole thing by finding a bug in the fight. It put
+`Ignore Pain` — zero damage, one `DamageTakenModifier` affix — at the top of the
+priority list and gained 3.4%. A defensive cooldown cannot raise damage, so
+something was wrong: `restat`, which re-prices a cast while a buff is up, copied
+the three modifier accumulators at *call* time, and the averaged-sheet step
+mutates those same maps to fold in every timed buff at its uptime. So the moment
+any window opened, casts were priced against base + every timed buff averaged in
++ the one actually up, and **pressing any buff at all was a global damage
+bonus**. Warrior 378.8 → 367.5, Priest 252.7 → 227.1; Rogue and Mage do not
+move, because their builds put up no timed self-buff for it to bite on.
+
+### Why the number is small, and what would change it
+
+Sequencing is worth 0–0.5% on this data, and the reason is not the search. The
+mechanics that reward ordering are mostly ones the model refuses: 17 skills gate
+on `hasStatusMaxStacked` and 24 read `getStatusCount`, and 43 sites reset or
+reduce another skill's cooldown. The fight tracks *which* statuses are up but not
+*how many*, and nothing is permitted to touch cooldown state. Ram Veil is the
+worked case — build five Benediction stacks with the combo, spend them for a
+15-second Crit/Fervor window, and a critical combo finisher resets the cooldown
+and makes the next cast instant — and the model prices it at a flat `0.8 × Faith`
+whether you press it at five stacks or none.
+
+Two mechanisms would unlock most of it, and both are the same move this project
+has made repeatedly: take a predicate off the refusal list by giving the fight
+the state to answer it, rather than approximating it.
+
 ## Stat profiles, and why they exist
 
 The best rotation depends on the weapon, the talents, the runes and the stats.

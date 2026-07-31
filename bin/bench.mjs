@@ -1262,7 +1262,10 @@ const commands = {
       });
       apl = got.apl;
       aplScore = got.score;
-      log.push({ round, what: 'rotation', score: aplScore, fights: got.evaluations, vocab: vocabulary.length });
+      log.push({
+        round, what: 'rotation', score: aplScore, fights: got.evaluations,
+        vocab: vocabulary.length, trace: got.trace,
+      });
       if (aplScore > best.score + 1e-9) best = { kit, apl, score: aplScore };
 
       // --- then the kit again, this time answering to that rotation ---------
@@ -1317,6 +1320,102 @@ const commands = {
     console.log(f.table(['  ROUND', 'SEARCHED', s.goal.toUpperCase(), 'FIGHTS'],
       log.map((l) => ['  ' + l.round, l.what, l.score.toFixed(1), l.fights ? String(l.fights) : ''])
       , { align: [null, null, 'r', 'r'] }));
+
+    // --- is that edge real? -------------------------------------------------
+    // The search runs deterministic - procs folded in at their expected rate,
+    // which is the mean exactly. A rotation tuned on the mean still has to beat
+    // the other one when the dice are actually rolled, and an edge inside the
+    // spread is not an edge. This is the difference between "the search found
+    // 0.4%" and "0.4% is there to find".
+    const rolls = s.numFlag('validate', 200, { integer: true });
+    if (rolls > 1) {
+      const rolled = createEngine({
+        game: typeof args.flags.game === 'string' ? args.flags.game : undefined,
+        assume: s.engine.opts.assume,
+        fight: { ...s.fight, count: rolls },
+        classSkillSlots: args.flags['class-skills'] != null && args.flags['class-skills'] !== true
+          ? Number(args.flags['class-skills']) : undefined,
+      });
+      const rolledTarget = rolled.combat.foe(s.targetName, s.level);
+      const run = (p) => rolled.evaluate(best.kit.loadout,
+        { target: rolledTarget, rank: s.rank, mix: s.mix, policy: p }).throughput;
+      const a = run(null);
+      const b = run(makePolicy(best.apl));
+      // Two independent means, so the difference has the pooled standard error.
+      const se = Math.sqrt((a.dpsSd ** 2 + b.dpsSd ** 2) / rolls);
+      const diff = b.dps - a.dps;
+      // A spread of exactly zero is not a suspiciously clean result, it is a
+      // build with nothing to roll: every proc-applied dot and every triggered
+      // skill is what the dice touch, and a build with neither plays out the
+      // same way every time. Saying "clears the noise" about a fight that has
+      // none would dress a tautology up as a test.
+      const deterministic = a.dpsSd < 1e-9 && b.dpsSd < 1e-9;
+      console.log('\n' + f.bold('AND WHETHER IT SURVIVES THE DICE')
+        + f.dim(`  - ${rolls} fights each, procs rolled rather than averaged`));
+      console.log(f.table(['  ', 'MEAN', 'SD', ''], [
+        ['  derived order', a.dps.toFixed(1), a.dpsSd.toFixed(2), ''],
+        ['  searched rotation', b.dps.toFixed(1), b.dpsSd.toFixed(2), ''],
+        ['  difference', (diff > 0 ? '+' : '') + diff.toFixed(2),
+          deterministic ? '-' : '+/- ' + se.toFixed(2),
+          deterministic ? f.dim('exact')
+            : Math.abs(diff) > 2 * se ? f.bold('clears the noise')
+              : f.warn('INSIDE THE NOISE - not a real edge')],
+      ], { align: [null, 'r', 'r'] }));
+      if (deterministic) {
+        console.log(f.dim('  This build has nothing for the dice to touch - no proc-applied dot and no\n'
+          + '  triggered skill - so every fight plays out identically and the difference is exact\n'
+          + `  rather than significant. Rolling it ${rolls} times proves that, and nothing more.`));
+      } else if (Math.abs(diff) <= 2 * se) {
+        console.log(f.dim('  The searched rotation is not distinguishable from pressing whatever is ready.\n'
+          + '  That is a fact about this build, not a failure of the search: the mechanics that\n'
+          + '  reward sequencing here are mostly ones the model still refuses - see `bench audit`.'));
+      }
+    }
+
+    // --- does it transfer? --------------------------------------------------
+    // The entire reason to search a POLICY rather than a sequence is that its
+    // conditions are re-evaluated against whatever build wears it. That is a
+    // claim, and it is checkable: run this rotation at other corners of the
+    // stat space and see whether it still beats pressing whatever is ready
+    // there. A rotation that only wins at the corner it was tuned on is a
+    // rotation for that corner.
+    if (s.profile && args.flags.across !== undefined) {
+      const others = typeof args.flags.across === 'string'
+        ? args.flags.across.split(',').map((x) => resolve(x.trim(), s.engine.profiles.list().map((p) => p.id), 'profile'))
+        : ['naked', 'half', 'full', 'crit', 'armorpen', 'fervor'];
+      console.log('\n' + f.bold('AND WHETHER IT TRANSFERS')
+        + f.dim('  - the same rotation, re-evaluated at other stat corners'));
+      const rows = [];
+      for (const p of others) {
+        const l2 = { ...best.kit.loadout, profile: p };
+        let der, run;
+        try {
+          der = scorer.scoreFrom(s.engine.evaluate(l2, { target, rank: s.rank, mix: s.mix }));
+          run = scorer.scoreFrom(s.engine.evaluate(l2, {
+            target, rank: s.rank, mix: s.mix, policy: makePolicy(best.apl),
+          }));
+        } catch { continue; }
+        rows.push(['  ' + p + (p === s.profile ? f.dim('  (tuned here)') : ''),
+          der.toFixed(1), run.toFixed(1),
+          ((run / der - 1) * 100).toFixed(2) + '%',
+          run >= der - 1e-6 ? f.dim('holds') : f.warn('LOSES to the derived order')]);
+      }
+      console.log(f.table(['  PROFILE', 'DERIVED', 'THIS ROTATION', 'GAIN', ''], rows,
+        { align: [null, 'r', 'r', 'r'] }));
+      console.log(f.dim('  A rotation that only wins where it was tuned is a rotation for that corner.\n'
+        + '  One that holds everywhere is a rotation for the weapon, which is the thing worth having.'));
+    }
+
+    // How much of the search agreed. Restarts are independent climbs from
+    // random lists, so the fraction that reach the same score is the honest
+    // evidence that this is an optimum rather than the best of a few tries.
+    const top = log.filter((l) => l.what === 'rotation');
+    if (top.length && top[0].trace) {
+      const tr = top[top.length - 1].trace;
+      const hit = tr.filter((x) => x.score >= best.score - 1e-6).length;
+      console.log(f.dim(`\n  ${hit} of ${tr.length} independent restarts reached this score`
+        + `; worst reached ${Math.min(...tr.map((x) => x.score)).toFixed(1)}.`));
+    }
 
     console.log('\n' + f.talentBlock(s.engine, best.kit.loadout, best.kit.talentAlloc, best.kit.talentCoverage));
     console.log('\n' + f.bold('SKILLS'));

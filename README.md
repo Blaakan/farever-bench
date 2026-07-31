@@ -65,7 +65,84 @@ still in the model.
 | `talents` | the talent trees and runes, and how much of them is readable |
 | `profiles` | the stat corners a weapon or a rotation can be compared at |
 | `weapons` | every mainhand, ranked at one of those corners |
+| `rotation` | search for the rotation a weapon wants, and the kit that goes with it |
 | `audit` | every assumption and gap in the model |
+
+### Searching a rotation
+
+```bash
+bench rotation --class Warrior --profile armorpen \
+  --pin weapon1=GA_Craft --pin weapon2=GA_Demon --restarts 250 --across
+```
+
+```
+326656 simulated fights in 41.2s over 6 rounds of (rotation, then kit)
+
+ROTATION  - walk it top to bottom, press the first line that is ready
+  #  SKILL          WHEN                   PER CAST   EVERY
+  1  Tear Reality   holding.Surging Force     355.5  16.67s
+  2  Shockwave      always                    383.9  20.00s
+  3  Charge         always                    247.5  14.29s
+  4  Rampage        always                   1285.1  10.53s
+  5  Raging Smash   always                    330.7   5.56s
+  6  Surging Force  always                    160.6  40.00s
+
+  derived order   336.3
+  searched        338.0     +0.49%
+  107 of 250 independent restarts reached this score; worst reached 312.0.
+```
+
+**What is searched is a policy, not a sequence.** A sequence is optimal for one
+build against one deterministic fight, transfers to nothing, and learns to dump
+every cooldown before the bell — none of which is a rotation anyone can play. An
+ordered list of `(skill, condition)` — what SimulationCraft calls an Action
+Priority List — is stationary and re-evaluates against whatever build wears it.
+
+A condition may only say things the fight already tracks: `buff.X.up/.down`,
+`debuff.X.up/.down`, `rage>=n` at a threshold something actually costs,
+`ready.X` / `holding.X` for another skill, `charges>=n` for its own. Up to three
+of them may be ANDed. A skill may appear **more than once** under different
+conditions, which is the commonest idiom in a real list — the search used it to
+put `Raging Smash if rage>=18` above the armour-strip window and a bare
+`Raging Smash` below it.
+
+Steepest ascent over reorder / relocate / re-condition / conjoin / relax / drop /
+add, with **iterated local search**: every third restart is a fresh random list
+and the rest are kicks away from the best found so far. That matters — climbing
+from random lists alone reached the best score in 1 restart out of 30, because
+the basin around a sensible order is narrow. Restart 0 is always the order the
+model derives, so the answer can never be worse than what every other command
+reports. Ties break toward the simpler list, which is what keeps tautologies
+like `ready.X` on X's own line out of the output.
+
+Rounds alternate — search the rotation with the kit fixed, then the kit with the
+rotation fixed — until neither moves.
+
+Three things are checked rather than claimed:
+
+```
+AND WHETHER IT SURVIVES THE DICE  - procs rolled rather than averaged
+  difference  +1.65  -  exact
+  This build has nothing for the dice to touch, so every fight plays out
+  identically and the difference is exact rather than significant.
+
+AND WHETHER IT TRANSFERS  - the same rotation at other stat corners
+  naked      94.3 ->  94.7   +0.43%  holds
+  half      202.2 -> 200.8   -0.73%  LOSES to the derived order
+  full      329.8 -> 332.4   +0.78%  holds
+  crit      338.6 -> 341.2   +0.78%  holds
+```
+
+`--validate` rolls the procs instead of averaging them, and says outright when a
+difference is inside the spread. `--across` re-runs the rotation at other stat
+corners: one that only wins where it was tuned is a rotation for that corner.
+
+**On the size of the number.** +0.5% is small, and honestly so. The mechanics
+worth sequencing around in this game — Ram Veil's five-stack consume, the
+crit-combo cooldown resets, Surge of Violence's free cast — are mostly ones the
+model still refuses, because the fight tracks *which* statuses are up but not
+*how many*, and nothing is allowed to touch cooldown state. `bench audit` names
+them. The search is what will measure those when they land.
 
 ### Comparing weapons without the gear in the way
 
