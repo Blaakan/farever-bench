@@ -65,6 +65,7 @@ still in the model.
 | `talents` | the talent trees and runes, and how much of them is readable |
 | `profiles` | the stat corners a weapon or a rotation can be compared at |
 | `weapons` | every mainhand, ranked at one of those corners |
+| `layouts` | the best full build for every ordered (mainhand, arsenal) pair, one report each |
 | `rotation` | search for the rotation a weapon wants, and the kit that goes with it |
 | `audit` | every assumption and gap in the model |
 

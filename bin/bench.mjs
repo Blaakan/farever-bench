@@ -1224,6 +1224,176 @@ const commands = {
     ].join("\n"));
   },
 
+  /**
+   * The full build for every ORDERED (mainhand, arsenal) pair.
+   *
+   * `weapons --pairs` answers the same pairing question on a pinned stat rig -
+   * fast, comparable, and wearing no armour. This is the expensive sibling:
+   * both weapon slots pinned per cell and EVERYTHING else searched for real -
+   * every armour slot, the offhand, every enchant and gem socket, the arsenal
+   * skills, the sixteen talent points and the runes - so each pair gets the
+   * layout a player would actually wear with it. (A main, B arsenal) and
+   * (B main, A arsenal) are different builds with different rotations, and
+   * both are here.
+   *
+   * The cost is stated up front rather than discovered: pairs x a full
+   * optimize each. --main / --arsenal narrow the sweep, --restarts trades
+   * depth for time, --json records every layout, --show prints the top N in
+   * full.
+   */
+  layouts(args) {
+    const s = commonSetup(args);
+    const target = s.engine.combat.foe(s.targetName, s.level);
+    const base = loadBuild(args, s.engine, s.level, s.saved);
+    const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
+    const restarts = s.numFlag('restarts', 3, { integer: true });
+    // 0 is a legitimate ask here - the summary table alone - so this one is
+    // not run through numFlag's positive check.
+    const show = args.flags.show != null && args.flags.show !== true
+      ? Math.max(0, Math.trunc(Number(args.flags.show))) : 1;
+    if (Number.isNaN(show)) die('--show needs a number of layouts');
+
+    const candidatesFor = (slotId) => {
+      // One entry per item, at its BEST attainable rarity - the same "assume
+      // the good version" default a pin gets, or the sweep would quietly
+      // compare every weapon at its weakest roll.
+      const bestOf = new Map();
+      for (const c of s.engine.cat.candidates(slotId, {
+        aptitude: cls.aptitude, charLevel: s.level, rarities: s.rarities,
+        exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+      })) {
+        const held = bestOf.get(c.item.id);
+        if (!held || (s.engine.cat.rarityOrder.get(c.rarity) ?? -1)
+          > (s.engine.cat.rarityOrder.get(held.rarity) ?? -1)) {
+          bestOf.set(c.item.id, c);
+        }
+      }
+      return [...bestOf.values()];
+    };
+    const filterBy = (list, flag) => {
+      if (typeof args.flags[flag] !== 'string') return list;
+      const re = new RegExp(args.flags[flag], 'i');
+      const out = list.filter((c) => re.test(c.item.id) || re.test(c.item.name ?? ''));
+      if (!out.length) die(`--${flag} ${args.flags[flag]} matches no weapon for this class`);
+      return out;
+    };
+    const mains = filterBy(candidatesFor('Slot_Weapon1'), 'main');
+    const arsenals = filterBy(candidatesFor('Slot_Weapon2'), 'arsenal');
+    const gearFor = (c) => ({
+      item: c.item.id, rarity: c.rarity, generic: c.generic ?? null,
+      stars: s.stars === 'max' ? s.engine.cat.maxStars(c.item, c.rarity)
+        : Math.min(s.stars, s.engine.cat.maxStars(c.item, c.rarity)),
+    });
+
+    const pairs = [];
+    for (const m of mains) {
+      for (const a of arsenals) {
+        if (a.item.id === m.item.id) continue;
+        pairs.push([m, a]);
+      }
+    }
+    if (!pairs.length) die('no legal (mainhand, arsenal) pairs to sweep');
+
+    console.log(f.header(s.engine, VERSION) + '\n');
+    console.log(`${f.bold(base.class + ' ' + s.level)} - the best full layout for every ordered ` +
+      `(mainhand, arsenal) pair, by ${f.bold(s.goal)} vs ${target.name}`);
+    console.log(f.dim(`  ${mains.length} mainhands x ${arsenals.length} arsenals = ${pairs.length} pairs, ` +
+      `each a full optimize (${restarts} restart${restarts === 1 ? '' : 's'}) over armour, offhand, ` +
+      'augments, arsenal skills, talents and runes'));
+
+    const rows = [];
+    const t0 = Date.now();
+    const checkpoint = () => {
+      if (typeof args.flags.json !== 'string') return;
+      writeFileSync(args.flags.json, JSON.stringify({
+        version: VERSION, cdbSha: s.engine.meta.cdbSha, bootSha: s.engine.meta.bootSha,
+        goal: s.goal, weights: s.weights, target: s.targetName, targetLabel: target.name,
+        stars: s.stars, rank: s.rank, level: s.level,
+        fight: s.fight.seconds, targets: s.fight.targets, restarts,
+        // Each entry's `build` is a loadout `--build` can read back, so any
+        // pair's layout re-derives on its own.
+        pairs: rows.map((r) => ({
+          main: r.main.id, mainName: r.main.name, arsenal: r.ars.id, arsenalName: r.ars.name,
+          score: r.res.score,
+          metrics: {
+            dps: r.res.evaluation.throughput.dps,
+            hps: r.res.evaluation.throughput.hps,
+            ehp: r.res.evaluation.survivability.ehp,
+          },
+          build: r.res.loadout,
+        })),
+      }, null, 2));
+    };
+    for (let i = 0; i < pairs.length; i++) {
+      const [m, a] = pairs[i];
+      if (process.stderr.isTTY) {
+        const done = i, left = pairs.length - i;
+        const eta = done > 0 ? Math.round(((Date.now() - t0) / done) * left / 1000) : null;
+        process.stderr.write(`\r  ${i + 1}/${pairs.length}  ${m.item.id} / ${a.item.id}` +
+          `${eta != null ? `  ~${eta}s left` : ''}        `);
+      }
+      const loadout = { ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {} };
+      loadout.gear.Slot_Weapon1 = gearFor(m);
+      loadout.gear.Slot_Weapon2 = gearFor(a);
+      try {
+        const res = optimize(s.engine, {
+          loadout, pinnedGear: new Set(['Slot_Weapon1', 'Slot_Weapon2']), pinnedAug: new Set(),
+          goal: s.goal, weights: s.weights, target,
+          rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
+          exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
+          talentPoints: s.talentPoints, allowEmpty: true, restarts,
+        });
+        rows.push({ main: m.item, ars: a.item, res });
+        // A 20-minute sweep that dies at pair 140 should leave 139 behind.
+        if (i % 5 === 4) checkpoint();
+      } catch { /* a pair this class cannot legally hold */ }
+    }
+    if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(70) + '\r');
+    rows.sort((a, b) => b.res.score - a.res.score);
+    checkpoint();
+
+    const best = rows[0]?.res.score ?? 0;
+    console.log('');
+    console.log(f.table(
+      [s.goal.toUpperCase(), 'VS BEST', 'MAIN HAND', 'ARSENAL', 'ARSENAL SKILLS', 'TALENT TREE SPREAD'],
+      rows.map((r) => [
+        f.num(r.res.score, 1),
+        r.res.score >= best ? f.bold('best') : f.signedPct(r.res.score / best - 1),
+        r.main.name ?? r.main.id,
+        r.ars.name ?? r.ars.id,
+        (r.res.loadout.skills?.Slot_Weapon2 ?? []).map(f.short).join(', ') || f.dim('-'),
+        Object.keys(r.res.loadout.talents ?? {}).length + ' nodes',
+      ]),
+      { align: ['r', 'r', null, null, null, null] },
+    ));
+    console.log(f.dim(`  ${rows.length} of ${pairs.length} pairs legal, ${((Date.now() - t0) / 1000).toFixed(1)}s`));
+
+    for (const r of rows.slice(0, Math.max(0, show))) {
+      console.log('\n' + '='.repeat(78));
+      console.log(f.bold(`${r.main.name ?? r.main.id}  +  ${r.ars.name ?? r.ars.id} (arsenal)`)
+        + `   ${s.goal} ${f.num(r.res.score, 1)}`);
+      console.log('='.repeat(78) + '\n');
+      console.log(f.gearBlock(s.engine, r.res.loadout, {
+        pinnedGear: new Set(['Slot_Weapon1', 'Slot_Weapon2']),
+        indifferent: new Set(r.res.indifferent),
+      }) + '\n');
+      console.log(f.bold('AUGMENTS'));
+      console.log(f.augmentBlock(s.engine, r.res.loadout, { pinnedAug: new Set() }) + '\n');
+      if (r.res.talentAlloc) {
+        console.log(f.bold('TALENTS'));
+        console.log(f.talentBlock(s.engine, r.res.loadout, r.res.talentAlloc, r.res.talentCoverage) + '\n');
+      }
+      console.log(f.bold('SKILLS'));
+      console.log(f.skillsBlock(s.engine, r.res.loadout, r.res.evaluation, { pinnedSkills: new Set() }) + '\n');
+      console.log(f.runeBlock(s.engine, r.res.loadout, r.res.evaluation) + '\n');
+      console.log(f.throughputBlock(s.engine, r.res.evaluation, { goal: s.goal }));
+    }
+    if (rows.length > show && typeof args.flags.json !== 'string') {
+      console.log('\n' + f.dim(`the other ${rows.length - show} layouts are one --json away, or raise --show`));
+    }
+    console.log('\n' + f.auditBlock(s.engine));
+  },
+
   rotation(args) {
     const s = commonSetup(args);
     const loadout = loadBuild(args, s.engine, s.level, s.saved);
@@ -1773,6 +1943,11 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
   bench talents    the talent trees and runes, and how much of them is readable
   bench profiles   the stat corners a weapon or a rotation can be compared at
   bench weapons    every mainhand, ranked at one of those corners
+  bench layouts    the best FULL build for every ordered (mainhand, arsenal)
+                   pair - armour, offhand, augments, arsenal skills, talents
+                   and runes searched per pair; --main/--arsenal narrow it,
+                   --restarts <n> trades depth for time (default 3),
+                   --show <n> prints the top layouts in full, --json keeps all
   bench rotation   search for the rotation a weapon wants, and the kit with it
   bench audit      every assumption and gap in the model
 
