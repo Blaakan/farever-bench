@@ -1667,6 +1667,33 @@ group('pool dots');
   ok('the tree reports it as readable', eng.talents.readableValue('Warrior_Hemorrhage', 1).readable);
 }
 
+// --- the bytecode reader ----------------------------------------------------
+// hlboot.dat is where the composition rules live that data.cdb does not
+// state. The reader's checksum is the file itself: 40MB of varint-encoded
+// stream, and one wrong argument count desyncs it within a handful of reads -
+// so parsing to exactly EOF, with the function count the README has always
+// cited and the two findexes MODEL.md has always cited resolving to their
+// names, is the whole validation.
+group('the bytecode reader');
+{
+  const { readHlb, disasm } = await import('../src/lib/hl.mjs');
+  const { findBoot } = await import('../src/lib/game.mjs');
+  const code = readHlb(findBoot([]));
+  ok('hlboot.dat parses to exactly EOF', !!code);
+  ok('it is version 4 with debug info', code.version === 4 && code.hasDebug);
+  ok('the function count is the one the README cites', code.functions.length === 47342,
+    String(code.functions.length));
+  ok('findex 4835 is ent.Unit.applyDamage', code.nameOf(4835) === 'ent.Unit.applyDamage',
+    code.nameOf(4835) ?? '(unnamed)');
+  ok('findex 4841 is ent.Unit.computeDamage', code.nameOf(4841) === 'ent.Unit.computeDamage',
+    code.nameOf(4841) ?? '(unnamed)');
+  const f = code.byFindex.get(4841);
+  ok('...cited to its source line', code.debugFiles[f.debug[0]] === 'src/ent/Unit.hx',
+    code.debugFiles[f.debug[0]]);
+  const listing = disasm(code, 4841);
+  ok('the listing resolves fields and locals', /critDmgMult/.test(listing) && /modMult/.test(listing));
+}
+
 // --- checked against the game: Cheese Moon ---------------------------------
 // A second in-game reading (2026-08-01), on a real Rare 3-star Axe_Boomerang
 // trained to weapon level 25, held by a naked level-25 Warrior, against a
