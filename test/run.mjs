@@ -1719,7 +1719,10 @@ group('checked against the game: Cheese Moon');
   l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3 };
   eng.plan.pruneSelection(l);
   const ev = eng.evaluate(l, { rank: 3 });
-  near('WeaponPower is the flat primary budget at level 25', ev.weaponPower, 123.6, 0.5);
+  // Read from the bytecode: 0.4 x the SUM of the item's aptitude primary
+  // budgets - Fighter's Strength curve (123.6) plus Assassin's Dexterity
+  // curve (148.3) for this dual-aptitude axe.
+  near('WeaponPower is 0.4 x the sum of the aptitude budgets', ev.weaponPower, 0.4 * (123.6 + 148.3), 0.5);
 
   // Swing 1 against 0 armor: ratio 0.13 x (budget + Strength-with-weapon).
   // Observed in game: 19-24 across the +-10% per-swing roll.

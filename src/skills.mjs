@@ -900,9 +900,23 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       for (const id of Object.keys(loadout.talents ?? {})) noteGains(id);
     }
     // A pool is tracked when something declares income for it AND the sheet
-    // gives it a cap. Spark fails the first half in reverse: the Mage's costs
-    // live in a compiled `getSparkCost()`, so income without a readable spend
-    // buys nothing and is not claimed as tracked.
+    // gives it a cap.
+    //
+    // The Rogue's Combo Points were unreadable from data - the award lives
+    // inside a helper and the spend is `-getCp()` - but the bytecode reads
+    // clean now: `Rogue_ComboPoints.tryGetComboPoint@44698` grants +1 per
+    // distinct weapon skill or combo finisher (first damaging hit only), and
+    // the signature finisher adds +0.3 dmgMult per point and consumes them
+    // all. Modelled as +1 per weapon-skill cast and per finisher - the
+    // consecutive-same-skill dedup is not carried, which flatters a build
+    // that spams one skill - with the spend attached below.
+    if (loadout.class === 'Rogue') {
+      gains.push({
+        atb: 'ComboPoint', amount: 1, on: ['weapon-skill', 'combo'],
+        from: 'Rogue_ComboPoints', fromName: 'Combo Points',
+        why: 'read from tryGetComboPoint@44698: +1 per distinct weapon skill or combo finisher',
+      });
+    }
     const tracked = new Set(gains.map((g) => g.atb));
 
     const push = (bucket, id, extra = {}) => {
@@ -1466,6 +1480,48 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         kind: 'no rate',
         why: `${d.fromName} applies it, but nothing gives ${d.from} a rate this model can price`,
       });
+    }
+
+    // Costs the data does not declare, read from the bytecode instead.
+    // Mage: `Skill.getSparkCost@7986` - a weapon skill costs
+    // round(max(Mage_Spark_SpellMinCost, cooldown x Mage_Spark_SpellCDCostRatio)),
+    // spent by Mage_SparkMaster.onPreSkillProc on weapon skills and final
+    // attacks. The finisher's own 10-Spark cost is NOT gated here - the chain
+    // is not pool-gated in the fight - which flatters a Spark-starved build
+    // slightly and is on record rather than hidden.
+    // Rogue: the signature finisher consumes all Combo Points for +0.3 dmgMult
+    // each (Rogue_Sig_Finisher@44709); modelled at a 4-point spend, the cap.
+    // Profs are CLONED before costs are attached - the profile cache is shared
+    // across builds and a mutated cached prof would leak between classes.
+    const constNum = (id, dflt) => cdb.byId('constant').get(id)?.v?.float
+      ?? cdb.byId('constant').get(id)?.v?.int ?? dflt;
+    // A GainAtb a CAST carries is income the fight produces - Mage_RayOfSpark
+    // returns 18% of MaxSpark per cast - so the pool it fills is trackable
+    // the moment the skill is in the rotation, and a cost in it can gate.
+    for (const a of active) {
+      for (const e of a.prof.effects ?? []) {
+        if (e.kind === 'GainAtb' && e.atb) tracked.add(e.atb);
+      }
+    }
+    if (loadout.class === 'Mage' && tracked.has('Spark')) {
+      const minCost = constNum('Mage_Spark_SpellMinCost', 5);
+      const ratio = constNum('Mage_Spark_SpellCDCostRatio', 1);
+      for (const a of active) {
+        if (a.prof.type !== 'WeaponSkill' && a.prof.type !== 'WeaponSubSkill') continue;
+        const amount = Math.round(Math.max(minCost, a.prof.cooldown * ratio));
+        if (!(amount > 0)) continue;
+        a.prof = { ...a.prof, costs: [...(a.prof.costs ?? []), { atb: 'Spark', amount }] };
+      }
+    }
+    if (loadout.class === 'Rogue' && tracked.has('ComboPoint')) {
+      for (const a of active) {
+        if (a.prof.id !== 'Rogue_Sig_Finisher') continue;
+        a.prof = {
+          ...a.prof,
+          costs: [...(a.prof.costs ?? []), { atb: 'ComboPoint', amount: 4 }],
+          runeDamage: [...(a.prof.runeDamage ?? []), { amount: 4 * 0.3 }],
+        };
+      }
     }
 
     return {

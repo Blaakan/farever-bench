@@ -122,16 +122,25 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // mainhand's and which attributes its swings read.
     const mainItem = loadout.gear.Slot_Weapon1?.item
       ? cat.itemById.get(loadout.gear.Slot_Weapon1.item) : null;
+    const hasArsenal = !!loadout.gear.Slot_Weapon2?.item;
     const evalOpts = {
       ...opts,
+      attackerLevel: loadout.level,
       swingAttrs: mainItem
         ? mainItem.aptitudes.map((a) => combat.primaryAtbFor({ aptitude: a })).filter(Boolean)
         : null,
-      weaponMix: mainItem ? {
+      // The mix has NO slot gate - getStepEffectItemScaling@20775 checks only
+      // isWeaponBased on the skill type - so the arsenal's weapon skills mix
+      // exactly like the mainhand's. Class skills (type 9) stay pure
+      // attribute, read straight off BaseSkill.isWeaponBased@6057's set.
+      weaponMix: mainItem || hasArsenal ? {
         flats: combat.attributeBudgets(loadout.level),
         ids: new Set([
           ...rot.filler.map((x) => x.prof.id),
-          ...rot.active.filter((x) => x.source === 'Slot_Weapon1').map((x) => x.prof.id),
+          ...rot.active
+            .filter((x) => x.source === 'Slot_Weapon1' || x.source === 'Slot_Weapon2'
+              || x.source === 'Slot_OffhandWeapon')
+            .map((x) => x.prof.id),
         ]),
       } : null,
     };
@@ -563,27 +572,24 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
            'never a derived number, and only Area and Aura steps scale with it.',
     },
     {
-      severity: 'assumption',
+      severity: 'verified',
       what: opts.assume.chainResets
-        ? 'a skill cast restarts the base-attack chain'
-        : 'the base-attack chain holds its place through a skill cast (--chain-persists)',
-      why: 'Reported from play: a slow skill usually interrupts the chain, so the fight starts it over ' +
-           'after every cast and after standing idle beyond ComboWindow (0.6s). Everything gated on the ' +
-           'combo finisher - Warrior Rage income, prayer charging, per-combo procs - lands at the rate ' +
-           'this produces. Whether an INSTANT cast also interrupts is unmeasured; --chain-persists ' +
-           'restores the old always-continues reading, and the gap between the two is the exposure.',
+        ? 'the base-attack chain drops after ComboWindow (0.6s) without an attack'
+        : 'the base-attack chain holds its place through anything (--chain-persists)',
+      why: 'Read from Hero.update@7495 / isWithinAttackCombo@7459: one rule - the combo counter resets ' +
+           'when more than ComboWindow (0.6s) passes since the last attack finished, plus on the ' +
+           'finisher itself. A cast interrupts exactly because it outlasts the window, so the fight ' +
+           'resets the chain after any cast or idle gap longer than 0.6s and preserves it under one ' +
+           '- which matches what was reported from play before the code was read.',
     },
     {
-      severity: 'unverified',
+      severity: 'verified',
       what: 'a cast costs only its own authored duration - no global recovery window',
-      why: 'Skill_RecoveryTime (1s) used to be added to every cast, which billed a level-25 Priest 0.59 ' +
-           'attacks a second for a chain whose authored durations run at 2.2. It sits in the constant ' +
-           'sheet inside the SpawnTime/Aggro/Panic/PathSearch block between Skill_Pick_RetryCooldown and ' +
-           'Skill_RecoveryTime_Boss, and its only bytecode symbol is ent.Foe.getSkillRecoveryTime - so it ' +
-           'reads as foe AI. For the base-attack CHAIN this is now checked with a stopwatch: ten ' +
-           'Judgement chains ran ~3.0s each, exactly the authored 3.00 - no per-swing recovery - and the ' +
-           'fast axe\'s shortfall is the swing-period floor, not a recovery. A recovery after SKILL ' +
-           'casts remains unmeasured.',
+      why: 'Read from the bytecode: Skill_RecoveryTime\'s only reader is Foe.getSkillRecoveryTime@6773, ' +
+           'whose only callers are foe AI (onUseSkillEnd, canAutoPickSkill), and the once-unplaced bare ' +
+           '`recoveryTime` symbols resolve to the skill sheet\'s aiProps column - foe-AI data plumbing. ' +
+           'No hero path pays any global recovery. The stopwatch agreed first: ten Judgement chains ran ' +
+           '~3.0s each, exactly the authored 3.00.',
     },
     {
       severity: 'assumption',

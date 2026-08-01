@@ -380,8 +380,10 @@ things that make this tool possible:
    *with their formulas*, per-class stat budgets, per-slot budget shares, 962
    skills with timed damage effects, and 93 augments with explicit affixes.
 2. **`hlboot.dat`**, HashLink bytecode v4 **with full debug info** — source
-   filenames and per-opcode line numbers across 47342 functions. So the
-   composition rules were read out of the compiled game rather than guessed.
+   filenames and per-opcode line numbers across 47342 functions. The repo
+   ships its own reader for it (`node bin/hl.mjs find/disasm/grep-str`), so
+   the composition rules are read out of the compiled game rather than
+   guessed, and every citation below reproduces from your install.
 
 Four formulas carry the whole model. All four were read from the bytecode, and
 each is cited to its function index and source line in
@@ -422,12 +424,13 @@ Four consequences worth knowing as a player, none of them visible in game:
 Stated plainly, because a tool that hides its gaps is worse than no tool. `bench
 audit` prints this list with every result.
 
-- **No absolute DPS claim.** The composition order inside
-  `ent.Unit.applyDamage` is not yet disassembled, and three multipliers are
-  modelled from their descriptions rather than from code: Fervor's offensive
-  half, the two Masteries, and `WeaponPower`. Toggle the first two off with
-  `--no-fervor-damage` and `--no-mastery` and watch the answer move — that is
-  how much it depends on them.
+- **The composition order is READ now.** `ent.Unit.computeDamage` and
+  `applyDamage` are disassembled (`node bin/hl.mjs disasm 4841`): one folded
+  multiplier `(amount + adds) × dmgMult × crit × (1 − reduction) × taken`,
+  Fervor and the matching Mastery additive inside one bracket, Raw damage
+  bypassing all of it, and `WeaponPower` = 0.4 × the summed aptitude budgets.
+  Every formula was ALSO verified against live dummy readings before the code
+  was read, and the audit tracks the few places the two disagree.
 - **How many enemies you are hitting is an input, not an answer.** Most of a
   build's damage comes from area steps, and the geometry is fully authored —
   shape, range, height, an expanding radius — but *nothing anywhere says how
@@ -484,13 +487,14 @@ audit` prints this list with every result.
   from ordinary columns; `Warrior_Rage_Strike` spends 10. So it casts every ~7s
   on a real build, and it is worth **+14%** on the Warrior.
 
-  The Mage is genuinely blocked: `getSparkCost()` is a compiled method and no
-  Mage skill declares a cost in any column, so income without a readable spend
-  buys nothing. ComboPoints are in between — the cap is authored but
-  `Rogue_ComboPoints` awards through a local inside a helper and the finisher
-  spends `-getCp()`, so neither end is a number to read. A skill gated by a pool
-  nothing declares readable income for is still reported unscored rather than
-  treated as spammable.
+  The Mage and Rogue pools were unreadable from data and are now read from the
+  bytecode: `Skill.getSparkCost` prices a weapon skill at
+  `round(max(5, cooldown × 1.0))` Spark, refunded by Ray of Spark's authored
+  18% of MaxSpark per cast, and `Rogue_ComboPoints` grants one point per
+  distinct weapon skill or finisher with the signature spending all of them at
+  +30% damage each. Both gates run in the fight now; what is still simplified
+  is named in the audit (the finisher's own 10-Spark cost, the
+  consecutive-same-skill dedup).
 - **Coverage is reported by cause, not as one number.** The tool names every
   skill it could not score and groups them: `utility`, `rune`, `resource`,
   `no rate` (the amount is in the data, the schedule is not), `status`,

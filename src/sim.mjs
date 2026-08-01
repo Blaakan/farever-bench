@@ -100,7 +100,7 @@ function runFight(spec) {
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
     poolScale = null, poolFactor = null, goal = null, chainResets = true,
-    swingVariance = 0,
+    swingVariance = 0, comboWindow = 0.6,
   } = spec;
   // The objective the derived player maximises - see `goalWeights`.
   const [wDmg, wHeal, wShield] = goalWeights(goal);
@@ -568,7 +568,9 @@ function runFight(spec) {
         p.owed += src;
         p.perTick = p.owed / p.lifeTicks;
         if (p.expires <= at) p.nextTick = at + p.tick;
-        p.expires = at + (Number.isFinite(p.duration) ? p.duration : fight);
+        // max(new window, remaining) - a refresh never shortens the status
+        // (Status.refresh@14446).
+        p.expires = Math.max(p.expires, at + (Number.isFinite(p.duration) ? p.duration : fight));
       }
     };
 
@@ -662,7 +664,9 @@ function runFight(spec) {
               heal: out.heal + (st.out.heal * left) / ticks,
             };
           }
-          st.expires = expires;
+          // Status.refresh@14446: the window is max(new duration, what was
+          // left) - a refresh never SHORTENS a status.
+          st.expires = Math.max(expires, st.expires);
           st.out = out;
         } else live.set(d, { expires, nextTick: at + d.tick, out });
       }
@@ -800,10 +804,11 @@ function runFight(spec) {
         tickTo(end); advanceIncome(end);
         busy += a.occupancy;
         t = end;
-        // Reported from play: a cast interrupts the chain, so the next swing
-        // starts it over. The finisher - and the Rage, prayers and procs that
-        // ride it - only lands off swings with no cast between them.
-        if (chainResets) chainIndex = 0;
+        // The chain drops on ONE rule, read from Hero.update@7495: more than
+        // ComboWindow (0.6s) since the last attack finished. A cast interrupts
+        // exactly because it outlasts the window - a hypothetically sub-0.6s
+        // cast would preserve the chain, so the occupancy is what decides.
+        if (chainResets && a.occupancy > comboWindow) chainIndex = 0;
         continue;
       }
 
@@ -831,10 +836,11 @@ function runFight(spec) {
           for (const e of timeIncome) if (e.next > t && e.next < next) next = e.next;
         }
         if (!(next > t)) next = fight;
+        const stood = next - t;
         tickTo(next); advanceIncome(next);
         t = next;
-        // Standing still is longer than ComboWindow (0.6s), so the chain drops.
-        if (chainResets) chainIndex = 0;
+        // Standing still beyond ComboWindow drops the chain - same rule.
+        if (chainResets && stood > comboWindow) chainIndex = 0;
         continue;
       }
       chainIndex++;

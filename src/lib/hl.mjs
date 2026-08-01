@@ -335,12 +335,28 @@ export function readHlb(path, { opOverrides = null } = {}) {
 
   // --- name resolution -------------------------------------------------------
   // findex -> "Type.method". Protos are instance methods, bindings statics.
+  // A binding's field index runs over the FLATTENED field list - the parent's
+  // fields first, then the child's, the same numbering OField uses - so a
+  // class with a super resolves through the chain or every static's name
+  // shifts by the parent's field count.
+  const flatFields = (t) => {
+    const chain = [];
+    let cur = t;
+    while (cur) {
+      chain.unshift(cur);
+      cur = cur.super >= 0 ? types[cur.super] : null;
+    }
+    let flat = [];
+    for (const c of chain) flat = flat.concat(c.fields ?? []);
+    return flat;
+  };
   const fnNames = new Map();
   for (const t of types) {
     if (t.kind !== 11 && t.kind !== 21) continue;
     for (const p of t.protos ?? []) fnNames.set(p.findex, `${t.name}.${p.name}`);
+    const flat = (t.bindings ?? []).length ? flatFields(t) : null;
     for (const b of t.bindings ?? []) {
-      const f = t.fields?.[b.field];
+      const f = flat?.[b.field];
       if (f) fnNames.set(b.findex, `${t.name}.${f.name}`);
     }
   }

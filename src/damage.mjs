@@ -547,6 +547,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
       nature: natureName,
       cooldown: num(props.cooldown, num(s.cooldown)),
       occupancy: occupancyOf(s, typeName),
+      // A row that IS a status prices as a status tick: no crit (initVars
+      // zeroes ctx.critChance) and no attacker fervor/mastery bracket (the
+      // tick's SkillContext belongs to the carrier). See castOutput.
+      isStatusTick: !!s.props?.status,
       effects,
       affixes,
       // A skill with no cooldown but a resource cost is gated by income, not by
@@ -769,9 +773,13 @@ export function buildCombat(cdb, ctx, assume = {}) {
     return { armor: Math.max(0, armor), magicArmor: Math.max(0, magicArmor), taken: Math.max(0, taken) };
   }
 
-  function mitigate(effect, sheet, target, foe = NO_DEBUFF, mods = NO_MODS) {
+  function mitigate(effect, sheet, target, foe = NO_DEBUFF, mods = NO_MODS, attackerLevel = null) {
     const aff = affinityOf(effect.affinity);
-    if (aff.root === 'Raw' || !aff.resist) return foe.taken;
+    // Raw bypasses EVERYTHING on the receiving side too: computeDamage@4841
+    // ops 83-87 skips DamageTakenModifier for the Raw affinity and
+    // getAffinityDamageReduction@4510 returns 0 outright.
+    if (aff.root === 'Raw') return 1;
+    if (!aff.resist) return foe.taken;
     const resist = (aff.resist === 'MagicArmor' ? target.magicArmor * foe.magicArmor : target.armor * foe.armor);
     // `armorIgnore` is penetration by another name - Exposed Essence ignores 5%
     // of a bleeding enemy's armour - so it lands on the same lever, in points
@@ -781,7 +789,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
     const red = damageReduction({
       resist,
       penetrationPct: pen,
-      attackerLevel: target.level,
+      // The STRIKER's level feeds the divisor (getAffinityDamageReduction@4510
+      // op 237), not the target's. Identical at level parity - every reference
+      // foe sits at the character's level - and wrong off-level.
+      attackerLevel: attackerLevel ?? target.level,
       flatReduction: 0, // the target's own flat reductions; a reference foe has none
       formula: ctx.consts.resistFormula,
     });
@@ -857,11 +868,20 @@ export function buildCombat(cdb, ctx, assume = {}) {
         const cat = prof.isFiller ? 'Attack' : prof.type;
         const critBonus = mods.critDamageByType?.[cat] ?? 0;
         const chanceBonus = mods.critChanceByType?.[cat] ?? 0;
-        const localCrit = (critBonus || chanceBonus)
-          ? 1 + Math.min(1, critChance + chanceBonus)
-            * ((sheet.get('CritDamage') ?? 100) / 100 + critBonus - 1)
-          : critMult;
-        let m = dmgMod * localCrit * mitigate(e, sheet, target, foe, mods);
+        // A status tick cannot crit: SkillContext.initVars@5150 zeroes
+        // ctx.critChance for damage-carrying statuses, and the crit roll reads
+        // it (criticalRoll@6211). A talent that gives a bleed its own crit
+        // chance is a script hook and rides poolScale, not this path.
+        const rawAff = aff.root === 'Raw';
+        const statusTick = prof.isStatusTick === true;
+        const localCrit = statusTick ? 1
+          : (critBonus || chanceBonus)
+            ? 1 + Math.min(1, critChance + chanceBonus)
+              * ((sheet.get('CritDamage') ?? 100) / 100 + critBonus - 1)
+            : critMult;
+        // Raw damage bypasses every global multiplier: getDamageScale@5146
+        // returns 1 for Raw before fervor, mastery or DamageModifier enter.
+        let m = (rawAff ? 1 : dmgMod) * localCrit * mitigate(e, sheet, target, foe, mods, opts.attackerLevel ?? null);
         // A scoped damage bonus: by affinity (Magic Conduction), by skill type
         // (a weapon-skill bonus), or across the board.
         for (const rd of prof.runeDamage ?? []) {
@@ -871,10 +891,16 @@ export function buildCombat(cdb, ctx, assume = {}) {
         m *= 1 + (mods.damageByAffinity?.[aff.root] ?? 0)
           + (mods.damageByAffinity?.all ?? 0)
           + (prof.type === "WeaponSkill" ? (mods.damageByAffinity?.WeaponSkill ?? 0) : 0);
-        if (fervorHere) m *= 1 + fervor;
-        if (opts.assume.mastery) {
-          if (aff.root === 'Physical') m *= 1 + physMastery;
-          else if (aff.root === 'Magic') m *= 1 + magicMastery;
+        // Fervor and the matching mastery share ONE additive bracket -
+        // getDamageRatio@4505: (1 + fervor + mastery) x DamageModifier - and
+        // neither touches a status tick, whose SkillContext belongs to the
+        // CARRIER, not the attacker (initVars@5150 sources the owner).
+        if (!rawAff && !statusTick) {
+          const fervorAdd = fervorHere ? fervor : 0;
+          const masteryAdd = opts.assume.mastery
+            ? (aff.root === 'Physical' ? physMastery : aff.root === 'Magic' ? magicMastery : 0)
+            : 0;
+          m *= 1 + fervorAdd + masteryAdd;
         }
         damage += raw * m * targets;
         singleTargetDamage += raw * m;
@@ -1073,6 +1099,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       poolFactor,
       goal: live?.goal ?? null,
       chainResets: opts.assume?.chainResets ?? true,
+      comboWindow: cdb.byId('constant').get('ComboWindow')?.v?.float ?? 0.6,
       swingVariance: cdb.byId('constant').get('WeaponAttack_RandomRange')?.v?.float ?? 0.1,
       poolHealShare: bleedMods.healShare ?? 0,
       critChance: Math.min(1, Math.max(0, (sheet.get('CritChance') ?? 0) / 100)),
@@ -1099,8 +1126,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
     });
     const phys = red('Armor', null, []);
     const magic = red('MagicArmor', null, ['MagicReduction']);
-    const takenPhys = Math.max(1e-6, (1 - phys) * dtm);
-    const takenMagic = Math.max(1e-6, (1 - magic) * dtm);
+    // Resilience multiplies what a hero takes from anyone but themselves -
+    // computeDamage@4841 ops 102-146 - and it was missing here.
+    const resil = 1 - (sheet.get('Resilience') ?? 0) / 100;
+    const takenPhys = Math.max(1e-6, (1 - phys) * dtm * resil);
+    const takenMagic = Math.max(1e-6, (1 - magic) * dtm * resil);
     return {
       maxHealth: hp,
       physReduction: phys,
@@ -1139,23 +1169,27 @@ export function buildCombat(cdb, ctx, assume = {}) {
     if (!g?.item) return 0;
     const item = cat.itemById.get(g.item);
     if (!item) return 0;
-    // The FLAT half of the trained level's primary budget - no rarity or star
-    // iLevel bonuses, which the measured tooltips assign to the STATS, not to
-    // the damage line. The primary-attribute half is added at consumption, per
-    // sheet, in amountOf - it follows whatever Strength the sheet carries.
-    //
-    // ONE-HANDERS take the whole flat budget, TWO-HANDERS 0.4 of it - both
-    // measured on a 0-armor dummy at trained level 25: Cheese Moon's swings
-    // need a flat of ~116-120 (budget 123.6) through its 0.13 ratio, and
-    // Judgement's need ~52 (0.4 x budget) through its 0.7. The pair is what
-    // makes a two-hander a two-hander: 3-4x the swing damage, and 5x the
-    // Strength scaling per point. 1.0/0.4 are the parsimonious constants
-    // within the +-5% the display rounding leaves; the residuals are in the
-    // audit, and `constant.WeaponPowerRatio` carrying exactly {0.4, 1} is
-    // suggestive but unproven provenance.
-    const twoHanded = !cat.allowsOffhand(item);
-    return budget(loadout.level, primary.start, primary.end, ctx.consts.earlyMaxLevel)
-      * (twoHanded ? 0.4 : 1.0);
+    // READ FROM THE BYTECODE (descs@20780 / fn@20784, HSkill.hx): the flat is
+    // 0.4 x the SUM over the item's aptitudes of each aptitude's primary
+    // budget at the ITEM's own level. No handedness factor exists anywhere in
+    // the damage path - the measured 1H/2H asymmetry is the authored per-type
+    // swing ratios (Axe 0.13, GreatAxe 0.7, GreatSword 0.95, DualSwords
+    // 0.205...) times the aptitude count (dual-aptitude one-handers sum two
+    // budgets). The 0.4 is `WeaponPowerRatio.MainhandWeaponSkill`, clamped in
+    // getMainType@20778, and rarity/stars/iLevel bonuses never enter
+    // (fn@20784 consumes only aptitudes, atbScaling bounds and item level).
+    // Every measured tooltip flat reproduces: Beefury 13 = 0.13 x 0.4 x
+    // (123.6+123.6), Wingsabers 22 = 0.205 x 0.4 x (123.6+148.3), Judgement
+    // 0.4 x 123.6. The attribute half - the MEAN of the item's aptitude
+    // primaries - is added at consumption in amountOf.
+    let sum = 0;
+    for (const aptId of item.aptitudes ?? []) {
+      const a2 = cdb.byId('aptitude').get(aptId);
+      const p2 = (a2?.atbScaling ?? []).find((e) => (e.statGroup ?? 0) === 0);
+      if (p2) sum += budget(loadout.level, p2.start, p2.end, ctx.consts.earlyMaxLevel);
+    }
+    if (!sum) sum = budget(loadout.level, primary.start, primary.end, ctx.consts.earlyMaxLevel);
+    return 0.4 * sum;
   }
 
   /** The aptitude's primary attribute - what WeaponPower adds at consumption. */
@@ -1188,45 +1222,38 @@ export function buildCombat(cdb, ctx, assume = {}) {
   }
 
   const audit = [
-    { severity: 'verified', what: 'Fervor multiplies ALL damage by its own percentage, base attacks included',
-      why: 'Measured on a 0-armor dummy: a combo finisher at 133 reads exactly 133 x 1.12 x 1.016 = 151 ' +
-           'under +12% PhysicalMastery and 30 FervorRating (~+1.58%); without the Fervor term it prices ' +
-           '149. Its description says "your Skills", and the finisher that moved is a base-attack chain ' +
-           'link - so the description undersells it and the default is all. --fervor-scope skills|none ' +
-           'remain as sensitivity toggles.' },
-    { severity: 'verified', what: 'PhysicalMastery / MagicMastery multiply matching-affinity damage',
-      why: 'Measured on a 0-armor dummy: with 3 Brutal Frenzy stacks (+12 PhysicalMastery) swings moved ' +
-           'x1.127 and the finisher x1.135 - both 1.12 x the Fervor also up at the time. The coefficient ' +
-           'is 1 + mastery/100, exactly as modelled; --no-mastery remains as a sensitivity toggle.' },
-    { severity: 'assumption', what: 'WeaponPower = the TRAINED level\'s flat primary budget x (1.0 one-handed, 0.4 two-handed), plus the mean of the item\'s aptitude attributes',
-      why: 'Calibrated on a 0-armor dummy against two weapons at trained level 25 (Cheese Moon flat ' +
-           '~116-120 vs budget 123.6 through its 0.13; Judgement ~52 = 0.4 x budget through its 0.7), ' +
-           'and the attribute half is rendered outright by the expanded tooltips: Beefury swings ' +
-           '"(13 + 6.5% Strength + 6.5% Faith)" - the type ratio split across the item\'s two aptitude ' +
-           'attributes - Wingsabers "(22 + 10.25% Strength + 10.25% Intellect)", Judgement all 0.7 on ' +
-           'Strength. Two bag reads (Beefury 16-19, Wingsabers 27-32, both Epic 0-star) imply flats of ' +
-           '~100-107, consistent with weapons trained BELOW the character\'s level - the bench assumes ' +
-           'fully trained, which overstates an untrained pickup and is exact for a levelled main. Their ' +
-           'displayed weapon Level lines would confirm the trained-level reading.' },
-    { severity: 'verified', what: 'a mainhand skill\'s attribute scaling is 60% attribute + 40% of that attribute\'s own budget curve',
-      why: 'constant.WeaponPowerRatio\'s own description - "Percent of AP/SP scaling that are replaced ' +
-           'by a flat amount coming from the weapon", MainhandWeaponSkill 0.4 - measured exact on ten ' +
-           'integers, and the game\'s expanded tooltips RENDER the rule: Royal Severance shows ' +
-           '"(30 + 30% Intellect)" and "(25 + 30% Strength)" - 0.6 x its authored 0.5 on the attribute, ' +
-           '0.4 x 0.5 x each attribute\'s own level-25 curve as the flat (148.3 and 123.6) - Hive Bite ' +
-           '"(48 + 29.33% x2)" is authored 0.85 x its own rank-2 +15%, and its heal "(9 + 10.35% ' +
-           'Faith)" is 0.15 x 1.15. Live: Rampage 233/371/556, Brutal Frenzy 133 + 28 rider, Tear 75 ' +
-           '(the two-attribute case that proved the flat is per attribute). The flats follow the ' +
-           'CHARACTER\'s level even on a lower-trained weapon. Applied to skills the MAIN HAND grants; ' +
-           'arsenal and class skills keep pure attribute scaling, unmeasured.' },
+    { severity: 'verified', what: 'Fervor and the matching mastery share ONE additive bracket, on everything except Raw damage and status ticks',
+      why: 'Read from getDamageRatio@4505: ratio = (1 + fervor + mastery) x DamageModifier - additive ' +
+           'with each other, multiplicative with the rest - applied to every affinity except Raw ' +
+           '(getDamageScale@5146 returns 1 outright) and never to a status tick, whose SkillContext ' +
+           'belongs to the CARRIER (initVars@5150). Also measured live: finisher 133 -> 151 = ' +
+           'x(1 + 0.12 + 0.0158) exactly. --fervor-scope and --no-mastery remain as toggles.' },
+    { severity: 'verified', what: 'WeaponPower = 0.4 x the SUM of the item\'s aptitude primary budgets at the item\'s level, plus the MEAN of those attributes',
+      why: 'Read from the bytecode (descs@20780, fn@20784, makeSkillInf@20782): no handedness factor ' +
+           'exists anywhere in the damage path - the measured 1H/2H asymmetry is the authored per-type ' +
+           'swing ratio (Axe 0.13, DualSwords 0.205, GreatAxe 0.7, GreatSword 0.95) times the aptitude ' +
+           'count, since a dual-aptitude one-hander SUMS two budgets where Judgement has one. The 0.4 ' +
+           'is WeaponPowerRatio.MainhandWeaponSkill, every weapon type inherits MainhandWeapon, and ' +
+           'rarity/stars/iLevel bonuses never enter the flat. Every measured tooltip reproduces: ' +
+           'Beefury 13 = 0.13 x 0.4 x (123.6+123.6), Wingsabers 22 = 0.205 x 0.4 x (123.6+148.3). ' +
+           'The level is the gear row\'s own - assumed equal to yours for an unpinned item.' },
+    { severity: 'verified', what: 'a weapon skill\'s attribute scaling is 60% attribute + 40% of that attribute\'s own budget curve - from either hand',
+      why: 'Read from getStepEffectItemScaling@20775 and getMainType@20778: itemRatio = ' +
+           'WeaponPowerRatio.MainhandWeaponSkill (0.4) for every weapon, the attribute keeps ' +
+           '1 - 0.4, and the flat is that attribute\'s own budget at the item\'s level. The gate is ' +
+           'isWeaponBased@6057 - a set of skill TYPES with no slot check - so the ARSENAL\'s weapon ' +
+           'skills mix identically and class skills (type 9) stay pure attribute. Ten measured ' +
+           'integers reproduce (Rampage 233/371/556, Brutal Frenzy 133 + 28, Tear 75 through ' +
+           'Dexterity\'s own 148.3 curve), and the expanded tooltips render the rule outright.' },
     { severity: 'verified', what: 'an item pays EVERY aptitude it names - except armour, which pays once',
       why: 'Read off the character sheet: a naked Warrior at 38/34/28 Vitality/Strength/Dexterity ' +
            'equips Cheese Moon (Fighter+Assassin) and reads 74/49/46 - every tooltip line, including ' +
            'the Assassin\'s +18 Dexterity the old own-half rule refused a Warrior - and Tear\'s live 75 ' +
            'prices on that Dexterity too. Armour still pays once: its budget is the wearer\'s ' +
            'resistForReduction with no aptitude in it. Generic jewellery still pays exactly one named ' +
-           'row (measured separately). Consequence: dual-aptitude gear carries roughly two budgets ' +
-           'of primaries and ratings, and is priced that way now.' },
+           'row (measured separately). One bytecode reading (fn@20747 ops 278-285) reports a divide-by-' +
+           'aptitude-count in the gear-stat bake that would contradict the sheet - the sheet wins until ' +
+           'that function is re-read, and the discrepancy is on record here rather than resolved by fiat.' },
     { severity: 'assumption', what: 'Brutal Frenzy\'s 0.3-ratio step is billed per finisher, not as its 15%-per-attack rider',
       why: 'The tooltip says "all your attacks have a 15% chance to deal an additional 28" - a rider ' +
            'the script rolls on every attack - while the step itself is authored unconditionally on ' +
@@ -1281,11 +1308,23 @@ export function buildCombat(cdb, ctx, assume = {}) {
       why: 'Only the dev punching bags split them, so ArmorPenetration and SpellPenetration are worth the ' +
            'same against everything currently in the game. Which one you want is decided by your class and ' +
            'your gear\'s faction, not by the target.' },
-    { severity: 'verified', what: 'weapon-damage swings vary ±10% around the mean; attribute-scaled hits do not vary at all',
-      why: 'WeaponAttack_RandomRange = 0.1, and both halves are measured: WeaponPower-scaled swings ran ' +
-           '19-24 and 78-95 around their means, while the Strength-scaled combo finisher read a constant ' +
-           '133 every time. So the roll rides the weapon damage only; deterministic mode keeps the mean ' +
-           'and --fights N rolls the swings that actually vary.' },
+    { severity: 'verified', what: 'basic swings vary ±10% over their WHOLE value; nothing else varies at all',
+      why: 'Read from fn@20779 (HSkill.hx:192-201): WeaponAttack_RandomRange (0.1) applies only to ' +
+           'Damage effects on skill types Attack..Attack4 - the combo finisher, weapon skills, class ' +
+           'skills and status ticks all roll nothing, which is why the finisher read a constant 133 in ' +
+           'game - and the band covers flat plus attribute (getStepEffectItemScaling@20775 adds the ' +
+           'scaling first, then rolls). Deterministic mode keeps the mean; --fights N rolls the swings.' },
+    { severity: 'verified', what: 'a status tick cannot crit and skips the attacker\'s fervor/mastery bracket',
+      why: 'Read from initVars@5150: ctx.critChance is zeroed for damage-carrying statuses, and the ' +
+           'context is built from the status OWNER - the carrier, not the attacker - so the ' +
+           '(1 + fervor + mastery) bracket never reaches a tick. What DOES move a running tick is the ' +
+           'attacker\'s script hooks (onInflictDamageEval), which is the mechanism behind the measured ' +
+           'Berserk tick jump; the averaged DamageModifier this model applies to pool ticks stands in ' +
+           'for exactly those hooks, and a bleed-crit talent (Exsanguination) is such a hook too.' },
+    { severity: 'verified', what: 'displayed damage is the ceiling of the raw float; health loses the float',
+      why: 'Read from applyDamage@4835: heroes display ceil (Hero.flattenAtbScaling@7448), foes floor, ' +
+           'and the HP subtraction uses the un-rounded value. Back-inferring from a displayed integer ' +
+           'means raw is in (display-1, display].' },
     { severity: 'assumption', what: 'a chain link swings no faster than 0.7 seconds',
       why: 'Calibrated from two stopwatches: ten Cheese Moon chains in 28s where the authored durations ' +
            'sum to 1.81s - they are hit timings, not swing periods - and ten Judgement chains in ~30s, ' +
