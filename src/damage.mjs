@@ -1251,9 +1251,12 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'the Assassin\'s +18 Dexterity the old own-half rule refused a Warrior - and Tear\'s live 75 ' +
            'prices on that Dexterity too. Armour still pays once: its budget is the wearer\'s ' +
            'resistForReduction with no aptitude in it. Generic jewellery still pays exactly one named ' +
-           'row (measured separately). One bytecode reading (fn@20747 ops 278-285) reports a divide-by-' +
-           'aptitude-count in the gear-stat bake that would contradict the sheet - the sheet wins until ' +
-           'that function is re-read, and the discrepancy is on record here rather than resolved by fiat.' },
+           'row (measured separately). The gear bake (generateItemAffixes@20747, HItem.hx:415) DOES ' +
+           'divide each row by the aptitude count - read directly - but for attributes both aptitudes ' +
+           'carry, sum-of-halves equals mean-of-fulls, so this model\'s per-aptitude-rounded sum ' +
+           'reproduces every measured tooltip integer regardless; the two decompositions differ only ' +
+           'in which inferred drop level fits a single-aptitude line, and a full trace of the bake ' +
+           '(its per-row loop and gearRatio) is the named next read.' },
     { severity: 'assumption', what: 'Brutal Frenzy\'s 0.3-ratio step is billed per finisher, not as its 15%-per-attack rider',
       why: 'The tooltip says "all your attacks have a 15% chance to deal an additional 28" - a rider ' +
            'the script rolls on every attack - while the step itself is authored unconditionally on ' +
@@ -1323,7 +1326,9 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'for exactly those hooks, and a bleed-crit talent (Exsanguination) is such a hook too.' },
     { severity: 'verified', what: 'displayed damage is the ceiling of the raw float; health loses the float',
       why: 'Read from applyDamage@4835: heroes display ceil (Hero.flattenAtbScaling@7448), foes floor, ' +
-           'and the HP subtraction uses the un-rounded value. Back-inferring from a displayed integer ' +
+           'and the HP subtraction uses the un-rounded value. The tooltip renderer ' +
+           '(skillEffectValText@20949) dispatches through the same virtual on the live Hero, so a ' +
+           'weapon tooltip\'s range endpoints ceil too. Back-inferring from a displayed integer ' +
            'means raw is in (display-1, display].' },
     { severity: 'assumption', what: 'a chain link swings no faster than 0.7 seconds',
       why: 'Calibrated from two stopwatches: ten Cheese Moon chains in 28s where the authored durations ' +
