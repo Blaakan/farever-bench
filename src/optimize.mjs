@@ -93,9 +93,13 @@ export function optimize(engine, spec) {
   const pinnedSkills = spec.pinnedSkills ?? new Set();
   const pinnedRunes = spec.pinnedRunes ?? new Set();
 
+  // The objective the FIGHT maximises. A single goal is handed through so the
+  // derived rotation plays for it; a blend keeps the fight's everything-counts
+  // criterion, because the fight cannot see the blend's normalisation.
+  const simGoal = (weights && Object.keys(weights).length) || goal === 'mixed' ? 'mixed' : goal;
   // The reference used to normalise a weighted blend: the seed as given, so
   // the numbers a user reads are relative to where they started.
-  const refEval = engine.evaluate(spec.loadout, { target, rank, mix });
+  const refEval = engine.evaluate(spec.loadout, { target, rank, mix, goal: simGoal });
   const scorer = engine.makeScorer({ goal, weights, target, rank, mix, ref: refEval });
 
   const freeSlots = cat.combatSlots()
@@ -281,7 +285,7 @@ export function optimize(engine, spec) {
       + '%' + Object.entries(loadout.talents ?? {}).sort().map(([k, v]) => k + ':' + v).join('|');
     let v = evalCache.get(key);
     if (v === undefined) {
-      const ev = engine.evaluate(loadout, { target, rank, mix, policy });
+      const ev = engine.evaluate(loadout, { target, rank, mix, policy, goal: simGoal });
       // Ties are common and they are not noise: a shield's atbRatio is
       // `{armor: 0.337}` and nothing else, so for a dps goal every offhand -
       // and no offhand at all - scores identically, and whichever one a restart
@@ -688,7 +692,7 @@ export function optimize(engine, spec) {
     winner = cur;
   }
 
-  const finalEval = engine.evaluate(winner.loadout, { target, rank, mix, policy });
+  const finalEval = engine.evaluate(winner.loadout, { target, rank, mix, policy, goal: simGoal });
 
   return {
     loadout: winner.loadout,
@@ -715,7 +719,8 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
   const { cat } = engine;
   const { goal = 'dps', weights = null, target, rank = 1, mix = 0.5, rarities = null, stars = 'max' } = spec;
   const cls = cat.classes.find((c) => c.unit === loadout.class);
-  const refEval = engine.evaluate(loadout, { target, rank, mix });
+  const simGoal = (weights && Object.keys(weights).length) || goal === 'mixed' ? 'mixed' : goal;
+  const refEval = engine.evaluate(loadout, { target, rank, mix, goal: simGoal });
   const scorer = engine.makeScorer({ goal, weights, target, rank, mix, ref: refEval });
   const baseScore = scorer.scoreFrom(refEval);
 
@@ -738,7 +743,7 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
     for (const k of Object.keys(trial.augments)) if (!live.has(k)) delete trial.augments[k];
     trial.skills = Object.fromEntries(Object.entries(trial.skills ?? {}).map(([k, v]) => [k, v.slice()]));
     engine.plan.pruneSelection(trial);
-    const ev = engine.evaluate(trial, { target, rank, mix });
+    const ev = engine.evaluate(trial, { target, rank, mix, goal: simGoal });
     const score = scorer.scoreFrom(ev);
     rows.push({
       item: it,

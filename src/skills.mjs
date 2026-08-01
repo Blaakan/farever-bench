@@ -228,8 +228,14 @@ function scopeOf(block) {
   if (/isWeaponSkill/.test(guard)) return { scope: 'weaponSkill', targetBleeding };
   if (/isBaseAttack|isBasicAttack|isFinalCombo|isFinalAttack/.test(guard)) return { scope: 'attack', targetBleeding };
   if (fromStatus) {
+    // WHICH bleed is kept, not collapsed. The statusType sheet subtypes them
+    // one way - `Hemorage` declares `parent: Bleed`, nothing else declares a
+    // parent - so a guard naming Bleed covers a Hemorage dot but a guard
+    // naming Hemorage covers only Hemorage dots. Folding both onto one scope
+    // handed Exsanguination's crit chance to Bonethrow's plain-Bleed pool,
+    // a talent whose own guard says `isStatusType(StatusType.Hemorage)`.
     return /^(?:Bleed|Hemorage)$/.test(fromStatus)
-      ? { scope: 'bleed', targetBleeding }
+      ? { scope: 'bleed', statusType: fromStatus, targetBleeding }
       : { scope: 'dot:' + fromStatus, targetBleeding };
   }
   if (targetBleeding) return { scope: 'all', targetBleeding };
@@ -980,6 +986,19 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // against it.
       const st2 = statusesOf(id, { runes, rank, talents });
       noteDots(id, st2, extra);
+      // A skill can be scored for its damage while a buff it grants is
+      // refused - Ram Veil's +5 CritChance / +5 Fervor lands only when a
+      // max-stacked Benediction is consumed, which is live state. The cast is
+      // counted; the refusal is NAMED rather than swallowed, or the output
+      // would quietly read lower than the tooltip promises with no word why.
+      for (const u of st2.unreadable ?? []) {
+        if (!u.trigger?.unread) continue;
+        unmodelled.push({
+          id: u.status, name: u.name, source: extra.source ?? null, kind: 'buff refused',
+          why: `${prof.name} is scored, but ${u.name} lands only while ${u.trigger.unread}() `
+            + 'holds, which this reader cannot evaluate',
+        });
+      }
       bucket.push({ ...extra, prof, applies: { self: st2.self, target: st2.onTarget } });
     };
 
@@ -1742,12 +1761,29 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const direct = /^\w+\.amount\s*\*\s*vars\.([A-Za-z0-9_]+)$/.exec(t);
         const frac = direct ? s.vars?.[direct[1]] : local.get(t);
         if (typeof frac !== 'number' || !(frac > 0)) continue;
-        const scope = enclosingBlock(body.slice(0, mm.index));
+        // WHICH damage feeds the pool is the HOOK's business before it is the
+        // guard's. `onInflictDamage` is the owner-global hook - Hemorrhage
+        // takes a share of every physical critical strike you land, whoever
+        // landed it - while `onDamage` on a skill's own script sees only that
+        // skill's hits: Bonethrow's tooltip says "bleed for ::var1%:: of the
+        // damage dealt", meaning dealt BY BONETHROW. Reading both as global
+        // fed Bonethrow's pool from the whole rotation's crits, which invented
+        // ~18% of a Warrior's headline dps. A hook this reader does not know
+        // is refused, and the status falls through to the script-magnitude
+        // refusal below rather than riding a feed it does not have.
+        const beforeCall = body.slice(0, mm.index);
+        const hookAt = beforeCall.lastIndexOf('function on');
+        const hook = hookAt >= 0
+          ? /function\s+(on[A-Za-z0-9_]*)/.exec(beforeCall.slice(hookAt))?.[1] ?? null : null;
+        if (hook !== 'onInflictDamage' && hook !== 'onDamage') continue;
+        const scope = enclosingBlock(beforeCall);
         poolFraction.set(id, {
           fraction: frac,
+          own: hook === 'onDamage',
           // The guard says which damage feeds it. Hemorrhage takes physical
           // critical strikes and explicitly excludes damage from other dots,
-          // which is what stops a bleed from feeding itself.
+          // which is what stops a bleed from feeding itself. Bonethrow's guard
+          // is EMPTY - no crit test - so its feed is all of its own damage.
           crit: /\bcritical\b|\bisCrit\b/.test(scope),
           physical: /\bisPhysical\b/.test(scope),
           magic: /\bisMagic\b/.test(scope),
@@ -1833,6 +1869,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           status: statusId,
           name: st.texts?.name ?? statusId,
           to: wearer,
+          // What the game types this status as - `Bleed`, `Hemorage`, `Burn` -
+          // which is what a talent's `isStatusType` guard asks about, so a
+          // scoped modifier can be matched to the dots it actually covers.
+          types,
           tick: sp.periodic.tick,
           duration: life ?? sp.periodic.duration,
           stacks: st.props?.status?.maxStacks ?? 1,
@@ -1908,12 +1948,27 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         types,
         to: wearer,
         affixes,
+        trigger,
       };
       if (dynamic) {
         unreadable.push({ ...entry, why: 'its affixes are scaled by a script-set dynVal, so their magnitude is not in the data' });
         continue;
       }
       if (!affixes.length) continue;
+      // A status whose APPLICATION is gated on live state the reader computed
+      // the flag for and then dropped. Ram Veil's +5 CritChance / +5 Fervor
+      // lands only when a max-stacked Benediction is CONSUMED - the script says
+      // `hasStatusMaxStacked` in as many words - and the entry used to ship
+      // without the guard, so the buff was credited on every cast at ~100%
+      // uptime. That is the refuse-don't-approximate rule inverted: the
+      // conditional reward was maximised. Refused and named instead.
+      if (trigger?.unread) {
+        unreadable.push({
+          ...entry,
+          why: `its script applies it only while ${trigger.unread}() holds, which this reader cannot evaluate`,
+        });
+        continue;
+      }
       // A status the ENEMY wears is a debuff on them, not a stat on you. Merging
       // it into your own sheet would credit you with their armour reduction.
       if (wearer === 'Self' && isBuff) self.push(entry);
@@ -2128,9 +2183,9 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         if (typeof amount !== 'number' || amount <= 0) continue;
         const sc = scopeOf(enclosingBlock(body.slice(0, m.index)));
         if (!sc) continue;
-        const { scope, targetBleeding } = sc;
+        const { scope, statusType = null, targetBleeding } = sc;
         out.push({
-          field: 'healShare', scope, targetBleeding,
+          field: 'healShare', scope, statusType, targetBleeding,
           amount: amount * rank, from: skillId, name: s.texts?.name ?? skillId,
         });
       }
@@ -2151,7 +2206,8 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const cv = /checkProba\s*\(\s*vars\.([A-Za-z0-9_]+)/.exec(scope0)?.[1];
         if (cv && typeof s.vars?.[cv] === 'number') chance = s.vars[cv];
         out.push({
-          field: 'cooldownPerTick', scope: sc0.scope, targetBleeding: sc0.targetBleeding,
+          field: 'cooldownPerTick', scope: sc0.scope, statusType: sc0.statusType ?? null,
+          targetBleeding: sc0.targetBleeding,
           amount: seconds * chance * rank, from: skillId, name: s.texts?.name ?? skillId,
         });
       }
@@ -2162,13 +2218,14 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const guard = enclosingBlock(body.slice(0, m.index));
         const sc2 = scopeOf(guard);
         if (!sc2) continue;
-        const { scope, targetBleeding } = sc2;
+        const { scope, statusType = null, targetBleeding } = sc2;
         out.push({
           // `armorIgnore` and `magicArmorIgnore` are the SAME 5% applied to two
           // different armours, not 10% applied to one. Exposed Essence sets
           // both on consecutive lines and folding them together doubled it.
           field: m[1],
           scope,
+          statusType,
           targetBleeding,
           amount: amount * rank,
           from: skillId,

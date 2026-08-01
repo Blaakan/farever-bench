@@ -289,6 +289,7 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = 
       // The guard reader looked at the script and REFUSED, which is a different
       // statement from never having looked.
       ['conditional', 'it procs, but only while something this reader cannot evaluate holds'],
+      ['buff refused', 'the skill is scored, but a status it grants is gated on live state this reader cannot evaluate'],
       ['gated off', 'its script gates it on a rank or a talent this build does not have'],
       ['chain', 'the weapon\'s base-attack chain is shorter than its moveSet declares'],
       ['crowd control', 'a stun, root or slow - worth nothing while the simulated foe does not act'],

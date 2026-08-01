@@ -278,7 +278,7 @@ group('checked against the game: Spear_Eruption');
   // effective level rather than to the authored one.
   const INSTANCE_LEVEL = 10;
   ok('a level-10 Rare instance is effective level 11',
-    cat.effectiveLevel({ ...spear, level: INSTANCE_LEVEL, iLevel: null }, { charLevel: 25, stars: 0 }) === 11);
+    cat.effectiveLevel({ ...spear, iLevel: null }, { charLevel: 25, stars: 0, level: INSTANCE_LEVEL }) === 11);
 
   const OBSERVED = {
     mainHand: { Vitality: 36, Dexterity: 18, Faith: 15, CritChanceRating: 39, ArmorPenetrationRating: 39 },
@@ -290,8 +290,8 @@ group('checked against the game: Spear_Eruption');
   // the `allAptitudes` mode, and it still has to reproduce all ten exactly.
   for (const [slotId, want] of [['Slot_Weapon1', OBSERVED.mainHand], ['Slot_Weapon2', OBSERVED.arsenal]]) {
     const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
-    cat.contribute({ ...spear, level: INSTANCE_LEVEL, iLevel: null }, slotId, {
-      aptitude: 'Assassin', charLevel: 25, stars: 0, allAptitudes: true,
+    cat.contribute({ ...spear, iLevel: null }, slotId, {
+      aptitude: 'Assassin', charLevel: 25, stars: 0, allAptitudes: true, level: INSTANCE_LEVEL,
       rarity: 'Rare', armorReduction: cat.armorReductionFor('Assassin'),
     }, mods);
     for (const [atb, v] of Object.entries(want)) {
@@ -302,22 +302,36 @@ group('checked against the game: Spear_Eruption');
     ok(`${slotId} grants nothing the tooltip does not show`, extra.length === 0, extra.join(', '));
   }
 
-  // What a WEARER gets is one aptitude's half of that. A Rogue takes the
-  // Assassin reading - Dexterity and ArmorPenetration - and none of the Cleric
-  // one, which is why the same spear is not worth twice a single-class spear.
+  // What a WEARER gets is EVERYTHING the tooltip shows - read off the
+  // character sheet at last: a naked Warrior (Vit 38, Str 34, Dex 28) equips
+  // Cheese Moon (Fighter+Assassin, +36/+15/+18 and both ratings) and the
+  // sheet reads 74/49/46. So a Rogue holding this spear takes the Cleric
+  // half too, and the wearer reading IS the tooltip reading.
   {
     const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
-    cat.contribute({ ...spear, level: INSTANCE_LEVEL, iLevel: null }, 'Slot_Weapon1', {
-      aptitude: 'Assassin', charLevel: 25, stars: 0,
+    cat.contribute({ ...spear, iLevel: null }, 'Slot_Weapon1', {
+      aptitude: 'Assassin', charLevel: 25, stars: 0, level: INSTANCE_LEVEL,
       rarity: 'Rare', armorReduction: cat.armorReductionFor('Assassin'),
     }, mods);
-    near('a Rogue takes the Assassin primary', mods.flat.get('Dexterity') ?? 0, 18, 1e-9);
-    near('and the Assassin rating', mods.flat.get('ArmorPenetrationRating') ?? 0, 39, 1e-9);
-    ok('and none of the Cleric half', !mods.flat.get('Faith') && !mods.flat.get('CritChanceRating'),
-      `Faith ${mods.flat.get('Faith') ?? 0}, Crit ${mods.flat.get('CritChanceRating') ?? 0}`);
-    ok('so its Vitality is one share, not the sum of two',
-      (mods.flat.get('Vitality') ?? 0) < OBSERVED.mainHand.Vitality,
-      `${mods.flat.get('Vitality')} vs the tooltip's ${OBSERVED.mainHand.Vitality}`);
+    for (const [atb, v] of Object.entries(OBSERVED.mainHand)) {
+      near(`a Rogue wearer receives the whole ${atb} line`, mods.flat.get(atb) ?? 0, v, 1e-9);
+    }
+  }
+
+  // The reading that settled it, reproduced end to end: Cheese Moon's equip
+  // deltas on the character sheet. The instance dropped low (its stat lines
+  // match effective level 11 exactly, like the spear's); its aptitudes are
+  // Fighter+Assassin, and the Warrior receives both halves.
+  {
+    const axe = cat.itemById.get('Axe_Boomerang');
+    const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
+    cat.contribute(axe, 'Slot_Weapon1', {
+      aptitude: 'Fighter', charLevel: 25, stars: 0, level: 10,
+      rarity: 'Rare', armorReduction: cat.armorReductionFor('Fighter'),
+    }, mods);
+    near('the Warrior receives the axe\'s Vitality line', mods.flat.get('Vitality') ?? 0, 36, 1e-9);
+    near('...its Strength line', mods.flat.get('Strength') ?? 0, 15, 1e-9);
+    near('...and the Assassin\'s Dexterity line too', mods.flat.get('Dexterity') ?? 0, 18, 1e-9);
   }
 
   // The two aptitudes read the same faction differently, which is what produces
@@ -376,10 +390,12 @@ group('multi-aptitude items');
     }
   }
 
-  // A dual-aptitude item pays the wearer the SAME as a single-aptitude one.
-  // Naming two aptitudes means "either class may wear this", not "both classes'
-  // budgets apply" - otherwise every shared piece would be twice any exclusive
-  // one for both of the classes that can use it.
+  // A dual-aptitude item pays the wearer EVERYTHING it names - read off the
+  // character sheet: naked Warrior 38/34/28 Vit/Str/Dex, Cheese Moon equipped
+  // 74/49/46, every tooltip line including the Assassin half. ARMOUR is the
+  // exception and pays once: its budget is the wearer's resistForReduction,
+  // with no aptitude in it, so a second aptitude paying it would double the
+  // one stat that cannot double.
   const slot = multi.slots.find((s) => cat.slotById.get(s)?.combat);
   const l = emptyLoadout(cat, 'Priest', 25);
   l.gear[slot] = { item: multi.id, rarity: multi.rarity, stars: 0 };
@@ -393,13 +409,15 @@ group('multi-aptitude items');
   };
   const bothApt = contributionOf(multi);
   const clericOnly = contributionOf({ ...multi, aptitudes: ['Cleric'] });
-  ok(`${multi.id} pays a Priest the same with both aptitudes as with Cleric alone`,
-    (bothApt.get('Vitality') ?? 0) === (clericOnly.get('Vitality') ?? 0)
-      && (bothApt.get('Armor') ?? 0) === (clericOnly.get('Armor') ?? 0),
-    `${bothApt.get('Vitality')}/${bothApt.get('Armor')} vs ${clericOnly.get('Vitality')}/${clericOnly.get('Armor')} (${multi.aptitudes.join('+')})`);
-  ok('and it grants no primary belonging to the other class',
-    !['Strength', 'Dexterity', 'Intellect'].some((a) => bothApt.get(a)),
+  ok(`${multi.id} pays a Priest MORE with both aptitudes than with Cleric alone`,
+    (bothApt.get('Vitality') ?? 0) > (clericOnly.get('Vitality') ?? 0),
+    `${bothApt.get('Vitality')} vs ${clericOnly.get('Vitality')} (${multi.aptitudes.join('+')})`);
+  ok('and it grants the OTHER class\'s primary too',
+    ['Strength', 'Dexterity', 'Intellect'].some((a) => bothApt.get(a)),
     [...bothApt.entries()].map(([k, v]) => k + '=' + v).join(' '));
+  ok('but armour pays once whatever the aptitude count',
+    (bothApt.get('Armor') ?? 0) === (clericOnly.get('Armor') ?? 0),
+    `${bothApt.get('Armor')} vs ${clericOnly.get('Armor')}`);
   ok('and it grants at least one rating', ratingsOf(ev.sheet).length > 0, ratingsOf(ev.sheet).join(','));
   ok('every stat a full-factor slot grants is a whole number',
     [...bothApt.values()].every((v) => Number.isInteger(v)),
@@ -881,8 +899,11 @@ group('optimiser');
     .reduce((s, l) => s + l.perCast.damage / l.interval, 0);
   const fromSkills = byKind('active') + byKind('triggered');
   const totalDamage = fromSkills + byKind('filler');
+  // The threshold moved with the WeaponPower calibration: swings priced off
+  // the full budget carry most of a fight, and in game they visibly do. The
+  // guard is against skills contributing NOTHING, not against strong swings.
   ok('skills carry a real share of the damage, not just the base-attack chain',
-    totalDamage > 0 && fromSkills / totalDamage > 0.25,
+    totalDamage > 0 && fromSkills / totalDamage > 0.1,
     `skills ${fromSkills.toFixed(1)} of ${totalDamage.toFixed(1)} dps`);
   ok('the rotation contains skills the character pressed',
     a.evaluation.rotation.active.length > 0,
@@ -1646,6 +1667,390 @@ group('pool dots');
   ok('the tree reports it as readable', eng.talents.readableValue('Warrior_Hemorrhage', 1).readable);
 }
 
+// --- checked against the game: Cheese Moon ---------------------------------
+// A second in-game reading (2026-08-01), on a real Rare 3-star Axe_Boomerang
+// trained to weapon level 25, held by a naked level-25 Warrior, against a
+// 0-armor dummy. It settled three things at once: the naked base sheet, that
+// an item's STATS follow its drop-level budget while its DAMAGE follows its
+// trained level, and WeaponPower's formula - the flat primary budget plus the
+// wielder's primary attribute.
+group('checked against the game: Cheese Moon');
+{
+  const eng = createEngine({ quiet: true });
+  // The naked sheet, to the decimal: Vit 38, Str 34, Dex/Faith/Int 28,
+  // crit 5.8%, crit bonus 151.2%.
+  const naked = emptyLoadout(eng.cat, 'Warrior', 25);
+  const evN = eng.evaluate(naked, { rank: 3 });
+  near('naked Vitality', evN.sheet.get('Vitality'), 38, 0.5);
+  near('naked Strength', evN.sheet.get('Strength'), 34, 0.5);
+  near('naked Dexterity', evN.sheet.get('Dexterity'), 28, 0.5);
+  near('naked CritChance', evN.sheet.get('CritChance'), 5.8, 0.05);
+  near('naked CritDamage', evN.sheet.get('CritDamage'), 151.2, 0.1);
+
+  // WeaponPower: the flat primary budget at the trained (character) level.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { rank: 3 });
+  near('WeaponPower is the flat primary budget at level 25', ev.weaponPower, 123.6, 0.5);
+
+  // Swing 1 against 0 armor: ratio 0.13 x (budget + Strength-with-weapon).
+  // Observed in game: 19-24 across the +-10% per-swing roll.
+  const link1 = eng.plan.baseChain(eng.cat.itemById.get('Axe_Boomerang')).links[0];
+  const p1 = eng.combat.profile(link1, 3);
+  const dummy = { name: 'dummy', level: 25, armor: 0, magicArmor: 0 };
+  const out = eng.combat.castOutput(p1, ev.sheet, dummy,
+    { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength', 'Dexterity'] });
+  const critMult = 1 + Math.min(1, ev.sheet.get('CritChance') / 100)
+    * (ev.sheet.get('CritDamage') / 100 - 1);
+  const noncrit = out.damage / critMult;
+  ok('the naked swing lands inside the observed 19-24', noncrit > 19 && noncrit < 24,
+    noncrit.toFixed(2));
+  // ...and the equip delta is the same ratio applied to the weapon's own
+  // Strength: the bag showed 18-21 against Str 34, the swing runs ~2 higher
+  // against Str-with-weapon.
+  const bagSheet = new Map(ev.sheet);
+  bagSheet.set('Strength', 34);
+  const bag = eng.combat.castOutput(p1, bagSheet, dummy,
+    { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength', 'Dexterity'] });
+  const bagNoncrit = bag.damage / critMult;
+  ok('the bag tooltip reading lands inside 18-21 too', bagNoncrit > 18 && bagNoncrit < 21.5,
+    bagNoncrit.toFixed(2));
+
+  // The SECOND weapon, which is what caught the two-hander's 0.4 flat:
+  // Judgement equipped alone (Str 34+38=72) swings 78-95 on the same dummy.
+  const l2 = emptyLoadout(eng.cat, 'Warrior', 25);
+  l2.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Epic', stars: 4 };
+  eng.plan.pruneSelection(l2);
+  const ev2 = eng.evaluate(l2, { rank: 3 });
+  near('a two-hander takes 0.4 of the flat budget', ev2.weaponPower, 123.6 * 0.4, 0.5);
+  const ga1 = eng.combat.profile(eng.plan.baseChain(eng.cat.itemById.get('GA_Craft')).links[0], 3);
+  // The model's Strength includes the weapon's own contribution at its
+  // stat budget; the real item read +38. Pin the formula against the real
+  // sheet rather than against the model's item stats.
+  const gaSheet = new Map(ev2.sheet);
+  gaSheet.set('Strength', 72);
+  // The clean reading was without Brutal Frenzy stacks; the model's sheet
+  // folds them at cap, so pin mastery off the same way Strength is pinned.
+  gaSheet.set('PhysicalMastery', 0);
+  const ga = eng.combat.castOutput(ga1, gaSheet, dummy,
+    { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength'] });
+  const gaCritMult = 1 + Math.min(1, ev2.sheet.get('CritChance') / 100)
+    * (ev2.sheet.get('CritDamage') / 100 - 1);
+  const gaNoncrit = ga.damage / gaCritMult;
+  ok('the two-hander swing lands inside the observed 78-95', gaNoncrit > 78 && gaNoncrit < 95,
+    gaNoncrit.toFixed(2));
+
+  // The weapon-skill mix, measured exact on six integers: a mainhand skill's
+  // attribute scaling is 60% attribute + 40% of that attribute's OWN budget
+  // curve. Rampage read 233/371/556 at authored 2.5/4/6 x Strength, Brutal
+  // Frenzy 133 at 1.43, both against the naked-plus-Judgement sheet (Str 72);
+  // Tear's 75 at 45% Str + 45% Dex is what proved the flat is per attribute.
+  const mix = {
+    flats: eng.combat.attributeBudgets(25),
+    ids: new Set(['GA_Craft_Skill1', 'GA_Craft_FinalCombo', 'Axe_Boomerang_Combo']),
+  };
+  near('Dexterity has its own budget curve', mix.flats.get('Dexterity'), 148.3, 0.5);
+  const rampage = eng.combat.profile('GA_Craft_Skill1', 3);
+  const rOut = eng.combat.castOutput(rampage, gaSheet, dummy,
+    { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength'], weaponMix: mix });
+  near('Rampage at full charge reads the measured 556', rOut.damage / gaCritMult, 556, 2);
+  const frenzy = eng.combat.profile('GA_Craft_FinalCombo', 3);
+  const fOut = eng.combat.castOutput(frenzy, gaSheet, dummy,
+    { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength'], weaponMix: mix });
+  // The cast carries both authored steps (1.43 + 0.3); the tooltip's 133 is
+  // the 1.43 step alone, so the whole cast prices (1.43+0.3) x 92.7 = 160.4.
+  near('Brutal Frenzy prices both steps at the measured mix', fOut.damage / gaCritMult, 160.4, 2);
+  // Tear, at the REAL equipped stats (Str 49, Dex 46): 0.45x(0.6x49 +
+  // 0.4x123.6) + 0.45x(0.6x46 + 0.4x148.3) = 74.6, measured 75. The real
+  // sheet carries the axe's Dexterity half too, which the model's own-half
+  // rule does not grant a Warrior - that open question is in the audit -
+  // so the stats are pinned here and the FORMULA is what this checks.
+  const tear = eng.combat.profile('Axe_Boomerang_Combo', 3);
+  const tSheet = new Map(ev.sheet);
+  tSheet.set('PhysicalMastery', 0);
+  tSheet.set('Strength', 49);
+  tSheet.set('Dexterity', 46);
+  const tOut = eng.combat.castOutput(tear, tSheet, dummy,
+    { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength'], weaponMix: mix });
+  const tCritMult = 1 + Math.min(1, ev.sheet.get('CritChance') / 100)
+    * (ev.sheet.get('CritDamage') / 100 - 1);
+  near('Tear reads the measured 75', tOut.damage / tCritMult, 74.6, 1.2);
+}
+
+// --- pool feed scoping -----------------------------------------------------
+// WHICH damage feeds a pool is the hook's business: `onInflictDamage` is
+// owner-global, a skill's own `onDamage` sees only that skill's hits. Reading
+// Bonethrow's per-skill pool as global fed it from the whole rotation's crits
+// and invented ~18% of a Warrior's headline dps - and the guard flags (crit,
+// physical) were collected and never consumed, so it was simultaneously fed
+// the wrong slice. These pin both readings and the per-type multipliers.
+group('pool feed scoping');
+{
+  const eng = createEngine({ quiet: true });
+  const N = { rank: 3, runes: new Set(), talents: new Set() };
+  const dotOf = (id) => eng.plan.statusesOf(id, N).dots.find((d) => d.pool);
+
+  const bone = dotOf('Axe_Boomerang_Skill1');
+  ok('Bonethrow is read as a pool dot', !!bone);
+  if (bone) {
+    near('...at 40% of the hit', bone.pool.fraction, 0.4);
+    ok('...of its OWN damage - the hook is onDamage, not onInflictDamage', bone.pool.own === true);
+    ok('...crit or not - its guard has no crit test', !bone.pool.crit);
+    ok('...and its status is a plain Bleed, not a Hemorage',
+      (bone.types ?? []).includes('Bleed') && !(bone.types ?? []).includes('Hemorage'),
+      JSON.stringify(bone.types));
+  }
+  const hem = dotOf('Warrior_Hemorrhage');
+  ok('Hemorrhage stays owner-global', hem && hem.pool.own !== true);
+  ok('...and its status is typed Hemorage', hem && (hem.types ?? []).includes('Hemorage'));
+
+  // End to end: with Bonethrow's weapon held, its pool is fed by its own casts
+  // alone, so its line must be far below Hemorrhage's rotation-wide one - the
+  // bug fed both the identical number.
+  const build = (talents) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', stars: 0 };
+    l.talents = talents;
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  };
+  const lineOf = (ev, id) => ev.throughput.lines.find((x) => x.id === id);
+  const both = build({ Warrior_Hemorrhage: 1 });
+  const boneLine = lineOf(both, 'Axe_Boomerang_Skill1_Status');
+  const hemLine = lineOf(both, 'Warrior_Hemorrhage_Status');
+  ok('the two pools are fed different numbers', boneLine && hemLine
+    && boneLine.why.split(' of ')[1] !== hemLine.why.split(' of ')[1],
+    `${boneLine?.why} vs ${hemLine?.why}`);
+  ok('Bonethrow says whose damage it pools', boneLine?.why.includes('dealt by itself'), boneLine?.why);
+  ok('Hemorrhage still says critical', hemLine?.why.includes('critical'), hemLine?.why);
+
+  // Exsanguination's guard says `isStatusType(StatusType.Hemorage)`, and the
+  // statusType sheet subtypes ONE way - so it must move Hemorrhage's pool and
+  // leave Bonethrow's plain-Bleed pool exactly where it was.
+  const withEx = build({ Warrior_Hemorrhage: 1, Warrior_Talent_Exsanguination: 2 });
+  const bone0 = lineOf(both, 'Axe_Boomerang_Skill1_Status')?.perCast.damage ?? 0;
+  const bone1 = lineOf(withEx, 'Axe_Boomerang_Skill1_Status')?.perCast.damage ?? 0;
+  const hem0 = lineOf(both, 'Warrior_Hemorrhage_Status')?.perCast.damage ?? 0;
+  const hem1 = lineOf(withEx, 'Warrior_Hemorrhage_Status')?.perCast.damage ?? 0;
+  ok('Exsanguination raises the Hemorrhage pool', hem1 > hem0 * 1.05,
+    `${hem0.toFixed(0)} -> ${hem1.toFixed(0)}`);
+  near('...and does not touch the plain-Bleed pool', bone1, bone0, Math.max(1, bone0 * 0.01));
+  // Bloodletting's guard says Bleed, the parent type, so it covers BOTH.
+  const withBl = build({ Warrior_Hemorrhage: 1, Warrior_Talent_Bloodletting: 2 });
+  const boneBl = lineOf(withBl, 'Axe_Boomerang_Skill1_Status')?.perCast.damage ?? 0;
+  ok('Bloodletting covers the plain Bleed too', boneBl > bone0 * 1.05,
+    `${bone0.toFixed(0)} -> ${boneBl.toFixed(0)}`);
+}
+
+// --- the pool ledger -------------------------------------------------------
+// A pool dot pays out over its own tick schedule, DurationBased-style: each
+// feed redistributes what is still owed over a fresh window, and what the bell
+// catches un-ticked is dropped - a damage meter never saw it. Crediting the
+// whole bank read a 3-second fight four ticks rich.
+group('the pool ledger');
+{
+  const prof = (id, cooldown, occ, extra = {}) => ({
+    id, name: id, cooldown, occupancy: occ, charges: 1, isCombo: false, type: 'ClassSkill',
+    costs: [], ...extra,
+  });
+  const mkPool = (from, own) => ({
+    from, fromName: from, status: from + '_Pool', name: from + ' pool', to: 'Target',
+    types: ['Bleed'], tick: 2, duration: 8, stacks: -1, stacking: 'DurationBased',
+    pool: { fraction: 0.5, own, crit: true, physical: true, magic: false, excludesDot: true },
+    trigger: { on: 'cast', chance: 1 },
+    on: 'cast', chance: 1,
+  });
+  const cast = (p) => p.id === 'Hit'
+    ? { damage: 100, heal: 0, shield: 0, critPhysical: 100, totalPhysical: 100 }
+    : p.id === 'Big'
+      ? { damage: 1000, heal: 0, shield: 0, critPhysical: 1000, totalPhysical: 1000 }
+      : { damage: 0, heal: 0, shield: 0 };
+  const dotOutput = () => ({ damage: 0, heal: 0 });
+  const base = {
+    filler: [], triggered: [], passive: [], unmodelled: [], runes: [], rank: 3,
+  };
+
+  // One cast at t=0, an 8s/2s bleed, a 3-second fight: one tick lands, so a
+  // quarter of the owed 100 is paid - 50 fraction on that is 12.5, not 50.
+  {
+    const rotation = {
+      ...base,
+      active: [{ prof: prof('Hit', 100, 0.5), source: 't', applies: { self: [], target: [] } }],
+      dots: [mkPool('Hit', false)],
+    };
+    const short = simulate({ rotation, cast, dotOutput, fight: 3 });
+    const poolLine = (r) => r.lines.find((l) => l.id === 'Hit_Pool');
+    near('a short fight pays only the ticks that landed',
+      poolLine(short)?.perCast.damage ?? 0, 12.5, 0.01);
+    // Over a fight long against the window, nearly everything is paid.
+    const rot2 = {
+      ...base,
+      active: [{ prof: prof('Hit', 5, 0.5, { charges: 1 }), source: 't', applies: { self: [], target: [] } }],
+      dots: [mkPool('Hit', false)],
+    };
+    const long = simulate({ rotation: rot2, cast, dotOutput, fight: 200 });
+    const paid = poolLine(long)?.perCast.damage ?? 0;
+    // A 5s cooldown with 0.5s occupancy casts every 5s: 40 casts, 2000 owed.
+    const fedHalf = 0.5 * 100 * 40;
+    ok('a long fight converges on the whole share', paid > fedHalf * 0.85 && paid <= fedHalf + 1,
+      `${paid.toFixed(0)} of ${fedHalf.toFixed(0)}`);
+  }
+
+  // An `own` pool eats only its own skill's output: Big crits ten times harder,
+  // and none of it may leak into Hit's per-skill pool.
+  {
+    const rotation = {
+      ...base,
+      active: [
+        { prof: prof('Hit', 20, 0.5), source: 't', applies: { self: [], target: [] } },
+        { prof: prof('Big', 20, 0.5), source: 't', applies: { self: [], target: [] } },
+      ],
+      dots: [mkPool('Hit', true)],
+    };
+    const r = simulate({ rotation, cast, dotOutput, fight: 200 });
+    const pool = r.lines.find((l) => l.id === 'Hit_Pool');
+    const hits = r.lines.find((l) => l.id === 'Hit');
+    ok('an own pool is fed by its own skill alone',
+      pool && hits && pool.perCast.damage < hits.perCast.damage * (r.fight ?? 200),
+      JSON.stringify({ pool: pool?.perCast.damage, why: pool?.why }));
+    ok('...and says so', pool?.why.includes('dealt by itself'), pool?.why);
+    // 10 casts of 100, half owed to the pool, everything ticked out: ~500.
+    const total = pool?.perCast.damage ?? 0;
+    ok('...and the number is its own share, not the rotation\'s',
+      total > 350 && total < 550, String(total));
+  }
+}
+
+// --- the fight plays for the goal ------------------------------------------
+// The derived player used to maximise dps+hps+sps whatever the caller asked,
+// so a dps query on a Priest spent GCDs on heals - and the best-of-two pick
+// could keep the branch that healed more and damaged less.
+group('the fight plays for the goal');
+{
+  const prof = (id, cooldown, occ) => ({
+    id, name: id, cooldown, occupancy: occ, charges: 1, isCombo: false, type: 'ClassSkill', costs: [],
+  });
+  const cast = (p) => p.id === 'Nuke' ? { damage: 1000, heal: 0, shield: 0 }
+    : p.id === 'Mend' ? { damage: 0, heal: 5000, shield: 0 }
+      : { damage: 10, heal: 0, shield: 0 };
+  const dotOutput = () => ({ damage: 0, heal: 0 });
+  const rotation = {
+    active: [
+      { prof: prof('Mend', 10, 1), source: 't', applies: { self: [], target: [] } },
+      { prof: prof('Nuke', 10, 1), source: 't', applies: { self: [], target: [] } },
+    ],
+    filler: [{ prof: prof('Swing', 0, 1), applies: { self: [], target: [] } }],
+    triggered: [], passive: [], dots: [], unmodelled: [], runes: [], rank: 3,
+  };
+  const dps = simulate({ rotation, cast, dotOutput, fight: 120, goal: 'dps' });
+  const all = simulate({ rotation, cast, dotOutput, fight: 120 });
+  ok('a dps fight spends no time healing', dps.hps === 0, String(dps.hps));
+  ok('...and gets at least the blended fight\'s damage', dps.dps >= all.dps - 1e-9,
+    `${all.dps.toFixed(1)} -> ${dps.dps.toFixed(1)}`);
+  ok('with no goal, everything still counts', all.hps > 0, String(all.hps));
+  const hps = simulate({ rotation, cast, dotOutput, fight: 120, goal: 'hps' });
+  ok('an hps fight heals more than the blend', hps.hps >= all.hps, `${all.hps.toFixed(1)} -> ${hps.hps.toFixed(1)}`);
+}
+
+// --- live resource gain factor ---------------------------------------------
+// `attribute.gainAtb` is a multiplier on INCOME and it is a live stat:
+// Warrior_BerserkStatus carries RageGainFactor ARatio +1, so Rage earned
+// inside a Berserk window doubles. Frozen at the resting sheet's 1, the
+// doubling never applied - and the shortfall sat exactly inside the +20%
+// window where a Rage spender is worth most.
+group('live resource gain factor');
+{
+  const eng = createEngine({ quiet: true });
+  const st = eng.cdb.byId('skill').get('Warrior_BerserkStatus');
+  const aff = (st?.affixes ?? []).find((a) => a.target?.attribute === 'RageGainFactor');
+  ok('Warrior_BerserkStatus declares the doubling', !!aff && aff.val === 1 && /ARatio/.test(aff.ref),
+    JSON.stringify(aff ?? null));
+
+  const prof = (id, cooldown, occ, extra = {}) => ({
+    id, name: id, cooldown, occupancy: occ, charges: 1, isCombo: false, type: 'ClassSkill',
+    costs: [], ...extra,
+  });
+  const BUFF = { status: 'Berserk', duration: 6, stacks: 1, affixes: [] };
+  const cast = (p) => p.id === 'Spend' ? { damage: 500, heal: 0, shield: 0 }
+    : p.id === 'Roar' ? { damage: 0, heal: 0, shield: 0 }
+      : { damage: 10, heal: 0, shield: 0 };
+  const dotOutput = () => ({ damage: 0, heal: 0 });
+  const rotation = {
+    active: [
+      { prof: prof('Roar', 30, 0.5), source: 't', applies: { self: [BUFF], target: [] } },
+      { prof: prof('Spend', 0, 0.5, { costs: [{ atb: 'Rage', amount: 10 }] }), source: 't', applies: { self: [], target: [] } },
+    ],
+    filler: [{ prof: prof('Swing', 0, 1), applies: { self: [], target: [] } }],
+    triggered: [], passive: [], dots: [], unmodelled: [], runes: [], rank: 3,
+    resources: { tracked: ['Rage'], gains: [{ atb: 'Rage', amount: 1, on: 'attack', from: 'income', chance: 1 }] },
+  };
+  const run = (poolFactor) => simulate({
+    rotation, cast, dotOutput, fight: 200,
+    timedBuffs: [{ status: 'Berserk' }],
+    resources: { Rage: { max: 20, start: 0, factor: 1, gainAtb: 'RageGainFactor' } },
+    poolFactor,
+  });
+  const flat = run(null);
+  const live = run((atb, state) => state.key.includes('Berserk') ? 2 : 1);
+  ok('income earned inside the window doubles',
+    live.dps > flat.dps, `${flat.dps.toFixed(1)} -> ${live.dps.toFixed(1)}`);
+}
+
+// --- the idle wake ---------------------------------------------------------
+// A cast blocked only by its POOL comes back when income does. The idle branch
+// used to wake only for cooldown timers, so a build with no filler slept to
+// the bell on a full bank of Rage income: 0 casts where the income funds ~6.
+group('the idle wake');
+{
+  const prof = (id, cooldown, occ, extra = {}) => ({
+    id, name: id, cooldown, occupancy: occ, charges: 1, isCombo: false, type: 'ClassSkill',
+    costs: [], ...extra,
+  });
+  const cast = (p) => p.id === 'Spend' ? { damage: 100, heal: 0, shield: 0 } : { damage: 0, heal: 0, shield: 0 };
+  const dotOutput = () => ({ damage: 0, heal: 0 });
+  const rotation = {
+    active: [
+      { prof: prof('Spend', 0, 0.5, { costs: [{ atb: 'Rage', amount: 10 }] }), source: 't', applies: { self: [], target: [] } },
+    ],
+    filler: [],
+    triggered: [], passive: [], dots: [], unmodelled: [], runes: [], rank: 3,
+    resources: { tracked: ['Rage'], gains: [{ atb: 'Rage', amount: 1, on: 'time', every: 3, from: 'income' }] },
+  };
+  const r = simulate({
+    rotation, cast, dotOutput, fight: 200,
+    resources: { Rage: { max: 20, start: 0, factor: 1 } },
+  });
+  // 1 Rage per 3s is 66 Rage in 200s: six casts of ten, with rounding slack.
+  const total = r.dps * 200;
+  ok('a fillerless build wakes for pool income', total >= 500 && total <= 700,
+    `${total.toFixed(0)} damage = ${(total / 100).toFixed(1)} casts`);
+}
+
+// --- a guarded self-buff is refused ----------------------------------------
+// Ram Veil's +5 CritChance / +5 Fervor lands only when a max-stacked
+// Benediction is CONSUMED - `hasStatusMaxStacked` in as many words - and the
+// entry used to ship without the guard, so the buff was credited on every
+// cast at ~100% uptime. Refused and named instead.
+group('a guarded self-buff is refused');
+{
+  const eng = createEngine({ quiet: true });
+  const st = eng.plan.statusesOf('Mace_Benediction_Skill1', { rank: 3 });
+  ok('Ram Veil\'s buff is not a self entry', !st.self.some((b) => b.status === 'Mace_Benediction_Skill1_Status'),
+    JSON.stringify(st.self.map((b) => b.status)));
+  const refused = st.unreadable.find((u) => u.status === 'Mace_Benediction_Skill1_Status');
+  ok('...it is refused and NAMED', !!refused && /hasStatusMaxStacked/.test(refused.why), refused?.why);
+
+  // ...and a build that slots the skill says so in its coverage report.
+  const l = emptyLoadout(eng.cat, 'Priest', 25);
+  l.gear.Slot_Weapon1 = { item: 'Mace_Benediction', stars: 0 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  ok('the refusal reaches the coverage report',
+    ev.throughput.unmodelled.some((u) => u.kind === 'buff refused' && u.id === 'Mace_Benediction_Skill1_Status'),
+    JSON.stringify(ev.throughput.unmodelled.filter((u) => u.kind === 'buff refused')));
+}
+
 // --- the base-attack chain -------------------------------------------------
 // `moveSet.comboLength` is the authored length of a weapon's chain, and it went
 // unread for long enough that two weapons were swinging a chain shorter than
@@ -2119,8 +2524,13 @@ group('a buff window prices only itself');
   // not. Any gain at all means a buff window is crediting something else.
   ok('pressing a zero-damage defensive cooldown never raises dps',
     a <= b + 1e-6, `with ${a.toFixed(2)} vs without ${b.toFixed(2)}`);
-  ok('...and costs about what the clock says it should',
-    (b - a) / b < 0.02, `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s every 50s of a 200s fight`);
+  // The cost is the clock PLUS the chain: a cast interrupts the base-attack
+  // chain (reported from play), so pressing it also forfeits progress toward
+  // the combo finisher. 0.5s every 50s is 1% of the clock; the chain loss
+  // roughly doubles it. It must still be a small number, not a large one.
+  ok('...and costs about what the clock and the dropped chain say it should',
+    (b - a) / b > 0.001 && (b - a) / b < 0.045,
+    `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s + a chain restart every 50s of a 200s fight`);
 }
 
 // --- the rotation search ----------------------------------------------------

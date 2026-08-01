@@ -23,9 +23,11 @@
 //     HealGivenMultiplier (+1) and ShieldPowerMultiplier (+1). So the
 //     offensive half is a code-only path, modelled here as a multiplier and
 //     flagged UNVERIFIED.
-//   * PhysicalMastery and MagicMastery are the same shape of hole. They are
-//     also zero from every source this build ships, so the assumption is
-//     currently inert.
+//   * PhysicalMastery and MagicMastery are the same shape of hole - and they
+//     are LIVE, not inert: `GA_Craft_FinalCombo_Status` (Brutal Frenzy, on the
+//     Warrior's own top pick) stacks +4 PhysicalMastery to 12, so the assumed
+//     multiplier moves that build ~3.6% and can flip the weapon choice.
+//     `--no-mastery` is the toggle that shows the exposure.
 //   * WeaponPower has no scaling entry and no atbScaling group, so it must be
 //     set from the equipped weapon. The model derives it from the weapon's own
 //     share of the primary budget, which is consistent with
@@ -43,7 +45,15 @@ import { simulate } from './sim.mjs';
 const FILLER_TYPES = new Set(['Attack', 'Attack2', 'Attack3', 'Attack4', 'AttackCombo']);
 const COMBO_TYPES = new Set(['AttackCombo']);
 
-export function buildCombat(cdb, ctx) {
+export function buildCombat(cdb, ctx, assume = {}) {
+  // The floor on how fast a chain link swings. Two stopwatch measurements
+  // (Cheese Moon, 10 chains in 28s; Judgement, 10 in ~30s) both land on ~0.70s
+  // a swing: Judgement's authored durations already sit at 0.70-0.85 and match
+  // the watch exactly, while the fast axe's authored 0.25-0.55 are HIT timings
+  // that under-run it by a second a cycle. No constant in the sheet carries
+  // the 0.7 - `Attacks_RecoveryRatio` (0.25) reproduces neither watch - so it
+  // is calibrated, named in the audit, and movable with --swing-floor.
+  const swingFloor = Number.isFinite(assume.swingFloor) ? assume.swingFloor : 0.7;
   const skills = cdb.byId('skill');
   const affinities = cdb.byId('affinity');
   const effectNames = cdb.enumValues('skill@steps@effects', 'effect');
@@ -360,7 +370,11 @@ export function buildCombat(cdb, ctx) {
     // When a skill has NOTHING but lingering steps and declares no duration,
     // the area IS the cast - dropping to the 0.1s floor would make it free.
     if (end <= 0 && !(skillVal(skill.duration, skill, 0) > 0)) end = lingering;
-    return Math.max(skillVal(skill.duration, skill, 0), end, 0.1);
+    const span = Math.max(skillVal(skill.duration, skill, 0), end, 0.1);
+    // A chain link cannot swing faster than the measured swing period - see
+    // `swingFloor` above. Only the base-attack chain: a weapon skill's cast
+    // time is its own business.
+    return FILLER_TYPES.has(typeName) ? Math.max(span, swingFloor) : span;
   }
 
   // Flatten a skill into the shape the objective needs. Rank gates on effects
@@ -688,9 +702,39 @@ export function buildCombat(cdb, ctx) {
   }
 
   // --- one cast ------------------------------------------------------------
-  function amountOf(effect, sheet) {
+  function amountOf(effect, sheet, swingAttrs = null, weaponMixFlats = null) {
     let a = effect.baseVal;
-    for (const s of effect.scaling) a += s.ratio * (sheet.get(s.atb) ?? 0);
+    for (const s of effect.scaling) {
+      let v = sheet.get(s.atb) ?? 0;
+      // WeaponPower is the weapon's flat base PLUS the mean of the ITEM's
+      // aptitude attributes. The expanded tooltips render it outright:
+      // Beefury (Fighter+Cleric) swings "(13 + 6.5% Strength + 6.5% Faith)"
+      // - the type's 13% split across its two aptitude attributes -
+      // Wingsabers "(22 + 10.25% Strength + 10.25% Intellect)", and the
+      // single-aptitude Judgement keeps its whole 0.7 on Strength. The live
+      // reads agree: the axe's equip delta and the greataxe's 78-95 both
+      // price on ratio x (flat + attributes/n).
+      if (s.atb === 'WeaponPower' && swingAttrs?.length) {
+        let sum = 0;
+        for (const atb of swingAttrs) sum += sheet.get(atb) ?? 0;
+        v += sum / swingAttrs.length;
+      }
+      // A MAINHAND WEAPON SKILL's attribute scaling is 60% attribute and 40%
+      // a flat from THAT ATTRIBUTE's own budget curve. The rule is
+      // `constant.WeaponPowerRatio`'s own description - "Percent of AP/SP
+      // scaling that are replaced by a flat amount coming from the weapon",
+      // MainhandWeaponSkill 0.4 - and the flat being per-attribute is what
+      // Tear settled: 0.45 x (0.6x49 + 0.4x123.6[Strength curve]) + 0.45 x
+      // (0.6x46 + 0.4x148.3[Dexterity curve]) = 74.6 against a measured 75,
+      // where one shared Strength flat prices 70.5. Six measured integers
+      // reproduce exactly: Rampage 233/371/556, Brutal Frenzy 133 and its
+      // 28 rider, Tear 75.
+      else if (weaponMixFlats) {
+        const f = weaponMixFlats.get(s.atb);
+        if (f) v = 0.6 * v + 0.4 * f;
+      }
+      a += s.ratio * v;
+    }
     return a;
   }
 
@@ -778,6 +822,7 @@ export function buildCombat(cdb, ctx) {
     let damage = 0, heal = 0, shield = 0;
     let singleTargetDamage = 0;
     let critPhysical = 0, critMagic = 0;
+    let totalPhysical = 0, totalMagic = 0;
     // What this cast puts into a resource pool. `Mage_RayOfSpark` returns
     // 0.18 * MaxSpark, so the amount needs the sheet exactly the way damage
     // does - which is why it is computed here rather than at plan time.
@@ -785,12 +830,13 @@ export function buildCombat(cdb, ctx) {
     for (const e of prof.effects) {
       if (e.kind === 'GainAtb') {
         if (!e.atb) continue;
-        const got = amountOf(e, sheet) * (e.hits ?? 1);
+        const got = amountOf(e, sheet, opts.swingAttrs ?? null) * (e.hits ?? 1);
         if (!got) continue;
         (gains ??= []).push({ atb: e.atb, amount: got });
         continue;
       }
-      const raw = amountOf(e, sheet) * (e.hits ?? 1);
+      const raw = amountOf(e, sheet, opts.swingAttrs ?? null,
+        opts.weaponMix?.ids?.has(prof.id) ? opts.weaponMix.flats : null) * (e.hits ?? 1);
       if (!raw) continue;
       // Only an Area or Aura step reaches the crowd, and `props.hitCount` is a
       // target cap when the row sets one. `ignoreMainTarget` takes the enemy
@@ -832,21 +878,31 @@ export function buildCombat(cdb, ctx) {
         }
         damage += raw * m * targets;
         singleTargetDamage += raw * m;
-        // How much of that landed as a CRITICAL strike, by affinity. A pool dot
-        // is a share of the hit that triggered it and the trigger is usually a
-        // crit, so the fight needs the crit slice rather than the total. The
-        // fraction is `p*cd / (1 - p + p*cd)` and is the same for every effect,
-        // so this is the expected value, exactly - no sampling.
+        // How much of that landed at all and how much as a CRITICAL strike, by
+        // affinity. A pool dot is a share of the damage that triggered it -
+        // Hemorrhage's trigger is a crit, so it needs the crit slice, while
+        // Bonethrow's guard has no crit test and takes its whole output - so
+        // the fight needs both streams. The crit fraction is `p*cd / localCrit`
+        // with the CATEGORY bonuses in: Sever's +20% crit damage on weapon
+        // skills raises the crit slice of those hits, and reading the base
+        // p*cd/critMult against a total built with localCrit under-fed the
+        // pools of exactly the crit-stacked builds the optimiser recommends.
         // ...and BEFORE DamageModifier. A pool dot banks base damage and each
         // tick is multiplied by whatever is up when it lands - checked in game:
         // a bleed already ticking at 100 goes to 120 the moment Berserk is
         // pressed, without a new crit. So the multiplier cannot be baked in at
         // the moment the pool is fed; it is applied over the ticking window.
-        if (critMult > 0 && dmgMod > 0) {
-          const critShare = (raw * m * targets)
-            * (critChance * (sheet.get('CritDamage') ?? 100) / 100) / critMult / dmgMod;
-          if (aff.root === 'Physical') critPhysical += critShare;
-          else if (aff.root === 'Magic') critMagic += critShare;
+        if (dmgMod > 0) {
+          const banked = (raw * m * targets) / dmgMod;
+          if (aff.root === 'Physical') totalPhysical += banked;
+          else if (aff.root === 'Magic') totalMagic += banked;
+          if (localCrit > 0) {
+            const pEff = Math.min(1, critChance + chanceBonus);
+            const cdEff = (sheet.get('CritDamage') ?? 100) / 100 + critBonus;
+            const critShare = (raw * m * targets) * (pEff * cdEff) / localCrit / dmgMod;
+            if (aff.root === 'Physical') critPhysical += critShare;
+            else if (aff.root === 'Magic') critMagic += critShare;
+          }
         }
       } else if (e.kind === 'Heal') {
         // HealGivenMultiplier already carries Fervor - that one IS verified,
@@ -856,7 +912,7 @@ export function buildCombat(cdb, ctx) {
         shield += raw * shieldMod;
       }
     }
-    return { damage, heal, shield, singleTargetDamage, gains, critPhysical, critMagic };
+    return { damage, heal, shield, singleTargetDamage, gains, critPhysical, critMagic, totalPhysical, totalMagic };
   }
 
   // --- throughput ----------------------------------------------------------
@@ -929,16 +985,33 @@ export function buildCombat(cdb, ctx) {
       if (!(max > 0)) continue;
       // `attribute.gainAtb` names a multiplier on everything you EARN into this
       // pool - Rage declares `RageGainFactor`, which the Warrior unit sets to 1
-      // and `Warrior_BerserkStatus` doubles with an ARatio of +1. So it is a
-      // no-op today and a real doubling under Berserk, and reading it costs a
-      // lookup. A pool whose factor is absent earns at face value.
+      // and `Warrior_BerserkStatus` doubles with an ARatio of +1. The resting
+      // value is the default; the NAME travels too, so the fight can re-read
+      // the factor against whatever is up when the income actually arrives -
+      // frozen at rest, the doubling never applied and Berserk's extra Rage
+      // was lost exactly inside the +20% window where it pays most.
       const factor = a.gainAtb ? (sheet.get(a.gainAtb) ?? 1) : 1;
       resources[atb] = {
         max,
         start: a.flags.has('NoAutoFill') ? 0 : max,
         factor: factor > 0 ? factor : 1,
+        gainAtb: a.gainAtb ?? null,
       };
     }
+    // The live gain factor for a pool, priced against the buffs that are up at
+    // the moment the income arrives. Memoised on the state key the same way
+    // cast pricing is; the resting sheet answers when nothing is up.
+    const factorCache = new Map();
+    const poolFactor = (gainAtb, state) => {
+      const key = gainAtb + '|' + (state?.key ?? '');
+      let f = factorCache.get(key);
+      if (f == null) {
+        f = restat(state?.self ?? []).get(gainAtb) ?? 1;
+        if (!(f > 0)) f = 1;
+        factorCache.set(key, f);
+      }
+      return f;
+    };
 
     // What a pool dot's ticks are multiplied by, averaged over the fight.
     // The ticks are spread evenly across the bleed's life and a damage buff is
@@ -950,14 +1023,57 @@ export function buildCombat(cdb, ctx) {
     // on anything ticking; `Exsanguination` lets the bleed itself critically
     // strike, which the base game does not let it do - so it is a crit chance
     // applied to a damage stream that otherwise has none.
+    //
+    // PER POOL DOT, matched by status type. Exsanguination's guard says
+    // `isStatusType(StatusType.Hemorage)` and Bonethrow's status is a plain
+    // `Bleed`; the statusType sheet subtypes them ONE way (`Hemorage` declares
+    // `parent: Bleed`, nothing else declares a parent), so Bloodletting's Bleed
+    // guard covers both dots and Exsanguination's Hemorage guard covers only
+    // Hemorrhage and Infused Wound. One shared multiplier handed the crit
+    // chance to both. That the game's isStatusType walks the parent chain is
+    // an assumption - the column is in the data, the walk is not - and it is
+    // the only reading under which the parent column does anything at all.
     const bleedMods = live?.mods?.bleed ?? {};
     const bleedCrit = bleedMods.critChance ?? 0;
-    const poolMultiplier = ((live?.averagedSheet ?? sheet).get('DamageModifier') ?? 100) / 100
+    const avgDmgMod = ((live?.averagedSheet ?? sheet).get('DamageModifier') ?? 100) / 100;
+    const poolMultiplier = avgDmgMod
       * (1 + (bleedMods.dmgMult ?? 0))
       * (1 + bleedCrit * ((sheet.get('CritDamage') ?? 100) / 100 - 1));
+    const typeParent = new Map();
+    for (const r of cdb.lines('statusType')) typeParent.set(r.id, r.parent ?? null);
+    const coveredBy = (guardType, dotTypes) => (dotTypes ?? []).some((t) => {
+      for (let cur = t, hops = 0; cur != null && hops < 8; cur = typeParent.get(cur) ?? null, hops++) {
+        if (cur === guardType) return true;
+      }
+      return false;
+    });
+    const bleedScoped = live?.mods?.bleedScoped ?? null;
+    const poolScale = new Map();
+    if (bleedScoped) {
+      for (const d of rotation.dots ?? []) {
+        if (!d.pool) continue;
+        let dmgMult = 0, critCh = 0, healShare = 0;
+        for (const mod of bleedScoped) {
+          if (!coveredBy(mod.statusType, d.types)) continue;
+          if (mod.field === 'dmgMult') dmgMult += mod.amount;
+          else if (mod.field === 'critChance') critCh += mod.amount;
+          else if (mod.field === 'healShare') healShare += mod.amount;
+        }
+        poolScale.set(d.status, {
+          mult: avgDmgMod * (1 + dmgMult)
+            * (1 + critCh * ((sheet.get('CritDamage') ?? 100) / 100 - 1)),
+          healShare,
+        });
+      }
+    }
 
     return simulate({
       rotation, cast, dotOutput, cdr, cdrWeaponSkill, resources, poolMultiplier,
+      poolScale: bleedScoped ? poolScale : null,
+      poolFactor,
+      goal: live?.goal ?? null,
+      chainResets: opts.assume?.chainResets ?? true,
+      swingVariance: cdb.byId('constant').get('WeaponAttack_RandomRange')?.v?.float ?? 0.1,
       poolHealShare: bleedMods.healShare ?? 0,
       critChance: Math.min(1, Math.max(0, (sheet.get('CritChance') ?? 0) / 100)),
       timedBuffs: live?.timedBuffs ?? [],
@@ -996,8 +1112,20 @@ export function buildCombat(cdb, ctx) {
   }
 
   // WeaponPower: not shipped as a scaling entry or a budget group, so it has
-  // to come from the weapon. Modelled as the weapon slot's own share of the
-  // class primary budget at the weapon's effective level.
+  // to come from the weapon. It is the FULL class primary budget at the
+  // weapon's TRAINED level - calibrated against a real Cheese Moon on a
+  // 0-armor dummy: tooltip "18-21 Physical damage" and observed naked swings
+  // of 19-24, where swing 1's authored 0.13 x WeaponPower needs ~150-165 and
+  // the full budget at the trained effective level gives 148-156. The old
+  // slot-share reading (x0.28) priced the same swing at 4.5-5.7, four times
+  // low on every base attack in the game.
+  //
+  // TRAINED level, not drop level: weapons level per kills
+  // (WeaponKills_PerSkillRankPoint), and the same axe whose stats still read
+  // the level-11 drop budget swings with the level-25 curve once trained.
+  // Assumed fully trained to the character's level, alongside the bench's
+  // existing "fully mastered" default.
+  //
   // ONLY the main hand. This used to sum both weapon slots at the arsenal's 0.4
   // factor, so equipping an arsenal weapon raised every base attack by ~40% -
   // for a slot that skills.mjs is explicit grants no base-attack chain and no
@@ -1011,26 +1139,100 @@ export function buildCombat(cdb, ctx) {
     if (!g?.item) return 0;
     const item = cat.itemById.get(g.item);
     if (!item) return 0;
-    const ratio = cat.inherited(item.type, (t) => t?.atbRatio)?.primary ?? 0;
-    if (!ratio) return 0;
-    const effLevel = cat.effectiveLevel(item, {
-      charLevel: loadout.level,
-      stars: Math.min(g.stars ?? 0, cat.maxStars(item, g.rarity)),
-      flawless: !!g.flawless,
-      rarity: g.rarity ?? null,
-    });
-    return budget(effLevel, primary.start, primary.end, ctx.consts.earlyMaxLevel) * ratio;
+    // The FLAT half of the trained level's primary budget - no rarity or star
+    // iLevel bonuses, which the measured tooltips assign to the STATS, not to
+    // the damage line. The primary-attribute half is added at consumption, per
+    // sheet, in amountOf - it follows whatever Strength the sheet carries.
+    //
+    // ONE-HANDERS take the whole flat budget, TWO-HANDERS 0.4 of it - both
+    // measured on a 0-armor dummy at trained level 25: Cheese Moon's swings
+    // need a flat of ~116-120 (budget 123.6) through its 0.13 ratio, and
+    // Judgement's need ~52 (0.4 x budget) through its 0.7. The pair is what
+    // makes a two-hander a two-hander: 3-4x the swing damage, and 5x the
+    // Strength scaling per point. 1.0/0.4 are the parsimonious constants
+    // within the +-5% the display rounding leaves; the residuals are in the
+    // audit, and `constant.WeaponPowerRatio` carrying exactly {0.4, 1} is
+    // suggestive but unproven provenance.
+    const twoHanded = !cat.allowsOffhand(item);
+    return budget(loadout.level, primary.start, primary.end, ctx.consts.earlyMaxLevel)
+      * (twoHanded ? 0.4 : 1.0);
+  }
+
+  /** The aptitude's primary attribute - what WeaponPower adds at consumption. */
+  function primaryAtbFor(cls) {
+    const apt = cdb.byId('aptitude').get(cls.aptitude);
+    return (apt?.atbScaling ?? []).find((e) => (e.statGroup ?? 0) === 0)?.endAtb ?? null;
+  }
+
+  /** The flat primary budget at a level - the weapon's contribution to skills. */
+  function primaryBudgetFor(cls, level) {
+    const apt = cdb.byId('aptitude').get(cls.aptitude);
+    const primary = (apt?.atbScaling ?? []).find((e) => (e.statGroup ?? 0) === 0);
+    return primary ? budget(level, primary.start, primary.end, ctx.consts.earlyMaxLevel) : 0;
+  }
+
+  /**
+   * Every primary attribute's own budget curve at a level, one entry per
+   * aptitude - Strength 123.6 and Dexterity 148.3 at 25 are NOT the same
+   * number, and Tear (45% Str + 45% Dex) is what proved each scaling mixes
+   * with its own curve rather than the wielder's.
+   */
+  function attributeBudgets(level) {
+    const flats = new Map();
+    for (const apt of cdb.lines('aptitude')) {
+      const primary = (apt.atbScaling ?? []).find((e) => (e.statGroup ?? 0) === 0);
+      if (!primary?.endAtb || flats.has(primary.endAtb)) continue;
+      flats.set(primary.endAtb, budget(level, primary.start, primary.end, ctx.consts.earlyMaxLevel));
+    }
+    return flats;
   }
 
   const audit = [
-    { severity: 'unverified', what: 'Fervor increases the damage of skills by its own percentage',
-      why: 'Its description says "your Skills"; no attribute in the sheet carries the coefficient. ' +
-           '--fervor-scope skills|all|none decides whether base attacks get it too, and the choice ' +
-           'moves the answer between Fervor gear and penetration gear.' },
-    { severity: 'unverified', what: 'PhysicalMastery / MagicMastery multiply matching-affinity damage',
-      why: 'Both have empty scaling and are zero from every source in this build, so the assumption is currently inert.' },
-    { severity: 'unverified', what: 'WeaponPower = the weapon slot\'s share of the class primary budget',
-      why: 'WeaponPower has no scaling entry and no budget group. Every base attack scales off it, so absolute damage depends on this.' },
+    { severity: 'verified', what: 'Fervor multiplies ALL damage by its own percentage, base attacks included',
+      why: 'Measured on a 0-armor dummy: a combo finisher at 133 reads exactly 133 x 1.12 x 1.016 = 151 ' +
+           'under +12% PhysicalMastery and 30 FervorRating (~+1.58%); without the Fervor term it prices ' +
+           '149. Its description says "your Skills", and the finisher that moved is a base-attack chain ' +
+           'link - so the description undersells it and the default is all. --fervor-scope skills|none ' +
+           'remain as sensitivity toggles.' },
+    { severity: 'verified', what: 'PhysicalMastery / MagicMastery multiply matching-affinity damage',
+      why: 'Measured on a 0-armor dummy: with 3 Brutal Frenzy stacks (+12 PhysicalMastery) swings moved ' +
+           'x1.127 and the finisher x1.135 - both 1.12 x the Fervor also up at the time. The coefficient ' +
+           'is 1 + mastery/100, exactly as modelled; --no-mastery remains as a sensitivity toggle.' },
+    { severity: 'assumption', what: 'WeaponPower = the TRAINED level\'s flat primary budget x (1.0 one-handed, 0.4 two-handed), plus the mean of the item\'s aptitude attributes',
+      why: 'Calibrated on a 0-armor dummy against two weapons at trained level 25 (Cheese Moon flat ' +
+           '~116-120 vs budget 123.6 through its 0.13; Judgement ~52 = 0.4 x budget through its 0.7), ' +
+           'and the attribute half is rendered outright by the expanded tooltips: Beefury swings ' +
+           '"(13 + 6.5% Strength + 6.5% Faith)" - the type ratio split across the item\'s two aptitude ' +
+           'attributes - Wingsabers "(22 + 10.25% Strength + 10.25% Intellect)", Judgement all 0.7 on ' +
+           'Strength. Two bag reads (Beefury 16-19, Wingsabers 27-32, both Epic 0-star) imply flats of ' +
+           '~100-107, consistent with weapons trained BELOW the character\'s level - the bench assumes ' +
+           'fully trained, which overstates an untrained pickup and is exact for a levelled main. Their ' +
+           'displayed weapon Level lines would confirm the trained-level reading.' },
+    { severity: 'verified', what: 'a mainhand skill\'s attribute scaling is 60% attribute + 40% of that attribute\'s own budget curve',
+      why: 'constant.WeaponPowerRatio\'s own description - "Percent of AP/SP scaling that are replaced ' +
+           'by a flat amount coming from the weapon", MainhandWeaponSkill 0.4 - measured exact on ten ' +
+           'integers, and the game\'s expanded tooltips RENDER the rule: Royal Severance shows ' +
+           '"(30 + 30% Intellect)" and "(25 + 30% Strength)" - 0.6 x its authored 0.5 on the attribute, ' +
+           '0.4 x 0.5 x each attribute\'s own level-25 curve as the flat (148.3 and 123.6) - Hive Bite ' +
+           '"(48 + 29.33% x2)" is authored 0.85 x its own rank-2 +15%, and its heal "(9 + 10.35% ' +
+           'Faith)" is 0.15 x 1.15. Live: Rampage 233/371/556, Brutal Frenzy 133 + 28 rider, Tear 75 ' +
+           '(the two-attribute case that proved the flat is per attribute). The flats follow the ' +
+           'CHARACTER\'s level even on a lower-trained weapon. Applied to skills the MAIN HAND grants; ' +
+           'arsenal and class skills keep pure attribute scaling, unmeasured.' },
+    { severity: 'verified', what: 'an item pays EVERY aptitude it names - except armour, which pays once',
+      why: 'Read off the character sheet: a naked Warrior at 38/34/28 Vitality/Strength/Dexterity ' +
+           'equips Cheese Moon (Fighter+Assassin) and reads 74/49/46 - every tooltip line, including ' +
+           'the Assassin\'s +18 Dexterity the old own-half rule refused a Warrior - and Tear\'s live 75 ' +
+           'prices on that Dexterity too. Armour still pays once: its budget is the wearer\'s ' +
+           'resistForReduction with no aptitude in it. Generic jewellery still pays exactly one named ' +
+           'row (measured separately). Consequence: dual-aptitude gear carries roughly two budgets ' +
+           'of primaries and ratings, and is priced that way now.' },
+    { severity: 'assumption', what: 'Brutal Frenzy\'s 0.3-ratio step is billed per finisher, not as its 15%-per-attack rider',
+      why: 'The tooltip says "all your attacks have a 15% chance to deal an additional 28" - a rider ' +
+           'the script rolls on every attack - while the step itself is authored unconditionally on ' +
+           'the finisher. Per cast the model bills 28 x finisher rate; the rider reads 0.15 x 28 x ' +
+           'attack rate. At measured swing and combo rates the two are within a few dps of each other, ' +
+           'so the wrong schedule is kept knowingly rather than half-read.' },
     { severity: 'unmodelled', what: 'most of what a rune or a talent does, pending the script kernel',
       why: 'Most talent nodes and most runes declare nothing this model reads, but they DO ship hscript ' +
            'bodies calling a small, closed set of host functions - so the gap is the script kernel, not ' +
@@ -1041,8 +1243,12 @@ export function buildCombat(cdb, ctx) {
            'plays the second when Priest_Talent_SunHalo is also taken. Nothing in the step row says so, so ' +
            'the status reads as 1.2x Faith rather than 0.6x unless SunHalo is in the build. A talent that ' +
            'grants a status can therefore be overstated by whatever its conditional steps add.' },
-    { severity: 'assumption', what: 'charged skills are evaluated at full charge',
-      why: 'Steps gated on cond.castHoldStep are mutually exclusive charge levels; the highest is used.' },
+    { severity: 'assumption', what: 'charged skills are evaluated at full charge, and the hold is billed',
+      why: 'Steps gated on cond.castHoldStep are mutually exclusive charge levels; the highest is used ' +
+           'and its hold time is charged as occupancy. Checked in game on Rampage: 233/371/556 damage at ' +
+           '1s/2s/3s of hold - exactly its authored 2.5/4/6 x Strength and vars.time 3 - and a tap does ' +
+           'not cast at all. What remains assumed is the CHOICE of full charge, and the ~0.3s between ' +
+           'release and impact is not billed.' },
     { severity: 'unmodelled', what: 'skill scripts, beyond the links and guards read out of them',
       why: '427 of 962 skills carry hscript bodies this build does not execute. Four things ARE read out ' +
            'of the text, because the data records them nowhere else: the status a skill applies ' +
@@ -1058,26 +1264,39 @@ export function buildCombat(cdb, ctx) {
            'statuses declare it. Everything else refreshes, losing the overflow. Guessing which dots pool ' +
            'from "is the declared amount a total" instead matched nearly every dot in the game and took ' +
            'the answer to 44,000 dps, which is what the column is for.' },
-    { severity: 'assumption', what: 'a pool DoT is credited as a lossless share of what fed it',
+    { severity: 'assumption', what: 'a pool DoT is credited as the share of what fed it, paid out tick by tick',
       why: 'Warrior_Hemorrhage takes 35% of every physical critical strike (vars.damage, handed to ' +
            'addStatus as a third argument) and its status is DurationBased with unlimited stacks, so no ' +
-           'damage is ever dropped. The total is therefore the share of the crit damage the fight already ' +
-           'computes, without tracking individual bleed instances. What that loses is the TAIL - whatever ' +
-           'the last application had not ticked when the fight ended. The interactions ON the ticks are ' +
-           'modelled: the fight tracks when a pool dot is up and when it ticks even though its total ' +
-           'needs no schedule, so Red Tempo earns its cooldown back per tick and Cracking Blood rolls ' +
-           'against each one. What is still assumed is Magic Conduction\'s and Exposed Essence\'s ' +
-           '"while the target is bleeding", which are credited whole rather than at the bleed\'s uptime.' },
+           'damage is ever dropped while the fight runs. WHICH damage feeds a pool is read off the ' +
+           'script\'s hook: `onInflictDamage` is owner-global (Hemorrhage, Infused Wound), a skill\'s own ' +
+           '`onDamage` sees only that skill\'s hits (Bonethrow bleeds for 40% of what BONETHROW deals - ' +
+           'reading it as global fed it from the whole rotation\'s crits and invented ~18% of a Warrior\'s ' +
+           'headline). The bank pays out over the dot\'s own tick schedule, DurationBased-style - each ' +
+           'feed redistributes what is still owed over a fresh window - so what the bell catches ' +
+           'un-ticked is dropped, which is what a damage meter would have missed too. Red Tempo earns ' +
+           'its cooldown back per tick and Cracking Blood rolls against each one. What is still assumed ' +
+           'is Magic Conduction\'s and Exposed Essence\'s "while the target is bleeding", which are ' +
+           'credited whole rather than at the bleed\'s uptime.' },
     { severity: 'info', what: 'physical and magical reduction are equal on every real foe',
       why: 'Only the dev punching bags split them, so ArmorPenetration and SpellPenetration are worth the ' +
            'same against everything currently in the game. Which one you want is decided by your class and ' +
            'your gear\'s faction, not by the target.' },
-    { severity: 'unmodelled', what: 'per-swing damage variance',
-      why: 'WeaponAttack_RandomRange = 0.1 exists but its only located read is a UI text path, so casts are treated as deterministic.' },
+    { severity: 'verified', what: 'weapon-damage swings vary ±10% around the mean; attribute-scaled hits do not vary at all',
+      why: 'WeaponAttack_RandomRange = 0.1, and both halves are measured: WeaponPower-scaled swings ran ' +
+           '19-24 and 78-95 around their means, while the Strength-scaled combo finisher read a constant ' +
+           '133 every time. So the roll rides the weapon damage only; deterministic mode keeps the mean ' +
+           'and --fights N rolls the swings that actually vary.' },
+    { severity: 'assumption', what: 'a chain link swings no faster than 0.7 seconds',
+      why: 'Calibrated from two stopwatches: ten Cheese Moon chains in 28s where the authored durations ' +
+           'sum to 1.81s - they are hit timings, not swing periods - and ten Judgement chains in ~30s, ' +
+           'exactly the authored 3.00s, at or above the floor throughout. No located constant carries ' +
+           'the 0.7 (Attacks_RecoveryRatio 0.25 reproduces neither watch), so it is measured rather ' +
+           'than read, and --swing-floor moves it.' },
   ];
 
   return {
     profile, foe, foes: Object.keys(NAMED), namedTargets: NAMED, targetsByUnit, armourIntent,
-    castOutput, throughput, survivability, affinityOf, weaponPowerFor, audit,
+    castOutput, throughput, survivability, affinityOf, weaponPowerFor, primaryAtbFor,
+    primaryBudgetFor, attributeBudgets, audit,
   };
 }

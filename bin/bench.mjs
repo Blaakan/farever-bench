@@ -257,6 +257,14 @@ function parseWeights(args) {
   return Object.keys(w).length ? w : null;
 }
 
+// The objective the FIGHT plays for. A single goal is handed to the simulator
+// so the derived rotation maximises it - a dps query no longer spends casts on
+// heals - while a blend keeps the fight's everything-counts criterion, because
+// the fight cannot see the blend's normalisation. Mirrors makeScorer.
+function simGoalOf(s) {
+  return (s.weights && Object.keys(s.weights).length) || s.goal === 'mixed' ? 'mixed' : s.goal;
+}
+
 // Dev-only items are in the same sheet as everything else with no flag to tell
 // them apart, so the one heuristic is their id prefix. Visible and overridable
 // rather than silent: a filter you cannot see is a filter you cannot check.
@@ -311,8 +319,25 @@ function commonSetup(args) {
   if (env.fervorScope) assume.fervorScope = env.fervorScope;
   if (typeof args.flags[`fervor-scope`] === 'string') assume.fervorScope = args.flags[`fervor-scope`];
   if (args.flags['no-fervor-damage']) assume.fervorScope = 'none';
-  if (!FERVOR_SCOPES.includes(assume.fervorScope ?? 'skills')) die(`--fervor-scope must be one of ${FERVOR_SCOPES.join(', ')}`);
+  if (!FERVOR_SCOPES.includes(assume.fervorScope ?? 'all')) die(`--fervor-scope must be one of ${FERVOR_SCOPES.join(', ')}`);
   if (args.flags['no-mastery']) assume.mastery = false;
+  // Reported from play: a skill cast interrupts the base-attack chain, so the
+  // fight restarts it at link 1 after every cast. This flag restores the old
+  // reading - the chain holding its place through anything - for sensitivity.
+  if (args.flags['chain-persists']) assume.chainResets = false;
+  // An unpinned item's stats follow its authored/drop level (verified on a
+  // real tooltip); `scaled` prices the untested hypothesis that a fresh drop
+  // at your level carries your level's stats.
+  if (typeof args.flags.drops === 'string') {
+    if (!['scaled', 'authored'].includes(args.flags.drops)) die("--drops must be 'scaled' or 'authored'");
+    assume.dropsScale = args.flags.drops === 'scaled';
+  }
+  // The measured floor on a chain link's swing period (0 to trust the
+  // authored durations alone).
+  if (args.flags['swing-floor'] != null && args.flags['swing-floor'] !== true) {
+    assume.swingFloor = Number(args.flags['swing-floor']);
+    if (!Number.isFinite(assume.swingFloor) || assume.swingFloor < 0) die('--swing-floor needs a number of seconds');
+  }
 
   // The fight the numbers are computed over. Every one of these is an input,
   // never a derived number, and each is recorded in --json so a result can be
@@ -831,7 +856,7 @@ const commands = {
     const pins = applyProfile(s, loadout,
       applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
     const target = s.engine.combat.foe(s.targetName, s.level);
-    const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix });
+    const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s) });
     console.log(f.header(s.engine, VERSION) + '\n');
     if (ev.profile) console.log(f.profileBlock(ev.profile) + '\n');
     console.log(f.gearBlock(s.engine, loadout) + '\n');
@@ -1220,7 +1245,7 @@ const commands = {
     const rounds = s.numFlag('rounds', 3, { integer: true });
     const scorer = s.engine.makeScorer({
       goal: s.goal, weights: s.weights, target, rank: s.rank, mix: s.mix,
-      ref: s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix }),
+      ref: s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s) }),
     });
     const skillName = (x) => s.engine.cdb.byId('skill').get(x)?.texts?.name ?? x;
 
@@ -1244,7 +1269,7 @@ const commands = {
 
     for (let round = 1; round <= rounds; round++) {
       // --- search the rotation, kit fixed -----------------------------------
-      const ev = s.engine.evaluate(kit.loadout, { target, rank: s.rank, mix: s.mix });
+      const ev = s.engine.evaluate(kit.loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s) });
       const ids = ev.throughput.lines.filter((l) => l.kind === 'active').map((l) => l.id);
       // ...in the order the model derives, so restart 0 reproduces it exactly
       // and the search can only improve on what was already reported.
@@ -1260,7 +1285,7 @@ const commands = {
         totalFights++;
         try {
           return scorer.scoreFrom(s.engine.evaluate(kit.loadout, {
-            target, rank: s.rank, mix: s.mix, policy: makePolicy(candidate),
+            target, rank: s.rank, mix: s.mix, policy: makePolicy(candidate), goal: simGoalOf(s),
           }));
         } catch { return -Infinity; }
       };
@@ -1294,6 +1319,7 @@ const commands = {
     // --- report -------------------------------------------------------------
     const finalEv = s.engine.evaluate(best.kit.loadout, {
       target, rank: s.rank, mix: s.mix, policy: best.apl ? makePolicy(best.apl) : null,
+      goal: simGoalOf(s),
     });
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${f.bold(loadout.class + ' ' + s.level)} - searching for a rotation, maximising `
@@ -1356,7 +1382,7 @@ const commands = {
       });
       const rolledTarget = rolled.combat.foe(s.targetName, s.level);
       const run = (p) => rolled.evaluate(best.kit.loadout,
-        { target: rolledTarget, rank: s.rank, mix: s.mix, policy: p }).throughput;
+        { target: rolledTarget, rank: s.rank, mix: s.mix, policy: p, goal: simGoalOf(s) }).throughput;
       const a = run(null);
       const b = run(makePolicy(best.apl));
       // Two independent means, so the difference has the pooled standard error.
@@ -1407,13 +1433,13 @@ const commands = {
       const found = new Map();
       for (const p of corners) {
         const l2 = { ...best.kit.loadout, profile: p };
-        const ev2 = s.engine.evaluate(l2, { target, rank: s.rank, mix: s.mix });
+        const ev2 = s.engine.evaluate(l2, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s) });
         const ids2 = ev2.throughput.lines.filter((x) => x.kind === 'active').map((x) => x.id);
         const score2 = (apl2) => {
           fights++;
           try {
             return scorer.scoreFrom(s.engine.evaluate(l2, {
-              target, rank: s.rank, mix: s.mix, policy: makePolicy(apl2),
+              target, rank: s.rank, mix: s.mix, policy: makePolicy(apl2), goal: simGoalOf(s),
             }));
           } catch { return -Infinity; }
         };
@@ -1450,6 +1476,7 @@ const commands = {
         try {
           const v = scorer.scoreFrom(s.engine.evaluate(l2, {
             target, rank: s.rank, mix: s.mix, policy: makePolicy(found.get(from).apl),
+            goal: simGoalOf(s),
           }));
           return (v / found.get(to).own - 1) * 100;
         } catch { return NaN; }
@@ -1485,9 +1512,9 @@ const commands = {
         const l2 = { ...best.kit.loadout, profile: p };
         let der, run;
         try {
-          der = scorer.scoreFrom(s.engine.evaluate(l2, { target, rank: s.rank, mix: s.mix }));
+          der = scorer.scoreFrom(s.engine.evaluate(l2, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s) }));
           run = scorer.scoreFrom(s.engine.evaluate(l2, {
-            target, rank: s.rank, mix: s.mix, policy: makePolicy(best.apl),
+            target, rank: s.rank, mix: s.mix, policy: makePolicy(best.apl), goal: simGoalOf(s),
           }));
         } catch { continue; }
         rows.push(['  ' + p + (p === s.profile ? f.dim('  (tuned here)') : ''),
@@ -1830,10 +1857,18 @@ Common flags
                           Epic and Legendary versions are on the table)
   --exclude <regex>       drop matching item ids       (default ^GM_)
   --include-all           no id exclusions at all
-  --fervor-scope <s>      skills | all | none   (default skills)
-                          whether the unverified Fervor damage bonus applies to
-                          base attacks too, or at all
+  --fervor-scope <s>      all | skills | none   (default all)
+                          measured in game: a combo finisher moved by exactly
+                          its Fervor, so base attacks get it too
   --no-mastery            drop the unverified mastery multipliers
+  --chain-persists        let the base-attack chain hold its place through a
+                          skill cast (reported from play: it does not)
+  --drops <s>             authored | scaled   (default authored)
+                          whether an unpinned item's stats follow the item
+                          row's own level (verified on a real tooltip) or a
+                          drop at your level (untested hypothesis)
+  --swing-floor <s>       the measured floor on a chain link's swing period
+                          (default 0.7; 0 trusts the authored durations alone)
   --build <file.json>     start from a saved build - either a bare loadout or
                           the envelope --json writes, whose recorded goal,
                           target, level, fight and pins become the defaults

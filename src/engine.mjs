@@ -24,24 +24,39 @@ export const GOALS = ['dps', 'hps', 'sps', 'ehp', 'mixed'];
 export const FERVOR_SCOPES = ['skills', 'all', 'none'];
 
 export const DEFAULT_ASSUME = {
-  // Fervor's description says "your Skills", so base attacks are excluded by
-  // default. Which reading is right decides whether Fervor gear or penetration
-  // gear wins, and neither is verified - see docs/MODEL.md.
-  fervorScope: 'skills',
+  // Fervor's description says "your Skills", but the measurement says
+  // everything: a combo finisher at 133 went to exactly 133 x 1.12 x 1.016
+  // = 151 under +12% PhysicalMastery and 30 FervorRating (~+1.58%) - without
+  // the Fervor term it prices 149. So base attacks get it too, and 'all' is
+  // the default. --fervor-scope skills|none remain as sensitivity toggles.
+  fervorScope: 'all',
   mastery: true,
+  // Reported from play: casting a skill interrupts the base-attack chain, so
+  // the next swing starts the chain over. Everything gated on the combo
+  // finisher - Rage income, prayer charging, per-combo procs - rides on this.
+  // --chain-persists restores the old always-continues reading.
+  chainResets: true,
+  // An unpinned item's STATS follow its authored/drop level - verified on a
+  // real Cheese Moon tooltip - and --drops scaled is the untested hypothesis
+  // that a fresh drop at your level carries your level's stats.
+  dropsScale: false,
+  // The measured floor on a chain link's swing period - see buildCombat.
+  swingFloor: 0.7,
 };
 
 export function createEngine({ game, assume = {}, fight = {}, quiet = false, classSkillSlots } = {}) {
   const cdb = loadCdb({ game, quiet });
   const ctx = buildContext(cdb);
   const cat = buildCatalog(cdb, ctx);
-  const combat = buildCombat(cdb, ctx);
+  const assumeAll = { ...DEFAULT_ASSUME, ...assume };
+  cat.setDropsScale(assumeAll.dropsScale !== false);
+  const combat = buildCombat(cdb, ctx, assumeAll);
   const plan = buildSkillPlan(cdb, ctx, cat, combat,
     classSkillSlots != null ? { classSkillSlots } : {});
   const talents = buildTalentPlan(cdb, ctx, cat, combat, plan);
   const profiles = buildProfiles(cdb, ctx, cat);
   const opts = {
-    assume: { ...DEFAULT_ASSUME, ...assume },
+    assume: assumeAll,
     // The fight the numbers are computed over. 200 seconds because that is the
     // length a damage meter typically reports, and because a fight length is
     // what makes a banked charge worth anything.
@@ -92,11 +107,34 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
   }
 
   /** Full evaluation: stat sheet, throughput, survivability, rotation lines. */
-  function evaluate(loadout, { target, rank = 1, mix = 0.5, policy = null } = {}) {
+  function evaluate(loadout, { target, rank = 1, mix = 0.5, policy = null, goal = 'dps' } = {}) {
     const cls = classOf(cat, loadout);
     const tgt = target ?? combat.foe('reference', loadout.level);
     const weaponPower = combat.weaponPowerFor(cat, loadout, cls);
     const rot = rotationFor(loadout, rank);
+    // WeaponPower's other half: every read of it adds the mean of the ITEM's
+    // aptitude attributes off whatever sheet is being consulted - Beefury
+    // swings with (6.5% Strength + 6.5% Faith), Judgement with its whole 0.7
+    // on Strength - see amountOf in damage.mjs. And a MAINHAND skill's
+    // attribute scalings mix 60% attribute with 40% of that attribute's own
+    // budget curve at the CHARACTER's level (WeaponPowerRatio's 0.4), ten
+    // measured integers exact - so the fight knows which casts are the
+    // mainhand's and which attributes its swings read.
+    const mainItem = loadout.gear.Slot_Weapon1?.item
+      ? cat.itemById.get(loadout.gear.Slot_Weapon1.item) : null;
+    const evalOpts = {
+      ...opts,
+      swingAttrs: mainItem
+        ? mainItem.aptitudes.map((a) => combat.primaryAtbFor({ aptitude: a })).filter(Boolean)
+        : null,
+      weaponMix: mainItem ? {
+        flats: combat.attributeBudgets(loadout.level),
+        ids: new Set([
+          ...rot.filler.map((x) => x.prof.id),
+          ...rot.active.filter((x) => x.source === 'Slot_Weapon1').map((x) => x.prof.id),
+        ]),
+      } : null,
+    };
 
     // Stats that come from what you know rather than from what you wear:
     //
@@ -241,21 +279,29 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // zero: two points in it moved the Warrior's dps by 0.00.
     const mods = {
       critDamageByType: {}, critChanceByType: {}, damageByAffinity: {},
-      armorIgnore: {}, bleed: {}, cooldown: {},
+      armorIgnore: {}, bleed: {}, bleedScoped: [], cooldown: {},
     };
     // Modifiers whose scope this fight does not separate. Named, not dropped.
     const unreadMods = [];
     for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
       for (const mod of talents.modifiersOf(id, nodeRank)) {
         const add = (bag, key) => { bag[key] = (bag[key] ?? 0) + mod.amount; };
+        // A bleed-scoped modifier keeps the STATUS TYPE its guard named, so the
+        // fight can apply Exsanguination (isStatusType(Hemorage)) to the
+        // Hemorrhage pool and not to Bonethrow's plain-Bleed one. `Bleed` is
+        // the parent type and covers both; the match is resolved per pool dot
+        // in damage.mjs against the statusType sheet's parent chain.
+        const scoped = (field) => mods.bleedScoped.push({
+          statusType: mod.statusType ?? 'Bleed', field, amount: mod.amount,
+        });
         // Routing is EXPLICIT, with no default. A scope this does not recognise
         // is dropped, not folded into "everything": `Rogue_Talent_LethalDose`
         // scopes its +20% to Poison damage, and the model has no poison pool to
         // put it on, so it must contribute nothing rather than +20% globally.
         const type = mod.scope === 'attack' ? 'Attack'
           : mod.scope === 'weaponSkill' ? 'WeaponSkill' : null;
-        if (mod.field === 'healShare' && mod.scope === 'bleed') add(mods.bleed, 'healShare');
-        else if (mod.scope === 'bleed' && mod.field !== 'cooldownPerTick') add(mods.bleed, mod.field);
+        if (mod.field === 'healShare' && mod.scope === 'bleed') { add(mods.bleed, 'healShare'); scoped('healShare'); }
+        else if (mod.scope === 'bleed' && mod.field !== 'cooldownPerTick') { add(mods.bleed, mod.field); scoped(mod.field); }
         else if (mod.field === 'critDmgMult' && type) add(mods.critDamageByType, type);
         else if (mod.field === 'critChance' && type) add(mods.critChanceByType, type);
         else if (mod.field === 'dmgMult' && mod.scope === 'physical') add(mods.damageByAffinity, 'Physical');
@@ -389,8 +435,8 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       restatCache.set(key, hit);
       return hit;
     }
-    const tp = combat.throughput(rot, combatBase.sheet, tgt, opts,
-      { restat, timedBuffs: timed, averagedSheet: averaged.sheet, mods, policy });
+    const tp = combat.throughput(rot, combatBase.sheet, tgt, evalOpts,
+      { restat, timedBuffs: timed, averagedSheet: averaged.sheet, mods, policy, goal });
     // Survivability is what you average over a fight, so it reads the averaged
     // sheet - a defensive cooldown you press is real mitigation, just not
     // mitigation you are standing in right now.
@@ -443,7 +489,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     if (!w && goal !== 'mixed') {
       return {
         metrics,
-        score: (loadout) => metrics(evaluate(loadout, { target, rank, mix }))[goal] ?? 0,
+        score: (loadout) => metrics(evaluate(loadout, { target, rank, mix, goal }))[goal] ?? 0,
         scoreFrom: (ev) => metrics(ev)[goal] ?? 0,
       };
     }
@@ -459,7 +505,9 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     };
     return {
       metrics,
-      score: (loadout) => norm(metrics(evaluate(loadout, { target, rank, mix }))),
+      // A blend cannot hand the fight a single objective, so the fight keeps
+      // its everything-counts criterion for these - see sim.mjs `goalWeights`.
+      score: (loadout) => norm(metrics(evaluate(loadout, { target, rank, mix, goal: 'mixed' }))),
       scoreFrom: (ev) => norm(metrics(ev)),
     };
   }
@@ -515,15 +563,37 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
            'never a derived number, and only Area and Aura steps scale with it.',
     },
     {
+      severity: 'assumption',
+      what: opts.assume.chainResets
+        ? 'a skill cast restarts the base-attack chain'
+        : 'the base-attack chain holds its place through a skill cast (--chain-persists)',
+      why: 'Reported from play: a slow skill usually interrupts the chain, so the fight starts it over ' +
+           'after every cast and after standing idle beyond ComboWindow (0.6s). Everything gated on the ' +
+           'combo finisher - Warrior Rage income, prayer charging, per-combo procs - lands at the rate ' +
+           'this produces. Whether an INSTANT cast also interrupts is unmeasured; --chain-persists ' +
+           'restores the old always-continues reading, and the gap between the two is the exposure.',
+    },
+    {
       severity: 'unverified',
       what: 'a cast costs only its own authored duration - no global recovery window',
       why: 'Skill_RecoveryTime (1s) used to be added to every cast, which billed a level-25 Priest 0.59 ' +
            'attacks a second for a chain whose authored durations run at 2.2. It sits in the constant ' +
            'sheet inside the SpawnTime/Aggro/Panic/PathSearch block between Skill_Pick_RetryCooldown and ' +
            'Skill_RecoveryTime_Boss, and its only bytecode symbol is ent.Foe.getSkillRecoveryTime - so it ' +
-           'reads as foe AI. That is circumstantial: bare `recoveryTime` and `get_recoveryTime` symbols ' +
-           'also exist and have not been placed. ComboWindow (0.6) and AttackQueueTime (0.4) are ' +
-           'consistent with a chain that runs back to back.',
+           'reads as foe AI. For the base-attack CHAIN this is now checked with a stopwatch: ten ' +
+           'Judgement chains ran ~3.0s each, exactly the authored 3.00 - no per-swing recovery - and the ' +
+           'fast axe\'s shortfall is the swing-period floor, not a recovery. A recovery after SKILL ' +
+           'casts remains unmeasured.',
+    },
+    {
+      severity: 'assumption',
+      what: 'an item\'s stats follow the level it dropped at; its weapon damage follows its trained level',
+      why: 'Verified on a real Cheese Moon: trained to weapon level 25 it still shows the effective-' +
+           'level-11 stat budget (+36/+15/+18/+39/+39 - the same numbers as the level-10 Spear reading) ' +
+           'while its damage line reads 18-21, the FULL primary budget at the trained level. So "Level ' +
+           '25" on a weapon tooltip is training, not the drop. What a fresh drop at your level carries ' +
+           'is still unmeasured: --drops scaled prices that hypothesis, and a ^N pin names an instance ' +
+           'exactly.',
     },
     {
       severity: 'unmodelled',

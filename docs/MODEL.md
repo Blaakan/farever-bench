@@ -182,34 +182,31 @@ amount = budget(effectiveLevel, entry.start, entry.end) * atbRatio[group] * affi
 ```
 
 - `entry` — a row of `aptitude.atbScaling`, gated by `conds.minRarity` and
-  `conds.factions`. **One aptitude pays: the wearer's own.** An item naming two
-  is naming who may WEAR it, not how many budgets it hands out — 271 of the 513
-  stat-bearing items name a class pair, and the six `combines` aptitude rows
-  (FigAss, WizCle, …) exist to label exactly that. Each aptitude's share is
-  rounded on its own before any sum; that is a one-unit difference and the game
-  agrees.
+  `conds.factions`. **Every named aptitude pays — read off the character sheet
+  2026-08-01:** a naked level-25 Warrior at 38/34/28 Vitality/Strength/Dexterity
+  equips Cheese Moon (Fighter+Assassin, tooltip +36/+15/+18 with both ratings)
+  and the sheet reads exactly **74/49/46** — every tooltip line, including the
+  Assassin's Dexterity the earlier own-half rule refused a Warrior. Tear's
+  measured 75 prices on that Dexterity too, so the combat pipeline agrees with
+  the sheet. Each aptitude's share is rounded on its own before any sum; that
+  is a one-unit difference and the game agrees.
 
-  **The proof is `itemType.atbRatio` itself.** Summed over one item per core
-  slot — mainhand, the eight armour pieces, neck and two fingers — every stat
-  group comes to *exactly* 1.0:
+  **ARMOUR is the exception and pays once.** Its budget is
+  `resistForReduction(level, the wearer's props.armorReduction)` — no aptitude
+  in it — so a second aptitude paying it would double the one stat that cannot
+  double; the full-set reduction invariant (each class lands at its own
+  declared reduction in level-appropriate Rare gear) still holds and is still
+  asserted.
 
-  ```
-  primary 1.0    vitality 1.0    armor 1.0    ratings 1.0
-  ```
-
-  A full set is designed to deliver one aptitude curve per group, so paying
-  every named aptitude hands a dual-class item two of them. That is what put a
-  level-25 Priest at 453 Vitality where a real character sits at 193, gave the
-  same Priest a near-full Intellect budget *and* a near-full Faith one off gear
-  that is Mage-or-Priest, and — worst — doubled ARMOUR, which cannot double
-  because its budget is `resistForReduction(level, the wearer's
-  props.armorReduction)` and does not depend on the aptitude at all. Cleric
-  declares 0.25 and the sheet was reading 40.3%.
-
-  The in-game reading in [section 12](#12-checked-against-the-game) is not
-  contradicted: it is an ITEM TOOLTIP, and a tooltip has no wearer. `cat.contribute`
-  keeps that as an explicit `allAptitudes` mode and the test suite still asserts
-  all ten of its numbers.
+  The `itemType.atbRatio` identity — one item per core slot sums to exactly
+  1.0 per stat group — remains true, but it is a statement about the design
+  budget of a full single-class set, not about what a dual-class row pays: a
+  dual-aptitude item really does carry roughly two budgets of primaries and
+  ratings, and 271 of the 513 stat-bearing items name a class pair. An earlier
+  both-halves model reading 453 Vitality where a real character sat at 193 was
+  wrong for that era's other reasons (armour doubling among them), and the
+  own-half rule it spawned survived until a sheet was finally read with a
+  single known item equipped.
 
   **Generic aptitudes** — the five nameless rows `Crit / ArPen / MaPen / Fervor
   / Vita` that jewellery uses — are the same rule from the other side: nobody's
@@ -1316,8 +1313,8 @@ the absence of animation timing data, that item affixes have no RNG (findex
 | assumption | why it is a guess | how to settle it |
 |---|---|---|
 | Fervor multiplies damage by its own percentage | Its in-game description says so, but `DamageModifier.scaling` is **empty** and no attribute takes a scaling entry from Fervor except `DamageTakenModifier` (−0.5), `HealGivenMultiplier` (+1) and `ShieldPowerMultiplier` (+1). The offensive half is a code-only path. | disassemble `ent.Unit.computeDamage` (findex 4841) |
-| the two Masteries multiply matching-affinity damage | Same shape of hole. Currently **inert**: both are zero from every source in this build. | same |
-| `WeaponPower` = the MAIN-HAND weapon's share of the class primary budget | It has no scaling entry and no budget group, so the weapon must set it — 67 mentions across the whole CDB and three strings in the binary, none of them a setter. `constant.WeaponPowerRatio`'s description — *"Percent of AP/SP scaling that are replaced by a flat amount coming from weapon"* — is consistent but does not confirm it. Every base attack scales off it. It used to sum BOTH weapon slots, so equipping an arsenal raised every swing by 40% for a slot that grants no swings. | disassemble the weapon-equip path |
+| the two Masteries multiply matching-affinity damage | Same shape of hole — and **live**, not inert: `GA_Craft_FinalCombo_Status` (Brutal Frenzy) stacks +4 PhysicalMastery per combo finisher to 12 on the default Warrior pick, so `--no-mastery` moves that build ~3.6% and can change the weapon it recommends. | same |
+| `WeaponPower` = the trained level's flat primary budget **plus your primary attribute** | It has no scaling entry and no budget group, so the weapon must set it — 67 mentions across the whole CDB and three strings in the binary, none of them a setter. **Measured 2026-08-01 on a real Cheese Moon vs a 0-armor dummy, twice:** the bag tooltip reads 18–21 against a naked Strength of 34, and the same swing runs 19–24 once the axe's own +15 Strength is equipped — `0.13 × (budget(25) + Strength)` reproduces both within ~5%, the same flat 116 falls out of both readings, and the +2 the equip added is exactly 0.13 × 15. Rarity/star iLevel bonuses belong to the stats (the same tooltip's stat lines match the drop-level budget), not to the damage line. The old slot-share reading (×0.28 at the authored item level) was four to five times low on every base attack. The weapon's "Level 25" is its TRAINED level (weapons level per kills, `WeaponKills_PerSkillRankPoint`); assumed fully trained. **Completed cross-type the same day with Judgement dummy reads:** two-handers take 0.4 of the flat budget where one-handers take all of it (swings 78–95 at Str 72 → flat ≈ 52 = 0.4 × budget), and a **mainhand weapon skill's attribute scaling is 60% attribute + 40% weapon flat** — `constant.WeaponPowerRatio`'s own description, `MainhandWeaponSkill 0.4` — measured exact on five integers: Rampage 233/371/556 at authored 2.5/4/6 × Strength and Brutal Frenzy 133 + its 28 rider at 1.43/0.3, all `ratio × (0.6 × 72 + 0.4 × 123.6) = ratio × 92.7`. Also measured in the same session: PhysicalMastery ×1.12 exact, Fervor applying to base attacks (finisher 133 → 151 = ×1.12 × 1.016), and the ±10% roll riding only the WeaponPower-scaled swings (the Strength-scaled finisher never varies). **Completed with the expanded tooltips (Beefury, Wingsabers):** the game *renders* the rule — Royal Severance "(30 + 30% Intellect) + (25 + 30% Strength)" is 0.6 × authored 0.5 on the attribute and 0.4 × 0.5 × **each attribute's own level-25 curve** as the flat (148.3 / 123.6); Hive Bite's 29.33% is authored 0.85 × its own rank-2 +15%. Tear's 75 proved the per-attribute flats. Swing attribute terms **split across the item's aptitude attributes** — Beefury "(13 + 6.5% Strength + 6.5% Faith)". Skill flats follow the *character's* level; swing flats follow the *weapon's trained* level (two Epic 0-star bag reads imply flats ~100–107, i.e. under-trained weapons). Ten integers reproduce exactly. Open: whether a dual-aptitude item pays BOTH halves to one wearer — Tear's 75 needs the axe's +18 Dexterity on a Warrior sheet; one character-sheet read of Dexterity settles it. | read Dexterity on the equipped sheet (46 vs 28); read the bag weapons' Level lines; disassemble the weapon-equip path for provenance |
 | a cast costs only its own authored duration | `Skill_RecoveryTime` reads as foe AI from its position in the constant sheet and from `ent.Foe.getSkillRecoveryTime` being its only symbol, but bare `recoveryTime` / `get_recoveryTime` symbols exist and have not been placed. `ComboWindow` 0.6 and `AttackQueueTime` 0.4 are consistent with a chain that runs back to back. | disassemble the cast path |
 | how many enemies an area hits | Fully absent from the data — geometry is authored, population is not. `--targets` is an input, defaulting to 1. | measure in game |
 | a `Mono` step carrying an area does not cleave | 80 rows do it and their descriptions disagree; single-target is the reading that agrees with 87% of them and cannot flatter. | `forceMono` in the binary |
@@ -1444,21 +1441,36 @@ and its bleed tick, with no buffs up at all — would confirm it.
 
 ### Hemorrhage pools; it does not refresh
 
-On record from the game, and **not yet implemented**, so it is written down here
-rather than half-applied:
+On record from the game, and implemented as a **payout ledger** in the fight:
 
 > A 200 crit banks `200 × 0.35 = 70` damage over 8 seconds, four ticks of 17.5.
 > Crit again for 100 two ticks later and the 35 still owed is **added** to the
 > new 35, redistributing 70 over a fresh 8 seconds.
 
 So the remainder is carried, not dropped — which is neither the `refresh` the
-model does nor the `stack` it refuses. Generalising it to every dot whose
-declared amount is a total takes the answer to **44,000 dps** on a Mage: those
-are applied on every swing, so a pool that never drops its overflow never
-bounds. Hemorrhage is bounded in game because it is gated on a critical strike,
-and the model cannot read Hemorrhage at all yet — its magnitude is a script
-argument. The rule waits for the applier whose rate makes it finite; `d.pooled`
-already marks which dots it will apply to.
+model does elsewhere nor the `stack` it refuses. Each feed adds to what is
+owed and resets the per-tick rate over a fresh window; each tick pays it down;
+what the bell catches un-paid is dropped, because a damage meter never saw it
+either. Over a 200-second fight that tail is a fraction of a percent — over a
+short one it is not, and crediting it in full read a 3-second fight four ticks
+rich. Generalising the carry to every dot whose declared amount is a total
+takes the answer to **44,000 dps** on a Mage: those are applied on every
+swing, so a pool that never drops its overflow never bounds. The
+`stackingPolicy` column keeps it to the four statuses that declare it.
+
+**Which damage feeds a pool is the HOOK's rule, then the guard's.**
+`onInflictDamage` is owner-global — Hemorrhage takes 35% of every physical
+critical strike you land, whoever landed it, and `if (dmg.isDoT) return;`
+keeps it from feeding itself. A skill's own `onDamage` sees only that skill's
+hits: `Axe_Boomerang_Skill1` (Bonethrow) bleeds for 40% of the damage
+*Bonethrow* deals, crit or not — its guard has no crit test. Reading its
+per-skill hook as global fed its pool from the whole rotation's crits, which
+invented ~18% of a Warrior's headline dps and drove the arsenal pick. A hook
+the reader does not recognise refuses the pool by name. The multiplier a
+bleed-scoped talent adds is matched per pool dot through the `statusType`
+sheet's parent chain — `Hemorage` declares `parent: Bleed`, so Bloodletting's
+Bleed guard covers both dots and Exsanguination's Hemorage guard covers only
+Hemorrhage and Infused Wound.
 
 **The reading.** `Spear_Eruption` — "Gorgon Ratsay's Toothpick", Rare, Kobold
 faction, aptitudes `[Assassin, Cleric]` — on a level-10 instance, which with

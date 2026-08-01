@@ -154,12 +154,26 @@ export function buildCatalog(cdb, ctx) {
   // iLevel is ten times the level. Items with neither (every `*_R<Faction>_*`
   // row - 501 of them) drop at the character's level, so that is what they
   // are worth. Rarity, upgrade stars and "flawless" each add iLevel on top.
+  //
+  // An item's STATS follow the level it DROPPED at, not your level: a real
+  // Cheese Moon (Axe_Boomerang) trained to weapon level 25 still reads
+  // +36 Vitality +15 Strength +18 Dexterity +39/+39 on its tooltip - the
+  // effective-level-11 budget, the same numbers as the level-10 Spear reading
+  // in MODEL.md 12 - so the "Level 25" on a weapon tooltip is its TRAINED
+  // level and only the damage line follows it (see weaponPowerFor). Whether a
+  // FRESH drop at level 25 carries level-25 stats is still unmeasured, so
+  // `--drops scaled` exists as the hypothesis toggle; a `^N` pin names the
+  // instance exactly.
+  let dropsScale = false;
+  function setDropsScale(v) { dropsScale = !!v; }
   function effectiveLevel(item, { charLevel, stars = 0, flawless = false, rarity = null, level = null }) {
     // `level` is the INSTANCE level - what the thing actually dropped at. The
     // authored `item.level` is a reference, and a real drop is often higher, so
     // checking the tool against a character sheet needs the instance level.
+    const authored = item.iLevel ?? (item.level != null ? item.level * 10 : null);
     const baseILevel = level != null ? level * 10
-      : (item.iLevel ?? (item.level != null ? item.level * 10 : charLevel * 10));
+      : dropsScale ? Math.max(authored ?? 0, charLevel * 10)
+        : (authored ?? charLevel * 10);
     const rar = cdb.byId('rarity').get(rarity ?? item.rarity);
     const iLevel = baseILevel
       + (rar?.props?.iLevelBonus ?? 0)
@@ -334,64 +348,42 @@ export function buildCatalog(cdb, ctx) {
     return item.aptitudes.some((a) => a === aptitude || isGeneric(a));
   }
 
-  // ONE aptitude pays: the wearer's own. An item naming several is naming who
-  // may WEAR it, not how many budgets it hands out.
+  // EVERY named aptitude pays, whoever wears it. Settled by a character-sheet
+  // reading at last: a naked level-25 Warrior at 38/34/28 Vitality/Strength/
+  // Dexterity equips Cheese Moon (Fighter+Assassin, tooltip +36/+15/+18 with
+  // both ratings) and the sheet reads 74/49/46 - every tooltip line, both
+  // halves, including the Assassin's Dexterity a Warrior "should not" get.
+  // Tear's live 75 needs that Dexterity too, so the combat numbers agree with
+  // the sheet.
   //
-  // The whole stat system rests on this, and the proof is in `itemType.atbRatio`
-  // itself. Summed over one item per core slot - mainhand, the eight armour
-  // pieces, neck and two fingers - every stat group comes to EXACTLY 1.0:
+  // The rule this replaces - "you receive your own half" - rested on the
+  // `itemType.atbRatio` identity (one item per core slot sums to exactly 1.0
+  // per stat group, so a full set is one aptitude curve) and on an early
+  // both-halves model reading 453 Vitality where a real character sat at 193.
+  // The identity is real but it is a statement about the DESIGN BUDGET of a
+  // full single-class set, not about what a dual-class row pays; and the 453
+  // came from that era's other errors, of which one IS kept: ARMOUR pays
+  // once, because its budget is `resistForReduction(level, the WEARER's
+  // props.armorReduction)` - no aptitude in it - and paying it per aptitude
+  // doubles the one stat that cannot double. See `contribute`.
   //
-  //     primary 1.0   vitality 1.0   armor 1.0   ratings 1.0
-  //
-  // A full set is designed to deliver exactly one aptitude curve per group. So
-  // paying every named aptitude hands a dual-class item two of them, and the
-  // four-generic craft necklace four - and 271 of the 513 stat-bearing items
-  // name two. Three consequences that were all visible in the output:
-  //
-  //   * a level-25 Priest read 453 Vitality where a real character sits at 193,
-  //     and the one-budget ceiling is 182 + 39 naked = 221;
-  //   * a Priest read Intellect 185 AND Faith 206, both near a full primary
-  //     budget, off gear that is Mage-or-Priest;
-  //   * worst of all, ARMOUR doubled - and armour is the one stat that cannot,
-  //     because its budget is `resistForReduction(level, the WEARER's
-  //     props.armorReduction)` and does not depend on the aptitude at all.
-  //     Cleric declares 0.25 and the sheet was showing 40.3% reduction. The
-  //     model was contradicting the class row it had read itself.
-  //
-  // A dual-aptitude item would also be strictly twice a single-aptitude item of
-  // the same slot, rarity and drop level, for BOTH classes that can wear it -
-  // which would make every shared piece best-in-slot for everyone.
-  //
-  // What the earlier reading rested on is a real in-game observation, and it is
-  // not contradicted: `Spear_Eruption` (Kobold, [Assassin, Cleric]) READS
-  // +36 Vitality +18 Dexterity +15 Faith +39 Critical +39 ArmorPen, which is
-  // exactly the union of the two aptitudes. But that is an ITEM TOOLTIP, and a
-  // tooltip has no wearer - the six `combines` aptitude rows (FigAss, WizCle,
-  // ...) exist precisely to label an item as belonging to a class PAIR, carry
-  // no atbScaling of their own, and are the only aptitude rows with an icon.
-  // The character sheet is a different question, and 193 Vitality answers it.
+  // The tooltip reading (`Spear_Eruption` +36/+18/+15/+39/+39, the union of
+  // both aptitudes rounded per aptitude) is therefore also the WEARER reading;
+  // the two modes only differ for generic jewellery.
   //
   // Generic aptitudes - the five nameless rows Crit / ArPen / MaPen / Fervor /
-  // Vita that jewellery uses - are the same rule from the other side: nobody's
-  // class matches them, so an item naming only generics pays exactly ONE of
-  // them, and WHICH one is a decision rather than a sum. That is the difference
-  // between "Pendant of Adaptability" granting 46 rating and granting 184.
-  // Nothing in the data says which one you get, so it is enumerated as a
-  // candidate and printed, never chosen silently.
+  // Vita that jewellery uses - still pay exactly ONE: that half of the old
+  // rule was measured on its own ("Pendant of Adaptability" grants 46 rating,
+  // not 184) and stands. WHICH one is a decision, enumerated as a candidate
+  // and printed, never chosen silently.
   function payingAptitudes(item, aptitude = null, generic = null, { all = false } = {}) {
     if (!item.aptitudes.length) return [];
-    // `all` is the ITEM TOOLTIP reading - what the row grants across every
-    // class that can wear it, with no wearer in the picture. It is the only
-    // in-game reading on record for this rule and it is reproduced exactly, so
-    // it is kept as a mode rather than deleted.
     if (all) return item.aptitudes;
-    // The wearer's own, if the item names it.
-    const own = item.aptitudes.filter((a) => a === aptitude);
-    if (own.length) return own;
+    const real = item.aptitudes.filter((a) => !isGeneric(a));
     const generics = item.aptitudes.filter((a) => isGeneric(a));
-    if (!generics.length) return [];
-    if (generic && generics.includes(generic)) return [generic];
-    return [generics[0]];
+    const out = [...real];
+    if (generics.length) out.push(generic && generics.includes(generic) ? generic : generics[0]);
+    return out;
   }
 
   /** The generic aptitudes an item lets you choose between, or []. */
@@ -467,6 +459,11 @@ export function buildCatalog(cdb, ctx) {
     // Accumulated per item, not straight into `mods`, because the slot factor
     // applies to the finished per-stat total - see the ceil() below.
     const own = new Map();
+    // Armour pays ONCE however many aptitudes the item names: its budget is
+    // the WEARER's `resistForReduction`, with no aptitude in it, so a second
+    // aptitude paying it doubles the one stat that cannot double - which is
+    // half of what sank the early both-halves model.
+    const armorPaid = new Set();
 
     for (const aptId of payingAptitudes(item, opts.aptitude, opts.generic, { all: !!opts.allAptitudes })) {
       const apt = aptitudes.get(aptId);
@@ -481,6 +478,10 @@ export function buildCatalog(cdb, ctx) {
 
         // Armor and MagicArmor ignore their authored start/end.
         const isArmor = e.endAtb === 'Armor' || e.endAtb === 'MagicArmor';
+        if (isArmor) {
+          if (armorPaid.has(e.endAtb)) continue;
+          armorPaid.add(e.endAtb);
+        }
         const total = isArmor
           ? resistForReduction(effLevel, opts.armorReduction, ctx.consts.resistFormula)
           : budget(effLevel, e.start, e.end, ctx.consts.earlyMaxLevel);
@@ -524,7 +525,7 @@ export function buildCatalog(cdb, ctx) {
     cdb, ctx,
     slots, slotById, classes, items, itemById,
     chain, inherited, socketsFor, augmentTypes,
-    effectiveLevel, maxStars, canUpgrade, upgradeSkillFor,
+    effectiveLevel, setDropsScale, maxStars, canUpgrade, upgradeSkillFor,
     upgradableTypes: upgradeSkillByType,
     usableBy, payingAptitudes, genericChoices,
     contribute, applyAffixes, armorReductionFor,

@@ -28,6 +28,19 @@
 // a build's damage is luck.
 // ---------------------------------------------------------------------------
 
+// What the fight is FOR. The derived player model - which skill is worth
+// pressing, which of the two played fights is reported - used to maximise
+// dps+hps+sps whatever the caller asked, so a dps query on a Priest spent
+// GCDs on heals and could keep the branch that healed more and damaged less.
+// A single goal weights the objective; a blend keeps everything, because the
+// fight cannot see the caller's normalisation.
+function goalWeights(goal) {
+  return goal === 'dps' ? [1, 0, 0]
+    : goal === 'hps' ? [0, 1, 0]
+      : goal === 'sps' ? [0, 0, 1]
+        : [1, 1, 1];
+}
+
 // Reproducibility matters: a build a user shares has to re-derive. Nothing here
 // touches Math.random.
 function rng(seed) {
@@ -65,7 +78,10 @@ export function simulate(spec) {
   if (spec.lookahead > 0) {
     const greedy = runFight({ ...spec, lookahead: 0 });
     const ahead = runFight(spec);
-    const total = (r) => r.dps + r.hps + r.sps;
+    // Judged on the caller's goal, not on everything at once - a dps query
+    // must never keep the branch that healed more and damaged less.
+    const [wd, wh, ws] = goalWeights(spec.goal);
+    const total = (r) => r.dps * wd + r.hps * wh + r.sps * ws;
     const best = total(ahead) > total(greedy) + 1e-9 ? ahead : greedy;
     best.rotationSearched = {
       lookahead: spec.lookahead,
@@ -83,7 +99,12 @@ function runFight(spec) {
     rotation, cast, dotOutput, cdr = 1, cdrWeaponSkill = null, fight = 200, fights = 1,
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
+    poolScale = null, poolFactor = null, goal = null, chainResets = true,
+    swingVariance = 0,
   } = spec;
+  // The objective the derived player maximises - see `goalWeights`.
+  const [wDmg, wHeal, wShield] = goalWeights(goal);
+  const worth = (dmg, heal, shield) => dmg * wDmg + heal * wHeal + shield * wShield;
   // Every metric here is a total over the fight length, so a non-positive one
   // is a division by zero and a sheet full of NaN. The CLI guards it; the
   // library entry point has to guard it too.
@@ -122,6 +143,7 @@ function runFight(spec) {
       start: spec.start ?? 0,
       value: spec.start ?? 0,
       factor: spec.factor ?? 1,
+      gainAtb: spec.gainAtb ?? null,
     });
   }
   const tracked = (atb) => pools.has(atb);
@@ -135,10 +157,23 @@ function runFight(spec) {
       if (p) p.value = Math.max(0, p.value - c.amount);
     }
   };
+  // What is up right now, for the gain factor below. The fight sets this to
+  // its live state as it runs; the rollout deliberately does not - it is a
+  // bounded heuristic and keeps the frozen resting factor.
+  const stateRef = { now: null };
   const earn = (atb, amount) => {
     const p = pools.get(atb);
     if (!p || !(amount > 0)) return;
-    p.value = Math.min(p.max, p.value + amount * p.factor);
+    // `attribute.gainAtb` is a multiplier on INCOME, and it is a live stat:
+    // `Warrior_BerserkStatus` carries RageGainFactor ARatio +1, so Rage earned
+    // inside a Berserk window doubles. Read against what is up when the income
+    // arrives, not against the resting sheet the fight started from.
+    let f = p.factor;
+    if (poolFactor && p.gainAtb && stateRef.now) {
+      const live = poolFactor(p.gainAtb, stateRef.now);
+      if (live > 0) f = live;
+    }
+    p.value = Math.min(p.max, p.value + amount * f);
   };
   // What each event pays, pre-bucketed the way the fight raises them. `cast` is
   // keyed BY SKILL, not pooled: a gain whose guard names no event fires when
@@ -178,7 +213,10 @@ function runFight(spec) {
   for (const { prof, source, applies } of rotation.active) {
     const out = cast(prof, bare);
     const setsUp = (applies?.self?.length ?? 0) + (applies?.target?.length ?? 0);
-    if (!out.damage && !out.heal && !out.shield && !setsUp) continue;
+    // Worth nothing TOWARD THE GOAL and sets nothing up: not in this rotation.
+    // A dps fight does not spend GCDs on a pure heal; an hps fight does not
+    // spend them on a nuke. A buff-applier stays - the lookahead prices it.
+    if (!worth(out.damage, out.heal, out.shield) && !setsUp) continue;
     const cooldown = Math.max(prof.cooldown / cdrFor(prof), 0);
     actives.push({
       prof, source, out, applies,
@@ -191,10 +229,10 @@ function runFight(spec) {
       // per fight - `Warrior_Rage_Strike` read one cast in 200 seconds when its
       // income supports one every eight.
       poolGated: cooldown <= 0 && (prof.costs ?? []).some((c) => pools.has(c.atb)),
-      // The base priority: what a second of your time buys, before anything is
-      // up. With a lookahead this is only the tiebreak; without one it is the
-      // whole player model.
-      density: (out.damage + out.heal + out.shield) / Math.max(prof.occupancy, 0.05),
+      // The base priority: what a second of your time buys toward the goal,
+      // before anything is up. With a lookahead this is only the tiebreak;
+      // without one it is the whole player model.
+      density: worth(out.damage, out.heal, out.shield) / Math.max(prof.occupancy, 0.05),
       casts: 0, damage: 0, heal: 0, shield: 0,
     });
   }
@@ -237,7 +275,18 @@ function runFight(spec) {
   // it is up and when it ticks even though the damage is settled at the end.
   // Feeding it refreshes its life, which is what a `DurationBased` status does.
   const poolDots = (rotation.dots ?? []).filter((d) => d.pool)
-    .map((d) => ({ ...d, fed: 0, damage: 0, heal: 0, ticks: 0, expires: -1, nextTick: 0 }));
+    .map((d) => ({
+      ...d, fed: 0, damage: 0, heal: 0, ticks: 0, expires: -1, nextTick: 0,
+      // The payout ledger. `DurationBased` redistributes what is still OWED
+      // plus the new amount over a fresh window - that is the in-game reading,
+      // a second crit two ticks in adds the 35 still owed to the new 35 - so
+      // each feed resets the per-tick rate and each tick pays it down. What
+      // the bell catches un-paid is the tail a damage meter never saw.
+      owed: 0, paid: 0, perTick: 0,
+      lifeTicks: d.tick > 0
+        ? Math.max(1, Math.round((Number.isFinite(d.duration) ? d.duration : fight) / d.tick))
+        : 1,
+    }));
   const dots = (rotation.dots ?? []).filter((d) => !d.pool).map((d) => ({
     ...d, out: dotOutput(d, bare), damage: 0, heal: 0, ticks: 0, credit: 0,
   })).filter((d) => d.out.damage || d.out.heal);
@@ -310,7 +359,7 @@ function runFight(spec) {
    * `pick = -1` means "swing instead", which is how holding a cooldown for a
    * window is expressed.
    */
-  function rollout(pick, t0, state0, self0, foe0, live0) {
+  function rollout(pick, t0, state0, self0, foe0, live0, chainIdx0 = 0, timeCursors = null) {
     const horizon = Math.min(t0 + lookahead, fight);
     // Cheap copies: the horizon is short and these are all small.
     const cd = state0.map((s) => ({ charges: s.charges, nextCharge: s.nextCharge }));
@@ -338,8 +387,19 @@ function runFight(spec) {
     const self = new Map(self0), foe = new Map(foe0);
     const dotsUp = new Map();
     for (const [d, st] of live0) dotsUp.set(d, { expires: st.expires, nextTick: st.nextTick, out: st.out });
+    // Income from the clock keeps arriving inside the horizon too - without it
+    // the rollout judged a Rage-funded cast unaffordable that the real loop
+    // would fund - and the chain continues from where the fight actually IS,
+    // not from link 1: which swing comes next decides where the finisher lands.
+    const cursors = timeCursors ? timeCursors.map((e) => ({ g: e.g, next: e.next })) : null;
+    const advanceClock = (until) => {
+      if (!cursors) return;
+      for (const e of cursors) {
+        while (e.next <= until) { gain(e.g.atb, e.g.amount); e.next += e.g.every; }
+      }
+    };
 
-    let t = t0, total = 0, idx = 0, first = true;
+    let t = t0, total = 0, idx = chainIdx0, first = true;
     let dirty = true, st = null;
     const at = () => {
       for (const [b, e] of self) if (e <= t) { self.delete(b); dirty = true; }
@@ -356,7 +416,7 @@ function runFight(spec) {
     // Everything already ticking keeps ticking, at the value it snapshot.
     const tick = (until) => {
       for (const [d, s] of dotsUp) {
-        while (s.nextTick <= Math.min(until, s.expires)) { total += s.out.damage + s.out.heal; s.nextTick += d.tick; }
+        while (s.nextTick <= Math.min(until, s.expires)) { total += worth(s.out.damage, s.out.heal, 0); s.nextTick += d.tick; }
         if (s.expires <= until) dotsUp.delete(d);
       }
     };
@@ -391,7 +451,7 @@ function runFight(spec) {
         }
         spend(a.prof);
         const out = cast(a.prof, st);
-        total += out.damage + out.heal + out.shield;
+        total += worth(out.damage, out.heal, out.shield);
         for (const g of out.gains ?? []) gain(g.atb, g.amount);
         if (hasIncome) {
           const isSig = a.prof.type === 'SignatureSkill';
@@ -401,21 +461,22 @@ function runFight(spec) {
         putUp(a.applies);
         startDots(a.prof.id);
         const end = Math.min(t + a.occupancy, horizon);
-        tick(end);
+        tick(end); advanceClock(end);
         t = end;
+        if (chainResets) idx = 0;
       } else if (chain.length) {
         const link = chain[idx++ % chain.length];
         const out = cast(link.prof, st);
-        total += out.damage + out.heal + out.shield;
+        total += worth(out.damage, out.heal, out.shield);
         for (const g of out.gains ?? []) gain(g.atb, g.amount);
         if (hasIncome) awardTo(link.prof.isCombo ? income.combo : income.attack, false);
         putUp(link.applies);
         startDots(link.prof.id);
         const end = Math.min(t + link.occupancy, horizon);
-        tick(end);
+        tick(end); advanceClock(end);
         t = end;
       } else {
-        tick(horizon);
+        tick(horizon); advanceClock(horizon);
         break;
       }
       for (let i = 0; i < actives.length; i++) {
@@ -433,7 +494,10 @@ function runFight(spec) {
     for (const a of actives) { a.casts = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
     for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; }
-    for (const p of poolDots) { p.fed = 0; p.damage = 0; p.heal = 0; p.ticks = 0; p.expires = -1; p.nextTick = 0; }
+    for (const p of poolDots) {
+      p.fed = 0; p.damage = 0; p.heal = 0; p.ticks = 0; p.expires = -1; p.nextTick = 0;
+      p.owed = 0; p.paid = 0; p.perTick = 0;
+    }
 
     // A skill opens the fight with its full bank of charges - that is exactly
     // what a charge is - and regains one per cooldown thereafter.
@@ -447,11 +511,12 @@ function runFight(spec) {
 
     // The state everything is priced against, rebuilt only when it changes.
     let now = bare;
+    stateRef.now = bare;
     let stateDirty = false;
     const refresh = (at) => {
       for (const [b, exp] of upSelf) if (exp <= at) { upSelf.delete(b); stateDirty = true; }
       for (const [d, exp] of upFoe) if (exp <= at) { upFoe.delete(d); stateDirty = true; }
-      if (stateDirty) { now = stateOf([...upSelf.keys()], [...upFoe.keys()]); stateDirty = false; }
+      if (stateDirty) { now = stateOf([...upSelf.keys()], [...upFoe.keys()]); stateDirty = false; stateRef.now = now; }
       return now;
     };
     // What a cast puts up. Only the TIMED buffs: the permanent ones are already
@@ -481,17 +546,27 @@ function runFight(spec) {
     };
 
 
-    // Feed the pool dots from whatever this cast landed as a critical strike.
-    // Feeding one also (re)applies it, which is what starts and refreshes its
-    // tick schedule - the total does not need that, but anything riding the
-    // ticks does.
-    const feedPools = (out, at) => {
+    // Feed the pool dots from what this cast landed. WHO may feed a pool is
+    // the hook's rule, read in skills.mjs: an `onInflictDamage` pool eats the
+    // whole rotation's matching damage (Hemorrhage), an `own` pool only its
+    // own skill's (Bonethrow). WHICH slice is the guard's rule: a crit-guarded
+    // pool takes the crit share, an unguarded one takes everything. Feeding
+    // also (re)applies the dot - starting and refreshing its tick schedule -
+    // and banks the amount into the ledger the ticks pay down.
+    const feedPools = (out, at, fromId, scale = 1) => {
       for (const p of poolDots) {
-        const src = p.pool.magic ? (out.critMagic ?? 0)
-          : p.pool.physical ? (out.critPhysical ?? 0)
-            : (out.critPhysical ?? 0) + (out.critMagic ?? 0);
+        if (p.pool.own && p.from !== fromId) continue;
+        const src = scale * (p.pool.crit
+          ? (p.pool.magic ? (out.critMagic ?? 0)
+            : p.pool.physical ? (out.critPhysical ?? 0)
+              : (out.critPhysical ?? 0) + (out.critMagic ?? 0))
+          : (p.pool.magic ? (out.totalMagic ?? 0)
+            : p.pool.physical ? (out.totalPhysical ?? 0)
+              : (out.totalPhysical ?? 0) + (out.totalMagic ?? 0)));
         if (!(src > 0)) continue;
         p.fed += src;
+        p.owed += src;
+        p.perTick = p.owed / p.lifeTicks;
         if (p.expires <= at) p.nextTick = at + p.tick;
         p.expires = at + (Number.isFinite(p.duration) ? p.duration : fight);
       }
@@ -512,13 +587,17 @@ function runFight(spec) {
         }
         if (st.expires <= until) live.delete(d);
       }
-      // A pool dot's own ticks. Its damage is settled at the end from what fed
-      // it, so nothing is credited here - but the tick is an EVENT, and a proc
-      // guarded on `isStatusType(Bleed)` rides it rather than riding a swing.
+      // A pool dot's own ticks. Each one pays down the ledger - so the tail
+      // still owed when the bell goes is dropped, exactly what a damage meter
+      // would have missed - and each is an EVENT: a proc guarded on
+      // `isStatusType(Bleed)` rides it rather than riding a swing.
       for (const p of poolDots) {
         if (!(p.tick > 0)) continue;
         while (p.nextTick <= Math.min(until, p.expires) && p.nextTick <= fight) {
           p.ticks++;
+          const pay = Math.min(p.owed, p.perTick);
+          p.paid += pay;
+          p.owed -= pay;
           fireDotTick();
           p.nextTick += p.tick;
         }
@@ -625,7 +704,12 @@ function runFight(spec) {
         g.damage += out.damage * share;
         g.heal += out.heal * share;
         g.shield += out.shield * share;
-        setUp(g.applies, at);
+        // NOTE deliberately absent: a status a TRIGGER applies. No triggered
+        // entry ships an `applies` today, and wiring one through casually
+        // would hand a 10%-per-hit proc buff ~100% uptime in deterministic
+        // mode (the damage is chance-scaled; an application is not). When the
+        // data grows one, thin the applications like `put` does - never put
+        // the buff up on every eligible event.
       }
     };
 
@@ -678,13 +762,13 @@ function runFight(spec) {
       } else if (ready.length) {
         let best = -Infinity;
         for (const i of ready) {
-          const v = rollout(i, t, state, upSelf, upFoe, live);
+          const v = rollout(i, t, state, upSelf, upFoe, live, chainIndex, timeIncome);
           if (v > best + 1e-9) { best = v; pressed = i; }
         }
         // Waiting is a move. If every ready cast is worth less over the horizon
         // than swinging and saving them, swing - that is what "do not spend both
         // weapon skills inside one window" looks like from the inside.
-        if (chain.length && rollout(-1, t, state, upSelf, upFoe, live) > best + 1e-9) pressed = -1;
+        if (chain.length && rollout(-1, t, state, upSelf, upFoe, live, chainIndex, timeIncome) > best + 1e-9) pressed = -1;
       }
 
       if (pressed >= 0) {
@@ -705,7 +789,7 @@ function runFight(spec) {
         // Rage, Mage_RayOfSpark returns a share of MaxSpark - which is authored
         // in ordinary columns and needs the sheet, so it arrives with the cast.
         for (const g of out.gains ?? []) earn(g.atb, g.amount);
-        feedPools(out, t);
+        feedPools(out, t, a.prof.id);
         setUp(a.applies, t);
         applyDots(a.prof.id, t, {
           cast: true,
@@ -716,6 +800,10 @@ function runFight(spec) {
         tickTo(end); advanceIncome(end);
         busy += a.occupancy;
         t = end;
+        // Reported from play: a cast interrupts the chain, so the next swing
+        // starts it over. The finisher - and the Rage, prayers and procs that
+        // ride it - only lands off swings with no cast between them.
+        if (chainResets) chainIndex = 0;
         continue;
       }
 
@@ -733,18 +821,36 @@ function runFight(spec) {
           if (state[i].charges > 0) continue;
           if (state[i].nextCharge > t && state[i].nextCharge < next) next = state[i].nextCharge;
         }
+        // A cast blocked only by its POOL comes back when income does, not
+        // when a timer does. A pool-gated skill never spends a charge, so the
+        // scan above never wakes for it - and a build with no filler slept to
+        // the bell on a full bank of Rage income. Wake at the next time-income
+        // event and re-ask; each step is strictly forward, so this cannot spin.
+        if (timeIncome.length && actives.some((a, i) => state[i].charges > 0
+          && t + a.occupancy <= fight && !canPay(a.prof))) {
+          for (const e of timeIncome) if (e.next > t && e.next < next) next = e.next;
+        }
         if (!(next > t)) next = fight;
         tickTo(next); advanceIncome(next);
         t = next;
+        // Standing still is longer than ComboWindow (0.6s), so the chain drops.
+        if (chainResets) chainIndex = 0;
         continue;
       }
       chainIndex++;
       if (link.prof.isCombo) combos++; else swings++;
       const swingOut = cast(link.prof, now);
-      link.damage = (link.damage ?? 0) + swingOut.damage;
-      link.heal = (link.heal ?? 0) + swingOut.heal;
-      link.shield = (link.shield ?? 0) + swingOut.shield;
-      feedPools(swingOut, t);
+      // WeaponAttack_RandomRange: observed in play as a symmetric ~±10% on
+      // WeaponPower-scaled swings (19-24, 78-95 around their means) - and as
+      // NOTHING on the Strength-scaled combo finisher, which read a constant
+      // 133 every time. So the roll rides the plain swings only; the
+      // deterministic fight keeps the mean either way.
+      const roll = rand && swingVariance > 0 && !link.prof.isCombo
+        ? 1 + (rand() * 2 - 1) * swingVariance : 1;
+      link.damage = (link.damage ?? 0) + swingOut.damage * roll;
+      link.heal = (link.heal ?? 0) + swingOut.heal * roll;
+      link.shield = (link.shield ?? 0) + swingOut.shield * roll;
+      feedPools(swingOut, t, link.prof.id, roll);
       setUp(link.applies, t);
       applyDots(link.prof.id, t, { attack: !link.prof.isCombo, combo: link.prof.isCombo });
       const end = t + link.occupancy;
@@ -754,14 +860,19 @@ function runFight(spec) {
     }
     tickTo(fight); advanceIncome(fight);
 
-    // The pool dots settle at the end: lossless means the total is just the
-    // share of what fed them. Only the TAIL is lost - whatever the last
-    // application had not yet ticked when the bell went - which over a fight
-    // many times the status's own duration is a fraction of a percent.
+    // The pool dots settle at the end, on what their ticks actually PAID
+    // before the bell - the un-ticked tail is dropped, which is what a damage
+    // meter would report. Over a fight many times the status's own duration
+    // that tail is a fraction of a percent; over a short one it is not, and
+    // crediting it in full read a 3-second fight four ticks rich. The
+    // multiplier is per dot: a Hemorage-scoped talent covers Hemorrhage and
+    // Infused Wound, not Bonethrow's plain Bleed.
     for (const p of poolDots) {
-      p.damage = p.fed * p.pool.fraction * poolMultiplier;
+      const scale = poolScale?.get(p.status) ?? { mult: poolMultiplier, healShare: poolHealShare };
+      const settled = p.tick > 0 ? p.paid : p.fed;
+      p.damage = settled * p.pool.fraction * scale.mult;
       // A share of what the bleed dealt, handed back as healing (Bloodfeast).
-      p.heal = p.damage * poolHealShare;
+      p.heal = p.damage * scale.healShare;
     }
 
     // The denominator is the FIGHT, not the moment the last cast happened - a
@@ -891,8 +1002,12 @@ function runFight(spec) {
       id: p.status, name: p.name, kind: 'over time', source: p.from,
       perCast: { damage: e.damage / rolls, heal: (e.heal ?? 0) / rolls, shield: 0 },
       interval: elapsed, share: 0,
+      // Say what the guard actually says: Hemorrhage pools physical CRITICAL
+      // damage from everyone, Bonethrow pools its OWN damage, crit or not.
       why: Math.round(p.pool.fraction * 100) + '% of ' + Math.round(e.fed / rolls) + ' '
-        + (p.pool.magic ? 'magic' : 'physical') + ' critical damage, pooled by ' + p.fromName
+        + (p.pool.magic ? 'magic ' : p.pool.physical ? 'physical ' : '')
+        + (p.pool.crit ? 'critical ' : '') + 'damage'
+        + (p.pool.own ? ' dealt by itself' : '') + ', pooled by ' + p.fromName
         + (e.ticks ? `, ticking ${Math.round(e.ticks / rolls)} times` : ''),
     });
   }

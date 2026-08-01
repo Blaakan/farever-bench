@@ -259,7 +259,8 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
         || dots.length > 0 || mods.length > 0 || gains.length > 0,
       kind: affixes.length ? 'affix' : buffs.length ? 'status'
         : dots.length ? `${Math.round(dots[0].pool.fraction * 100)}% of `
-          + `${dots[0].pool.magic ? 'magic' : 'physical'} crits as a bleed`
+          + `${dots[0].pool.magic ? 'magic' : dots[0].pool.physical ? 'physical' : 'its'} `
+          + `${dots[0].pool.crit ? 'crits' : 'damage'} as a bleed`
           : modLabel || (gains.length ? gains.map((g) => `+${g.amount} ${g.atb}${g.critGated ? ' per crit' : ''}`).join(', ') : '')
             || (granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : '')
             || (needs.length ? `nothing without ${needs[0].needsName}` : 'none'),

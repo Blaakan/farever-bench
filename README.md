@@ -402,11 +402,15 @@ Four consequences worth knowing as a player, none of them visible in game:
 - **Faction decides your secondary stat.** The same Manfish chest gives a
   Priest Fervor and a Warrior ArmorPenetration, out of one data row. Gear with
   no faction has no secondary stat at all.
-- **An item naming two aptitudes is naming who may wear it**, not paying twice.
-  Its *tooltip* shows both readings — which is why a Kobold spear lists +39
-  Critical and +39 Armor Penetration at once — but you receive your own half.
-  The proof is in the budget: summed over one item per slot, `itemType.atbRatio`
-  comes to exactly 1.0 in every stat group, so a full set is one aptitude curve.
+- **An item naming two aptitudes pays you both halves** — everything its
+  tooltip shows, which is why a Kobold spear lists +39 Critical and +39 Armor
+  Penetration at once and you receive both. Read off the character sheet: a
+  naked Warrior at 38/34/28 Vitality/Strength/Dexterity equips a
+  Fighter+Assassin axe showing +36/+15/+18 and reads exactly 74/49/46.
+  Armour is the one exception — its budget is the wearer's own reduction
+  target, so it pays once however many aptitudes the row names. Dual-aptitude
+  gear therefore carries roughly two budgets of primaries and ratings, and
+  shared pieces really are stat-denser than exclusive ones.
 - **Only weapons can be upgraded.** The game's own window text says so, and the
   twenty `<WeaponType>_Upgrade` skills exist for weapon types only. Reading the
   per-rarity `gearUpgrades` column alone put three stars on every armour piece.
