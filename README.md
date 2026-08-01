@@ -264,8 +264,10 @@ those lists for this game, so `--lookahead` stands in for one: it scores each
 ready cast by what the next few seconds are worth if you press it. That is worth
 up to +97% on a rotation built to reward it. It is a heuristic and it can lose
 to plain priority order, so the fight is played **both ways and the better
-kept**, and the output says which won. On this game's actual numbers sequencing
-is worth 0–0.4% — the player-facing debuffs are mostly movement slows.
+kept**, and the output says which won. Sequencing used to be worth 0–0.4% on
+this game's numbers; with Rage, Spark and Combo Points modelled for real it
+reaches ~1.7% where a resource wants managing, and grows as more of the
+stack-and-reset mechanics land.
 
 `--targets` is the one to reach for when the tool's number looks low against an
 in-game meter. Most of a build's damage is area-borne, and *nothing in the data
@@ -386,8 +388,9 @@ things that make this tool possible:
    the composition rules are read out of the compiled game rather than
    guessed, and every citation below reproduces from your install.
 
-Four formulas carry the whole model. All four were read from the bytecode, and
-each is cited to its function index and source line in
+Seven formulas carry the whole model. All seven were read from the bytecode —
+the last three with the repo's own reader, after live measurements found them
+first — and each is cited to its function index and source line in
 [docs/MODEL.md](docs/MODEL.md):
 
 ```
@@ -395,6 +398,9 @@ budget(L, min, max) = min * (max/min)^((L-1)/(EarlyMaxLevel-1))     one curve, e
 rating contribution = (rating / budget(L, min, max)) * target        `scale` is NOT read
 armor budget        = red * (385 + 100L) / (1 - red)                 authored columns are dead
 attribute           = (stored + scaling + flat) * modAdd * modMul
+weaponPower         = 0.4 * SUM(aptitude budgets at item level)      + MEAN of those attributes per swing
+weapon-skill term   = ratio * (0.6*attribute + 0.4*its own curve)    either hand; class skills pure
+one hit             = (amount + adds) * dmgMult * crit               * (1+fervor+mastery) * (1-reduction) * taken
 ```
 
 Four consequences worth knowing as a player, none of them visible in game:
@@ -522,14 +528,16 @@ audit` prints this list with every result.
   authored. There is no movement, no target switching, no interrupt, and the
   foe does not act, so crowd control and mitigation-through-avoidance are worth
   nothing here.
-- **Almost nothing has been checked against the running game.** One item has:
-  , main-hand and arsenal, all ten values reproduced exactly.
-  That one reading corrected two things the static model had wrong — every
-  aptitude on an item pays and they sum, and each share is rounded before the
-  sum — and confirmed the arsenal factor as  rather than a half.
-  See [docs/MODEL.md section 12](docs/MODEL.md#12-checked-against-the-game).
-  Everything else is still "the bytecode says X", which is not the same claim as
-  "the process does X".
+- **The model has been checked against the running game, extensively.** A
+  naked level-25 character sheet reproduces to the decimal; two weapons were
+  measured live on a 0-armor dummy (swings, crits, bleed ticks, charge
+  timings) and every formula reproduces the displayed integers; six expanded
+  tooltips render the weapon-skill mix the model implements; a character-sheet
+  reading settled how aptitudes pay; and the composition order itself is now
+  disassembled from `hlboot.dat` rather than assumed (`node bin/hl.mjs disasm
+  4841`). See [docs/MODEL.md](docs/MODEL.md). What remains unmeasured is
+  behavioral, not numeric — movement, target switching, a foe that acts — and
+  the audit names it.
 
 ---
 

@@ -860,11 +860,12 @@ rotations the simulator can execute, so the higher of the two is a lower bound
 on what a player can reach, and the lower one never was. The output says which
 won.
 
-On the builds in this data, sequencing is worth **0–0.4%**, on 22 of about 90
-weapons. The player-facing debuffs are mostly movement slows, and the few damage
-amplifiers sit on cooldowns long relative to their windows. That is a fact about
-this game's numbers, not a limit of the method — the synthetic cases show the
-method finding a 2× when the data offers one.
+Sequencing was worth **0–0.4%** while the resource mechanics were refused; with
+Rage, Spark and Combo Points modelled for real the searcher finds **~1.7%**
+where a pool wants managing. The player-facing debuffs are mostly movement
+slows and the few damage amplifiers sit on long cooldowns, so the ceiling is
+still modest — a fact about this game's numbers, not a limit of the method,
+which finds a 2× on the synthetic cases whenever the data offers one.
 
 ### Reference targets
 
@@ -1317,7 +1318,7 @@ the absence of animation timing data, that item affixes have no RNG (findex
 | ~~a cast costs only its own authored duration~~ **READ 2026-08-02**: no hero recovery exists | `Skill_RecoveryTime`'s only reader is `Foe.getSkillRecoveryTime@6773`, whose only callers are foe AI; the once-unplaced bare `recoveryTime` symbols resolve to the skill sheet's `aiProps` column — foe-AI data plumbing. The stopwatch agreed first (ten Judgement chains at exactly the authored 3.0s). | done |
 | how many enemies an area hits | Fully absent from the data — geometry is authored, population is not. `--targets` is an input, defaulting to 1. | measure in game |
 | a `Mono` step carrying an area does not cleave | 80 rows do it and their descriptions disagree; single-target is the reading that agrees with 87% of them and cannot flatter. | `forceMono` in the binary |
-| a re-applied status refreshes rather than stacks | `stackingPolicy` is authored on 11 of 250 status rows. | disassemble the status path |
+| ~~a re-applied status refreshes rather than stacks~~ **READ 2026-08-02** | `addStatus@4561` switches on the authored `stackingPolicy` enum [Additive, DurationBased, Override] exactly as modelled, and `Status.refresh@14446` never SHORTENS a window — the refresh duration is max(new, remaining), which the fight now applies too. | done |
 | `LinearRatio` behaves like `Flat` | No row in this build uses it. | wait for one, then check |
 
 **Absent entirely** — most of what a skill script does. 427 of 962 skills carry
