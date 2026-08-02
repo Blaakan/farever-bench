@@ -7,8 +7,50 @@ remaining items with the reads already done against them, and what "done" means
 per class.
 
 State at handoff (2026-08-02, second pass): **664 checks green**; baselines
-Warrior 438.2, Rogue 306.7, Mage 223.0, Priest 296.3 (`optimize`, level 25,
+Warrior 438.2, Rogue 358.1, Mage 238.7, Priest 296.3 (`optimize`, level 25,
 named boss). Unscored lists: Warrior 5, Priest 7, Rogue 6, Mage 6.
+
+## READ FIRST: docs/GROUND-TRUTH.md
+
+An instrumented capture (4,916 logged damage events, 88s dummy session) now
+supersedes several things below and settles others. **Landed from it so far:**
+the swing floor is retired — 12 uninterrupted cycles measure 1903ms against the
+model's floored 2850ms, a ratio of 1.498, and the authored durations were right
+all along.
+
+**Still open from that document, each with a measured target — this is the live
+work list, ahead of everything in the older sections:**
+
+1. **Crit conversion.** Steady-state crit measures 28.8–34.0% against the
+   computed sheet's 21.39% (p = 2.8e-4). The player has confirmed **no talents
+   beyond the Hemorrhage root and no runes at all**, so every build-side
+   explanation is dead. `ent.UnitAttributes` carries both `critChance` and
+   `critChanceRating`; the conversion between them is a bytecode read waiting to
+   happen.
+2. **Three refused script riders all fire in game** — the combo's +20% vs a
+   bleeding target (dmgMult, not critDmgMult: the clean 1.5325 crit ratio proves
+   which), Bonethrow's rank-3 +20% critDmgMult, and Domination against the stun
+   window, because **the training dummy IS stunnable**. Riderless numbers run
+   −13.7% to −17.5%. Policy to adopt: publish rider-on conditioned on status
+   uptime rather than refusing.
+3. **ComboWindow is half wrong.** Chains reset, but a cast does NOT reset a
+   BANKED finisher — decisive sequence at t=47.6→55.0s, where link 3 survived
+   three Rage Strikes and a fully-held Rampage before the finisher fired. Needs
+   a banked-chain concept.
+4. **Rage Strike crits 56.3%** (9/16) against 28.8% for everything else, with no
+   talent to explain it. Read the skill row and script for an authored crit rider.
+5. **Berserk measures ×1.183–1.187, not ×1.20**, composing additively with
+   dmgMult riders. Either the authored value differs or a base is excluded.
+6. **Bleed tick ratio is 0.1023–0.1028, not 0.100** — small and systematic; best
+   candidate is Fervor applied a second time at tick landing.
+7. **The bake's live residuals still need re-checking.** GROUND-TRUTH's Armor
+   +11% / Strength −5.4% were measured at HEAD `947c02f`, which is BEFORE the
+   bake landed in `4b63c44`. Recompute before acting on them.
+
+Also confirmed correct and needing no work: the ±10% band (and the log ceils like
+the display), the crit multiplier to 0.3%, the whole Hemorrhage ledger, status
+ticks never critting (0/98), and full-charge Rampage as the standing assumption.
+Bonethrow's 269ms pairs are cleave, not a return hit — retire that hypothesis.
 
 ## The method (proven, in order of preference)
 
