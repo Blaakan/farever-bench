@@ -257,6 +257,23 @@ or arsenal-empty capture); GS-build crit conversion — fleet steady 30.2% vs th
 build's modelled 17.95%, P ≈ 0.02, so the v1 crit close was axe-build-specific
 (sheet CritChance read on the GS loadout); SurgingForce's unmodelled ~+20%/~2s
 self-window and its own hit ×1.41–1.48 short (SF spam at fixed Devote stacks);
+
+**SHEET READ, 2026-08-02 evening — the player photographed the Character
+Profile on the exact v2 loadout (GS_Nova mainhand, GA_Craft arsenal, OFFHAND
+EMPTY — the shield was unequipped, so no shield socket in these numbers):
+Vitality 179, Strength 144, Dexterity 32, Faith 32, Intellect 28, level 25.**
+What it settles: the +11-Strength anomaly is a SHEET-SIDE deficit — the game's
+own sheet carries 144 against the model's computed 135.2, and the
+damage-inferred 145.6–146.8 sits within hero-quantization of the sheet. The
+damage path is exonerated end to end; the −6.9% "multiplier" is dead. What it
+arms: the full five-attribute vector discriminates the two candidate sources —
+an arsenal stat share larger than the modelled 0.4 inflates every GA_Craft-
+carried attribute proportionally (Vit AND Str, in the GA's aptitude mix), while
+an unread talent node moves only its own stat. Diff all five against the
+model's sheet for THIS exact loadout (no offhand!) and the residual vector
+picks the hypothesis. The remaining ~1–3 between sheet 144 and damage-inferred
+145.6–146.8 is within fit precision; do not chase it until the sheet diff is
+clean.
 `(D+Σ)` vs `D×(1+Σ)` (DamageModifier ≠ 100 capture); the three-rider sum (axe
 session: finisher on a bleeding target inside Berserk during the stun); the
 Battle Shout ±13pt floor (~100 in-window hits); hero-side rounding polarity and
