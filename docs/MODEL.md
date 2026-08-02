@@ -439,6 +439,34 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**Damage riders SUM into one bracket; they do not compound.**
+`computeDamage@4841` (`Unit.hx:2000-2031`) op 8 runs the hooks, op 14 seeds
+`modMult` from `hitData.dmgMult` — one scalar that starts at 1 and that every
+rider only ever `+=`s — and op 165 applies it once. The model multiplied a line
+at a time: `runeDamage`, then `damageByAffinity`, then the basic-attack proc.
+Two +20% riders read ×1.44 where the game gives ×1.40.
+
+Decided three ways in the v2 capture: the one deterministic double-rider hit
+(Rage Strike 352 under Berserk *and* Domination) fits `1 + 0.20 + 0.25 = 1.45`
+to −0.23% where `1.20 × 1.25` misses by +3.2%; a 42-hit least-squares prefers
+additive at rms 0.26% against 0.66%; and Berserk-added-*into*-the-fervor-bracket
+is excluded by the GA ratio window [1.1903, 1.1954]. So the shape is
+
+```
+amount = B x (1 + Fervor + Mastery) x (1 + SUM dmgMult) x critDamage^crit
+```
+
+**A scripted `dmgMult` is not a sheet stat.** `skills.mjs` turns an unconditional
+`hit.dmgMult += vars.n` into a `TAttribute_Flat DamageModifier` row so the buff,
+its uptime and its place in the fight come for free — but DamageModifier
+*multiplies* in `castOutput`. Those rows are now diverted into the additive rider
+channel at the same uptime the sheet would have given them. `critDmgMult` rows
+are left alone: `ctx.critDmgMult` really does start at `atbVal(CritDamage)`.
+
+*Named caveat:* at sheet DamageModifier = 100, `(D + Σ)` and `D × (1 + Σ)` are
+indistinguishable. Deciding that needs a capture with a permanent
+DamageModifier ≠ 100 source.
+
 **The arsenal's upgrade effect reaches you, whole.** The harvest read
 `Slot_Weapon1` and `Slot_OffhandWeapon`, on the reasoning that the arsenal grants
 two chosen skills and its discounted stats and an upgrade effect is neither. The
@@ -448,11 +476,15 @@ reads **17.3%** where base + ratings alone give 14.26%. Nothing else in that
 loadout grants CritChance. It is *not* scaled by the slot's 0.4 either — an
 upgrade row is a skill affix, not a stat line.
 
-*Named residual:* `GreatAxe_Upgrade` is +1/+2/+3/+4/+5 by star and that weapon is
-four stars (iLevel 320 = 250 + Epic 30 + 4 × 10), so the data says **+4** where
-the sheet wants **+3**. One screenshot of Judgement's upgrade line settles
-whether the rank the row sees is the star count. The model ships what the data
-says and carries the point.
+*The rider row and the iLevel do not count the same thing.* The iLevel is
+unambiguous about the stars — 320 = 250 + Epic 30 + 4 × 10 — and the ladder is
++1/+2/+3/+4/+5 by rank, so the data reads +4. The screenshot reads *"Critical
+Chance increased by 3%"* on that same four-star weapon, and the sheet closes at
+17.3 with 3. **The rank the row sees is `stars - 1`**, and a one-star weapon
+carries no rider at all. Which of two rules that is stays open: plain
+`stars - 1`, or `stars` capped at the rarity's own maximum minus one. Every Epic
+case agrees, so one hover of the Rare 3-star Axe_Boomerang decides it — +2 is the
+first, +3 the second.
 
 *Reading a printed sheet against the game's:* the model folds a proc-applied
 buff with no cooldown behind it into the resting sheet at its cap, because in

@@ -3200,6 +3200,35 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- dmgMult riders sum, they do not compound --------------------------------
+// `computeDamage@4841` (Unit.hx:2000-2031) op 8 runs the hooks, op 14 seeds
+// `modMult` from `hitData.dmgMult` - one scalar that starts at 1 and that every
+// rider only ever `+=`s - and op 165 applies it once. The model multiplied a
+// line at a time: runeDamage, then damageByAffinity, then the basic-attack
+// proc. The v2 capture's one deterministic double-rider hit (Rage Strike 352
+// under Berserk AND Domination) fits 1 + 0.20 + 0.25 = 1.45 to -0.23%, where
+// 1.20 x 1.25 misses by +3.2%; a 42-hit least-squares agrees, rms 0.26% to 0.66%.
+group('two damage riders make 1.45, not 1.50');
+{
+  const eng = createEngine({ quiet: true });
+  const t = eng.combat.foe('dummy', 25);
+  const prof = eng.combat.profile('Warrior_Rage_Strike', 3);
+  const sheet = new Map([['Strength', 100], ['CritDamage', 100], ['DamageModifier', 100]]);
+  const hit = (all) => {
+    const o = eng.combat.castOutput(prof, sheet, t,
+      { targets: 1, assume: eng.opts.assume, attackerLevel: 25 }, undefined,
+      { critDamageByType: null, critChanceByType: null, damageByAffinity: { all },
+        armorIgnore: null, bleed: null });
+    return o.critRoll ? o.critRoll.fixed + o.critRoll.base : o.damage;
+  };
+  const base = hit(0);
+  near('one +20% rider reads 1.20', hit(0.20) / base, 1.20, 1e-9);
+  near('one +25% rider reads 1.25', hit(0.25) / base, 1.25, 1e-9);
+  near('...and the two together read 1.45', hit(0.45) / base, 1.45, 1e-9);
+  ok('which is not the compounded 1.50',
+    Math.abs(hit(0.45) / base - 1.20 * 1.25) > 1e-6, String(hit(0.45) / base));
+}
+
 // --- the arsenal's upgrade effect reaches the wearer --------------------------
 // The harvest read Slot_Weapon1 and Slot_OffhandWeapon, on the reasoning that
 // the arsenal grants two chosen skills and its discounted stats and an upgrade
@@ -3216,14 +3245,14 @@ group("the arsenal's upgrade effect is not discounted away");
     eng.plan.pruneSelection(l);
     return eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 }).sheet.get('CritChance');
   };
-  // GreatAxe_Upgrade is +1/+2/+3/+4/+5 CritChance by star, mutually exclusive.
-  near('a 4-star arsenal axe is worth 4 crit over an unupgraded one',
-    crit(4) - crit(0), 4, 1e-9);
-  near('...and a 2-star one exactly 2', crit(2) - crit(0), 2, 1e-9);
-  // It arrives WHOLE - the slot's 0.4 applies to stat lines, not to a skill's
-  // affix row - so it must not read ceil(4 x 0.4) = 2.
-  ok('it is not scaled by the arsenal stat factor', Math.abs((crit(4) - crit(0)) - 2) > 1e-6,
-    String(crit(4) - crit(0)));
+  // GreatAxe_Upgrade is +1/+2/+3/+4/+5 CritChance by rank, mutually exclusive,
+  // and the rank is STARS - 1: the four-star weapon's own tooltip reads
+  // "Critical Chance increased by 3%" while its iLevel 320 proves four stars.
+  near('a 4-star arsenal axe is worth 3 crit over an unupgraded one',
+    crit(4) - crit(0), 3, 1e-9);
+  near('...and a 2-star one exactly 1', crit(2) - crit(0), 1, 1e-9);
+  ok('...and a 1-star one carries no rider at all', Math.abs(crit(1) - crit(0)) < 1e-9,
+    String(crit(1) - crit(0)));
 }
 
 // --- the bake, against the game's own return value ---------------------------

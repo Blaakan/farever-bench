@@ -215,10 +215,17 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // slot's 0.4 either, because an upgrade row is a skill affix and not a
     // stat line.
     //
-    // Named residual: `GreatAxe_Upgrade` is +1/+2/+3/+4/+5 by star and the
-    // weapon is 4 stars (iLevel 320 = 250 + Epic 30 + 4x10), so the data says
-    // +4 where the sheet wants +3. One screenshot of Judgement's upgrade line
-    // settles whether the rank the row sees is the star count.
+    // THE RIDER ROW AND THE iLEVEL DO NOT COUNT THE SAME THING. The iLevel is
+    // unambiguous about the stars - 320 = 250 + Epic 30 + 4x10 - and the affix
+    // ladder is +1/+2/+3/+4/+5 by rank, so the data reads +4. The screenshot
+    // reads "Critical Chance increased by 3%" on that same four-star weapon,
+    // and the sheet closes at 17.3 with 3. So the rank the row sees is
+    // STARS - 1, and a one-star weapon carries no rider at all.
+    //
+    // Which of two rules that is stays open: plain `stars - 1`, or `stars`
+    // capped at the rarity's own maximum minus one. Every Epic case agrees, so
+    // one hover of the Rare 3-star Axe_Boomerang decides it - +2 is the first,
+    // +3 the second.
     const upgradeGaps = [];
     const upgradeProcs = [];
     for (const slotId of ['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']) {
@@ -229,11 +236,15 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       if (!upgradeId) continue;
       const stars = Math.min(g.stars ?? 0, cat.maxStars(item, g.rarity));
       if (stars < 1) continue;
+      // The affix ladder is read at STARS - 1; see above. A one-star weapon
+      // still reaches the script-proc branch below, which is keyed on the star
+      // count and not on this ladder.
+      const riderRank = stars - 1;
       const up = cdb.byId('skill').get(upgradeId);
-      const rows = (up?.affixes ?? []).filter((a) => a.target?.attribute
-        && !(a.conds?.minRank != null && stars < a.conds.minRank)
-        && !(a.conds?.maxRank != null && stars > a.conds.maxRank)
-        && !(a.conds?.equalRank != null && stars !== a.conds.equalRank));
+      const rows = riderRank < 1 ? [] : (up?.affixes ?? []).filter((a) => a.target?.attribute
+        && !(a.conds?.minRank != null && riderRank < a.conds.minRank)
+        && !(a.conds?.maxRank != null && riderRank > a.conds.maxRank)
+        && !(a.conds?.equalRank != null && riderRank !== a.conds.equalRank));
       if (!rows.length) {
         // ...but a script proc is not automatically unreadable. Twelve of the
         // twenty `<Type>_Upgrade` rows carry a script instead of affixes, and
@@ -485,6 +496,25 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // uptime, because that IS what a character averages - but the fight does
     // not read that sheet.
     const buffs = plan.selfBuffs(rot);
+
+    // A SCRIPTED `dmgMult` IS NOT A SHEET STAT. `skills.mjs` turns an
+    // unconditional `hit.dmgMult += vars.n` into a `TAttribute_Flat
+    // DamageModifier` row so the buff, its uptime and its place in the fight
+    // all come for free - but DamageModifier MULTIPLIES in `castOutput`, and
+    // `computeDamage@4841` says these riders SUM. Berserk at +0.20 beside
+    // Domination at +0.25 has to read 1.45, not 1.20 x 1.25 = 1.50, and the
+    // capture's one deterministic double-rider hit picks 1.45 to -0.23%.
+    //
+    // So they are diverted here into the additive rider channel, at the same
+    // uptime the sheet would have given them. `critDmgMult` rows are left
+    // alone: `ctx.critDmgMult` really does start at atbVal(CritDamage) and
+    // compose the way the sheet's CritDamage does.
+    const isScriptDmgMult = (a) => a.fromScript && a.target?.attribute === 'DamageModifier';
+    const scriptDmgMult = (b, uptime) => {
+      let s = 0;
+      for (const a of b.affixes) if (isScriptDmgMult(a)) s += ((a.val ?? 0) / 100) * b.stacks * uptime;
+      return s;
+    };
     const timed = [];
     const conduitBuffGaps = [];
     // The two rows that must keep folding in permanent at the cap. Named by id
@@ -554,7 +584,10 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       b.uptime = (cd > 0 && dur > 0) ? Math.min(1, dur / Math.max(cd, src.occupancy)) : 1;
       b.timed = cd > 0 && dur > 0;
       if (b.timed) timed.push(b);
-      else for (const a of b.affixes) applyAffix(a, b.stacks, 1);
+      else {
+        mods.damageByAffinity.all = (mods.damageByAffinity.all ?? 0) + scriptDmgMult(b, 1);
+        for (const a of b.affixes) if (!isScriptDmgMult(a)) applyAffix(a, b.stacks, 1);
+      }
     }
 
     // The sheet the FIGHT starts from: everything permanent, nothing timed.
@@ -585,7 +618,10 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // So both are computed and both are reported: `sheet` is what the game
     // shows you standing still, `averaged` is what the fight sees.
     const resting = combatBase;
-    for (const b of timed) for (const a of b.affixes) applyAffix(a, b.stacks, b.uptime);
+    for (const b of timed) {
+      mods.damageByAffinity.all = (mods.damageByAffinity.all ?? 0) + scriptDmgMult(b, b.uptime);
+      for (const a of b.affixes) if (!isScriptDmgMult(a)) applyAffix(a, b.stacks, b.uptime);
+    }
     const averaged = evaluateLoadout(cat, loadout, {
       baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio, force,
     });

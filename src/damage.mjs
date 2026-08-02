@@ -1002,13 +1002,27 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // Raw damage bypasses every global multiplier: getDamageScale@5146
         // returns 1 for Raw before fervor, mastery or DamageModifier enter.
         let m = (rawAff ? 1 : dmgMod) * localCrit * mitigate(e, sheet, target, foe, mods, opts.attackerLevel ?? null);
+        // EVERY dmgMult RIDER SUMS INTO ONE BRACKET. They used to compound, one
+        // multiplication per line. `computeDamage@4841` (Unit.hx:2000-2031) op 8
+        // runs the hooks, op 14 seeds `modMult` from `hitData.dmgMult` - a
+        // single scalar that starts at 1 and that every rider only ever `+=`s -
+        // and op 165 applies it once. Two +20% riders give x1.40, not x1.44.
+        //
+        // Measured three ways in the 2026-08-02 v2 capture: the one
+        // deterministic double-rider hit (Rage Strike 352 under Berserk and
+        // Domination) fits 1 + 0.20 + 0.25 = 1.45 to -0.23% where 1.20 x 1.25
+        // misses by +3.2%; a 42-hit least-squares prefers additive at rms 0.26%
+        // over 0.66%; and Berserk-added-INTO-the-fervor-bracket is excluded by
+        // the GA ratio window [1.1903, 1.1954].
+        //
         // A scoped damage bonus: by affinity (Magic Conduction), by skill type
         // (a weapon-skill bonus), or across the board.
+        let riders = 0;
         for (const rd of prof.runeDamage ?? []) {
           if (rd.singleTarget && wantTargets !== 1) continue;
-          m *= 1 + rd.amount;
+          riders += rd.amount;
         }
-        m *= 1 + (mods.damageByAffinity?.[aff.root] ?? 0)
+        riders += (mods.damageByAffinity?.[aff.root] ?? 0)
           + (mods.damageByAffinity?.all ?? 0)
           + (prof.type === "WeaponSkill" ? (mods.damageByAffinity?.WeaponSkill ?? 0) : 0);
         // BASIC attacks only. `isBasicAttack` is skill types Attack..Attack4
@@ -1016,7 +1030,8 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // a type outside that set - so a rider that says "your basic attacks"
         // must not reach the swing that ends the chain. `prof.isFiller` is the
         // wrong test here: it covers the finisher too.
-        if (mods.basicAttack && /^Attack[234]?$/.test(prof.type ?? '')) m *= 1 + mods.basicAttack;
+        if (mods.basicAttack && /^Attack[234]?$/.test(prof.type ?? '')) riders += mods.basicAttack;
+        m *= 1 + riders;
         // Fervor and the matching mastery share ONE additive bracket -
         // getDamageRatio@4505: (1 + fervor + mastery) x DamageModifier - and
         // neither touches a status tick, whose SkillContext belongs to the
