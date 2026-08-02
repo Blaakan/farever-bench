@@ -218,9 +218,19 @@ The same sheet exposes the bake, though, at 5–9% per line:
 The weapon's tooltip reads +32 Vitality / +25 Strength / +69 Critical; the model
 reads +35 / +27 and slightly low on crit.
 
-**(2) Fully geared** (the build in `.scratch/_meterbuild.mjs`). Strength lands to
-one point — 173 against 174 — and Critical Bonus to a tenth. What does NOT land
-is independent of the weapon's rarity and stars, i.e. it is armour and jewellery:
+**(2) Fully geared** (the build in `.scratch/_meterbuild.mjs`). **CAVEAT, and it
+is load-bearing: the GS_Nova instance in this reading is NOT the one in (1).**
+"Martyr of Enripit" is the only GreatSword row in the game, so both readings are
+that item — but at different rarity/stars/drop level, and the geared instance is
+not yet identified. Until it is, the ATTRIBUTE rows below cannot be used to fit
+the bake, because the weapon's own contribution is unknown. Fit against (0) and
+(1), which are fully specified, and use this only as a confirmation afterwards.
+
+Strength lands to one point — 173 against 174 — but that was computed with the
+weapon ASSUMED Legendary 5★, which is circular: the same assumption that makes
+Strength match is the one the bake error would hide in. What is safe to read here
+is the shape rather than the size, because these three miss identically across
+every weapon rarity and star count tried, so none of them is the weapon:
 
 | | game | model |
 |---|---|---|
