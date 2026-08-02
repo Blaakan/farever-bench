@@ -439,8 +439,44 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     };
     // Modifiers whose scope this fight does not separate. Named, not dropped.
     const unreadMods = [];
-    for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
-      for (const mod of talents.modifiersOf(id, nodeRank)) {
+    // WHAT RATE A SECONDS-PER-EVENT MODIFIER RIDES belongs to the skill whose
+    // script carries it, not to the scope. The scope says who BENEFITS - "your
+    // weapon skills" - while the source says how often it fires. `Red Tempo` is
+    // a talent on bleed ticks; `Sword_Start_Combo` is `onFirstHit` on the
+    // finisher, so its rate is the chain's finisher rate.
+    //
+    // The chain cadence is an ESTIMATE and named as one: the fight derives the
+    // real rate by playing it, and this has to be known before the fight to set
+    // the cooldowns it will play with. Sum of the chain's own occupancies, one
+    // finisher per cycle and the rest swings.
+    const chainCycle = (rot.filler ?? []).reduce((s, x) => s + Math.max(x.prof.occupancy, 0.05), 0);
+    const perCombo = chainCycle > 0 ? 1 / chainCycle : 0;
+    const perSwing = chainCycle > 0 ? Math.max(0, (rot.filler?.length ?? 1) - 1) / chainCycle : 0;
+    const eventRate = (mod) => {
+      const f = (rot.filler ?? []).find((x) => x.prof.id === mod.from);
+      if (f) return f.prof.isCombo ? perCombo : perSwing;
+      if (mod.scope === 'attack') return perSwing;
+      const a = (rot.active ?? []).find((x) => x.prof.id === mod.from);
+      if (a && a.prof.cooldown > 0) return 1 / a.prof.cooldown;
+      return 0;
+    };
+    // The nodes you allocated, at the points in them - AND every skill the
+    // rotation plays, at the weapon rank, because a skill's own script carries
+    // these too and only talents were ever offered to the reader.
+    //
+    // ONLY the cooldown field comes through from a non-talent source. A skill's
+    // dmgMult/critDmgMult riders are already read per-skill by `runeDamage`,
+    // which applies them to THAT skill behind their live gate; letting them
+    // through here credits them twice AND at scope 'all', across the whole
+    // build. That read the Warrior 31% high.
+    const modSources = [
+      ...Object.entries(loadout.talents ?? {}).map(([id, r]) => [id, r, true]),
+      ...[...new Set([...(rot.filler ?? []), ...(rot.active ?? []), ...(rot.triggered ?? []),
+        ...(rot.passive ?? [])].map((e) => e.prof.id))].map((id) => [id, rank, false]),
+    ];
+    for (const [id, nodeRank, asTalent] of modSources) {
+      for (const mod of plan.talentModifiers(id, nodeRank, { asTalent })) {
+        if (!asTalent && mod.field !== 'cooldownPerTick') continue;
         const add = (bag, key) => { bag[key] = (bag[key] ?? 0) + mod.amount; };
         // A bleed-scoped modifier keeps the STATUS TYPE its guard named, so the
         // fight can apply Exsanguination (isStatusType(Hemorage)) to the
@@ -498,6 +534,14 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
           const tickInterval = (rot.dots ?? []).find((d) => d.pool)?.tick ?? 0;
           if (tickInterval > 0) add(mods.cooldown, 'weaponSkill');
           else unreadMods.push(mod);
+        } else if (mod.field === 'cooldownPerTick') {
+          // Every other source: seconds per event x events per second. The rate
+          // comes from the SOURCE skill - see `eventRate`. A source the
+          // rotation never plays has no rate and stays named rather than
+          // credited, which is why this reads the resolved rotation.
+          const r = eventRate(mod);
+          if (r > 0) mods.cooldown.weaponSkillFlat = (mods.cooldown.weaponSkillFlat ?? 0) + mod.amount * r;
+          else unreadMods.push(mod);
         } else if (mod.field === 'armorIgnore') add(mods.armorIgnore, 'Physical');
         else if (mod.field === 'magicArmorIgnore') add(mods.armorIgnore, 'Magic');
         else unreadMods.push(mod);
@@ -508,6 +552,12 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     if (mods.cooldown.weaponSkill) {
       const tickInterval = (rot.dots ?? []).find((d) => d.pool)?.tick ?? 0;
       mods.cooldown.weaponSkill /= tickInterval;
+    }
+    // The non-bleed sources were already turned into seconds-per-second by
+    // their own rate, so they only have to join the same total.
+    if (mods.cooldown.weaponSkillFlat) {
+      mods.cooldown.weaponSkill = (mods.cooldown.weaponSkill ?? 0) + mods.cooldown.weaponSkillFlat;
+      delete mods.cooldown.weaponSkillFlat;
     }
 
     // Self-buffs, at the uptime the fight actually supports rather than at a

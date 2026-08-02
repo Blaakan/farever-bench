@@ -189,9 +189,20 @@ const DMG_FIELD = /\b\w+\.(dmgMult|critDmgMult|critChance|armorIgnore|magicArmor
 // `Priest_Talent_Radiance` as a flat +24% damage, which took that class from
 // 249 to 380 dps. So the guard must be EMPTY, or built only from the predicates
 // named here. Anything else and the talent stays unread, by name.
-const KNOWN_PRED = /\b\w+\.(?:isMagic|isPhysical|isWeaponSkill|isBaseAttack|isBasicAttack|isFinalCombo|isFinalAttack|isStatusType|hasStatusType|critical|isCrit)\b|\b(?:isStatusType|hasStatusType)\s*\(/g;
+// `\w+[.?]+` rather than `\w+\.`: the scripts use optional chaining, and
+// `hit.skill?.isBaseAttack()` is the same predicate as `hit.skill.isBaseAttack()`.
+// `Halos_Upgrade` was refused for a question mark.
+const KNOWN_PRED = /\b\w+[.?]+(?:isMagic|isPhysical|isWeaponSkill|isBaseAttack|isBasicAttack|isFinalCombo|isFinalAttack|isStatusType|hasStatusType|critical|isCrit)\b|\b(?:isStatusType|hasStatusType)\s*\(/g;
 
-function scopeOf(block) {
+/**
+ * `rank` is optional and changes what the guard reader will answer. A talent
+ * caller passes none: a node's rank is how many POINTS are in it, and the
+ * scripts do not test it. A weapon-skill caller passes the weapon rank, because
+ * its scripts DO - `if (rank >= 3)` is a question about the build, not about
+ * live state, and refusing it left five of the eight `reduceWeaponsCooldown`
+ * rows in the game unread.
+ */
+function scopeOf(block, rank = null) {
   // Only the `if` CONDITIONS are the guard. The enclosing block also carries
   // whatever statements ran before the call, and `Exposed Essence` sets two
   // fields on consecutive lines - so reading the whole block made the second
@@ -199,8 +210,21 @@ function scopeOf(block) {
   const guard = [...String(block).matchAll(/\bif\s*\(([^{]*)\)/g)].map((m) => m[1]).join(' && ');
   // Strip the handler signature and every predicate we understand. If anything
   // condition-shaped survives, we do not understand this guard.
+  // A rank comparison is answered when the caller knows the rank, and only for
+  // a plain conjunction - inside a disjunction the clause belongs to one
+  // alternative and vetoing the whole guard on it silences the other paths.
+  if (rank != null && !/\|\|/.test(guard)) {
+    for (const r of guard.matchAll(/\brank\s*(>=|<=|==|!=|>|<)\s*(\d+)/g)) {
+      const n = Number(r[2]);
+      const ok = r[1] === '>=' ? rank >= n : r[1] === '<=' ? rank <= n
+        : r[1] === '>' ? rank > n : r[1] === '<' ? rank < n
+          : r[1] === '==' ? rank === n : rank !== n;
+      if (!ok) return null;
+    }
+  }
   const rest = String(guard)
     .replace(/function\s+on\w+\s*\([^)]*\)/g, ' ')
+    .replace(rank != null ? /\brank\s*(?:>=|<=|==|!=|>|<)\s*\d+/g : /(?!)/g, ' ')
     .replace(KNOWN_PRED, ' ')
     // Enum members and bare status-type names - `StatusType.Hemorage`, and the
     // plain `Bleed` the scripts also write.
@@ -2920,8 +2944,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * is not a reading worth preferring.
    */
   const modCache = new Map();
-  function talentModifiers(skillId, rank = 1) {
-    const key = skillId + '@' + rank;
+  /**
+   *  separates two things that both call themselves a rank. A talent
+   * NODE rank is a dose - its effect scales with the points spent, so amounts
+   * multiply by it. A weapon skill rank is a THRESHOLD its script tests, and
+   * nothing multiplies by it. A non-talent caller passes  and
+   * gets the amount once, with the rank spent answering the guard instead.
+   */
+  function talentModifiers(skillId, rank = 1, { asTalent = true } = {}) {
+    const key = skillId + '@' + rank + (asTalent ? '' : '#skill');
     let hit = modCache.get(key);
     if (hit) return hit;
     const s = skills.get(skillId);
@@ -2938,12 +2969,12 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       for (let m; (m = HEAL_SHARE.exec(body));) {
         const amount = s.vars?.[m[1]];
         if (typeof amount !== 'number' || amount <= 0) continue;
-        const sc = scopeOf(enclosingBlock(body.slice(0, m.index)));
+        const sc = scopeOf(enclosingBlock(body.slice(0, m.index)), asTalent ? null : rank);
         if (!sc) continue;
         const { scope, statusType = null, targetBleeding } = sc;
         out.push({
           field: 'healShare', scope, statusType, targetBleeding,
-          amount: amount * rank, from: skillId, name: s.texts?.name ?? skillId,
+          amount: amount * (asTalent ? rank : 1), from: skillId, name: s.texts?.name ?? skillId,
         });
       }
       // Cooldown reduction earned off an EVENT rather than carried as a stat.
@@ -2951,13 +2982,18 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // reduceWeaponsCooldown(1)` - so every bleed tick has a 12% chance to cut
       // a second off your weapon skills. That is a rate the fight can derive
       // once it knows the bleed's tick interval, which it does.
-      const CD_PROC = /reduce(?:Weapons)?Cooldown\s*\(\s*vars\.([A-Za-z0-9_]+)\s*\)/g;
+      // The optional second argument is WHOSE cooldowns - `owner`, or
+      // `dmg.status.owner` for a status carrying its instigator. Both are you on
+      // a self-applied status, so it changes nothing here except whether the row
+      // is read at all: demanding a bare one-argument call refused two rows on
+      // their punctuation alone.
+      const CD_PROC = /reduce(?:Weapons)?Cooldown\s*\(\s*vars\.([A-Za-z0-9_]+)\s*(?:,\s*[\w.?]+\s*)?\)/g;
       CD_PROC.lastIndex = 0;
       for (let m; (m = CD_PROC.exec(body));) {
         const seconds = s.vars?.[m[1]];
         if (typeof seconds !== 'number' || seconds <= 0) continue;
         const scope0 = enclosingBlock(body.slice(0, m.index));
-        const sc0 = scopeOf(scope0);
+        const sc0 = scopeOf(scope0, asTalent ? null : rank);
         if (!sc0) continue;
         let chance = 1;
         const cv = /checkProba\s*\(\s*vars\.([A-Za-z0-9_]+)/.exec(scope0)?.[1];
@@ -2965,7 +3001,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         out.push({
           field: 'cooldownPerTick', scope: sc0.scope, statusType: sc0.statusType ?? null,
           targetBleeding: sc0.targetBleeding,
-          amount: seconds * chance * rank, from: skillId, name: s.texts?.name ?? skillId,
+          amount: seconds * chance * (asTalent ? rank : 1), from: skillId, name: s.texts?.name ?? skillId,
         });
       }
       DMG_FIELD.lastIndex = 0;
@@ -2973,7 +3009,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const amount = s.vars?.[m[2]];
         if (typeof amount !== 'number' || amount === 0) continue;
         const guard = enclosingBlock(body.slice(0, m.index));
-        const sc2 = scopeOf(guard);
+        const sc2 = scopeOf(guard, asTalent ? null : rank);
         if (!sc2) continue;
         const { scope, statusType = null, targetBleeding } = sc2;
         out.push({
@@ -2984,7 +3020,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           scope,
           statusType,
           targetBleeding,
-          amount: amount * rank,
+          amount: amount * (asTalent ? rank : 1),
           from: skillId,
           name: s.texts?.name ?? skillId,
         });
@@ -3014,7 +3050,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         out.push({
           field: m[1], scope: aff === 'all' ? 'all' : aff.toLowerCase(),
           targetBleeding: false, onTarget: true,
-          amount: amount * rank, from: skillId, name: s.texts?.name ?? skillId,
+          amount: amount * (asTalent ? rank : 1), from: skillId, name: s.texts?.name ?? skillId,
         });
       }
     }

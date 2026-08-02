@@ -3200,6 +3200,53 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- cooldown earned off an event, from any source ---------------------------
+// Eight rows in the game call `reduceWeaponsCooldown` and one was credited. The
+// other seven were refused for three reasons that are not about the mechanic:
+// `scopeOf` would not answer `rank >= N`; KNOWN_PRED's `\w+\.` missed optional
+// chaining, so `hit.skill?.isBaseAttack()` failed on a question mark; and
+// CD_PROC demanded a bare one-argument call, so `reduceWeaponsCooldown(vars.time,
+// owner)` failed on a comma. And even once read, the engine only CREDITED the
+// bleed scope - everything else fell to `unreadMods` and scored zero.
+group('cooldown earned off an event, not only off a bleed');
+{
+  const eng = createEngine({ quiet: true });
+  const cd = (id, rank) => eng.plan.talentModifiers(id, rank, { asTalent: false })
+    .filter((m) => m.field === 'cooldownPerTick');
+
+  // The rank gate is answered, not refused - and answered per rank.
+  ok('a rank-3 combo rider reads at rank 3', cd('Sword_Start_Combo', 3).length === 1
+    && Math.abs(cd('Sword_Start_Combo', 3)[0].amount - 0.5) < 1e-9,
+    JSON.stringify(cd('Sword_Start_Combo', 3)));
+  ok('...and not at rank 2', cd('Sword_Start_Combo', 2).length === 0,
+    JSON.stringify(cd('Sword_Start_Combo', 2)));
+  // A weapon-skill rank is a THRESHOLD, not a dose: the amount must not scale.
+  ok('the amount does not multiply by the weapon rank',
+    Math.abs(cd('Spear_Eruption_Combo', 3)[0].amount - 0.5) < 1e-9,
+    JSON.stringify(cd('Spear_Eruption_Combo', 3)));
+  // Optional chaining and a second argument are punctuation, not conditions.
+  ok('an optional-chained basic-attack guard reads', cd('Halos_Upgrade', 3).length === 1,
+    JSON.stringify(cd('Halos_Upgrade', 3)));
+  // ...and the two that genuinely need live state still refuse.
+  for (const id of ['GS_Nova_Combo', 'Thrown_Seeds_Skill1']) {
+    ok(`${id} still refuses - it needs live state`, cd(id, 3).length === 0,
+      JSON.stringify(cd(id, 3)));
+  }
+
+  // It reaches the fight. Sword_Start_Skill1 has a 10s cooldown, and its own
+  // combo hands back 0.5s per finisher at rank 3.
+  const at = (rank) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'Sword_Start', rarity: 'Rare', stars: 3, level: 25 };
+    eng.plan.pruneSelection(l);
+    const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank });
+    return ev.throughput.lines.find((x) => x.id === 'Sword_Start_Skill1');
+  };
+  near('at rank 2 the weapon skill waits its whole cooldown', at(2).interval, 10, 1e-9);
+  ok('at rank 3 the finisher buys it back', at(3).interval < 9,
+    `${at(2).interval} -> ${at(3).interval}`);
+}
+
 // --- a next-cast register: free, and a guaranteed crit -----------------------
 // Surge of Violence is the only one in the game, and it needs no talent point -
 // DemonSigil_War_SurgeOfViolence hands the node over from a Head socket. The

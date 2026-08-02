@@ -439,6 +439,50 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**Cooldown earned off an event, from any source.** Eight rows call
+`reduceWeaponsCooldown` and one was credited. Three of the refusals were about
+punctuation and one about the engine, none about the mechanic:
+
+- `scopeOf` would not answer `rank >= N`. A rank comparison is a question about
+  the **build**, not about live state, and it is now answered when the caller
+  knows the rank — for a plain conjunction only, since inside a disjunction the
+  clause belongs to one alternative.
+- `KNOWN_PRED` matched `\w+\.`, so `hit.skill?.isBaseAttack()` was refused **on a
+  question mark**.
+- `CD_PROC` demanded a bare one-argument call, so `reduceWeaponsCooldown(vars.time,
+  owner)` was refused **on a comma**. The second argument is whose cooldowns, and
+  on a self-applied status that is you.
+- And once read, the engine credited only `scope === 'bleed'`. Everything else
+  fell to `unreadMods` and scored zero.
+
+**The rate belongs to the SOURCE skill, not to the scope.** The scope says who
+benefits ("your weapon skills"); the source says how often it fires. `Red Tempo`
+is a talent on bleed ticks; `Sword_Start_Combo` is `onFirstHit` on the finisher,
+so its rate is the chain's finisher rate. The chain cadence used for that is an
+**estimate** — the fight derives the real rate by playing it, and this has to be
+known before the fight in order to set the cooldowns it will play with.
+
+Four of eight now read and credit. The two that still refuse are correct:
+`GS_Nova_Combo` needs `hasStatusMaxStacked` and `Thrown_Seeds_Skill1` needs a
+status on the target. Two more (`Rogue_Talent_NoxiousStrategem`,
+`Priest_Talent_SwiftJustice`) are gated on `dmg.skillId == Skill.X`, which is
+readable but see the caution below.
+
+*Not landed, and why.* Teaching `scopeOf` that `dmg.skillId == Skill.X` names a
+status — gated on the row really having `props.status`, so
+`Priest_Talent_Authority`'s `Priest_Prayer_Smite` (a cast, not a status) stays
+refused — correctly un-refuses `Priest_Talent_PiercingLight` at
+`dot:Priest_Talent_Sunlight_Status`. It also drops the Priest optimum 298.4 →
+293.2, stable across restarts and isolated to that one line. The **read** is
+right; the talent search finds a worse build once the node becomes visible to it.
+That is a search-quality bug and has to be understood before the read ships.
+
+*Also not to be repeated:* offering rotation skills to `talentModifiers` without
+filtering the field credits a skill's `dmgMult` riders a second time — once
+per-skill through `runeDamage`, once here at scope `all` across the whole build.
+That read the Warrior **31% high**. Only `cooldownPerTick` comes through from a
+non-talent source.
+
 **A next-cast register: free, and a guaranteed critical strike.** Something arms
 a one-shot flag and the next cast of ONE named skill spends it. Recognised by a
 **triple**, which a sweep of all 962 scripts matches exactly once — so this is a
