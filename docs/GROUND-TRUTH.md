@@ -180,15 +180,34 @@ under Berserk, all 14 inter-press deltas exact — so **M2 is refuted** (the
 check runs at PRESS, the forced-crit check at DAMAGE EVAL — a queued second
 Rage Strike gets the free cast without the crit.
 
-> **REFUTED from the bytecode, 2026-08-02.** The two hooks do run at those two
-> moments, but nothing can get between them. `GameObject.doUseSkill@4576` op 2
-> calls `stopActiveSkill@4580` as its FIRST action, which is
-> `BaseSkill.stop@6093` on the running skill, which runs `onStop` and removes
-> the status before the new cast evaluates anything. A press cannot outrun its
-> own stop, and a queued press resolves when the current cast ENDS — the same
-> removal. Spamming Rage Strike at full Rage under Surge gives **one** free
-> critical cast and then full price, not two free casts. The register is
-> modelled one-shot accordingly.
+> **REFUTED — by this capture's own press rows, and then by the bytecode.**
+>
+> The Rage column already contains the test. Four back-to-back Rage Strike
+> pairs, all inside one 0.4s cast:
+>
+> | t | rage at press | verdict |
+> |---|---|---|
+> | 35.153 → 35.552 (399ms) | 14 → 15 | rage went UP; press 1 was **free** |
+> | 46.219 → 46.636 (417ms) | 20 → 10 | press 1 **paid** (not armed) |
+> | 87.657 → 88.087 (430ms) | 20 → 20 | at the cap and unmoved; press 1 **free** |
+> | 88.087 → 88.517 (430ms) | 20 → 10 | press 2 **paid** |
+>
+> **Never two free casts in a row.** The 87.657 triple is the decisive one: free,
+> then full price, 430ms apart.
+>
+> The mechanism agrees. The two hooks do run at those two moments, but nothing
+> gets between them: `GameObject.doUseSkill@4576` op 2 calls
+> `stopActiveSkill@4580` as its FIRST action, which is `BaseSkill.stop@6093` on
+> the running skill, which runs `onStop` and removes the status before the new
+> cast evaluates anything. A press cannot outrun its own stop, and a queued press
+> resolves when the current cast ENDS — the same removal. One arm buys one free
+> critical cast. The register is modelled one-shot accordingly.
+>
+> *Method note, because this cost a wrong commit:* the claim above was inherited
+> and then "verified" by looking for a mechanism that would explain it, which
+> found one and stopped. Asking what it PREDICTED — two free casts off a single
+> 25% proc — killed it in one line, and eight rows of a CSV already on disk
+> settled it. Check the prediction before the mechanism.
 
 **Item 5 — Berserk, exactly ×1.20; do not retune, and nothing was wrong with
 the authored value.** Identical-state pairs read 1.1915/1.1924/1.1928 raw —
