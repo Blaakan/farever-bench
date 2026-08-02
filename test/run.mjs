@@ -3130,6 +3130,58 @@ group('the search remembers what it has played');
   ok('...and takes the same number of fights to do it', real2 === real, `${real2} vs ${real}`);
 }
 
+// --- a permanent aura survives its skill's refusal ---------------------------
+// Bloodrage Aura declares two things: a heal played only from `on: Code` on a
+// physical crit at rank >= 3, and an Aura step at Start with `duration: -1`
+// carrying +5 CritChance for the wielder. The heal has no rate this reader can
+// derive, so the WHOLE skill was refused and five points of crit went with it -
+// on the one weapon in the game whose passive is a crit aura. Refusing the
+// payload is right; refusing the stat that is on regardless is not.
+group('a refused payload does not take its aura with it');
+{
+  const eng = createEngine({ quiet: true });
+
+  // The amounts, straight off the status row, so a patch that retunes them
+  // fails here rather than silently moving every Cheese Moon number.
+  const aura = eng.cdb.byId('skill').get('Axe_Boomerang_Skill_Passive_Status');
+  const vals = (aura?.affixes ?? []).filter((a) => a.target?.attribute === 'CritChance');
+  ok('the aura is two rank-exclusive CritChance rows, 3 and 5',
+    vals.length === 2 && vals.some((a) => a.val === 3 && a.conds?.maxRank === 1)
+      && vals.some((a) => a.val === 5 && a.conds?.minRank === 2),
+    JSON.stringify(vals.map((a) => [a.val, a.conds])));
+  const step = (eng.cdb.byId('skill').get('Axe_Boomerang_Skill_Passive')?.steps ?? [])
+    .find((s) => s.props?.status?.ref === 'Axe_Boomerang_Skill_Passive_Status');
+  ok('...applied by a step that never expires', step?.duration === -1, String(step?.duration));
+
+  const sheetAt = (rank) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3, level: 25 };
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank }).sheet;
+  };
+  near('the rank-2+ row reaches the sheet whole',
+    sheetAt(3).get('CritChance') - sheetAt(1).get('CritChance'), 2, 1e-9);
+
+  // The bare axe, against the same build with no weapon at all: the aura is the
+  // only flat CritChance either one grants.
+  const naked = emptyLoadout(eng.cat, 'Warrior', 25);
+  const bare = eng.evaluate(naked, { target: eng.combat.foe('dummy', 25), rank: 3 }).sheet;
+  ok('and it is worth its whole 5 points over an empty hand',
+    sheetAt(3).get('CritChance') > bare.get('CritChance') + 5 - 1e-9,
+    `${bare.get('CritChance')} -> ${sheetAt(3).get('CritChance')}`);
+
+  // ...while the payload it could not rate stays refused, and SAYS it kept the
+  // stat. A refusal that hides a half-score is the bug this test exists for.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3, level: 25 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 });
+  const row = (ev.rotation.unmodelled ?? []).find((u) => u.id === 'Axe_Boomerang_Skill_Passive');
+  ok('the heal is still refused', !!row, JSON.stringify(row ?? null));
+  ok('...and the refusal names what it kept',
+    /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
+}
+
 // --- crit is a die, and --fights throws it ----------------------------------
 // Procs rolled and the ±10% swing band rolled, but crit stayed at its
 // expectation - so a crit-bleed build, whose entire damage profile is "did the

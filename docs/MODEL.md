@@ -439,6 +439,26 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**A refused payload does not take an always-on stat with it.** The buckets are
+not exclusive, and one row can land in two of them. `Axe_Boomerang_Skill_Passive`
+declares a heal played only from `on: Code` — its script fires it on a physical
+critical strike at rank ≥ 3 — and, on the same row, an `Aura` step at `Start`
+with `duration: -1` that puts `Axe_Boomerang_Skill_Passive_Status` on the wielder
+and every ally in range. That status is `TAttribute_Flat CritChance` **3** at
+rank ≤ 1 and **5** at rank ≥ 2. The heal genuinely has no rate this reader can
+derive; the aura is on from the moment the axe is equipped and never expires.
+Refusing the skill whole cost five points of crit on the one weapon in the game
+whose passive *is* a crit aura — about 1.6% of the Warrior's optimum.
+
+So a `carries`-payload refusal now files the skill under **both** `unmodelled`
+and `passive`, and the refusal sentence names what it kept. Only two things come
+through: the skill's own affix rows, and self-buffs with no positive duration. A
+*timed* buff needs the very rate that was just refused in order to know how often
+it goes up, so it stays out; anything script-gated or `dynVal`-scaled never
+reaches `self` in the first place — `statusesOf` diverts those to `unreadable`
+with a reason. `selfBuffs` honours an entry's declared `buffs` list where it has
+one, so the restriction survives the round trip.
+
 **A skill you have not learned is not a gap.** `unit@skills.level` gates the
 class list, and ignoring it put three level-30 capstones in a level-25
 character's coverage report as things the model had failed to score.

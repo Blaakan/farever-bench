@@ -1256,6 +1256,39 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const st = statusesOf(id, { runes, rank, talents, talentRanks });
       noteDots(id, st, { source });
 
+      // A skill whose DAMAGE has no derivable rate can still carry a stat that
+      // is simply ALWAYS ON, and refusing the damage is no reason to throw the
+      // stat out with it. Bloodrage Aura is the row that proved it: its Heal
+      // step is `on: Code`, played only by the script on a physical crit at
+      // rank >= 3, so the skill really has no rate this reader can derive - but
+      // the SAME row also runs an Aura step at Start with `duration: -1`, which
+      // puts +5 CritChance on the wielder and every ally in range for the whole
+      // fight. The skill was refused whole and five points of crit went with
+      // it, on the one weapon in the game whose passive IS a crit aura.
+      //
+      // Only a PERMANENT self-buff and the skill's own affix rows come through
+      // here. A timed buff needs the rate that was just refused to know how
+      // often it goes up; a debuff and a DoT need it too. Anything script-gated
+      // or dynVal-scaled never reaches `st.self` - `statusesOf` has already
+      // diverted those into `unreadable` with a reason.
+      // Returns the clause to append to the refusal, so the report never says
+      // "not scored" about a skill half of which just was.
+      const alwaysOn = st.self.filter((b) => !(b.duration > 0));
+      const keepAlwaysOn = () => {
+        if (!ownAffixes.length && !alwaysOn.length) return '';
+        passive.push({
+          prof, source, affixes: ownAffixes, buffs: alwaysOn, debuffs: [], dots: [], ...extra,
+        });
+        const kept = [
+          ...ownAffixes.map((a) => a.target.attribute),
+          ...alwaysOn.flatMap((b) => b.affixes.map((a) => a.target.attribute)),
+        ];
+        return kept.length
+          ? ` - the ${[...new Set(kept)].join('/')} it grants IS scored, at the permanent value; `
+            + 'only this payload is not'
+          : '';
+      };
+
       if (carries) {
         const rule = triggerRule(id, prof, extra, guardOpts);
         if (usableRule(rule)) {
@@ -1281,7 +1314,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           unmodelled.push({
             id, name: prof.name, source, kind: 'foe is passive',
             why: 'it fires when you block or when you are hit, and the simulated foe never attacks - '
-              + 'real in game, correctly worth zero here',
+              + 'real in game, correctly worth zero here' + keepAlwaysOn(),
           });
           return;
         }
@@ -1307,7 +1340,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         }
         unmodelled.push({
           id, name: prof.name, source, kind: 'no rate',
-          why: extra.parent
+          why: (extra.parent
             // The parent link IS in the data (props.subskills); what is not is
             // the counter that arms it. Both ultimates hang off a weapon
             // passive that banks stacks per damage event and swaps to the
@@ -1315,7 +1348,8 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
             // once something counts damage instances.
             ? `${skills.get(extra.parent)?.texts?.name ?? extra.parent} unlocks it, and that is a passive - `
               + 'nothing in the data says how many hits arm it'
-            : 'declares damage but no trigger rate can be derived from the data',
+            : 'declares damage but no trigger rate can be derived from the data')
+            + keepAlwaysOn(),
         });
         return;
       }
@@ -3017,7 +3051,13 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const seen = new Set();
     const out = [];
     for (const entry of [...rotation.active, ...rotation.triggered, ...rotation.filler, ...(rotation.passive ?? [])]) {
-      for (const b of selfBuffsOf(entry.prof.id, { runes, rank: rotation.rank ?? 1 })) {
+      // A passive entry may declare WHICH of its self-buffs it is claiming. The
+      // two long-standing call sites hand over the whole of `st.self`, so this
+      // is a no-op for them; it exists for the entry that reaches `passive`
+      // because its damage had no rate, and is therefore only entitled to the
+      // buffs that are up regardless of that rate.
+      const own = entry.buffs ?? selfBuffsOf(entry.prof.id, { runes, rank: rotation.rank ?? 1 });
+      for (const b of own) {
         if (seen.has(b.status)) continue;
         seen.add(b.status);
         out.push(b);
