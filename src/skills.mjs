@@ -1419,6 +1419,17 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         || (s?.steps ?? []).some((x) => (x.effects ?? []).length || x.props?.status?.ref);
       if (!isAbility) return;
 
+      // A REFUSAL WHOSE REASON IS FALSE IS A BUG, and the two channels added
+      // most recently both created one. `GA_Craft_Passive` was still filed
+      // under "everything it does lives in its hscript body" while its +25%
+      // rider was being read off that very body and applied; the same sentence
+      // sat on `Warrior_Talent_SurgeOfViolence` after its register started
+      // making Rage Strike free and certain. The coverage report is the thing a
+      // player checks the tool against, so a skill the model DOES score must
+      // not appear in the list of skills it does not.
+      if ((prof.runeDamage ?? []).length) return;
+      if (empowermentIds(rank, runes).has(id)) return;
+
       // What KIND of gap this is, so a reader can tell a teleport apart from
       // damage the model cannot reach. "Contributes zero" is true of both and
       // useful about neither: `Mage_Blink` contributes zero because it is a
@@ -3133,6 +3144,27 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * (which is `inf.type == 4`, AttackCombo), op 16 `checkProba`, op 29
    * `addStatus`. `vars.chance` is 0.25 and `props.talent.maxPoints` is 1.
    */
+  /**
+   * Every id that PARTICIPATES in an empowerment anywhere in the sheet - the
+   * skill that spends the register and the skill that arms it. Computed over
+   * the whole skill list once per (rank, runes), because the pair is only
+   * visible when both halves are in scope: asking about the applier alone finds
+   * nothing. Used to keep the coverage report honest.
+   */
+  const empIdCache = new Map();
+  function empowermentIds(rank = 1, runes = null) {
+    const key = rank + '@' + (runes?.size ? [...runes].sort().join('+') : '-');
+    let hit = empIdCache.get(key);
+    if (!hit) {
+      hit = new Set();
+      for (const e of empowermentsOf([...skills.keys()], { rank, runes })) {
+        hit.add(e.from); hit.add(e.skill);
+      }
+      empIdCache.set(key, hit);
+    }
+    return hit;
+  }
+
   function empowermentsOf(ownedIds, { rank = 1, runes = null } = {}) {
     const out = [];
     const consumers = new Map();     // status -> skill that spends it

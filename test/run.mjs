@@ -3200,6 +3200,38 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- the coverage report may not refuse what the model scores ----------------
+// A refusal whose reason is FALSE is a bug, and the two newest channels each
+// made one. `GA_Craft_Passive` was filed under "everything it does lives in its
+// hscript body" while its +25% rider was being read off that very body and
+// applied; the same sentence sat on `Warrior_Talent_SurgeOfViolence` after its
+// register started making Rage Strike free and certain. The coverage list is
+// what a player checks the tool against.
+group('a skill the model scores is not in the unscored list');
+{
+  const eng = createEngine({ quiet: true });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Epic', stars: 4, level: 25 };
+  l.gear.Slot_Head = { item: 'Head_RDemon_Fig_Craft', rarity: 'Rare', stars: 0, level: 25 };
+  eng.plan.pruneSelection(l);
+  l.augments = { 'Slot_Head/AugmentDemonSigil': 'DemonSigil_War_SurgeOfViolence' };
+  const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 });
+  const unscored = new Set((ev.rotation.unmodelled ?? []).map((u) => u.id));
+
+  ok('Domination carries a rider, so it is scored',
+    (eng.combat.profile('GA_Craft_Passive', 3).runeDamage ?? []).length === 1);
+  ok('...and is therefore absent from the unscored list',
+    !unscored.has('GA_Craft_Passive'), [...unscored].join(', '));
+
+  const emp = eng.plan.empowermentsOf(eng.talents.runableSkillIds(l), { rank: 3 });
+  ok('Surge of Violence arms a register, so it is scored', emp.length === 1, JSON.stringify(emp));
+  ok('...and is therefore absent too',
+    !unscored.has('Warrior_Talent_SurgeOfViolence'), [...unscored].join(', '));
+
+  // The check must not swallow a genuine refusal along with the stale ones.
+  ok('a real refusal is still reported', unscored.size > 0, [...unscored].join(', '));
+}
+
 // --- cooldown earned off an event, from any source ---------------------------
 // Eight rows in the game call `reduceWeaponsCooldown` and one was credited. The
 // other seven were refused for three reasons that are not about the mechanic:
