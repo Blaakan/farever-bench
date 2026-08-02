@@ -19,7 +19,9 @@ import { createEngine } from '../src/engine.mjs';
 import { emptyLoadout, illegalReason, pruneIllegal } from '../src/loadout.mjs';
 import { optimize } from '../src/optimize.mjs';
 import { simulate } from '../src/sim.mjs';
-import { makePolicy, derivedApl, repairApl, searchApl, vocabularyFor } from '../src/rotation.mjs';
+import {
+  makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel, conjoin, contradictory,
+} from '../src/rotation.mjs';
 
 let pass = 0;
 const failures = [];
@@ -2628,6 +2630,114 @@ group('a buff window prices only itself');
   ok('...and costs about what the clock and the dropped chain say it should',
     (b - a) / b > 0.001 && (b - a) / b < 0.045,
     `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s + a chain restart every 50s of a 200s fight`);
+}
+
+// --- what a rotation line is allowed to say ---------------------------------
+// `buff.X.up` cannot say "will the window still be open when this lands", and
+// `rage>=n` cannot say "press the generator before the bar caps". Both are
+// ordinary rotation decisions and neither was expressible.
+group('new APL atoms');
+{
+  // The evaluator, against a hand-built fight state - which is the only way to
+  // assert the SEMANTICS rather than assert that some search happened to like
+  // a condition.
+  const buff = { status: 'S' };
+  const debuff = { status: 'D' };
+  const ctx = {
+    ready: [0, 1],
+    actives: [{ prof: { id: 'A' } }, { prof: { id: 'B' } }],
+    t: 4,
+    buffs: new Map([[buff, 10]]),
+    debuffs: new Map([[debuff, 5]]),
+    pools: new Map([['Rage', { value: 12 }]]),
+    charges: (i) => (i === 0 ? 1 : 0),
+    remains: (i) => (i === 0 ? 0 : 1.5),
+  };
+  const holds = (cond) => makePolicy({ entries: [{ skill: 'A', cond }], excluded: [] })(ctx) === 0;
+
+  ok('buff.S.remains>=5 holds with 6 seconds left',
+    holds({ kind: 'remains', on: 'buff', id: 'S', min: 5 }));
+  ok('...and fails with 6 seconds left and 7 asked for',
+    !holds({ kind: 'remains', on: 'buff', id: 'S', min: 7 }));
+  ok('debuff.D.remains>=1 holds with 1 second left',
+    holds({ kind: 'remains', on: 'debuff', id: 'D', min: 1 }));
+  ok('a window that is not up has no time left at all',
+    !holds({ kind: 'remains', on: 'buff', id: 'NOPE', min: 0.5 }));
+
+  ok('rage<=12 holds at 12', holds({ kind: 'resource', atb: 'Rage', max: 12 }));
+  ok('rage<=10 fails at 12', !holds({ kind: 'resource', atb: 'Rage', max: 10 }));
+  ok('rage>=12 still holds at 12', holds({ kind: 'resource', atb: 'Rage', min: 12 }));
+
+  ok('cd.B<=2 holds when B is 1.5s from coming back',
+    holds({ kind: 'cd', id: 'B', max: 2 }));
+  ok('cd.B<=1 fails when B is 1.5s away',
+    !holds({ kind: 'cd', id: 'B', max: 1 }));
+  // Ready counts as back-within-n, which is what makes cd a superset of ready
+  // rather than a rival to it - and is why it is vacuous on its own line.
+  ok('cd.A<=0.5 holds because A is ready now', holds({ kind: 'cd', id: 'A', max: 0.5 }));
+
+  ok('the labels read the way a player would write them',
+    condLabel({ kind: 'remains', on: 'buff', id: 'S', min: 2 }) === 'buff.S.remains>=2'
+    && condLabel({ kind: 'cd', id: 'B', max: 1.5 }) === 'cd.B<=1.5'
+    && condLabel({ kind: 'resource', atb: 'Rage', max: 10 }) === 'rage<=10'
+    && condLabel({ kind: 'resource', atb: 'Rage', min: 10 }) === 'rage>=10');
+
+  // A line that can never fire costs a whole fight to discover, so the search
+  // must never be handed one.
+  ok('rage>=10 & rage<=5 is refused as contradictory',
+    contradictory(conjoin([{ kind: 'resource', atb: 'Rage', min: 10 },
+      { kind: 'resource', atb: 'Rage', max: 5 }])));
+  ok('...but rage>=5 & rage<=10 is a legal band',
+    !contradictory(conjoin([{ kind: 'resource', atb: 'Rage', min: 5 },
+      { kind: 'resource', atb: 'Rage', max: 10 }])));
+  ok('buff.S.down & buff.S.remains>=1 is refused as contradictory',
+    contradictory(conjoin([{ kind: 'buff', id: 'S', want: false },
+      { kind: 'remains', on: 'buff', id: 'S', min: 1 }])));
+}
+
+// --- the same list, scored twice --------------------------------------------
+group('the search remembers what it has played');
+{
+  const eng = createEngine({ quiet: true, fight: { seconds: 200, targets: 1, lookahead: 0 } });
+  const target = eng.combat.foe('boss', 25);
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.profile = 'armorpen';
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+  const ev = eng.evaluate(l, { target, rank: 3 });
+  const ids = ev.throughput.lines.filter((x) => x.kind === 'active').map((x) => x.id);
+  const vocab = vocabularyFor(ev.rotation);
+  ok('the vocabulary stays small enough to search exhaustively',
+    vocab.length > 4 && vocab.length < 300, String(vocab.length));
+  ok('...and it offers the new atoms', vocab.some((c) => c.kind === 'cd')
+    && vocab.some((c) => c.kind === 'remains')
+    && vocab.some((c) => c.kind === 'resource' && c.max != null),
+    vocab.map((c) => c.kind).join(','));
+
+  let real = 0;
+  const score = (apl) => {
+    real++;
+    return eng.evaluate(l, { target, rank: 3, policy: makePolicy(apl) }).throughput.dps;
+  };
+  const got = searchApl({
+    score, ids, vocabulary: vocab, restarts: 3, maxSteps: 5, startFrom: derivedApl(ids),
+  });
+  ok('a search of any size replays lists it has already played', got.cacheHits > 0, String(got.cacheHits));
+  ok('...and only the misses reach the fight',
+    real === got.evaluations, `${real} fights vs ${got.evaluations} reported`);
+  ok('...and the reported total is what it considered',
+    got.considered === got.evaluations + got.cacheHits, String(got.considered));
+  ok('the memo never returns worse than the derived order',
+    got.score >= eng.evaluate(l, { target, rank: 3, policy: makePolicy(derivedApl(ids)) }).throughput.dps - 1e-6);
+
+  // Determinism survives the cache: the same seed has to re-derive, or a build
+  // a user shares stops being reproducible.
+  let real2 = 0;
+  const again = searchApl({
+    score: (apl) => { real2++; return eng.evaluate(l, { target, rank: 3, policy: makePolicy(apl) }).throughput.dps; },
+    ids, vocabulary: vocab, restarts: 3, maxSteps: 5, startFrom: derivedApl(ids),
+  });
+  near('the same seed still re-derives the same score', again.score, got.score, 1e-9);
+  ok('...and takes the same number of fights to do it', real2 === real, `${real2} vs ${real}`);
 }
 
 // --- crit is a die, and --fights throws it ----------------------------------

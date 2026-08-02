@@ -1510,6 +1510,12 @@ const commands = {
 
     const t0 = Date.now();
     let totalFights = 0;
+    // Lists the search WANTED to score and did not have to, because it had
+    // played that exact list before. Reported rather than swallowed: "570k
+    // fights" and "570k lists considered" stopped being the same number the
+    // moment the search grew a memo, and quietly printing the smaller one under
+    // the old label would understate the search and overstate the machine.
+    let totalRepeats = 0;
     // Round 0: the kit, against the rotation the model derives. That is where
     // every other command stops.
     let kit = kitSearch(null);
@@ -1548,6 +1554,7 @@ const commands = {
       });
       apl = got.apl;
       aplScore = got.score;
+      totalRepeats += got.cacheHits ?? 0;
       log.push({
         round, what: 'rotation', score: aplScore, fights: got.evaluations,
         vocab: vocabulary.length, trace: got.trace,
@@ -1578,7 +1585,11 @@ const commands = {
     console.log(f.dim(`main hand ${f.short(loadout.gear.Slot_Weapon1.item)}`
       + (loadout.gear.Slot_Weapon2?.item ? `   arsenal ${f.short(loadout.gear.Slot_Weapon2.item)}` : '')
       + `\n${totalFights} simulated fights in ${((Date.now() - t0) / 1000).toFixed(1)}s over `
-      + `${rounds} round${rounds === 1 ? '' : 's'} of (rotation, then kit)`));
+      + `${rounds} round${rounds === 1 ? '' : 's'} of (rotation, then kit)`
+      + (totalRepeats
+        ? `\n${totalFights + totalRepeats} lists considered - ${totalRepeats} of them were lists `
+          + 'this search had already played, and were re-scored from the memo'
+        : '')));
     console.log('');
 
     console.log(f.bold('ROTATION') + f.dim('  - walk it top to bottom, press the first line that is ready'));

@@ -63,7 +63,10 @@ export function condLabel(c, nameOf = (x) => x) {
     case 'always': return '';
     case 'buff': return `buff.${nameOf(c.id)}.${c.want ? 'up' : 'down'}`;
     case 'debuff': return `debuff.${nameOf(c.id)}.${c.want ? 'up' : 'down'}`;
-    case 'resource': return `${c.atb.toLowerCase()}>=${c.min}`;
+    case 'remains': return `${c.on}.${nameOf(c.id)}.remains>=${c.min}`;
+    case 'cd': return `cd.${nameOf(c.id)}<=${c.max}`;
+    case 'resource': return c.max != null
+      ? `${c.atb.toLowerCase()}<=${c.max}` : `${c.atb.toLowerCase()}>=${c.min}`;
     case 'ready': return `ready.${nameOf(c.id)}`;
     case 'holding': return `holding.${nameOf(c.id)}`;
     case 'charges': return `charges>=${c.min}`;
@@ -102,7 +105,7 @@ export function conjoin(atoms) {
  * Is this conjunction self-defeating? Two atoms that can never hold at once
  * make the entry dead, and a dead entry is a fight spent finding that out.
  */
-function contradictory(c) {
+export function contradictory(c) {
   const list = terms(c);
   for (let i = 0; i < list.length; i++) {
     for (let j = i + 1; j < list.length; j++) {
@@ -113,6 +116,19 @@ function contradictory(c) {
       }
       if (a.id && a.id === b.id
         && ((a.kind === 'ready' && b.kind === 'holding') || (a.kind === 'holding' && b.kind === 'ready'))) return true;
+      // "at least n seconds left on X" and "X is down" cannot both hold, and
+      // neither can two windows on the same status pointing opposite ways.
+      if (a.id && a.id === b.id) {
+        const pair = (x, y) => x.kind === 'remains' && y.kind === (x.on === 'buff' ? 'buff' : 'debuff')
+          && y.want === false;
+        if (pair(a, b) || pair(b, a)) return true;
+      }
+      // `rage>=10 & rage<=5` is a line that can never fire, and finding that
+      // out costs a whole fight.
+      if (a.kind === 'resource' && b.kind === 'resource' && a.atb === b.atb) {
+        const lo = a.min ?? b.min, hi = a.max ?? b.max;
+        if (lo != null && hi != null && lo > hi) return true;
+      }
     }
   }
   return false;
@@ -142,8 +158,33 @@ export function vocabularyFor(rot) {
   for (const id of selfBuffs) { push({ kind: 'buff', id, want: true }); push({ kind: 'buff', id, want: false }); }
   for (const id of targetDebuffs) { push({ kind: 'debuff', id, want: true }); push({ kind: 'debuff', id, want: false }); }
 
+  // HOW LONG a window has left, not just whether it is open. `buff.X.up` says
+  // nothing about whether the window will still be open when the cast lands,
+  // and the classic thing a priority list gets right is exactly that: do not
+  // start a three-second channel into a window with one second left, and do
+  // refresh a debuff before it drops rather than after.
+  //
+  // The thresholds are NOT a continuum. The only question a remaining-time test
+  // can answer is "is there room for what I am about to press", so the discrete
+  // set is the OCCUPANCIES of this build's own casts - the durations that are
+  // actually on offer - rounded to the half second and capped at three distinct
+  // values. A vocabulary of arbitrary thresholds would be mostly conditions
+  // that duplicate each other, and every one of them costs a fight to find out.
+  const windows = [...new Set(rot.active
+    .map((e) => Math.max(0.5, Math.round((e.prof.occupancy ?? 0.5) * 2) / 2))
+    .concat(rot.filler?.length ? [1] : []))]
+    .sort((a, b) => a - b);
+  const thresholds = windows.length <= 3 ? windows
+    : [windows[0], windows[windows.length >> 1], windows[windows.length - 1]];
+  for (const id of selfBuffs) for (const n of thresholds) push({ kind: 'remains', on: 'buff', id, min: n });
+  for (const id of targetDebuffs) for (const n of thresholds) push({ kind: 'remains', on: 'debuff', id, min: n });
+
   // Resource thresholds, at the amounts something actually costs. `Rage >= 10`
   // is a real decision because Raging Smash costs 10; `Rage >= 7` is noise.
+  //
+  // And the OTHER side of the same test. A generator is wasted at a full bar -
+  // Surging Force hands back Rage you cannot hold - so "press it while the pool
+  // is low" is a real rotation decision that `rage>=n` cannot express at all.
   const costs = new Map();
   for (const e of rot.active) {
     for (const c of e.prof.costs ?? []) {
@@ -156,6 +197,8 @@ export function vocabularyFor(rot) {
     for (const a of amounts) {
       push({ kind: 'resource', atb, min: a });
       push({ kind: 'resource', atb, min: a * 2 });
+      push({ kind: 'resource', atb, max: a });
+      push({ kind: 'resource', atb, max: a * 2 });
     }
   }
 
@@ -163,6 +206,11 @@ export function vocabularyFor(rot) {
   for (const e of rot.active) {
     push({ kind: 'ready', id: e.prof.id });
     push({ kind: 'holding', id: e.prof.id });
+    // ...and the near miss. `holding.X` is "X is on cooldown", which is true
+    // for the whole of a forty-second wait; `cd.X<=2` is "X is nearly back",
+    // which is the only form in which "hold this filler, the big one is coming"
+    // can be said. Same discrete set as the windows above, for the same reason.
+    for (const n of thresholds) push({ kind: 'cd', id: e.prof.id, max: n });
   }
 
   // "Do not spend the last charge." A banked charge is the one resource the
@@ -210,7 +258,26 @@ export function makePolicy(apl, { appendUnlisted = false } = {}) {
           for (const d of ctx.debuffs.keys()) if (d.status === c.id) { up = true; break; }
           return up === c.want;
         }
-        case 'resource': return (ctx.pools.get(c.atb)?.value ?? 0) >= c.min - 1e-9;
+        case 'remains': {
+          // The fight hands over the live maps and the clock, so "how long is
+          // left" needs no new state - only the subtraction nobody was doing.
+          const src = c.on === 'buff' ? ctx.buffs : ctx.debuffs;
+          for (const [b, expires] of src) {
+            if (b.status === c.id) return expires - ctx.t >= c.min - 1e-9;
+          }
+          return false;
+        }
+        case 'cd': {
+          const i = index.get(c.id);
+          if (i === undefined) return false;
+          // Ready counts as "back within n seconds", which is the reading that
+          // makes `cd.X<=n` a superset of `ready.X` rather than a rival to it.
+          return ctx.charges(i) > 0 || ctx.remains(i) <= c.max + 1e-9;
+        }
+        case 'resource': {
+          const v = ctx.pools.get(c.atb)?.value ?? 0;
+          return c.max != null ? v <= c.max + 1e-9 : v >= c.min - 1e-9;
+        }
         case 'ready': {
           const i = index.get(c.id);
           return i !== undefined && ctx.charges(i) > 0;
@@ -294,6 +361,38 @@ export function searchApl({
   maxEntries = maxEntries ?? ids.length * 2;
   const rand = rng(seed);
   let evaluations = 0;
+  let cacheHits = 0;
+
+  // The same list, scored twice. Steepest ascent regenerates the WHOLE
+  // neighbourhood every step, and most of it is unchanged from the step before:
+  // swapping i and j then stepping elsewhere puts the original list back in the
+  // next neighbourhood, and iterated local search kicks the incumbent by one or
+  // two moves and re-climbs from a list it has mostly already seen. Roughly a
+  // third of the fights in a 250-restart run were re-simulations of a list this
+  // search had already played.
+  //
+  // The key is the list itself - skills, conditions, order, and the exclusion
+  // set, because a caller using `appendUnlisted` reads that too. The BUILD is
+  // fixed for the whole of one searchApl call, so it needs no fingerprint; a
+  // kit change makes a fresh call and therefore a fresh cache.
+  //
+  // Bounded, like every other cache here: a search that never evicts is a leak
+  // with a hit rate, and evicting the oldest entry costs one re-simulated
+  // fight and never correctness.
+  const CACHE_CAP = 200000;
+  const memo = new Map();
+  const aplKey = (apl) => apl.entries.map((e) => e.skill + '' + condKey(e.cond)).join('')
+    + '' + [...(apl.excluded ?? [])].sort().join(',');
+  const scoreOf = (apl) => {
+    const k = aplKey(apl);
+    const hit = memo.get(k);
+    if (hit !== undefined) { cacheHits++; return hit; }
+    evaluations++;
+    const v = score(apl);
+    memo.set(k, v);
+    if (memo.size > CACHE_CAP) memo.delete(memo.keys().next().value);
+    return v;
+  };
   // A SIMPLER list that scores the same is a better rotation - fewer lines to
   // remember and fewer conditions on each. Without the second half of this,
   // conditions that are quietly tautologies survive to the output: `rage>=9` on
@@ -303,7 +402,7 @@ export function searchApl({
   // real difference, so it only ever breaks ties.
   const complexity = (apl) => apl.entries.length * 1e-6
     + apl.entries.reduce((n, e) => n + terms(e.cond).length, 0) * 1e-7;
-  const at = (apl) => { evaluations++; return score(apl) - complexity(apl); };
+  const at = (apl) => scoreOf(apl) - complexity(apl);
 
   const clone = (apl) => ({
     entries: apl.entries.map((e) => ({ skill: e.skill, cond: e.cond })),
@@ -334,8 +433,11 @@ export function searchApl({
     }
     // A condition that asks about the line's OWN skill being off cooldown is a
     // tautology - the fight only offers a cast that is ready - and its mirror
-    // is a contradiction. Neither is worth a fight to discover.
-    const vacuous = (skill, c) => (c.kind === 'ready' || c.kind === 'holding') && c.id === skill;
+    // is a contradiction. `cd.X<=n` on X's own line is the same tautology
+    // wearing a number, because ready counts as back-within-n. None is worth a
+    // fight to discover.
+    const vacuous = (skill, c) => (c.kind === 'ready' || c.kind === 'holding' || c.kind === 'cd')
+      && c.id === skill;
 
     // Re-condition: this is where a rotation stops being a priority list.
     for (let i = 0; i < n; i++) {
@@ -420,7 +522,7 @@ export function searchApl({
     // break ties during the climb and has no business in the number the caller
     // reports - comparing a nudged score against an un-nudged one made every
     // restart look like it had missed the winner by a hair.
-    return { apl: cur, score: score(cur) };
+    return { apl: cur, score: scoreOf(cur) };
   }
 
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
@@ -494,5 +596,5 @@ export function searchApl({
     if (!winner || got.score > winner.score + 1e-9) winner = got;
     if (onProgress) onProgress({ evaluations, best: winner.score, restart: r });
   }
-  return { ...winner, evaluations, trace };
+  return { ...winner, evaluations, cacheHits, considered: evaluations + cacheHits, trace };
 }

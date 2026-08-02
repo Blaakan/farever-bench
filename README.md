@@ -100,9 +100,17 @@ ordered list of `(skill, condition)` — what SimulationCraft calls an Action
 Priority List — is stationary and re-evaluates against whatever build wears it.
 
 A condition may only say things the fight already tracks: `buff.X.up/.down`,
-`debuff.X.up/.down`, `rage>=n` at a threshold something actually costs,
-`ready.X` / `holding.X` for another skill, `charges>=n` for its own. Up to three
-of them may be ANDed. A skill may appear **more than once** under different
+`debuff.X.up/.down`, `buff.X.remains>=n` for how much of a window is left,
+`rage>=n` and `rage<=n` at a threshold something actually costs or wastes,
+`ready.X` / `holding.X` / `cd.X<=n` for another skill, `charges>=n` for its own.
+Up to three of them may be ANDed.
+
+The `remains` and `cd` thresholds are not a continuum. The only question a
+remaining-time test can answer is *is there room for what I am about to press*,
+so the discrete set is the **occupancies of this build's own casts** — the
+durations actually on offer — rounded to the half second and capped at three
+distinct values. Arbitrary thresholds would mostly duplicate each other, and
+every one of them costs a fight to find that out. A skill may appear **more than once** under different
 conditions, which is the commonest idiom in a real list — the search used it to
 put `Raging Smash if rage>=18` above the armour-strip window and a bare
 `Raging Smash` below it.

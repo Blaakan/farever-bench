@@ -982,11 +982,48 @@ a sequence, and the distinction is the whole design:
 
 **A condition may only say what the fight already tracks**, because one it
 cannot evaluate is a rotation nobody can execute: `buff.X.up/.down`,
-`debuff.X.up/.down`, `rage>=n` at a threshold something actually costs,
-`ready.X` / `holding.X` against another skill, `charges>=n` against its own. Up
-to three ANDed. The vocabulary is built from what **this build** produces — one
-taken from the whole game would be mostly conditions that are never true, and
-each costs a fight to find that out.
+`debuff.X.up/.down`, `buff.X.remains>=n`, `rage>=n` and `rage<=n` at a threshold
+something actually costs, `ready.X` / `holding.X` / `cd.X<=n` against another
+skill, `charges>=n` against its own. Up to three ANDed. The vocabulary is built
+from what **this build** produces — one taken from the whole game would be
+mostly conditions that are never true, and each costs a fight to find that out.
+
+Three of those atoms are recent and each one closes a sentence the list could
+not previously say:
+
+- **`buff.X.remains>=n` / `debuff.X.remains>=n`.** `buff.X.up` says nothing about
+  whether the window will still be open when the cast lands, which is exactly
+  what a priority list is for: do not start a long cast into a window with a
+  second left, and do refresh a debuff before it drops rather than after.
+- **`rage<=n`.** A generator is wasted at a full bar — Surging Force hands back
+  Rage you cannot hold — so *press it while the pool is low* is a real decision,
+  and `rage>=n` cannot express it at all.
+- **`cd.X<=n`.** `holding.X` is true for the whole of a forty-second wait.
+  *Hold the filler, the big one is nearly back* needs the near miss, not the
+  binary. The reading is a superset of `ready.X` (ready counts as back-within-n),
+  which is why it is refused as vacuous on X's own line, the same way `ready.X`
+  already was.
+
+The `remains` and `cd` thresholds are **not a continuum**. The only question a
+remaining-time test can answer is *is there room for what I am about to press*,
+so the discrete set is the occupancies of this build's own casts — the durations
+actually on offer — rounded to the half second and capped at three distinct
+values. On an `armorpen` Warrior that vocabulary is 45 atoms, and the search
+reached for one immediately: `Shockwave if cd.Rampage<=1`, which is *do not
+spend the filler cooldown a second before the big one comes back*.
+
+**And the search remembers what it has played.** Steepest ascent regenerates the
+whole neighbourhood every step, and most of it is unchanged from the step
+before; iterated local search then kicks the incumbent by one or two moves and
+re-climbs from a list it has mostly already seen. Roughly **43% of the fights in
+a 40-restart run were re-simulations of a list the search had already played** —
+99,601 fights for 176,358 lists considered. The memo is keyed on the list itself
+(skills, conditions, order, exclusions); the build is fixed for one `searchApl`
+call, so it needs no fingerprint, and a kit change makes a fresh call and a fresh
+cache. It is bounded at 200,000 entries, because a cache that never evicts is a
+leak with a hit rate, and evicting the oldest costs one re-simulated fight and
+never correctness. The reported "N simulated fights" now means N fights actually
+played, with the repeats reported beside it rather than folded in.
 
 **A skill may appear more than once.** `Rampage if the armour is stripped` near
 the top and a bare `Rampage` below it is the commonest idiom in a real list, and
