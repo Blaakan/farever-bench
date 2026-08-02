@@ -164,6 +164,35 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
             .map((x) => x.prof.id),
         ]),
       } : null,
+      // THE LIVE-STATE GATES a skill's own script riders ask about. Both were
+      // refusals until the 2026-08-02 capture priced them; refusing them cost
+      // -13.7% to -17.5% on the skills that carry one.
+      //
+      //   bleeding - the combo's `+20% vs a bleeding target`. Credited whole
+      //     when this build actually applies a Bleed-typed dot and zero when it
+      //     does not, which is the policy the scoped talent modifiers already
+      //     use: a bleed re-applied off every crit is up essentially always,
+      //     and the capture measured it up at 17 of 17 steady finishers.
+      //
+      //   cc - Domination's `+25% vs a stunned target`. The union of every stun
+      //     this kit can apply, each at duration/cooldown: independent windows,
+      //     so 1 - PROD(1 - u). Nothing here is invented - the durations come
+      //     off the applying steps and the cooldowns off the skills.
+      gates: (() => {
+        const bleeding = rot.dots?.some((d) => (d.types ?? []).some((t) => /Bleed|Hemorage/i.test(t)))
+          ? 1 : 0;
+        let miss = 1;
+        for (const e of [...rot.active, ...rot.filler, ...(rot.triggered ?? [])]) {
+          const st = plan.statusesOf(e.prof.id, { rank, runes: new Set(rot.runes ?? []) });
+          for (const cc of st.flaggedCC ?? []) {
+            const dur = cc.duration;
+            if (!(dur > 0)) continue;
+            const cd = Math.max(e.prof.cooldown ?? 0, e.prof.occupancy ?? 0.05);
+            miss *= 1 - Math.min(1, dur / cd);
+          }
+        }
+        return { bleeding, cc: 1 - miss };
+      })(),
     };
 
     // Stats that come from what you know rather than from what you wear:

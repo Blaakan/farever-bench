@@ -439,6 +439,34 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**A skill can carry its own damage rider, and three of them were refused.** The
+2026-08-02 capture proved all three fire; shipping without them cost −13.7% to
+−17.5% on the skills that carry one. Each was refused for a different reason:
+
+| rider | field | guard | why it was refused |
+|---|---|---|---|
+| `Axe_Boomerang_Combo` +20% | `dmgMult` | target has a Bleed | the guard was readable, but only *talents* were offered to the reader |
+| `Axe_Boomerang_Skill1` +20% | `critDmgMult` | `rank >= 3` | `rank` survived `scopeOf`'s predicate strip |
+| `GA_Craft_Passive` +25% | `dmgMult` | target Stunned/Rooted/Slowed | same, plus its amount lives in a `rankOverride` nothing merged |
+
+The reader is `runeDamage`, generalised: it already read a skill's own script for
+a rune-gated `dmgMult`, so it now also answers a **rank** comparison (a question
+about the build, not about live state) and tags a **target-state** guard for the
+fight to answer. `critDmgMult` entries land in `critBonus`; `dmgMult` entries in
+the additive bracket. Anything else in the guard still refuses.
+
+One trap worth naming: Domination reads `Stun || Root || Slow || (rank >= 3 &&
+isCCImmune())`, where the rank clause belongs to **one alternative**. Vetoing the
+whole rider on it silences a +25% that fires on the stun path at any rank, so the
+rank test applies only when the guard is a plain conjunction.
+
+The gates are the **build's own**. `bleeding` is 1 when this build applies a
+Bleed-typed dot and 0 when it does not — the same whole-credit policy the scoped
+talent modifiers already use, and the capture measured a bleed up at 17 of 17
+steady finishers. `cc` is the union of every stun the kit can apply, each at
+duration/cooldown, combined as `1 - PROD(1 - u)`; the durations come off the
+applying steps and the cooldowns off the skills, so nothing is invented.
+
 **Damage riders SUM into one bracket; they do not compound.**
 `computeDamage@4841` (`Unit.hx:2000-2031`) op 8 runs the hooks, op 14 seeds
 `modMult` from `hitData.dmgMult` — one scalar that starts at 1 and that every

@@ -183,33 +183,70 @@ export function buildCombat(cdb, ctx, assume = {}) {
    * than averaged.
    */
   const runeDmgCache = new Map();
-  function runeDamage(s, runes) {
-    if (!runes?.size || !s?.script) return [];
-    const key = s.id + '@' + [...runes].sort().join('+');
+  function runeDamage(s, rank, runes, vars) {
+    if (!s?.script) return [];
+    const key = s.id + '@' + rank + '@' + (runes?.size ? [...runes].sort().join('+') : '-');
     let hit = runeDmgCache.get(key);
     if (hit) return hit;
     hit = [];
     const body = String(s.script).replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
-    for (const m of body.matchAll(/\w+\.dmgMult\s*\+=\s*vars\.([A-Za-z0-9_]+)/g)) {
+    for (const m of body.matchAll(/\w+\.(dmgMult|critDmgMult)\s*\+=\s*vars\.([A-Za-z0-9_]+)/g)) {
+      const field = m[1];
       const before = body.slice(0, m.index);
       const line = before.slice(before.lastIndexOf('function'));
+
+      // A RUNE guard still has to be satisfied by a slotted rune.
       const rune = /hasMastery\s*\(\s*(?:Mastery\.)?([A-Za-z0-9_]+)/.exec(line)?.[1];
-      if (!rune || !runes.has(rune)) continue;
-      const runeVars = (s.mastery ?? []).find((x) => x.id === rune)?.vars ?? null;
-      const amount = s.vars?.[m[1]] ?? runeVars?.[m[1]];
+      if (rune && !runes?.has(rune)) continue;
+      const runeVars = rune ? (s.mastery ?? []).find((x) => x.id === rune)?.vars ?? null : null;
+      // `vars` is the RANK-RESOLVED set - `props.rankOverride` restates them and
+      // Domination's 0.15 becomes 0.25 from rank 2. Reading `s.vars` here would
+      // understate it by 1.67x at every rank bench actually uses.
+      const amount = vars?.[m[2]] ?? runeVars?.[m[2]];
       if (typeof amount !== 'number' || amount <= 0) continue;
-      // Everything the guard says beyond the rune and the target count is a
-      // condition this cannot answer, and it must refuse rather than approximate.
+
+      // A RANK guard is a question about the build, not about live state, so it
+      // is answered here rather than refused. Bonethrow's rank-3 +20% crit
+      // damage is the case: `if (rank >= 3) hit.critDmgMult += vars.var2`, with
+      // no live condition anywhere in it.
+      //
+      // Only when the guard is a plain conjunction. Domination reads
+      // `Stun || Root || Slow || (rank >= 3 && isCCImmune())`, where the rank
+      // clause belongs to ONE alternative - vetoing the whole rider on it
+      // silenced a +25% that fires on the stun path at any rank.
+      if (!/\|\|/.test(line)) {
+        let rankOk = true;
+        for (const r of line.matchAll(/\brank\s*(>=|<=|==|!=|>|<)\s*(\d+)/g)) {
+          const n = Number(r[2]);
+          rankOk = rankOk && (r[1] === '>=' ? rank >= n : r[1] === '<=' ? rank <= n
+            : r[1] === '>' ? rank > n : r[1] === '<' ? rank < n
+              : r[1] === '==' ? rank === n : rank !== n);
+        }
+        if (!rankOk) continue;
+      }
+
+      // A TARGET-STATE guard the fight can answer. `hasStatusType(Bleed)` is
+      // the combo's +20%; the Stun/Root/Slow trio is Domination's. Anything
+      // else stays a refusal.
+      const gate = /hasStatusType\s*\(\s*(?:StatusType\.)?Bleed\s*\)/.test(line) ? 'bleeding'
+        : /hasStatusType\s*\(\s*(?:StatusType\.)?(?:Stun|Root|Slow)\s*\)/.test(line) ? 'cc'
+          : null;
+
+      // Everything the guard says beyond what is stripped here is a condition
+      // this cannot answer, and it must refuse rather than approximate.
       const singleTarget = /totalHits\s*==\s*1/.test(line);
       const rest = line
         .replace(/function\s+on\w+\s*\([^)]*\)/g, ' ')
         .replace(/hasMastery\s*\([^)]*\)/g, ' ')
+        .replace(/hasStatusType\s*\([^)]*\)/g, ' ')
+        .replace(/\w+\.isCCImmune\s*\(\s*\)/g, ' ')
+        .replace(/\brank\s*(?:>=|<=|==|!=|>|<)\s*\d+/g, ' ')
         .replace(/\w+\.ctx\.totalHits\s*==\s*1/g, ' ')
-        .replace(/\w+\.dmgMult\s*\+=\s*vars\.\w+\s*;?/g, ' ')
-        .replace(/\b(?:if|hit|dmg|ctx|var)\b/g, ' ')
+        .replace(/\w+\.(?:dmgMult|critDmgMult)\s*\+=\s*vars\.\w+\s*;?/g, ' ')
+        .replace(/\b(?:if|hit|dmg|ctx|var|target)\b/g, ' ')
         .replace(/[\s{}()&|!,;.=+]/g, '');
       if (rest.length) continue;
-      hit.push({ amount, singleTarget, rune });
+      hit.push({ amount, singleTarget, rune: rune ?? null, field, gate });
     }
     runeDmgCache.set(key, hit);
     return hit;
@@ -669,7 +706,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
         amount: Math.max(0, c.amount - costRelief(s, c.atb, runes)),
       })),
       hasScript: !!s.script,
-      runeDamage: runeDamage(s, runes),
+      runeDamage: runeDamage(s, rank, runes, vars),
       // `props.enableCond` says when a skill may be used at all -
       // InCombat | InCombatOrTargetting | OutOfCombat - and nothing read it.
       // Nine rows carry it and only one matters for a fight: an OutOfCombat
@@ -986,7 +1023,22 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // cannot say any of that, so a reader that folded them into one would
         // apply a weapon-skill bonus to every swing.
         const cat = prof.isFiller ? 'Attack' : prof.type;
-        const critBonus = mods.critDamageByType?.[cat] ?? 0;
+        // A SKILL'S OWN SCRIPT RIDERS, read off its `onDamageEval` /
+        // `onInflictDamageEval` body. `opts.gates` says which live-state guards
+        // hold; a gate with no answer is worth nothing rather than a guess.
+        // The three the capture proved live are all here: the combo's +20% vs
+        // a bleeding target, Bonethrow's rank-3 +20% crit damage, and
+        // Domination's +25% inside a stun window.
+        const gateOn = (g) => g == null || (opts.gates?.[g] ?? 0) > 0;
+        const gateVal = (g) => (g == null ? 1 : (opts.gates?.[g] ?? 0));
+        let scriptCritDmg = 0;
+        for (const rd of prof.runeDamage ?? []) {
+          if (rd.field !== 'critDmgMult') continue;
+          if (rd.singleTarget && wantTargets !== 1) continue;
+          if (!gateOn(rd.gate)) continue;
+          scriptCritDmg += rd.amount * gateVal(rd.gate);
+        }
+        const critBonus = (mods.critDamageByType?.[cat] ?? 0) + scriptCritDmg;
         const chanceBonus = mods.critChanceByType?.[cat] ?? 0;
         // A status tick cannot crit: SkillContext.initVars@5150 zeroes
         // ctx.critChance for damage-carrying statuses, and the crit roll reads
@@ -1019,8 +1071,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // (a weapon-skill bonus), or across the board.
         let riders = 0;
         for (const rd of prof.runeDamage ?? []) {
+          if (rd.field === 'critDmgMult') continue;   // handled at `critBonus`
           if (rd.singleTarget && wantTargets !== 1) continue;
-          riders += rd.amount;
+          if (!gateOn(rd.gate)) continue;
+          riders += rd.amount * gateVal(rd.gate);
         }
         riders += (mods.damageByAffinity?.[aff.root] ?? 0)
           + (mods.damageByAffinity?.all ?? 0)

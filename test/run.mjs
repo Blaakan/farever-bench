@@ -3200,6 +3200,61 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- the three riders that were refused --------------------------------------
+// All three fire in game, proven by the 2026-08-02 capture, and shipping without
+// them cost -13.7% to -17.5% on the skills that carry one. Each was refused for
+// a different reason: the combo's guard was readable but only talents were ever
+// offered to the reader; Bonethrow's `rank >= 3` survived the predicate strip;
+// and Domination's did too, plus its amount came from a rankOverride nothing
+// merged.
+group('a skill can carry its own damage rider');
+{
+  const eng = createEngine({ quiet: true });
+  const riders = (id, rank) => eng.combat.profile(id, rank)?.runeDamage ?? [];
+
+  // (i) The combo: +20% against a bleeding target, and it is dmgMult - the
+  // capture's clean 1.5325 crit ratio is what proves it is not critDmgMult.
+  const combo = riders('Axe_Boomerang_Combo', 3);
+  ok('the combo rides +20% dmgMult against a bleeding target',
+    combo.length === 1 && combo[0].field === 'dmgMult'
+      && Math.abs(combo[0].amount - 0.2) < 1e-9 && combo[0].gate === 'bleeding',
+    JSON.stringify(combo));
+
+  // (ii) Bonethrow: +20% CRIT damage, gated on nothing but the weapon rank.
+  ok('Bonethrow rides +20% critDmgMult at rank 3',
+    riders('Axe_Boomerang_Skill1', 3).some((r) => r.field === 'critDmgMult'
+      && Math.abs(r.amount - 0.2) < 1e-9 && r.gate == null),
+    JSON.stringify(riders('Axe_Boomerang_Skill1', 3)));
+  ok('...and carries none at rank 2', riders('Axe_Boomerang_Skill1', 2).length === 0,
+    JSON.stringify(riders('Axe_Boomerang_Skill1', 2)));
+
+  // (iii) Domination: the amount comes from props.rankOverride, and the
+  // `rank >= 3` in its guard belongs to ONE alternative of a disjunction -
+  // vetoing the rider on it silenced a +25% that fires on the stun path at
+  // any rank.
+  const dom = (r) => riders('GA_Craft_Passive', r)[0];
+  near('Domination is the authored 0.15 at rank 1', dom(1).amount, 0.15, 1e-9);
+  near('...and the overridden 0.25 from rank 2', dom(2).amount, 0.25, 1e-9);
+  ok('...gated on crowd control, as dmgMult', dom(3).gate === 'cc' && dom(3).field === 'dmgMult',
+    JSON.stringify(dom(3)));
+
+  // The gates are the build's own, not a constant. A kit with no bleed and no
+  // stun must price both at zero rather than credit them.
+  const t = eng.combat.foe('dummy', 25);
+  const prof = eng.combat.profile('Axe_Boomerang_Combo', 3);
+  const sheet = new Map([['Strength', 100], ['Dexterity', 100], ['CritDamage', 150],
+    ['CritChance', 0], ['DamageModifier', 100]]);
+  const at = (gates) => {
+    const o = eng.combat.castOutput(prof, sheet, t,
+      { targets: 1, assume: eng.opts.assume, attackerLevel: 25, gates });
+    return o.critRoll ? o.critRoll.fixed + o.critRoll.base : o.damage;
+  };
+  near('a bleeding target is worth exactly the authored 20%',
+    at({ bleeding: 1 }) / at({ bleeding: 0 }), 1.2, 1e-9);
+  near('...and no bleed in the build is worth nothing',
+    at({}) / at({ bleeding: 0 }), 1, 1e-9);
+}
+
 // --- one chain clock, not two tests ------------------------------------------
 // `Hero.update@7495` / `isWithinAttackCombo@7459` keep ONE timestamp - the end
 // of the last completed basic - and never refresh it when a skill ends. The

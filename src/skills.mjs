@@ -2482,7 +2482,14 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const kinds = new Set(types.flatMap((t) => [...statusTypeFlags(t)]));
       const label = { status: statusId, name: st.texts?.name ?? statusId, types };
       if (kinds.has('DoT') || kinds.has('HoT')) flaggedDot.push(label);
-      if (kinds.has('CrowdControl') || kinds.has('HardCC')) flaggedCC.push(label);
+      // A CC label carries its LIFETIME. The status row's own `duration` if it
+      // declares one, else the duration the applying step handed it - which is
+      // where the stuns keep theirs (Shockwave's `dur1`, Charge's literal 1).
+      // Nothing consumed this before, so it was dropped; Domination's whole
+      // value is the fraction of the fight this covers.
+      if (kinds.has('CrowdControl') || kinds.has('HardCC')) {
+        flaggedCC.push({ ...label, duration: st.duration ?? appliedDuration ?? null });
+      }
       // Typed as a tick by the game and carrying no tick schedule this model can
       // find. Scoring its effects once, as a lump, is the wrong shape - so say
       // so rather than quietly reading a damage-over-time as a hit.
