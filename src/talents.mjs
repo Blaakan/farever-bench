@@ -273,6 +273,9 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       desc: s?.texts?.desc ?? '',
     };
     valueCache.set(key, v);
+    // The key carries the allocation set, so a long talent search mints
+    // entries without bound; evicting the oldest only costs a re-read.
+    if (valueCache.size > 20000) valueCache.delete(valueCache.keys().next().value);
     return v;
   }
 

@@ -93,16 +93,33 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // one engine handed the Warrior the ROGUE's rotation, complete with
     // Rogue_Sig_Finisher. The class also decides which unit skills exist and
     // the level decides which of them are unlocked, so both belong in the key.
+    //
+    // Only SKILL-BEARING items key the gear portion. An armour swap cannot
+    // change the rotation, and keying every slot's item made each of the
+    // optimiser's ~20k armour candidates mint its own cached rotation - a
+    // cache with a near-zero hit rate that ate 4GB twenty-five pairs into a
+    // `bench layouts` sweep. The cap is the second seatbelt: evicting the
+    // oldest entry costs a re-resolve, never correctness.
+    const skillBearing = (slotId) => {
+      const g = loadout.gear[slotId];
+      if (!g?.item) return '';
+      const it = cat.itemById.get(g.item);
+      return it?.skills?.length ? it.id : '';
+    };
     const key = loadout.class + '@' + loadout.level + '|' + rank
       + '|' + (loadout.gear.Slot_Weapon1?.item ?? '-')
       + '|' + (loadout.gear.Slot_Weapon2?.item ?? '-')
       + '|' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + ':' + v.join('+')).join(';')
-      + '|' + cat.combatSlots().map((s) => loadout.gear[s.id]?.item ?? '').join(',')
+      + '|' + cat.combatSlots().map((s) => skillBearing(s.id)).join(',')
       + '|' + Object.entries(loadout.augments ?? {}).filter(([, v]) => v).sort().join(',')
       + '|' + Object.values(loadout.runes ?? {}).flat().filter(Boolean).sort().join(',')
       + '|' + Object.entries(loadout.talents ?? {}).sort().map(([k, v]) => k + ':' + v).join(',');
     let r = rotationCache.get(key);
-    if (!r) { r = plan.resolve(loadout, rank); rotationCache.set(key, r); }
+    if (!r) {
+      r = plan.resolve(loadout, rank);
+      rotationCache.set(key, r);
+      if (rotationCache.size > 4000) rotationCache.delete(rotationCache.keys().next().value);
+    }
     return r;
   }
 

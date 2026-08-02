@@ -600,6 +600,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       statusRefs,
     };
     profileCache.set(key, p);
+    if (profileCache.size > 20000) profileCache.delete(profileCache.keys().next().value);
     return p;
   }
 

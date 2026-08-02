@@ -2041,6 +2041,9 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       flaggedDot, flaggedCC, missingTick, unmetDeps,
     };
     statusCache.set(key, hit);
+    // The key carries the talents set, so a long talent search mints entries
+    // without bound. Evicting the oldest costs a re-read, never correctness.
+    if (statusCache.size > 20000) statusCache.delete(statusCache.keys().next().value);
     return hit;
   }
 
@@ -2203,6 +2206,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     }
 
     gainCache.set(key, out);
+    if (gainCache.size > 20000) gainCache.delete(gainCache.keys().next().value);
     return out;
   }
 

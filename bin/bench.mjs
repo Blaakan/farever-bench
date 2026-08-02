@@ -1329,8 +1329,9 @@ const commands = {
       if (process.stderr.isTTY) {
         const done = i, left = pairs.length - i;
         const eta = done > 0 ? Math.round(((Date.now() - t0) / done) * left / 1000) : null;
+        const mb = Math.round(process.memoryUsage().rss / 1048576);
         process.stderr.write(`\r  ${i + 1}/${pairs.length}  ${m.item.id} / ${a.item.id}` +
-          `${eta != null ? `  ~${eta}s left` : ''}        `);
+          `${eta != null ? `  ~${eta}s left` : ''}  ${mb}MB        `);
       }
       const loadout = { ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {} };
       loadout.gear.Slot_Weapon1 = gearFor(m);
