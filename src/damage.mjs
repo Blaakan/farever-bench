@@ -1470,6 +1470,24 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'than letting the multiplier run. The same -1 used to reach the affix scale through a bare ' +
            '`?? 1`, i.e. a buff worth MINUS its own value; only a foe status carries affixes among the ' +
            'seven, so nothing was visibly wrong, which is the kind of bug that waits for a patch.' },
+    { severity: 'verified', what: 'a proc-applied buff that blocks its own renewal never saturates',
+      why: 'StoneOfPower rolls `checkProba(vars.chance) && !owner.hasStatus(<the status this very call ' +
+           'applies>)` on every damage instance you deal. That guard is not a question about live ' +
+           'state - it is the applier declining to renew its own buff - so the buff is an ALTERNATING ' +
+           'RENEWAL process: on for its whole duration, then off until the next success, uptime ' +
+           'rD/(1+rD). At one damage instance a second that is 34%, at five it is 72%, and it never ' +
+           'reaches the cap. A refresh-and-stack buff is 1-e^(-rD) instead, which does saturate; ' +
+           'reading one as the other is a third of the answer. Read as unreadable, all four trinket ' +
+           'Stones scored exactly ZERO. Both closed forms are Monte-Carlo checked against the game\'s ' +
+           'own addStacks/refresh semantics. They are applied as closed forms rather than as events in ' +
+           'the fight on purpose: the fight thins applications evenly, one every 1/p events, and even ' +
+           'spacing is not a renewal process - for a blocked buff whose duration sits near the mean ' +
+           'gap it gives ~95% uptime where the real geometric process gives ~49%, which is the ' +
+           'flattering direction. The event RATE is estimated from the rotation\'s own swing cadence ' +
+           'rather than from the true damage-instance count (a multi-hit cast and a bleed tick both ' +
+           'raise onInflictDamage), so the number is a floor. Enchant_Zealot and Enchant_Devote are ' +
+           'held frozen at the cap by id: the measured cost of that is under 1% in a filler-heavy ' +
+           'fight and up to ~40% at a quarter swing clock.' },
     { severity: 'unmodelled', what: 'a stat buff is still counted at its cap, not at a tracked count',
       why: 'The stack channel landed on the DAMAGE side - a dot\'s ticks now follow a live count - and ' +
            'not yet on the AFFIX side, where applyAffixes@6083 multiplies each affix by ' +

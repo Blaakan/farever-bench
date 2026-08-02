@@ -2686,6 +2686,63 @@ group('a buff window prices only itself');
     `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s + a chain restart every 50s of a 200s fight`);
 }
 
+// --- a proc that refuses to re-apply itself ---------------------------------
+// `!owner.hasStatus(X)` where X is the very status the call applies is not a
+// question about live state - it is the applier declining to renew its own
+// buff, which makes the uptime an alternating renewal process rather than a
+// refresh. Read as unreadable, all four trinket Stones scored exactly zero.
+group('a proc that blocks its own renewal');
+{
+  const eng = createEngine({ quiet: true });
+  const target = eng.combat.foe('boss', 25);
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const before = eng.evaluate(l, { target, rank: 3 });
+
+  l.gear.Slot_Trinket = { item: 'StoneOfPower', rarity: 'Rare', stars: 0 };
+  const ev = eng.evaluate(l, { target, rank: 3 });
+  const b = ev.buffs.find((x) => x.status === 'StoneOfPower_Trinket_Status');
+  ok('the Stone\'s buff is read at all', !!b, ev.buffs.map((x) => x.status).join(','));
+  ok('...and its guard is recognised as a self-block, not as live state',
+    b?.reapply === 'blocked', JSON.stringify(b?.trigger));
+  ok('...so it is no longer in the refusal list',
+    !ev.throughput.unmodelled.some((u) => /StoneOfPower/.test(u.id)),
+    JSON.stringify(ev.throughput.unmodelled.filter((u) => /Stone/i.test(u.id))));
+  // The whole point: it must be worth something, and NOT its full value.
+  ok('the Stone is worth more than nothing', ev.throughput.dps > before.throughput.dps,
+    `${ev.throughput.dps.toFixed(2)} vs ${before.throughput.dps.toFixed(2)}`);
+  ok('...and less than a permanent +10 Strength',
+    (ev.sheet.get('Strength') - before.sheet.get('Strength')) < 10 - 1e-9,
+    `+${(ev.sheet.get('Strength') - before.sheet.get('Strength')).toFixed(2)} Strength`);
+  // The closed form, which is what makes it a number rather than a guess. A
+  // blocked renewal is rD/(1+rD) and NEVER reaches 1; a refresh is 1-e^(-rD),
+  // which does. Reading one as the other is a third of the answer.
+  if (b?.proc) {
+    const rd = b.proc.rate * b.duration;
+    near('the blocked-renewal uptime is rD/(1+rD)', b.uptime, rd / (1 + rd), 1e-9);
+    ok('...which is strictly below one however fast the procs come',
+      b.uptime < 1 && b.uptime > 0, String(b.uptime));
+  }
+
+  // The two enchant rows the roadmap freezes must NOT be re-priced: they are
+  // folded in permanent at the cap, and the cost of that is in the audit.
+  const l2 = emptyLoadout(eng.cat, 'Warrior', 25);
+  l2.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l2);
+  const sock = eng.socketsOf(l2).find((s) => s.type === 'AugmentEnchantWeapon');
+  if (sock) {
+    l2.augments = { [sock.key]: 'FormulaWeaponZealot' };
+    const ev2 = eng.evaluate(l2, { target, rank: 3 });
+    const z = ev2.buffs.find((x) => x.status === 'Enchant_Zealot_Status');
+    ok('Zealot is still read', !!z, ev2.buffs.map((x) => x.status).join(','));
+    ok('...and is still folded in permanent at the cap, not thinned',
+      !z || (z.uptime === 1 && !z.proc), JSON.stringify({ up: z?.uptime, proc: z?.proc }));
+    ok('...at five stacks of +6 CritChanceRating',
+      !z || z.stacks === 5, String(z?.stacks));
+  }
+}
+
 // --- the stack counter ------------------------------------------------------
 // `getStackFactor@20772` runs as the last line of `getStepEffectVal@20775` and
 // multiplies a step effect by `Status.stacks` when the running skill is a

@@ -403,10 +403,54 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // not read that sheet.
     const buffs = plan.selfBuffs(rot);
     const timed = [];
+    // The two rows that must keep folding in permanent at the cap. Named by id
+    // rather than by shape, because every shape-based gate catches something
+    // else: "chance < 1" also catches Staff_SummonDemon's rank-3 buff and "is a
+    // Passive" catches the trinket Stones. The cost of leaving these two frozen
+    // is measured - under 1% of the cap in a filler-heavy fight, up to ~40% at a
+    // quarter swing clock - and it is in the audit.
+    const FROZEN_ENCHANTS = new Set(['Enchant_Zealot_Status', 'Enchant_Devote_Status']);
+    // A rough swing cadence, for the DISPLAY sheet only. The fight derives the
+    // real rate by raising the event; this is what the averaged column shows,
+    // and it is an estimate rather than a claim.
+    const swingPeriod = rot.filler?.length
+      ? rot.filler.reduce((s, x) => s + Math.max(x.prof.occupancy, 0.05), 0) / rot.filler.length
+      : 2;
     for (const b of buffs) {
       const src = combat.profile(b.from, rank, new Set(rot.runes ?? []));
       const cd = src?.cooldown ?? 0;
       const dur = b.duration;
+      // A PROC-APPLIED self-buff: no cooldown behind it, applied from a damage
+      // hook, and either rolled or blocked while it is already up. Those are the
+      // ones the blanket "no cooldown, so it is permanent at the cap" reading
+      // gets wrong in the flattering direction - and the four trinket Stones
+      // were not even getting that, they were refused outright.
+      const procHook = /^on(InflictDamage|InflictHit|Damage|Hit)$/.test(b.trigger?.hook ?? '');
+      const isProc = dur > 0 && !(cd > 0) && procHook && !FROZEN_ENCHANTS.has(b.status)
+        && ((b.trigger?.chance ?? 1) < 1 || b.reapply === 'blocked');
+      if (isProc) {
+        const r = Math.max(1e-9, (1 / swingPeriod) * (b.trigger?.chance ?? 1));
+        // Blocked-while-up is an ALTERNATING RENEWAL process - on for its whole
+        // duration, then off until the next success - so its uptime is
+        // rD/(1+rD) and it NEVER saturates: 34% at one damage instance a
+        // second, 72% at five. Refresh-and-stack is 1 - e^(-rD), which does
+        // saturate. Reading one as the other is a third of the answer.
+        //
+        // This is a CLOSED FORM and not an event in the fight, deliberately.
+        // The fight thins applications deterministically - one every 1/p
+        // events, evenly spaced - and even spacing is not a renewal process:
+        // for a blocked buff whose duration is near the mean gap, regular
+        // arrivals give ~95% uptime where the real geometric process gives
+        // ~49%. That is the flattering direction, which is the one to refuse.
+        // Both forms are Monte-Carlo checked against the game's own semantics.
+        b.uptime = b.reapply === 'blocked'
+          ? (r * dur) / (1 + r * dur)
+          : 1 - Math.exp(-r * dur);
+        b.timed = false;
+        b.proc = { chance: b.trigger?.chance ?? 1, blocked: b.reapply === 'blocked', rate: r };
+        for (const a of b.affixes) applyAffix(a, b.stacks, b.uptime);
+        continue;
+      }
       b.uptime = (cd > 0 && dur > 0) ? Math.min(1, dur / Math.max(cd, src.occupancy)) : 1;
       b.timed = cd > 0 && dur > 0;
       if (b.timed) timed.push(b);

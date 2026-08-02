@@ -2334,7 +2334,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // bleeding for a share of the hit that applied it. The status row then
         // carries a placeholder, not an amount.
         const magnitudeFromScript = tail === ',';
-        note(resolved, to, triggerOf(live.slice(0, m.index), s, g), null, magnitudeFromScript);
+        note(resolved, to, triggerOf(live.slice(0, m.index), s, g, resolved), null, magnitudeFromScript);
       }
     }
 
@@ -2583,6 +2583,11 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         to: wearer,
         affixes,
         trigger,
+        // How a re-application composes, from the APPLIER's guard rather than
+        // from the status row: `blocked` means the script refuses to re-apply
+        // while its own buff is up, which is an alternating renewal process and
+        // not a refresh.
+        reapply: trigger?.reapply ?? null,
       };
       if (dynamic) {
         unreadable.push({ ...entry, why: 'its affixes are scaled by a script-set dynVal, so their magnitude is not in the data' });
@@ -2642,7 +2647,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * `before` is the script text up to the call, so the enclosing hook and the
    * `if` that wraps the call are both in it.
    */
-  function triggerOf(before, skill, guard = null) {
+  function triggerOf(before, skill, guard = null, appliedId = null) {
     // Only the innermost handler matters: take the text after the last hook.
     const lastHook = before.lastIndexOf('function on');
     const handler = lastHook >= 0 ? before.slice(lastHook) : before;
@@ -2675,9 +2680,35 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // can only make the status land LESS often than this says. Carrying the
     // flag lets the caller say so instead of quietly presenting a ceiling as a
     // rate - `DM_Multispin_Passive` needs its own buff max-stacked first.
-    const unread = guard?.unread ?? (UNREAD_COND.exec(scope) ?? [null])[1] ?? null;
+    let unread = guard?.unread ?? (UNREAD_COND.exec(scope) ?? [null])[1] ?? null;
+    // ...with ONE exception, and it is a big one. `!owner.hasStatus(X)` where X
+    // is the very status this call applies is not a question about live state -
+    // it is the applier refusing to re-apply while its own buff is up, which is
+    // a rule, not a mystery. StoneOfPower is the shape:
+    //
+    //   onInflictDamage(dmg) {
+    //     if( checkProba(vars.chance) && !owner.hasStatus(Skill.StoneOfPower_Trinket_Status))
+    //       addStatus(owner, Skill.StoneOfPower_Trinket_Status);
+    //   }
+    //
+    // Read as an unreadable condition, all four Stones scored exactly zero.
+    // Read as what it is, the buff is an alternating renewal process - ON for
+    // its whole duration, then OFF until the next success - whose uptime is
+    // rD/(1 + rD): a third at one damage instance a second, never saturating.
+    // That is a number, and refusing a number is not the same discipline as
+    // refusing a guess.
+    let reapply = null;
+    if (unread === 'hasStatus' && appliedId
+      && new RegExp(`!\\s*(?:\\w+\\.)?hasStatus\\s*\\(\\s*(?:owner\\s*,\\s*)?(?:Skill\\.)?${appliedId}\\b`)
+        .test(scope.replace(/\s+/g, ' '))) {
+      unread = (UNREAD_COND.exec(scope.replace(
+        new RegExp(`!\\s*(?:\\w+\\.)?hasStatus\\s*\\(\\s*(?:owner\\s*,\\s*)?(?:Skill\\.)?${appliedId}\\s*\\)`), ' '),
+      ) ?? [null])[1] ?? null;
+      reapply = 'blocked';
+    }
     if (unread) why += `, and only while ${unread}() holds - which this reader cannot evaluate`;
-    return { on, chance, why, hook, unread };
+    else if (reapply === 'blocked') why += ', and not again until it has run out';
+    return { on, chance, why, hook, unread, reapply };
   }
 
   /**
