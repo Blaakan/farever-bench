@@ -794,6 +794,26 @@ Throughput is not a steady state any more. `sim.mjs` plays out a fight of
   overflow of a long debuff on a short cooldown is lost.
 - **the base-attack chain fills the gaps**, one link at a time, because you
   cannot press swing 3 without 1 and 2.
+- **what you socket raises the host item's gear level.** `Gear.getILevel@8123`
+  (`src/st/item/Gear.hx:48-51`) is three lines:
+
+  ```
+  lvl  = Item.getILevel(this)                              // base + rarity, + flawless
+  lvl += round(upgradeLevel * Item_GearUpgradeILevelBonus)  // the stars
+  for (s in this.slots) lvl += Data.item.byId.get(s)?.iLevel ?? 0
+  ```
+
+  That third line was the one nothing read. Twelve items in the game carry an
+  `iLevel` among the augments and they are all `AugmentDemon`: the **Epic**
+  Corrupted Gifts declare `iLevel: 10`, so socketing one is worth a whole
+  effective level of stats on top of the affixes it swaps — every line on the
+  weapon moves, including the ones the gift does not mention. The **Rare**
+  Corrupted Gifts declare no `iLevel`, and neither does any enchant, jewel or
+  sigil, so those add nothing at all.
+
+  Reported from play — *"using a demonic gift on a weapon slightly increases its
+  stats"* — before the code was read, and worth 1–2% on all four baselines
+  because the search already takes the Epic gift wherever it fits.
 - **a conduit fires when Spark is spent from above the gauge — and they all fire
   together.** `Mage_Conduit_SparkBounds` is `[0.5, 0.5, 0.5]` and the test is
   `bound < ratio`, so all three tiers are the same number and the Low/Medium/High

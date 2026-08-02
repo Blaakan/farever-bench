@@ -1471,6 +1471,18 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'than letting the multiplier run. The same -1 used to reach the affix scale through a bare ' +
            '`?? 1`, i.e. a buff worth MINUS its own value; only a foe status carries affixes among the ' +
            'seven, so nothing was visibly wrong, which is the kind of bug that waits for a patch.' },
+    { severity: 'verified', what: 'what you socket raises the host item\'s gear level',
+      why: 'Read from Gear.getILevel@8123 (src/st/item/Gear.hx:48-51), which is three lines: the base ' +
+           'iLevel plus the rarity bonus (and the flawless bonus, in Item.getILevel@7787), then ' +
+           'round(upgradeLevel x Item_GearUpgradeILevelBonus) for the stars, then - the line nothing ' +
+           'read - `for (s in this.slots) lvl += Data.item.byId.get(s)?.iLevel ?? 0`. Every socketed ' +
+           'item adds its OWN iLevel to the host. Twelve items in the game do it and they are all ' +
+           'AugmentDemon: the EPIC Corrupted Gifts declare iLevel 10, so socketing one is worth a ' +
+           'whole effective level of stats on top of the affixes it swaps - every line on the weapon ' +
+           'moves, including the ones the gift does not mention. The RARE Corrupted Gifts declare no ' +
+           'iLevel, and neither does any enchant, jewel or sigil, so those add nothing. Reported from ' +
+           'play ("using a demonic gift on a weapon slightly increases its stats") before the code was ' +
+           'read, and worth 1-2% on all four baselines because the search already takes the Epic gift.' },
     { severity: 'verified', what: 'a conduit fires when Spark is spent from above the gauge, and they all fire together',
       why: 'Read from Mage_Conduit_SparkBounds ([0.5, 0.5, 0.5], and the test is `bound < ratio`, so ' +
            'all three tiers are the same number and the Low/Medium/High tiering is inert): a conduit ' +

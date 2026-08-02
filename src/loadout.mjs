@@ -107,8 +107,19 @@ export function evaluate(cat, loadout, {
     }
     const rarity = g.rarity ?? item.rarity;
     const stars = Math.min(g.stars ?? 0, cat.maxStars(item, rarity));
+    // What is SOCKETED into this piece, because Gear.getILevel@8123 adds every
+    // socketed item's own iLevel to the host's gear level - so an Epic
+    // Corrupted Gift (iLevel 10) is worth a whole effective level of stats on
+    // top of the affixes it swaps. The sockets have to be resolved BEFORE the
+    // host's stats are computed, which is why this is gathered here rather than
+    // in the augment pass below.
+    const socketed = [];
+    for (const type of cat.socketsFor(item)) {
+      const augId = loadout.augments?.[`${slot.id}/${type}`];
+      if (augId) socketed.push(augId);
+    }
     cat.contribute(item, slot.id, {
-      ...opts, stars, rarity, flawless: !!g.flawless, level: g.level ?? null,
+      ...opts, stars, rarity, flawless: !!g.flawless, level: g.level ?? null, socketed,
       // Which of an item's generic aptitudes this instance rolled. Only craft
       // jewellery names more than one; everything else ignores it.
       generic: g.generic ?? null,

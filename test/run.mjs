@@ -2686,6 +2686,90 @@ group('a buff window prices only itself');
     `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s + a chain restart every 50s of a 200s fight`);
 }
 
+// --- what you socket raises the host's gear level ---------------------------
+// `Gear.getILevel@8123` is three lines, and the third - adding every socketed
+// item's own iLevel - was the one nothing read. An Epic Corrupted Gift declares
+// iLevel 10, so it is worth a whole effective level of stats on top of the
+// affixes it swaps. Reported from play before the code was read.
+group('a socketed gift raises the gear level');
+{
+  const eng = createEngine({ quiet: true });
+  const censer = eng.cat.itemById.get('Staff_Censer');
+  const at = (socketed) => eng.cat.effectiveLevel(censer, {
+    charLevel: 25, stars: 3, rarity: 'Epic', level: 25, socketed,
+  });
+  // Twelve items in the game declare an iLevel among the augments, and they are
+  // all Epic Corrupted Gifts. Assert that, so a patch that adds one is noticed.
+  const withILevel = eng.cdb.lines('item')
+    .filter((it) => /^Augment/.test(String(it.type)) && it.iLevel != null);
+  ok('exactly the Epic Corrupted Gifts carry an iLevel',
+    withILevel.length === 12 && withILevel.every((it) => it.type === 'AugmentDemon' && it.iLevel === 10),
+    withILevel.map((it) => `${it.id}=${it.iLevel}`).join(', '));
+
+  near('an Epic gift is worth a whole effective level',
+    at(['DemonGearUpgrade_FervToCrit']) - at([]), 1, 1e-9);
+  near('a Rare one is worth none of it - it declares no iLevel',
+    at(['DemonGearUpgradeRare_FervToCrit']) - at([]), 0, 1e-9);
+  near('two sockets stack, because the game sums the slots',
+    at(['DemonGearUpgrade_FervToCrit', 'DemonGearUpgrade_APToCrit']) - at([]), 2, 1e-9);
+
+  // ...and it reaches the sheet, which is the point.
+  const l = emptyLoadout(eng.cat, 'Mage', 25);
+  l.gear.Slot_Weapon1 = { item: 'Staff_Censer', rarity: 'Epic', stars: 3 };
+  eng.plan.pruneSelection(l);
+  const target = eng.combat.foe('boss', 25);
+  const plain = eng.evaluate(l, { target, rank: 3 }).sheet;
+  const sock = eng.socketsOf(l).find((s) => s.type === 'AugmentDemon');
+  l.augments = { [sock.key]: 'DemonGearUpgrade_FervToCrit' };
+  const gifted = eng.evaluate(l, { target, rank: 3 }).sheet;
+  ok('a gift raises a stat line the gift does not even mention',
+    gifted.get('Vitality') > plain.get('Vitality'),
+    `${plain.get('Vitality')} -> ${gifted.get('Vitality')}`);
+  ok('...and the affix it DOES mention still lands on top',
+    gifted.get('CritChanceRating') > plain.get('CritChanceRating') + 40 - 1e-9,
+    `${plain.get('CritChanceRating')} -> ${gifted.get('CritChanceRating')}`);
+}
+
+// --- the pool feed is not a subtotal ----------------------------------------
+// The line used to read "35% of 11697 physical critical damage" beside a damage
+// table that does not contain 11697, and a reader was right to try adding it up
+// and fail. Two things separate the feed from the damage above it, and a third
+// separates the feed from the pool's own total.
+group('the pool feed says what it is');
+{
+  const eng = createEngine({ quiet: true, fight: { seconds: 75, lookahead: 8 } });
+  const target = eng.combat.foe('boss', 25);
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+  l.talents = { Warrior_Hemorrhage: 1 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { target, rank: 3 });
+  const line = ev.throughput.lines.find((x) => x.id === 'Warrior_Hemorrhage_Status');
+  ok('the probe build really does run Hemorrhage', !!line,
+    ev.throughput.lines.map((x) => x.id).join(','));
+  if (line) {
+    ok('the feed says it is the crit-attributable share, not the whole',
+      /crit-attributable share/.test(line.why), line.why);
+    ok('...and that it is measured before DamageModifier',
+      /before DamageModifier/.test(line.why), line.why);
+    ok('...and refuses to be read as a subtotal of the lines above',
+      /not a subtotal/.test(line.why), line.why);
+    // Over a fight only a few times the bleed's own life, the tail the bell
+    // catches is real and has to be reported rather than quietly dropped.
+    const fed = Number(/of (\d+)/.exec(line.why)?.[1] ?? 0);
+    ok('the feed is a real number', fed > 0, line.why);
+    const dropped = Number(/; (\d+) of it was still owed/.exec(line.why)?.[1] ?? 0);
+    ok('...and the un-ticked tail is named when it matters',
+      dropped > 0 && dropped < fed, `dropped ${dropped} of ${fed}`);
+    // The reconciliation the reader could not do: what the pool is worth is
+    // (fed - dropped) x fraction, times whatever the bleed's own multipliers
+    // are. Assert the bound, which is what makes the printed feed checkable.
+    ok('...and the pool total is at least (fed - dropped) x 35%',
+      line.perCast.damage >= (fed - dropped) * 0.35 - 1e-6,
+      `${line.perCast.damage.toFixed(0)} vs ${((fed - dropped) * 0.35).toFixed(0)}`);
+  }
+}
+
 // --- the conduit gauge ------------------------------------------------------
 // A conduit fires when Spark is SPENT from above the gauge threshold, and every
 // equipped conduit fires at once. The model used to refuse all of them as "no

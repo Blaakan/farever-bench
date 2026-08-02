@@ -6,8 +6,8 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
-State at handoff (2026-08-02, second pass): **645 checks green**; baselines
-Warrior 512.4, Rogue 392.3, Mage 323.5, Priest 383.2 (`optimize`, level 25,
+State at handoff (2026-08-02, second pass): **658 checks green**; baselines
+Warrior 520.1, Rogue 399.0, Mage 328.5, Priest 385.6 (`optimize`, level 25,
 named boss). Unscored lists: Warrior 5, Priest 7, Rogue 6, Mage 6.
 
 ## The method (proven, in order of preference)
@@ -106,11 +106,15 @@ has the most refusals outstanding):
   of them is a **cache key** (`b.status + '#' + b.stacks`), so a fractional mean
   must be quantised before it goes in or a bounded cache of integer states
   becomes an unbounded one of float states.
-- **Proc-applied self-buffs with real uptime.** The four Stones and
-  PrismaticPearl score **zero** today, refused because `hasStatus` is in
-  `UNREAD_COND` — but the guard is `checkProba(chance) && !owner.hasStatus(<the
-  very status this call applies>)`, which is a readable self-block, not a
-  question about live state. Two closed forms, both Monte-Carlo checked:
+- **Proc-applied self-buffs — LANDED for the blocked shape, remainder below.**
+  The four Stones now score at `rD/(1+rD)`. What is left: **PrismaticPearl**,
+  which is not a proc at all but a deterministic `onUpdate` clock alternating two
+  statuses every `vars.time` seconds — ~100% uptime of exactly one of them,
+  needing its own case rather than thinning; and the **event rate**, currently
+  estimated from the rotation's swing cadence when the real trigger is
+  `onInflictDamage`, which fires per damage instance *including your own dot
+  ticks*, so the present number is a floor. Two closed forms, both Monte-Carlo
+  checked:
   - *blocked-while-up* (Stones, Pearl): `uptime = rD/(1+rD)` — 34% to 72%, never
     saturating. On a fixed cadence *T* with per-event probability *p*:
     `D / (D + T(1/p − 1/2))`.

@@ -166,7 +166,9 @@ export function buildCatalog(cdb, ctx) {
   // instance exactly.
   let dropsScale = false;
   function setDropsScale(v) { dropsScale = !!v; }
-  function effectiveLevel(item, { charLevel, stars = 0, flawless = false, rarity = null, level = null }) {
+  function effectiveLevel(item, {
+    charLevel, stars = 0, flawless = false, rarity = null, level = null, socketed = null,
+  }) {
     // `level` is the INSTANCE level - what the thing actually dropped at. The
     // authored `item.level` is a reference, and a real drop is often higher, so
     // checking the tool against a character sheet needs the instance level.
@@ -175,9 +177,26 @@ export function buildCatalog(cdb, ctx) {
       : dropsScale ? Math.max(authored ?? 0, charLevel * 10)
         : (authored ?? charLevel * 10);
     const rar = cdb.byId('rarity').get(rarity ?? item.rarity);
+    // WHAT YOU SOCKET RAISES THE HOST'S GEAR LEVEL. Read from
+    // Gear.getILevel@8123 (src/st/item/Gear.hx:48-51), which is three lines:
+    //
+    //   lvl  = Item.getILevel(this)                              // base + rarity, + flawless
+    //   lvl += round(upgradeLevel * Item_GearUpgradeILevelBonus)  // the stars
+    //   for (s in this.slots) lvl += Data.item.byId.get(s)?.iLevel ?? 0
+    //
+    // That third line is the one nothing read, and it is not decorative: an
+    // EPIC Corrupted Gift declares `iLevel: 10`, so socketing one adds a whole
+    // effective level to the weapon and every stat line on it moves. Twelve
+    // items in the game do this and they are all AugmentDemon; the Rare
+    // Corrupted Gifts and every enchant, jewel and sigil declare no iLevel at
+    // all and therefore add nothing. Reported from play - "using a demonic gift
+    // on a weapon slightly increases its stats" - and the code says exactly why.
+    const socketBonus = (socketed ?? []).reduce(
+      (s, id) => s + (itemById.get(id)?.iLevel ?? 0), 0);
     const iLevel = baseILevel
       + (rar?.props?.iLevelBonus ?? 0)
       + ctx.consts.gearUpgradeILevelBonus * stars
+      + socketBonus
       + (flawless ? ctx.consts.flawlessILevelBonus : 0);
     return iLevel / 10;
   }

@@ -1073,8 +1073,13 @@ function runFight(spec) {
     }
     for (const p of poolDots) {
       damage += p.damage; heal += p.heal ?? 0;
-      const e = acc.pool.get(p) ?? { damage: 0, fed: 0, heal: 0, ticks: 0 };
+      const e = acc.pool.get(p) ?? { damage: 0, fed: 0, paid: 0, heal: 0, ticks: 0 };
       e.damage += p.damage; e.fed += p.fed; e.heal += p.heal ?? 0; e.ticks += p.ticks ?? 0;
+      // What the ticks actually PAID OUT before the bell, as against what was
+      // banked. The difference is the tail a damage meter never saw either, and
+      // it is one of the two reasons the printed feed does not tie out against
+      // the printed damage.
+      e.paid += p.tick > 0 ? p.paid : p.fed;
       acc.pool.set(p, e);
     }
     for (const g of triggers) {
@@ -1166,11 +1171,36 @@ function runFight(spec) {
       interval: elapsed, share: 0,
       // Say what the guard actually says: Hemorrhage pools physical CRITICAL
       // damage from everyone, Bonethrow pools its OWN damage, crit or not.
-      why: Math.round(p.pool.fraction * 100) + '% of ' + Math.round(e.fed / rolls) + ' '
-        + (p.pool.magic ? 'magic ' : p.pool.physical ? 'physical ' : '')
-        + (p.pool.crit ? 'critical ' : '') + 'damage'
-        + (p.pool.own ? ' dealt by itself' : '') + ', pooled by ' + p.fromName
-        + (e.ticks ? `, ticking ${Math.round(e.ticks / rolls)} times` : ''),
+      //
+      // ...and say what the FEED NUMBER IS, because it is not a subtotal of the
+      // damage above it and a reader was right to try adding it up and fail.
+      // Two things separate them:
+      //
+      //   * it is the CRIT-ATTRIBUTABLE share of that damage, not the whole of
+      //     it - a guard that says `dmg.critical` only ever sees the part that
+      //     crit, which at 36% crit and 154% crit damage is under half the total;
+      //   * it is measured BEFORE DamageModifier, because a pool banks base
+      //     damage and each tick is multiplied by whatever is up when it lands.
+      //     That is on record from play: a bleed already ticking at 100 goes to
+      //     120 the moment Berserk is pressed, with no new crit.
+      //
+      // And a third if the bell catches it: what was still owed is dropped.
+      why: (() => {
+        const fed = e.fed / rolls;
+        const paid = (e.paid ?? fed) / rolls;
+        const dropped = Math.max(0, fed - paid);
+        return Math.round(p.pool.fraction * 100) + '% of ' + Math.round(fed) + ' '
+          + (p.pool.magic ? 'magic ' : p.pool.physical ? 'physical ' : '')
+          + (p.pool.crit ? 'critical ' : '') + 'damage'
+          + (p.pool.own ? ' dealt by itself' : '') + ', pooled by ' + p.fromName
+          + (e.ticks ? `, ticking ${Math.round(e.ticks / rolls)} times` : '')
+          + ' - that feed is the '
+          + (p.pool.crit ? 'crit-attributable share of your damage, ' : '')
+          + 'measured before DamageModifier because the ticks carry it, so it is not a subtotal '
+          + 'of the lines above'
+          + (dropped > Math.max(1, fed * 0.01)
+            ? `; ${Math.round(dropped)} of it was still owed when the bell went and is dropped` : '');
+      })(),
     });
   }
   lines.push(...triggeredLines);
