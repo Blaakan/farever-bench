@@ -6,9 +6,9 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
-State at handoff (2026-08-02, second pass): **624 checks green**; baselines
-Warrior 512.4, Rogue 392.3, Mage 364.6, Priest 383.2 (`optimize`, level 25,
-named boss). Unscored lists: Warrior 5, Priest 7, Rogue 6, Mage 7.
+State at handoff (2026-08-02, second pass): **645 checks green**; baselines
+Warrior 512.4, Rogue 392.3, Mage 323.5, Priest 383.2 (`optimize`, level 25,
+named boss). Unscored lists: Warrior 5, Priest 7, Rogue 6, Mage 6.
 
 ## The method (proven, in order of preference)
 
@@ -60,6 +60,14 @@ messages in the repo's voice with **no AI attribution**; caches must stay bounde
   `unmodelled` to `verified`, with a patch tripwire on `props.hitCount`.
 - **The gear bake traced and reconciled** — see the audit entry; the rewrite is
   named below.
+- **Proc-applied buffs that block their own renewal.** `!owner.hasStatus(<the
+  status this very call applies>)` is a readable self-block, not live state. The
+  four trinket Stones went from scoring zero to scoring, at `rD/(1+rD)` rather
+  than at the cap.
+- **The conduit gauge, read and then measured.** Conduits fire when Spark is
+  spent from above half of MaxSpark, all together. Measured in game both ways —
+  five stacks when starved, twenty when fed — which confirmed the rule to the
+  integer *and* retired a permanent +10 MagicMastery the Mage had been carrying.
 
 ## Per-class expansion program
 
@@ -74,9 +82,13 @@ has the most refusals outstanding):
    `layouts` per class; every `not scored in this build` entry gets a data-read,
    a bytecode-read, or a measurement protocol — or a better reason.
 3. **Finish the class resource.**
-   - Mage: the conduit gauge is the missing rate (see below). Remaining after
-     that — the finisher's 10-Spark cost, Foresight's free cast, chaincast
-     bypass, `Mage_ChronoReset`.
+   - Mage: the conduit gauge and the finisher's flat 10 Spark have landed.
+     Remaining — base Spark regen as time income (0.005 × MaxSpark × 1.3 per
+     second on a 3s tick, plus the talent income: Infinite Resources +3/2s,
+     Conduit Residues 25% × 5 per trigger, Prodigious Mind, Spark Flask),
+     Foresight's free cast, the chaincast bypass and `Reverberate`'s second
+     forced volley, and `Mage_ChronoReset`. And `Conduit: Power`'s mean stack
+     count, which waits on the stack counter's affix side.
    - Rogue: CP income/spend lands; remaining — the distinct-kind dedup
      (consecutive same skill pays once), M1 crit extra, M2 cap 5, M3 refund 1,
      UrgeToKill (8s→1s finisher CD + 1 CP/s window).
@@ -187,14 +199,14 @@ has the most refusals outstanding):
 Each is one session on the 0-armor dummy. Design note: every one of these is
 built so a single reading discriminates between candidate formulas.
 
-1. **Mage conduit gauge (60s).** Naked but for one weapon, Conduit: Shard
-   slotted. Fill Spark, then cast weapon skills continuously for 60s and
-   stopwatch every shard impact. The gaps ARE the trigger rule. Second read: note
-   `MagicMastery` on the sheet, then watch it while triggering — (a) the value
-   after one trigger gives Conduit: Power's 0.5, (b) the maximum reached gives
-   the real `maxStacks`, (c) whether it decays after 15s gives the real duration.
-   The row authors neither a duration nor a cap and the description promises
-   both, so this is the one Mage row not to trust.
+1. ~~**Mage conduit gauge.**~~ **DONE, 2026-08-02.** The trigger rule turned out
+   to be fully readable (`Mage_Conduit_SparkBounds`), so only the buff needed a
+   reading. Result: `+0.5%` MagicMastery a stack, cap **20** (`+10%`), and the
+   five-stack ceiling that first showed up was the *gauge*, not the cap — the
+   row's `maxStacks: 20` and `duration: 15` are both correct, and a claim that
+   the row authored neither is retired. The measurement's real value was the
+   second half: it proved the model had been standing at a cap the fight cannot
+   reach, worth 13% of the class.
 2. **Censer's Hidden Power absorption (5 min).** (i) Enter combat and stand
    still 60s: count the clouds (expect 20 at one per 3s) and confirm the stack
    counter stays at 0 — that proves absorption is positional. (ii) Play normally
