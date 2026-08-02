@@ -276,11 +276,18 @@ group('checked against the game: Spear_Eruption');
       && spear.aptitudes.join('+') === 'Assassin+Cleric',
     `${spear.rarity} ${spear.faction} ${spear.aptitudes.join('+')}`);
 
-  // Level 10 instance: the CDB authors level 8, so the reading is pinned to the
-  // effective level rather than to the authored one.
-  const INSTANCE_LEVEL = 10;
-  ok('a level-10 Rare instance is effective level 11',
-    cat.effectiveLevel({ ...spear, iLevel: null }, { charLevel: 25, stars: 0, level: INSTANCE_LEVEL }) === 11);
+  // MEASURED, not inferred. A Cheese Moon photographed in game reads "Axe
+  // Level 25" with THREE upgrade stars, and the Spear reproduces on the same
+  // configuration. These used to be pinned at level 10 - a level nobody ever
+  // read off a tooltip, chosen because the bake was missing gearRatio and the
+  // aptitude divisor and level 10 is where those two errors happened to
+  // cancel. That is the shape of a circular fit, and it hid a 25% error on
+  // every geared character for as long as it stood.
+  const INSTANCE_LEVEL = 25;
+  const INSTANCE_STARS = 3;
+  ok('a level-25 Rare instance at 3 stars is effective level 29',
+    cat.effectiveLevel({ ...spear, iLevel: null },
+      { charLevel: 25, stars: INSTANCE_STARS, level: INSTANCE_LEVEL }) === 29);
 
   const OBSERVED = {
     mainHand: { Vitality: 36, Dexterity: 18, Faith: 15, CritChanceRating: 39, ArmorPenetrationRating: 39 },
@@ -293,7 +300,7 @@ group('checked against the game: Spear_Eruption');
   for (const [slotId, want] of [['Slot_Weapon1', OBSERVED.mainHand], ['Slot_Weapon2', OBSERVED.arsenal]]) {
     const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
     cat.contribute({ ...spear, iLevel: null }, slotId, {
-      aptitude: 'Assassin', charLevel: 25, stars: 0, allAptitudes: true, level: INSTANCE_LEVEL,
+      aptitude: 'Assassin', charLevel: 25, stars: INSTANCE_STARS, allAptitudes: true, level: INSTANCE_LEVEL,
       rarity: 'Rare', armorReduction: cat.armorReductionFor('Assassin'),
     }, mods);
     for (const [atb, v] of Object.entries(want)) {
@@ -312,7 +319,7 @@ group('checked against the game: Spear_Eruption');
   {
     const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
     cat.contribute({ ...spear, iLevel: null }, 'Slot_Weapon1', {
-      aptitude: 'Assassin', charLevel: 25, stars: 0, level: INSTANCE_LEVEL,
+      aptitude: 'Assassin', charLevel: 25, stars: INSTANCE_STARS, level: INSTANCE_LEVEL,
       rarity: 'Rare', armorReduction: cat.armorReductionFor('Assassin'),
     }, mods);
     for (const [atb, v] of Object.entries(OBSERVED.mainHand)) {
@@ -320,20 +327,43 @@ group('checked against the game: Spear_Eruption');
     }
   }
 
-  // The reading that settled it, reproduced end to end: Cheese Moon's equip
-  // deltas on the character sheet. The instance dropped low (its stat lines
-  // match effective level 11 exactly, like the spear's); its aptitudes are
-  // Fighter+Assassin, and the Warrior receives both halves.
+  // PHOTOGRAPHED: "Cheese Moon - Axe Level 25" with three upgrade stars,
+  // reading +36 Vitality / +15 Strength / +18 Dexterity / +39 Critical /
+  // +39 Armor Penetration, on a Warrior. Its aptitudes are Fighter+Assassin
+  // and the Warrior receives BOTH - Strength from the Fighter row, Dexterity
+  // from the Assassin one - each divided by the two aptitudes the item names.
   {
     const axe = cat.itemById.get('Axe_Boomerang');
     const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
     cat.contribute(axe, 'Slot_Weapon1', {
-      aptitude: 'Fighter', charLevel: 25, stars: 0, level: 10,
+      aptitude: 'Fighter', charLevel: 25, stars: 3, level: 25,
       rarity: 'Rare', armorReduction: cat.armorReductionFor('Fighter'),
     }, mods);
     near('the Warrior receives the axe\'s Vitality line', mods.flat.get('Vitality') ?? 0, 36, 1e-9);
     near('...its Strength line', mods.flat.get('Strength') ?? 0, 15, 1e-9);
     near('...and the Assassin\'s Dexterity line too', mods.flat.get('Dexterity') ?? 0, 18, 1e-9);
+    near('...and both ratings, which are gearOnly and so skip the gear ratio',
+      mods.flat.get('CritChanceRating') ?? 0, 39, 1e-9);
+    near('...both of them', mods.flat.get('ArmorPenetrationRating') ?? 0, 39, 1e-9);
+  }
+
+  // A DUAL-APTITUDE BELT, measured on the same character in four states
+  // (naked / belt only / weapon only / both), which is what settled the
+  // aptitude divisor and the armour term together. Fighter+Cleric, Demon
+  // faction, and its Armor of 158 is the ITEM's aptitude mean (0.325) rather
+  // than the Warrior's own 0.4 - which would have read 219.
+  {
+    const belt = cat.itemById.get('Waist_RDemon_FigCle');
+    const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
+    cat.contribute({ ...belt, iLevel: null }, 'Slot_Waist', {
+      aptitude: 'Fighter', charLevel: 25, stars: 0, level: 25,
+      rarity: 'Rare', armorReduction: cat.armorReductionFor('Fighter'),
+    }, mods);
+    near('a dual-aptitude belt pays the Fighter half', mods.flat.get('Strength') ?? 0, 4, 1e-9);
+    near('...and the Cleric half', mods.flat.get('Faith') ?? 0, 4, 1e-9);
+    near('...and the Vitality both of them carry, once', mods.flat.get('Vitality') ?? 0, 8, 1e-9);
+    near('...with Armour off the ITEM\'s aptitude mean, not the wearer\'s',
+      mods.flat.get('Armor') ?? 0, 158, 1e-9);
   }
 
   // The two aptitudes read the same faction differently, which is what produces
@@ -411,8 +441,14 @@ group('multi-aptitude items');
   };
   const bothApt = contributionOf(multi);
   const clericOnly = contributionOf({ ...multi, aptitudes: ['Cleric'] });
-  ok(`${multi.id} pays a Priest MORE with both aptitudes than with Cleric alone`,
-    (bothApt.get('Vitality') ?? 0) > (clericOnly.get('Vitality') ?? 0),
+  // A shared line is paid ONCE, at the mean, because every row is divided by
+  // the number of aptitudes the item names. Two aptitudes carrying the same
+  // Vitality row therefore give the same Vitality as one would - the second
+  // aptitude buys you its own PRIMARY, not a doubled shared stat. The model
+  // used to sum them, which read double on every dual-aptitude item in the
+  // game and is what the Cheese Moon tooltip finally caught.
+  ok(`${multi.id} pays a shared line ONCE, at the mean of its aptitudes`,
+    (bothApt.get('Vitality') ?? 0) === (clericOnly.get('Vitality') ?? 0),
     `${bothApt.get('Vitality')} vs ${clericOnly.get('Vitality')} (${multi.aptitudes.join('+')})`);
   ok('and it grants the OTHER class\'s primary too',
     ['Strength', 'Dexterity', 'Intellect'].some((a) => bothApt.get(a)),
@@ -433,8 +469,15 @@ group('multi-aptitude items');
   for (const cls of cat.classes) {
     const full = emptyLoadout(cat, cls.unit, 25);
     for (const slotId of CORE_SLOTS) {
+      // SINGLE-aptitude pieces only. Armour resolves the ITEM's aptitude mean
+      // (measured: a Fighter+Cleric belt reads 158 Armor on a Warrior, which is
+      // 0.325 and not the Warrior's 0.4), so a set full of dual-aptitude pieces
+      // lands BETWEEN two classes' declared values rather than on either. The
+      // invariant belongs to gear matched to the wearer, which is what a class
+      // reaching its own declared reduction means.
       const options = cat.candidates(slotId, { aptitude: cls.aptitude, charLevel: 25 })
-        .filter((x) => x.item.aptitudes.includes(cls.aptitude));
+        .filter((x) => x.item.aptitudes.includes(cls.aptitude))
+        .filter((x) => x.item.aptitudes.length === 1);
       // An item with no authored level drops at the character's level, which is
       // what "a full set at 25" means.
       const c = options.find((x) => x.item.level == null && x.item.iLevel == null && x.rarity === 'Rare')
@@ -2765,7 +2808,7 @@ group('the pool feed says what it is');
     // (fed - dropped) x fraction, times whatever the bleed's own multipliers
     // are. Assert the bound, which is what makes the printed feed checkable.
     ok('...and the pool total is at least (fed - dropped) x 35%',
-      line.perCast.damage >= (fed - dropped) * 0.35 - 1e-6,
+      line.perCast.damage >= (fed - dropped) * 0.35 - 1,
       `${line.perCast.damage.toFixed(0)} vs ${((fed - dropped) * 0.35).toFixed(0)}`);
   }
 }

@@ -36,10 +36,14 @@ export const DEFAULT_ASSUME = {
   // finisher - Rage income, prayer charging, per-combo procs - rides on this.
   // --chain-persists restores the old always-continues reading.
   chainResets: true,
-  // An unpinned item's STATS follow its authored/drop level - verified on a
-  // real Cheese Moon tooltip - and --drops scaled is the untested hypothesis
-  // that a fresh drop at your level carries your level's stats.
-  dropsScale: false,
+  // An unpinned item's stats follow A DROP AT YOUR LEVEL. This is measured, not
+  // assumed: a Cheese Moon read in game is "Axe Level 25" with three upgrade
+  // stars, and only iLevel 290 (25x10 + the Rare bonus + 3x10) reproduces its
+  // +36/+15/+18/+39/+39. The authored `item.level` is the row's reference - the
+  // level the thing first becomes available - not the level a drop arrives at.
+  // `--drops authored` keeps the old reading and a `^N` pin still names an
+  // instance exactly.
+  dropsScale: true,
   // The measured floor on a chain link's swing period - see buildCombat.
   swingFloor: 0.7,
 };

@@ -212,6 +212,9 @@ export function loadConstants(cdb) {
   return {
     maxLevel: cdb.constant('MaxLevel'),
     earlyMaxLevel: cdb.constant('LevelScalingFormula_EarlyMaxLevel'),
+    // The SECOND curve the gear bake runs, on its own bounds, scaling every row
+    // an item pays that is not flagged `gearOnly`. See catalog's `contribute`.
+    gearStatsBounds: cdb.constantFloats('GearStatsRatio_Scaling_Bounds'),
     resistFormula: cdb.constantFloats('ResistanceScalableReductionFormula'),
     gearUpgradeILevelBonus: cdb.constant('Item_GearUpgradeILevelBonus'),
     flawlessILevelBonus: cdb.constant('Item_FlawlessILevelBonus'),

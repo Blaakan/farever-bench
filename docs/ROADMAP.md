@@ -6,7 +6,7 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
-State at handoff (2026-08-02, second pass): **658 checks green**; baselines
+State at handoff (2026-08-02, second pass): **664 checks green**; baselines
 Warrior 520.1, Rogue 399.0, Mage 328.5, Priest 385.6 (`optimize`, level 25,
 named boss). Unscored lists: Warrior 5, Priest 7, Rogue 6, Mage 6.
 
@@ -254,7 +254,49 @@ it settles on its own: `GS Base Attack`'s **max hit was 604**, which no crit on
 the top of the model's ±10% band can reach (~429), so the geared swing really is
 too small; and **Anger Release fired twice**, which the model scores at zero.
 
-## The gear bake: what is proven, and why half of it must not land
+## The gear bake: LANDED 2026-08-02
+
+Three terms were missing and they only reconcile **together** — each alone makes
+the other two look wrong, which is why a first attempt at the gear ratio by
+itself was implemented and reverted.
+
+1. **Gear ratio.** The level curve runs a second time on
+   `GearStatsRatio_Scaling_Bounds` (0.5 → 0.9) and multiplies every row not
+   flagged `gearOnly`. Armour and the ratings *are* `gearOnly`, which is what
+   lets them pin an item's level independently of the term under test.
+2. **The aptitude divisor.** Every row is divided by the number of aptitudes the
+   ITEM names. A dual-aptitude item pays a shared line ONCE at the mean; what the
+   second aptitude buys is its own primary. The model summed them and read
+   **double** on every dual-aptitude item in the game.
+3. **Armour takes the ITEM's aptitude mean**, not the wearer's. A Fighter+Cleric
+   belt reads 158 Armor on a Warrior — 0.325, where the Warrior's own 0.4 would
+   read 219.
+
+Plus the level: an item's stats follow **a drop at your level**, not its authored
+row level. The Cheese Moon is photographed as "Axe Level 25" with three stars,
+iLevel 290 — the level the old tests pinned at 10 was never read off a tooltip,
+it was the level at which the two missing terms happened to cancel.
+
+Measured against one level-25 Warrior in four equip states, three items, twelve
+integers, **all exact**, with the naked control still exact on all sixteen
+attributes:
+
+| item | aptitudes | measured |
+|---|---|---|
+| GS_Nova, Rare 0★ | 1 | +25 Str, +32 Vit, +69 Crit |
+| Waist_RDemon_FigCle | 2 | +4 Str, +4 Faith, +8 Vit, 158 Armor |
+| Axe_Boomerang, Rare 3★ | 2 | +36 Vit, +15 Str, +18 Dex, +39 Crit, +39 ArPen |
+
+On the fully geared character the sheet went from Vitality 226 / Armor 1576 to
+the measured **213 / 1949**, and Dexterity and Faith land exactly once the waist
+is specified correctly. Baselines fell accordingly: Warrior 539.5 → 438.2,
+Rogue 399.0 → 306.7, Mage 328.5 → 223.0, Priest 385.6 → 296.3.
+
+**Still open from the same trace:** the Uncommon `statGroup` rules — Vitality is
+dropped off a dual-aptitude Uncommon and Primary off a single-aptitude one — which
+no measurement here touches.
+
+## Historical: why half of it must not land
 
 **`gearRatio` is real, and it is measured.** `generateItemAffixes@20747` runs the
 level curve a SECOND time on `GearStatsRatio_Scaling_Bounds` (0.5 → 0.9) and

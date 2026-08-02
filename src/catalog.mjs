@@ -478,11 +478,39 @@ export function buildCatalog(cdb, ctx) {
     // Accumulated per item, not straight into `mods`, because the slot factor
     // applies to the finished per-stat total - see the ceil() below.
     const own = new Map();
-    // Armour pays ONCE however many aptitudes the item names: its budget is
-    // the WEARER's `resistForReduction`, with no aptitude in it, so a second
-    // aptitude paying it doubles the one stat that cannot double - which is
-    // half of what sank the early both-halves model.
+    // Armour pays ONCE however many aptitudes the item names.
     const armorPaid = new Set();
+
+    // THE BAKE, as `generateItemAffixes@20747` actually computes it. Three
+    // terms were missing and they only reconcile together - each one alone
+    // makes the other two look wrong, which is why a first attempt at just the
+    // gearRatio was reverted.
+    //
+    //   1. GEAR RATIO. The level curve runs a SECOND time on
+    //      `GearStatsRatio_Scaling_Bounds` (0.5 -> 0.9) and multiplies every
+    //      row that is not flagged `gearOnly`. Armour and the ratings ARE
+    //      gearOnly, which is what lets them pin an item's level independently
+    //      of the term under test.
+    //   2. THE APTITUDE DIVISOR. Every row is divided by the number of
+    //      aptitudes the ITEM names. A dual-aptitude item therefore pays the
+    //      MEAN of its two aptitudes rather than their sum, and the model was
+    //      reading exactly double on every one of them.
+    //   3. ARMOUR TAKES THE ITEM'S APTITUDE MEAN, not the wearer's. A
+    //      Fighter+Cleric belt resolves 0.325, not the Warrior's 0.4 - the
+    //      difference between 219 Armor and the measured 158.
+    //
+    // Measured, on one level-25 Warrior, three items, twelve integers:
+    //   GS_Nova       Rare 0*  1 aptitude   +25 Str  +32 Vit  +69 Crit
+    //   Waist_RDemon_FigCle    2 aptitudes  +4 Str   +4 Faith +8 Vit  158 Armor
+    //   Axe_Boomerang Rare 3*  2 aptitudes  +36 Vit  +15 Str  +18 Dex  +39/+39
+    // and the naked control - no item at all - still reads exactly.
+    const aptCount = Math.max(1, (item.aptitudes ?? []).length);
+    const gearRatio = budget(effLevel, ctx.consts.gearStatsBounds[0],
+      ctx.consts.gearStatsBounds[1], ctx.consts.earlyMaxLevel);
+    const itemReds = (item.aptitudes ?? [])
+      .map((a) => aptitudes.get(a)?.props?.armorReduction).filter((x) => x != null);
+    const itemArmorRed = itemReds.length
+      ? itemReds.reduce((s, x) => s + x, 0) / aptCount : opts.armorReduction;
 
     for (const aptId of payingAptitudes(item, opts.aptitude, opts.generic, { all: !!opts.allAptitudes })) {
       const apt = aptitudes.get(aptId);
@@ -501,16 +529,18 @@ export function buildCatalog(cdb, ctx) {
           if (armorPaid.has(e.endAtb)) continue;
           armorPaid.add(e.endAtb);
         }
-        const total = isArmor
-          ? resistForReduction(effLevel, opts.armorReduction, ctx.consts.resistFormula)
+        // Armour is paid once and then divided by the aptitude count like
+        // everything else, so it carries the count back up to stay whole.
+        let total = isArmor
+          ? resistForReduction(effLevel, itemArmorRed, ctx.consts.resistFormula) * aptCount
           : budget(effLevel, e.start, e.end, ctx.consts.earlyMaxLevel);
         if (!total) continue;
+        if (!e.gearOnly) total *= gearRatio;
+        total /= aptCount;
 
         const target = e.sourceAtb ?? e.endAtb;
-        // Each aptitude's contribution is rounded on its own before the sum.
-        // That is a one-unit discriminator and the game agrees with it: rounding
-        // per aptitude gives Spear_Eruption 36 Vitality (16 + 20), summing first
-        // gives 35, and the character sheet says 36.
+        // Each row is rounded on its own before the sum. That is a one-unit
+        // discriminator and the measured tooltips agree with it.
         const amount = Math.round((total * ratio) / sourceConversion(e.endAtb, e.sourceAtb));
         own.set(target, (own.get(target) ?? 0) + amount);
       }
