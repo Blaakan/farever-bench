@@ -181,6 +181,60 @@ has the most refusals outstanding):
   although `setUp` will never put it up. Fix that first; every new atom family
   multiplies against the same defect.
 
+## Measured 2026-08-02: three character sheets and a damage meter
+
+A level-25 Warrior, 0-armour dummy. These are the numbers the gear-bake rewrite
+has to land against, and the first one already retired a hypothesis.
+
+**(1) Naked + GS_Nova, Rare 0★.** The swing formula is CONFIRMED EXACT and needs
+no change: the model predicts a `GS_Base_Attack` band of **94–115** and the
+measured hits are **94–113**, matching the weapon's own written damage line.
+`GS_Base_Attack` authors `0.95 × WeaponPower`, and although the in-game tooltip
+renders that as "95% Strength", reading it literally predicts 76 and is wrong —
+the flat belongs in the term. A rival hypothesis fitted from the geared meter
+alone (flat = the FULL primary budget rather than 0.4 × it) predicted 174 here
+and is dead. **Do not re-open this without a naked read.**
+
+The same sheet exposes the bake, though, at 5–9% per line:
+
+| | game | model |
+|---|---|---|
+| Strength | 59 | 61 |
+| Vitality | 70 | 73 |
+| Dex / Faith / Int | 28 / 28 / 28 | 28 / 28 / 28 ✓ |
+| Critical Bonus | 151.7% | 151.8% ✓ |
+| Critical Chance | 9.4% | 8.8% |
+| Max Health | 210 | 219 |
+
+The weapon's tooltip reads +32 Vitality / +25 Strength / +69 Critical; the model
+reads +35 / +27 and slightly low on crit.
+
+**(2) Fully geared** (the build in `.scratch/_meterbuild.mjs`). Strength lands to
+one point — 173 against 174 — and Critical Bonus to a tenth. What does NOT land
+is independent of the weapon's rarity and stars, i.e. it is armour and jewellery:
+
+| | game | model |
+|---|---|---|
+| Dexterity | 32 | **45** |
+| Faith | 32 | **28** |
+| Armor | 1,949 | **1,576** |
+| Fervor | 20.2% | 18.0% |
+| Critical Chance | 20.8% | 23.2% |
+
+Dexterity is 28 naked plus 4 from the two Honed augments, so the game pays
+`Waist_RCrimson_FigAss`'s **Assassin half nothing** while the model pays it +13.
+Faith is 28 plus 4 the model pays nothing for, most likely the three
+Fervor-aptitude jewellery pieces. That is in direct tension with the audit's
+verified "an item pays EVERY aptitude it names" — which was measured on a
+**weapon** (Cheese Moon), never on armour or on jewellery. Armour may simply not
+follow the same rule.
+
+**(3) The damage meter**, 75s, same build: **703 dps**, 53k total, 127 hits, 24%
+crit. Per-line totals are in the table in `.scratch/_meterbuild.mjs`. Two things
+it settles on its own: `GS Base Attack`'s **max hit was 604**, which no crit on
+the top of the model's ±10% band can reach (~429), so the geared swing really is
+too small; and **Anger Release fired twice**, which the model scores at zero.
+
 ## Model verification remainder
 
 - **Gear bake REWRITE** (not a read — the read is done, in the audit). Landing it
