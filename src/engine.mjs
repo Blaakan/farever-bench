@@ -204,11 +204,24 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // The rows are MUTUALLY EXCLUSIVE per star, the same shape as every other
     // rank-gated affix in this database, so they are filtered and never summed.
     //
-    // Only the weapons you actually wield: the arsenal grants two chosen skills
-    // and its discounted stats, and the upgrade effect is neither.
+    // THE ARSENAL'S UPGRADE EFFECT REACHES YOU TOO. This used to read only the
+    // weapons you wield, on the reasoning that the arsenal grants two chosen
+    // skills and its discounted stats and the upgrade effect is neither. The
+    // player's own Character Profile refutes it: on a build whose only crit
+    // sources are the naked base, the ratings, and Judgement's upgrade line, the
+    // sheet reads 17.3% where base + ratings alone give 14.26%. Nothing else in
+    // that loadout grants CritChance, so the ~3 points are the ARSENAL weapon's
+    // `GreatAxe_Upgrade` row arriving whole - it is not discounted by the
+    // slot's 0.4 either, because an upgrade row is a skill affix and not a
+    // stat line.
+    //
+    // Named residual: `GreatAxe_Upgrade` is +1/+2/+3/+4/+5 by star and the
+    // weapon is 4 stars (iLevel 320 = 250 + Epic 30 + 4x10), so the data says
+    // +4 where the sheet wants +3. One screenshot of Judgement's upgrade line
+    // settles whether the rank the row sees is the star count.
     const upgradeGaps = [];
     const upgradeProcs = [];
-    for (const slotId of ['Slot_Weapon1', 'Slot_OffhandWeapon']) {
+    for (const slotId of ['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']) {
       const g = loadout.gear[slotId];
       if (!g?.item) continue;
       const item = cat.itemById.get(g.item);

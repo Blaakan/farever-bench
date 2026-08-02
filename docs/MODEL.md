@@ -439,6 +439,27 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**The arsenal's upgrade effect reaches you, whole.** The harvest read
+`Slot_Weapon1` and `Slot_OffhandWeapon`, on the reasoning that the arsenal grants
+two chosen skills and its discounted stats and an upgrade effect is neither. The
+player's own Character Profile refutes it: on a build whose only CritChance
+sources are the naked base, the ratings and Judgement's upgrade line, the sheet
+reads **17.3%** where base + ratings alone give 14.26%. Nothing else in that
+loadout grants CritChance. It is *not* scaled by the slot's 0.4 either — an
+upgrade row is a skill affix, not a stat line.
+
+*Named residual:* `GreatAxe_Upgrade` is +1/+2/+3/+4/+5 by star and that weapon is
+four stars (iLevel 320 = 250 + Epic 30 + 4 × 10), so the data says **+4** where
+the sheet wants **+3**. One screenshot of Judgement's upgrade line settles
+whether the rank the row sees is the star count. The model ships what the data
+says and carries the point.
+
+*Reading a printed sheet against the game's:* the model folds a proc-applied
+buff with no cooldown behind it into the resting sheet at its cap, because in
+sustained combat that is where it sits. The game's Character Profile shows you
+standing still. On the captured build that is the Raclette Pan's +5, so the two
+are compared as `model − 5`.
+
 **The bake is checked against the game's own return value, not against tooltips.**
 `captures/2026-08-02-v2/bench-probe-bakes.csv` is a postfix on
 `$HItem.generateItemAffixes@20747`: the item, the iLevel it was called with, and

@@ -3200,6 +3200,32 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- the arsenal's upgrade effect reaches the wearer --------------------------
+// The harvest read Slot_Weapon1 and Slot_OffhandWeapon, on the reasoning that
+// the arsenal grants two chosen skills and its discounted stats and an upgrade
+// effect is neither. The player's Character Profile refutes it: on a build whose
+// only CritChance sources are the naked base, the ratings, and Judgement's
+// upgrade line, the sheet reads 17.3% against 14.26% from base + ratings alone.
+group("the arsenal's upgrade effect is not discounted away");
+{
+  const eng = createEngine({ quiet: true });
+  const crit = (arsenalStars) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'GS_Nova', rarity: 'Rare', stars: 0, level: 25 };
+    l.gear.Slot_Weapon2 = { item: 'GA_Craft', rarity: 'Epic', stars: arsenalStars, level: 25 };
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 }).sheet.get('CritChance');
+  };
+  // GreatAxe_Upgrade is +1/+2/+3/+4/+5 CritChance by star, mutually exclusive.
+  near('a 4-star arsenal axe is worth 4 crit over an unupgraded one',
+    crit(4) - crit(0), 4, 1e-9);
+  near('...and a 2-star one exactly 2', crit(2) - crit(0), 2, 1e-9);
+  // It arrives WHOLE - the slot's 0.4 applies to stat lines, not to a skill's
+  // affix row - so it must not read ceil(4 x 0.4) = 2.
+  ok('it is not scaled by the arsenal stat factor', Math.abs((crit(4) - crit(0)) - 2) > 1e-6,
+    String(crit(4) - crit(0)));
+}
+
 // --- the bake, against the game's own return value ---------------------------
 // `captures/2026-08-02-v2/bench-probe-bakes.csv` is a postfix on
 // `$HItem.generateItemAffixes@20747`: item, the iLevel it was called with, and
