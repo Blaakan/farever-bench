@@ -334,3 +334,15 @@ inventory dump would split. Named non-finding so nobody reopens it: group-mean
 vs per-row in the bake is algebraically undecidable on shipped data (equal
 end/start ratios make the curve commute with the mean) and numerically
 irrelevant on all 636 keys.
+
+**UPGRADE-RIDER RANK, 2026-08-02 night — the screenshot decides against the
+star count.** The 4★ Judgement's tooltip prints "Upgrade: Critical Chance
+increased by 3%" — on the same item whose effective iLevel is 320 = 250 +
+Epic 30 + 4×10 (bake-row confirmed). The sheet corroborates independently:
+5.8 base + ~8.4 ratings + 3 = 17.2–17.3 vs the printed 17.3; +4 would read
+18.2+. So iLevel counts four upgrades while the rider row fires at rank 3:
+the rank that row sees is NOT the star count. The RULE is underdetermined by
+one point (stars−1? capped at rarity-max−1?); the discriminator is the
+player's Rare 3★ Axe_Boomerang tooltip — +2 settles stars−1, +3 settles
+something subtler. Until then, model the rider at stars−1 with the Axe read
+as the pending check, and keep the resting sheet pinned to 17.3.
