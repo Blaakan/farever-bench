@@ -292,6 +292,44 @@ gearRatio cannot satisfy both. The `gearOnly` flags are uniform across every
 aptitude (Primary and Vitality false, Armor and Ratings true), so it is not a
 per-item difference either.
 
+**THE FULL SEARCH, and it does not close.** The four ambiguous choices were
+implemented switchable and swept against all three tooltips at once
+(`.scratch/_bakefit.mjs`):
+
+| group | gearRatio | divisor | GS_Nova (single apt) | Spear (dual) | Cheese Moon (dual) |
+|---|---|---|---|---|---|
+| mean | **true** | false | **EXACT** | err 30 | err 30 |
+| row | false | false | err 27 | **EXACT** | **EXACT** |
+| either | true | true | EXACT | err 90 | err 50 |
+| mean | false | false | err 27 | err 1 | err 1 |
+
+No combination satisfies all three. Two things ARE settled by the sweep: the
+divisor must be OFF (the bytecode's per-row re-add cancels it exactly, and
+turning it on makes every dual case three times worse), and `mean` versus
+per-row grouping is worth at most one point, so it is not the discriminator.
+
+The remaining conflict cannot be traded against level either, because **each
+item pins its own level through its `gearOnly` ratings row**, which gearRatio
+never touches: GS_Nova's Critical of 69 forces L = 26, the Spear's 39/39 forces
+L = 11, and at exactly those levels the attributes want x0.675 and x1.0. With
+gearRatio on, the dual items land on exactly 0.5617x their tooltips — which is
+`gearRatio(11)` to four figures, so the term is being applied and is simply not
+wanted there.
+
+So one of the two measurement families is not what it is assumed to be. The
+GS_Nova reading is the stronger of the two: it is fresh, and it comes with a
+naked control, a full character sheet, the item tooltip and a damage meter that
+all agree. The Spear and Cheese Moon readings are older, and what they actually
+pin is the tooltip integers — their *instance level* was inferred by the very
+model now in question, which makes them circular in precisely the way the geared
+sheet was.
+
+**THE DISCRIMINATING MEASUREMENT, and it is one tooltip:** equip any
+DUAL-APTITUDE item at a known level and read its stat lines. If a dual item at a
+known level shows gearRatio applied, the old Spear/Cheese Moon level attributions
+are wrong and gearRatio lands globally. If it does not, aptitude count really
+does change the rule and the bake needs a branch. Until then, nothing lands.
+
 **What separates the two cases is the APTITUDE COUNT.** GS_Nova is single
 (Fighter); Spear_Eruption and Cheese Moon are dual. The bytecode GROUPS the
 surviving rows by `endAtb`, takes the arithmetic MEAN of `start`/`end` across the
