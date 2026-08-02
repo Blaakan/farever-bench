@@ -193,12 +193,6 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // the fight - or a buff window would quietly escape the rig.
     const force = profile?.force ?? null;
 
-    for (const p of rot.passive ?? []) {
-      for (const a of p.affixes ?? []) {
-        if (a.ref === 'TAttribute_Flat') addFlat(a.target.attribute, a.val ?? 0);
-      }
-    }
-
     // The effect a weapon's upgrade stars unlock. The game's own window says
     // upgrading a weapon gives "access to a unique effect", and each weapon
     // type has a `<Type>_Upgrade` skill whose affix rows are gated by the
@@ -292,6 +286,48 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         mulRatio.set(atb, ctx.affix.composeMul(a.ref, mulRatio.get(atb) ?? 1, m));
       }
     };
+    // A SKILL'S OWN AFFIX ROWS. This used to read `rot.passive` only, which is
+    // the wrong half of the game's rule. `BaseSkill.permaAffixes@6081`
+    // (BaseSkill.hx:850) returns false for exactly two natures - Status(4) and
+    // Passive(5) - and true for everything else, and `initData@6029` then does
+    // `if (permaAffixes()) updateAffixes()`, handing them to `owner.addAffix`
+    // for good. A passive's rows are not permanent by that test but arrive the
+    // other way, through `setRunning@6025`, and a passive is always running; a
+    // status's rows belong to the buff path, which prices them at an uptime.
+    //
+    // So the rule here is every owned skill EXCEPT a status, and the row that
+    // proves it is `Axe_Boomerang_Combo`: nature Combo, `TAttribute_Flat
+    // CritChance +5` at `minRank: 2`, `displayed: false`, and a rankDesc that
+    // says "You permanently gain ::val1%:: [CritChance]" in as many words. It
+    // is owed for WIELDING the axe - `Weapon.applySkills@8181` creates a skill
+    // object for every row of `item.skills` - and the model dropped it because
+    // a combo is filler, not a passive.
+    //
+    // A census of the whole sheet finds six rows outside Status/Passive that
+    // carry an attribute affix: the three weapon-class Block abilities (already
+    // arriving through `passive`, hence the dedupe), Axe_Boomerang_Combo,
+    // DA_Water_Combo's +2 CritChance at rank 3, and one Bee NPC row. So this
+    // cannot move anything by accident.
+    //
+    // `applyAffix` rather than the old Flat-only `addFlat`, because a ratio row
+    // in this position would otherwise be read as a flat and silently mangled.
+    const affixSeen = new Set();
+    for (const e of [...(rot.filler ?? []), ...(rot.active ?? []), ...(rot.triggered ?? []),
+      ...(rot.passive ?? [])]) {
+      const id = e.prof?.id;
+      if (!id || affixSeen.has(id)) continue;
+      affixSeen.add(id);
+      if (e.prof.nature === 'Status') continue;
+      for (const a of (e.affixes ?? e.prof.affixes ?? [])) {
+        // Script-scaled magnitudes are not in the data; the reader that owns
+        // those says so rather than guessing at one.
+        if (!a.target?.attribute || a.mod?.dynVal) continue;
+        // One stack, always: `BaseSkill.getAffixMultiplier@6082` returns 1, and
+        // only `Status.getAffixMultiplier@14436` returns the stack count.
+        applyAffix(a, 1, 1);
+      }
+    }
+
     // Talents. A talent has no cooldown of its own, so a status it grants is
     // permanent unless the status says otherwise - and where the status DOES
     // declare a short duration with no applier cooldown to divide it by, the

@@ -3159,8 +3159,10 @@ group('a refused payload does not take its aura with it');
     eng.plan.pruneSelection(l);
     return eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank }).sheet;
   };
-  near('the rank-2+ row reaches the sheet whole',
-    sheetAt(3).get('CritChance') - sheetAt(1).get('CritChance'), 2, 1e-9);
+  // Two rank-gated rows move together on this axe, and the sum is the check:
+  // the aura goes 3 -> 5 (+2) and the combo's own affix goes 0 -> 5 (+5).
+  near('both rank-2 rows reach the sheet, whole',
+    sheetAt(3).get('CritChance') - sheetAt(1).get('CritChance'), 7, 1e-9);
 
   // The bare axe, against the same build with no weapon at all: the aura is the
   // only flat CritChance either one grants.
@@ -3180,6 +3182,53 @@ group('a refused payload does not take its aura with it');
   ok('the heal is still refused', !!row, JSON.stringify(row ?? null));
   ok('...and the refusal names what it kept',
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
+}
+
+// --- a skill's own affix is owed for owning the skill ------------------------
+// `BaseSkill.permaAffixes@6081` is false for exactly two natures, Status and
+// Passive, and `initData@6029` hands everything else's affix rows to
+// `owner.addAffix` permanently. The harvest read `rot.passive` alone, so
+// `Axe_Boomerang_Combo` - nature Combo, +5 CritChance at rank 2, tooltip "You
+// permanently gain" - was dropped for being filler rather than a passive.
+group("a skill's own affix does not need to be a passive");
+{
+  const eng = createEngine({ quiet: true });
+  const NATURES = eng.cdb.enumValues('skill', 'nature');
+  const outside = eng.cdb.lines('skill')
+    .filter((s) => (s.affixes ?? []).some((a) => a.target?.attribute))
+    .filter((s) => NATURES[s.nature ?? -1] !== 'Status' && NATURES[s.nature ?? -1] !== 'Passive')
+    .map((s) => s.id);
+  // The census is the safety rail: this change can only ever touch these rows,
+  // so a patch that adds a seventh is a thing to look at rather than absorb.
+  ok('exactly six rows in the game carry one outside Status/Passive',
+    outside.length === 6 && outside.includes('Axe_Boomerang_Combo')
+      && outside.includes('DA_Water_Combo'),
+    outside.join(', '));
+
+  const combo = eng.cdb.byId('skill').get('Axe_Boomerang_Combo');
+  ok('the combo row is a Combo carrying +5 CritChance at rank 2',
+    NATURES[combo.nature] === 'Combo'
+      && combo.affixes[0].target.attribute === 'CritChance'
+      && combo.affixes[0].val === 5 && combo.affixes[0].conds.minRank === 2,
+    JSON.stringify(combo.affixes));
+
+  const at = (rank) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3, level: 25 };
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank }).sheet.get('CritChance');
+  };
+  ok('it reaches the sheet at rank 2 and not at rank 1', at(2) - at(1) > 5 - 1e-9,
+    `${at(1)} -> ${at(2)}`);
+
+  // A shield's Block ability is nature Ability and already arrived through
+  // `passive`. Counting it twice is the failure mode this dedupe exists for.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_OffhandWeapon = { item: 'Shield_Craft', rarity: 'Rare', stars: 3, level: 22 };
+  eng.plan.pruneSelection(l);
+  const block = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 })
+    .sheet.get('BlockMitigation');
+  ok('a Block ability is still counted exactly once', block <= 110 + 1e-9, String(block));
 }
 
 // --- crit is a die, and --fights throws it ----------------------------------

@@ -439,6 +439,27 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**A skill's own affix is owed for owning the skill, not for being a passive.**
+`BaseSkill.permaAffixes@6081` (`BaseSkill.hx:850`) returns false for exactly two
+natures — `Status` and `Passive` — and true for every other. `initData@6029` then
+runs `if (permaAffixes()) updateAffixes()`, which hands the rows to
+`owner.addAffix@4478` for good. A passive's rows are not permanent *by that test*
+but arrive the other way, through `setRunning@6025`, and a passive is always
+running; a status's rows belong to the buff path, which prices them at an uptime.
+So the harvest is **every owned skill except a status**, deduplicated by id.
+
+The row that proves it is `Axe_Boomerang_Combo`: nature `Combo`, `TAttribute_Flat
+CritChance +5` at `minRank: 2`, `displayed: false`, and a `rankDesc` reading *"You
+permanently gain ::val1%:: [CritChance]"*. It is owed for **wielding** the axe —
+`Weapon.applySkills@8181` creates a skill object for every row of `item.skills` —
+and the model dropped it because a combo lives in `filler`, not in `passive`.
+
+A census of the whole sheet finds six rows outside Status/Passive carrying an
+attribute affix: the three weapon-class Block abilities (which already arrived
+through `passive`, hence the dedupe), `Axe_Boomerang_Combo`, `DA_Water_Combo`'s
++2 CritChance at rank 3, and one Bee NPC row. The change cannot move anything
+else by accident, and the test asserts that census so a seventh row is noticed.
+
 **A refused payload does not take an always-on stat with it.** The buckets are
 not exclusive, and one row can land in two of them. `Axe_Boomerang_Skill_Passive`
 declares a heal played only from `on: Code` — its script fires it on a physical
