@@ -565,14 +565,15 @@ function runFight(spec) {
     // `chance` and a proc that lands while it is already armed is WASTED, so
     // the update is `p += (1 - p) * chance` and never saturates past 1.
     //
-    // Spending it does two things at two different moments, and only the first
-    // is modelled here: the cost check runs at PRESS and the forced-crit check
-    // at DAMAGE EVAL, with `onStop` removing the status in between. A second
-    // Rage Strike queued before the first one stops therefore gets the free
-    // cast WITHOUT the crit - `startSkill@6034` builds a fresh Skill per press,
-    // so the removal is driven by the FIRST cast's lifetime. This fight casts
-    // sequentially and never queues, so that split cannot arise here; it is
-    // named in the audit rather than approximated.
+    // Spending it is ONE event, not two. The cost check runs at press and the
+    // forced-crit check at damage eval, which looks like it should let a second
+    // press slip in free while the first cast is still running - but
+    // `GameObject.doUseSkill@4576` op 2 calls `stopActiveSkill@4580` as its
+    // FIRST action, and that is `BaseSkill.stop@6093` on the running skill,
+    // which runs `onStop` and removes the status before the new cast evaluates
+    // anything. Pressing again cannot outrun its own stop. Queueing cannot
+    // either: a queued press resolves when the current cast ENDS, which is the
+    // same removal. So one arm buys exactly one free critical cast.
     const emp = new Map();   // skill id -> { chance, p }
     for (const e of empowerments ?? []) emp.set(e.skill, { chance: e.chance, p: 0 });
     const armAll = () => { for (const r of emp.values()) r.p += (1 - r.p) * r.chance; };

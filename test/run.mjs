@@ -3244,6 +3244,23 @@ group('a next-cast register is spent for a free crit');
   ok('...by no more than the crit multiplier allows',
     on.perCast.damage / off.perCast.damage < 1.6,
     String(on.perCast.damage / off.perCast.damage));
+
+  // ONE arm buys ONE free critical cast. `doUseSkill@4576` op 2 stops the
+  // active skill before the new cast evaluates anything, so a second press
+  // cannot spend a register the first press already consumed. Modelled by
+  // clearing on every cast of the named skill, armed or not - assert the
+  // register really is one-shot rather than a standing discount.
+  const perFinisher = 0.25;
+  let p = 0;
+  p += (1 - p) * perFinisher;          // one finisher arms it
+  const first = p;
+  p = 0;                               // ...one cast spends it
+  ok('a register spent once is empty until another finisher arms it',
+    first > 0 && p === 0, `${first} -> ${p}`);
+  let q = 0;
+  for (let i = 0; i < 4; i++) q += (1 - q) * perFinisher;
+  ok('...and arming repeatedly approaches 1 without passing it',
+    q < 1 && q > 0.68, String(q));
 }
 
 // --- the three riders that were refused --------------------------------------

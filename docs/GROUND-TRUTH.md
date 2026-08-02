@@ -180,6 +180,16 @@ under Berserk, all 14 inter-press deltas exact — so **M2 is refuted** (the
 check runs at PRESS, the forced-crit check at DAMAGE EVAL — a queued second
 Rage Strike gets the free cast without the crit.
 
+> **REFUTED from the bytecode, 2026-08-02.** The two hooks do run at those two
+> moments, but nothing can get between them. `GameObject.doUseSkill@4576` op 2
+> calls `stopActiveSkill@4580` as its FIRST action, which is
+> `BaseSkill.stop@6093` on the running skill, which runs `onStop` and removes
+> the status before the new cast evaluates anything. A press cannot outrun its
+> own stop, and a queued press resolves when the current cast ENDS — the same
+> removal. Spamming Rage Strike at full Rage under Surge gives **one** free
+> critical cast and then full price, not two free casts. The register is
+> modelled one-shot accordingly.
+
 **Item 5 — Berserk, exactly ×1.20; do not retune, and nothing was wrong with
 the authored value.** Identical-state pairs read 1.1915/1.1924/1.1928 raw —
 and every pair spans the Enchant_Devote 3→5 fervor ramp (+0.632 pts); corrected,

@@ -465,12 +465,17 @@ feed follows the same die. Both halves are real: on a bare axe build the sigil
 raises Rage Strike 11% per cast *and* shortens its interval 4.65s → 3.33s,
 because a free cast waits on no Rage income.
 
-*Named, not modelled:* the cost check runs at **press** and the forced-crit check
-at **damage eval**, with `onStop` removing the status in between — and
-`startSkill@6034` builds a fresh `Skill` per press, so the removal is driven by
-the FIRST cast's lifetime. A second cast queued before the first stops therefore
-gets the free cast **without** the crit. This fight casts sequentially and never
-queues, so the split cannot arise here.
+*One arm buys exactly one free critical cast.* The cost check runs at press and
+the forced-crit check at damage eval, which looks like it should let a second
+press slip in free while the first cast is still running — the shape VERDICT-V2
+describes as "a queued second Rage Strike gets the free cast without the crit".
+The bytecode does not allow it. `GameObject.doUseSkill@4576` **op 2** calls
+`stopActiveSkill@4580` as its very first action, which is `BaseSkill.stop@6093`
+on the running skill, which runs `onStop` and removes the status *before* the new
+cast evaluates anything. Pressing again cannot outrun its own stop, and queueing
+cannot either: a queued press resolves when the current cast ends, which is the
+same removal. Spamming Rage Strike at full Rage under Surge gives one free
+critical cast and then full price.
 
 **A skill can carry its own damage rider, and three of them were refused.** The
 2026-08-02 capture proved all three fire; shipping without them cost −13.7% to
