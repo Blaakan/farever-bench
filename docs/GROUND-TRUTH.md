@@ -274,6 +274,55 @@ model's sheet for THIS exact loadout (no offhand!) and the residual vector
 picks the hypothesis. The remaining ~1–3 between sheet 144 and damage-inferred
 145.6–146.8 is within fit precision; do not chase it until the sheet diff is
 clean.
+
+**FULL SHEET + EVERY TOOLTIP, 2026-08-02 late evening — the anomaly is closed.**
+The player photographed More Stats and every equipped tooltip on the same
+loadout. The sheet is an EXACT LINEAR SUM of the naked base (Vit 38, Str 34,
+Dex 28, Faith 28, Int 28 — the old naked measurement, still exact at 25) plus
+the tooltip lines including enchants and augments: Vit 179, Str 144, Dex 32,
+Faith 32, Armor 1930, all to the integer; MaxHealth = 3 × Vit = 537 exactly.
+
+What killed the +11: **+8 is enchants** — Honed Bronze Plate (+2 Str +2 Dex) on
+chest AND back, Magic Formula: Strength (+4) on hands — which the inventory
+dump has no field for; the rest is per-line item prediction diffs. The arsenal
+hypothesis is executed by the game's own UI: Judgement's tooltip prints
+"Arsenal stats efficiency: 40%" with the discounted lines (+20 Vit +16 Str
++35 ArPen). The talent pane shows 15 points UNSPENT, only the root and the
+sigil-granted Surge of Violence — no hidden talent node either.
+
+More settlements riding along:
+- **Necklace generic = the four-rating spread, tooltip-confirmed**: Pendant of
+  Adaptability (L20): +4 Vit, +11 Critical, +11 ArPen, +11 MagPen, +11 Fervor —
+  exactly the owed fix #5.
+- **Sheet crit 17.3% closes the conversion**: base 5.8 + ratings (~159 crit
+  rating → ~8.4) + Judgement's 4★ upgrade "+3% Critical Chance" ≈ 17.2–17.3 —
+  AND proves arsenal upgrade riders reach the wearer's sheet.
+- **Armor 1930 = pure gear sum** (279+259+358+100+219+158+318+239), consistent
+  with v2's 2431 minus the unequipped shield's 501. The sheet prints the
+  mitigation beside it: −40.08% at armor 1930 — a free mitigation-curve point.
+- **Fervor 4.6%** closes from the rating sum (~87 rating) through the budget
+  conversion.
+- Judgement carries a Corrupted Gift (−8 MagPen +8 ArPen) — augments of this
+  family are the standing explanation for the shield's +10 effective iLevel.
+- Per-item stat lines (for the item-bake diff, verbatim from tooltips):
+  Martyr of Enripit (2H Sword L25 Rare 0★): 174–213 phys, +32 Vit +25 Str +69 Critical.
+  Judgement (2H Axe L25 Epic 4★, arsenal @40%): +20 Vit +16 Str +35 ArPen; Gift −8 MagPen +8 ArPen; Devote formula; upgrade +3% crit.
+  Brutality Faceshield (Head 25): 279 Armor, +11 Vit +10 Str +30 ArPen; Sigil of Bet'Hatesht.
+  Miner Ramparts (Shoulders 25): 259 Armor, +9 Vit +7 Str +22 Critical.
+  Whirring Gem of Apix (Chest 25): 358 Armor, +11 Vit +10 Str +30 ArPen; Honed Bronze Plate +2 Str +2 Dex.
+  Crimson Wings (Back 25): 100 Armor, +6 Vit +6 Str +16 Fervor; Honed Soft Embroidery +2 Str +2 Dex.
+  Unholy Crimson Gloves (Hands 25): 219 Armor, +8 Vit +7 Str +22 Fervor; Magic Formula +4 Str.
+  Night Servant's Girdle (Waist 25): 158 Armor, +8 Vit +4 Str +4 Faith +11 MagPen +11 Fervor.
+  Wrong Trousers (Legs 25): 318 Armor, +11 Vit +10 Str +30 Critical.
+  Melain's Golden Greaves (Feet 25): 239 Armor, +9 Vit +7 Str +22 ArPen; Magic Formula +15 ArPen.
+  Set Eye of Fracture (Ring 25, ×2): +6 Vit +39 ArPen; Cursed Eye of Brutality +9 Crit +9 Fervor +9 ArPen −9 MagPen.
+  Pendant of Adaptability (Neck 20): above; plus the same Cursed Eye augment.
+  Raclette Pan (Trinket 25): +32 ArPen; equipped effect: attacks grant 0.5% Critical 10s, stacking ×10.
+
+**The one survivor, sharpened:** live steady combat crit 30.2% vs sheet 17.3%
++ trinket cap +5 = 22.3% — about +8 points from a combat-time source the sheet
+does not show and the buffs do not explain (Battle Shout windows already
+excluded from the 30.2%). Everything else about crit is now confirmed twice.
 `(D+Σ)` vs `D×(1+Σ)` (DamageModifier ≠ 100 capture); the three-rider sum (axe
 session: finisher on a bleeding target inside Berserk during the stun); the
 Battle Shout ±13pt floor (~100 in-window hits); hero-side rounding polarity and
