@@ -186,6 +186,15 @@ has the most refusals outstanding):
 A level-25 Warrior, 0-armour dummy. These are the numbers the gear-bake rewrite
 has to land against, and the first one already retired a hypothesis.
 
+**(0) COMPLETELY NAKED — the control, and it is exact.** All sixteen attributes
+match to the displayed digit: Vitality 38, Strength 34, Dexterity/Faith/Intellect
+28, CritChance 5.8%, Critical Bonus 151.2%, ArPen/MPen/Fervor/Block/both
+Masteries 0, Dodge 0.3%, MaxHealth 114, HealthRegen 1.1. So the attribute curve,
+the rating→percent conversion, the health pool and the crit derivation are all
+right, and **every error below enters through the ITEM stat bake** — it grows
+with the number of items worn and with nothing else. That is the whole
+justification for doing the bake rewrite next rather than hunting elsewhere.
+
 **(1) Naked + GS_Nova, Rare 0★.** The swing formula is CONFIRMED EXACT and needs
 no change: the model predicts a `GS_Base_Attack` band of **94–115** and the
 measured hits are **94–113**, matching the weapon's own written damage line.
