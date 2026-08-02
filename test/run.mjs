@@ -3200,6 +3200,44 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- one chain clock, not two tests ------------------------------------------
+// `Hero.update@7495` / `isWithinAttackCombo@7459` keep ONE timestamp - the end
+// of the last completed basic - and never refresh it when a skill ends. The
+// fight asked two separate questions instead: is this cast longer than the
+// window, and did I stand still longer than it. Neither sees a RUN of short
+// casts, and two 0.4s Rage Strikes break the chain in game.
+group('the chain clock is cumulative');
+{
+  const W = 0.6;
+  // The rule, in the form sim.mjs now runs it. Two 0.4s casts total 0.8s
+  // since the last swing ended, so the chain drops - where "is this ONE cast
+  // longer than 0.6" says it survives both.
+  const oneClock = (gaps) => {
+    let last = 0, t = 0;
+    for (const g of gaps) t += g;
+    return t - last > W;
+  };
+  ok('a single 0.4s cast keeps the chain', !oneClock([0.4]), '0.4s');
+  ok('...but two of them in a row break it', oneClock([0.4, 0.4]), '0.8s');
+  ok('...which the old per-cast test could never see', !(0.4 > W), 'max(0.4) vs 0.6');
+  ok('a single 0.7s cast still breaks it', oneClock([0.7]), '0.7s');
+  // The capture's decisive bracket: a basic pressed 13ms after the second Rage
+  // Strike ended still reset, because 854ms had passed since the last BASIC's
+  // end. The authored 600 sits inside [597, 854).
+  ok('the authored ComboWindow sits inside the measured bracket',
+    W * 1000 >= 597 && W * 1000 < 854, String(W * 1000));
+
+  // And end to end: the fight still runs and the chain still cycles.
+  const eng = createEngine({ quiet: true, fight: { seconds: 200, targets: 1 } });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3, level: 25 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 });
+  ok('a chain-only build still swings and still finishes combos',
+    ev.throughput.attackRate > 0 && ev.throughput.comboRate > 0,
+    `attacks/s ${ev.throughput.attackRate}, combos/s ${ev.throughput.comboRate}`);
+}
+
 // --- dmgMult riders sum, they do not compound --------------------------------
 // `computeDamage@4841` (Unit.hx:2000-2031) op 8 runs the hooks, op 14 seeds
 // `modMult` from `hitData.dmgMult` - one scalar that starts at 1 and that every

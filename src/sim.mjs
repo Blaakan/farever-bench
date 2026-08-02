@@ -424,6 +424,9 @@ function runFight(spec) {
     };
 
     let t = t0, total = 0, idx = chainIdx0, first = true;
+    // The lookahead runs the same one-clock rule as the fight. It used to
+    // assume any cast reset the chain, which made a setup cast look free.
+    let lastSwingEnd = t0;
     let dirty = true, st = null;
     const at = () => {
       for (const [b, e] of self) if (e <= t) { self.delete(b); dirty = true; }
@@ -495,8 +498,8 @@ function runFight(spec) {
         const end = Math.min(t + a.occupancy, horizon);
         tick(end); advanceClock(end);
         t = end;
-        if (chainResets) idx = 0;
       } else if (chain.length) {
+        if (chainResets && t - lastSwingEnd > comboWindow) idx = 0;
         const link = chain[idx++ % chain.length];
         const out = cast(link.prof, st);
         total += worth(out.damage, out.heal, out.shield);
@@ -507,6 +510,7 @@ function runFight(spec) {
         const end = Math.min(t + link.occupancy, horizon);
         tick(end); advanceClock(end);
         t = end;
+        lastSwingEnd = end;
       } else {
         tick(horizon); advanceClock(horizon);
         break;
@@ -551,6 +555,9 @@ function runFight(spec) {
     const upFoe = new Map();  // debuff -> expires
     let t = 0;
     let chainIndex = 0;
+    // The end of the last COMPLETED basic attack. The chain clock runs from
+    // here to the start of the next one, and nothing else refreshes it.
+    let lastSwingEnd = -Infinity;
     let swings = 0, combos = 0, busy = 0, fillerTime = 0;
 
     // The state everything is priced against, rebuilt only when it changes.
@@ -945,13 +952,25 @@ function runFight(spec) {
         tickTo(end); advanceIncome(end);
         busy += a.occupancy;
         t = end;
-        // The chain drops on ONE rule, read from Hero.update@7495: more than
-        // ComboWindow (0.6s) since the last attack finished. A cast interrupts
-        // exactly because it outlasts the window - a hypothetically sub-0.6s
-        // cast would preserve the chain, so the occupancy is what decides.
-        if (chainResets && a.occupancy > comboWindow) chainIndex = 0;
         continue;
       }
+
+      // ONE CUMULATIVE CLOCK, from the END of the last completed basic to the
+      // START of the next. `Hero.update@7495` / `isWithinAttackCombo@7459` keep
+      // a single timestamp and never refresh it on a skill's end, so casts,
+      // idle, and RUNS of short casts all break the chain by the same measure.
+      // The model used to ask two separate questions - is THIS cast longer than
+      // the window, did I stand still longer than the window - and neither sees
+      // two 0.4s Rage Strikes back to back, which break the chain in game.
+      //
+      // The v2 capture predicts 52/52 basic-chain casts on this rule. Literal
+      // start-to-start scores 18/52; a banked finisher scores 50/52 and both
+      // its misses are mid-chain links surviving casts, which banking cannot
+      // produce. The anchor is the double-Rage-Strike reset: a basic pressed
+      // 13ms after the second one ended still reset, because 854ms had passed
+      // since the last BASIC's end. Measured bracket [597, 854)ms contains the
+      // authored 600.
+      if (chainResets && t - lastSwingEnd > comboWindow) chainIndex = 0;
 
       // Nothing to press: swing. One step of the chain at a time, so the combo
       // finisher only ever lands after the swings that lead to it.
@@ -980,8 +999,6 @@ function runFight(spec) {
         const stood = next - t;
         tickTo(next); advanceIncome(next);
         t = next;
-        // Standing still beyond ComboWindow drops the chain - same rule.
-        if (chainResets && stood > comboWindow) chainIndex = 0;
         continue;
       }
       chainIndex++;
@@ -1010,6 +1027,7 @@ function runFight(spec) {
       tickTo(end); advanceIncome(end);
       fillerTime += link.occupancy;
       t = end;
+      lastSwingEnd = end;
     }
     tickTo(fight); advanceIncome(fight);
 

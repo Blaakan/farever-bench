@@ -796,11 +796,17 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       what: opts.assume.chainResets
         ? 'the base-attack chain drops after ComboWindow (0.6s) without an attack'
         : 'the base-attack chain holds its place through anything (--chain-persists)',
-      why: 'Read from Hero.update@7495 / isWithinAttackCombo@7459: one rule - the combo counter resets ' +
-           'when more than ComboWindow (0.6s) passes since the last attack finished, plus on the ' +
-           'finisher itself. A cast interrupts exactly because it outlasts the window, so the fight ' +
-           'resets the chain after any cast or idle gap longer than 0.6s and preserves it under one ' +
-           '- which matches what was reported from play before the code was read.',
+      why: 'Read from Hero.update@7495 / isWithinAttackCombo@7459: ONE CUMULATIVE CLOCK, from the END ' +
+           'of the last completed basic to the START of the next, never refreshed by a skill ending - ' +
+           'so casts, idle and RUNS of short casts all break the chain by the same measure. The fight ' +
+           'used to ask two separate questions instead, is THIS cast longer than the window and did I ' +
+           'stand still longer than the window, and neither sees two 0.4s Rage Strikes back to back. ' +
+           'The 2026-08-02 v2 capture predicts 52/52 basic-chain casts on the one-clock rule; literal ' +
+           'start-to-start scores 18/52 and a BANKED finisher 50/52, whose two misses are mid-chain ' +
+           'links surviving casts - which banking cannot produce, so that concept is retired rather ' +
+           'than modelled. The anchor is the double-Rage-Strike reset: a basic pressed 13ms after the ' +
+           'second one ENDED still reset, because 854ms had passed since the last BASIC ended. The ' +
+           'measured bracket [597, 854)ms contains the authored 600.',
     },
     {
       severity: 'verified',
