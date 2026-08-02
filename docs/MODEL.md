@@ -794,6 +794,58 @@ Throughput is not a steady state any more. `sim.mjs` plays out a fight of
   overflow of a long debuff on a short cooldown is lost.
 - **the base-attack chain fills the gaps**, one link at a time, because you
   cannot press swing 3 without 1 and 2.
+- **a step whose `on` is `Code` is not part of the cast.** `skill@steps.on` has
+  a `Code` case and it means what it says: that step is played by
+  `playStep(Steps.<id>)` from the row's own script and by nothing else, where
+  `Steps.<name>` is the step's `id` column (139 of the 141 `playStep` call sites
+  in the sheet name a step id on their own row). 158 steps declare it, 72 carry
+  a real amount, and every one was being folded into its skill's cast output.
+
+  Brutal Frenzy is the case that shows the size of it. The cast is the
+  `1.43 × Strength` Area step — the measured **133**. The `0.3 × Strength` Mono
+  step is `id: "Attack", on: Code`, played by
+
+  ```
+  function onInflictHit(hit) {
+    if( rank >= 3 && hit.isBaseAttack) {
+      if(checkProba(vars.chance)) { playStep(Steps.Attack, hit.target); }
+    }
+  }
+  ```
+
+  at `vars.chance` 0.15 — which is the tooltip's *"all your attacks have a 15%
+  chance to deal an additional 28"* in as many words. So the finisher prices 133
+  rather than 161, and the 28 goes on the base-attack clock through the same
+  trigger machinery every other proc uses. This closes the audit line that used
+  to read *"billed per finisher, not as its 15%-per-attack rider… the wrong
+  schedule is kept knowingly rather than half-read"*.
+
+  Three shapes come out of it:
+
+  - **an event rider** — `isBaseAttack` / `isFinalCombo` / `isWeaponSkill` /
+    `isStatusType(Bleed)` in the guard: it goes on that event's clock, with the
+    roll and the crit gate read the same way a proc's are.
+  - **a per-cast rider** — `onDamage`, `onHit`, `onStart`, `onCastEnd`,
+    `onAreaElapsed`, or a guard naming one of the host's own steps: its schedule
+    *is* the cast's, so it is folded back into the cast at its chance. That fold
+    is not cosmetic. `Staff_Censer_Skill2`'s entire damage is one such step
+    (`onAreaElapsed` — a delayed detonation), and left outside the cast the skill
+    carries nothing, never reaches the rotation, and the rider then has no parent
+    to hang off. A weapon lost its best skill to that circle before the fold went
+    in.
+  - **a refusal, with the hook named** — `onGameBeat` (you blocked),
+    `onReceiveDamage` (you were hit), `onAreaExited` (the foe walked out),
+    `onStop`, `onStacksChange`, `checkStop`, or a guard asking live state.
+    `Halos_Demon_Skill2` plays `2.5 × Intellect` when a target *leaves* its
+    leash, and the simulated foe does not move: refusing it dropped that arsenal
+    from 340.5 to 311.9 for the Mage and freed the search onto `Spear_Goo`, which
+    scores **364.6 under both the old code and the new** — the optimiser had been
+    stuck 24 dps below an option it could already see.
+
+  A status row is deliberately exempt. A status is a thing that runs a script for
+  as long as it is up, and its script-played steps *are* its payload —
+  `Priest_Talent_Sunlight_Status` declares nothing else at all — so there is no
+  cast to take them out of.
 - **procs are events inside the fight.** By default each contributes its
   expected fraction — which is the mean, exactly, without sampling. `--fights n`
   rolls them with a seeded PRNG and reports the mean and the standard deviation

@@ -834,6 +834,46 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const talents = new Set(Object.keys(loadout.talents ?? {}));
     const guardOpts = { rank, runes, talents };
     const usableRule = (r) => !!r && r.kind !== 'never' && r.kind !== 'conditional';
+
+    // Riders that ride an EVENT rather than the host's own cast, collected as
+    // profiles are resolved and pushed into `triggered` once it is known which
+    // skills the fight can actually fire.
+    const pendingRiders = [];
+    const riderCache = new Map();
+    /**
+     * The profile a bucket should use: the same one `combat.profile` returns,
+     * with its per-cast script riders folded back in, and its event riders
+     * parked for the pass below. See `scriptedRiders` and `foldRider`.
+     */
+    function profileOf(id, atRank = rank) {
+      const key = id + '@' + atRank;
+      if (riderCache.has(key)) return riderCache.get(key);
+      const base = combat.profile(id, atRank, runes);
+      let prof = base;
+      if (base?.scripted?.length) {
+        const { riders, refused } = scriptedRiders(id, base, { rank: atRank, runes, talents });
+        let folded = null;
+        for (const r of riders) {
+          if (r.rule.kind !== 'per-parent-cast') { pendingRiders.push({ host: id, prof: base, ...r }); continue; }
+          // A crit gate needs the sheet, which plan time does not have. None of
+          // the per-cast riders in this sheet carries one; if one appears, it is
+          // named rather than folded at the wrong rate.
+          if (r.rule.critGated) {
+            refused.push({
+              step: r.step.stepId,
+              why: `${base.name}'s ${r.step.stepId} step is played by the cast itself but only on a `
+                + 'critical strike, and a per-cast rider is folded into the cast before the sheet exists',
+            });
+            continue;
+          }
+          folded = (folded ?? base.effects).concat(foldRider(r.step.effects, r.rule.chance ?? 1));
+        }
+        if (folded) prof = { ...base, effects: folded };
+        for (const f of refused) pendingRiders.push({ host: id, prof: base, refusal: f });
+      }
+      riderCache.set(key, prof);
+      return prof;
+    }
     const sel = loadout.skills ?? defaultSelection(loadout);
     const filler = [];
     const active = [];
@@ -843,6 +883,11 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const unmodelled = [];
     const seen = new Set();
     const dotSeen = new Set();
+    // Hosts whose payload the model DID reach, but through a bucket that runs
+    // after the coverage report has already been written into. Listing a skill
+    // as unscored while the fight is visibly firing one of its steps is the
+    // output contradicting itself.
+    const accountedLate = new Set();
 
     // Every damage- or heal-over-time this build can put up, with what applies
     // it and how often that lands. `checkProba(vars.chance)` is the one gate the
@@ -922,10 +967,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const push = (bucket, id, extra = {}) => {
       if (seen.has(id)) return;
       seen.add(id);
-      const prof = combat.profile(id, rank, runes);
+      const prof = profileOf(id);
       if (!prof) return;
       if (outOfCombatOnly(prof)) return;
-      const carries = prof.effects.some((e) => ['Damage', 'Heal', 'Shield'].includes(e.kind));
+      const carries = carriesPayload(prof);
       if (!carries) {
         // No declared amount, but it may still grant a stat or leave something
         // ticking on the target.
@@ -1154,12 +1199,12 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // stacking rating buffs - so those go to `passive` instead of being dropped.
     function pushTriggered(id, source, extra = {}) {
       if (seen.has(id)) return;
-      const prof = combat.profile(id, rank, runes);
+      const prof = profileOf(id);
       if (!prof) return;
       seen.add(id);
       if (outOfCombatOnly(prof)) return;
 
-      const carries = prof.effects.some((e) => ['Damage', 'Heal', 'Shield'].includes(e.kind));
+      const carries = carriesPayload(prof);
       const ownAffixes = (prof.affixes ?? []).filter((a) => a.target?.attribute);
       const st = statusesOf(id, { runes, rank, talents });
       noteDots(id, st, { source });
@@ -1432,8 +1477,12 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       //
       // Only where the rule is one the fight raises. A talent is not cast, so a
       // roll with no event named has no rate and stays unscored.
-      const tp = combat.profile(id, nodeRank, runes);
-      if (!tp?.effects.some((x) => ['Damage', 'Heal', 'Shield'].includes(x.kind)
+      // A talent's damage step is very often an `on: Code` one - the node has no
+      // cast, so a step it plays HAS to come from its script - and `profileOf`
+      // parks those for the rider pass below with the guard already read.
+      const tp = profileOf(id, nodeRank);
+      if (!tp) continue;
+      if (!tp.effects.some((x) => ['Damage', 'Heal', 'Shield'].includes(x.kind)
         && (x.baseVal || x.scaling.length))) continue;
       const rule = triggerRule(id, tp, {}, { rank, runes, talents });
       if (rule?.kind !== 'per-dot-tick') continue;
@@ -1468,6 +1517,29 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // every physical critical strike; asking it for a cast rate is asking the
     // wrong question.
     const canFire = (d) => !!d.pool || d.on !== 'cast' || castable.has(d.from);
+
+    // --- steps the cast does not play, on the clock the script gives them ----
+    //
+    // See `scriptedRiders`. This is where the 0.3-ratio step that the audit
+    // called "billed per finisher, not as its 15%-per-attack rider" stops being
+    // an assumption: the step is out of the cast, the guard in front of its
+    // playStep is read, and the rider goes on the base-attack clock at 15%.
+    for (const r of pendingRiders) {
+      if (r.refusal) {
+        // The HOST's own refusal is the better sentence when there is one:
+        // "it fires when you block and the simulated foe never attacks" says
+        // more than "one of its steps has no rate", and printing both makes the
+        // same skill appear twice under two different causes.
+        if (unmodelled.some((u) => u.id === r.host)) continue;
+        unmodelled.push({
+          id: `${r.host}#${r.refusal.step ?? 'step'}`, name: r.prof.name,
+          kind: r.refusal.kind ?? 'no rate', why: r.refusal.why,
+        });
+        continue;
+      }
+      triggered.push({ prof: riderProf(r.prof, r.step), source: 'scripted', rule: r.rule });
+      accountedLate.add(r.host);
+    }
 
     // Income is the same rule. A gain whose guard names no event is "when this
     // skill goes off", which is a rate only if the fight casts that skill -
@@ -1631,9 +1703,212 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
 
     return {
       filler, active, triggered, passive, dots: liveDots,
-      unmodelled: unmodelled.filter((u) => !accounted.has(u.id)),
+      // `accountedLate` is filled by passes that run after `accounted` is
+      // built, so it is applied here rather than folded in above.
+      unmodelled: unmodelled.filter((u) => !accounted.has(u.id) && !accountedLate.has(u.id)),
       selection: sel, runes: [...runes], rank, chain, cdMutations,
       resources: { gains, tracked: [...tracked] },
+    };
+  }
+
+  // --- steps the cast does not play ----------------------------------------
+  //
+  // `damage.mjs` splits a skill's `on: Code` steps out of its cast output,
+  // because the game plays those from `playStep(Steps.<id>)` and from nothing
+  // else. This puts them back on the clock the script actually gives them,
+  // through the same trigger machinery every other proc uses.
+  //
+  // The hooks accepted here are the ones that ride an event this fight
+  // produces. Everything else - onGameBeat (you blocked), onReceiveDamage (you
+  // were hit), onAreaExited, onStop, onStacksChange, onUpdate, checkStop - is
+  // refused with the hook named, because a rider on an event the fight does not
+  // raise is worth zero and the zero is a statement about the fight model.
+  //
+  // `onDamage` / `onDamageEval` / `onHit` see only the host's OWN hits - the
+  // same reading that separates Bonethrow's per-skill pool from Hemorrhage's
+  // owner-global `onInflictDamage` - so they schedule against the host's own
+  // rate. `onAreaElapsed` is the same thing on a delay: the cast drops an area
+  // and the area's own timer runs out, which is a delayed detonation and one
+  // fire per cast. Staff_Censer_Skill2 is that shape and nothing else -
+  // `onAreaElapsed(a, ctx) { playStep(Steps.Explosion, null, a.position); }`,
+  // no guard at all - and refusing it cost the Mage its best weapon.
+  //
+  // `onAreaExited` is NOT in the list and must not be: Halos_Demon_Skill2
+  // plays its damage when the target LEAVES a leash, and the simulated foe
+  // does not move. That zero is real, and it is a statement about the fight
+  // model rather than about the data.
+  const RIDER_HOOKS = /^on(InflictHit|InflictDamage|InflictDamageEval|Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed)$/;
+  const OWN_CAST_HOOKS = /^on(Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed)$/;
+
+  function scriptedRiders(skillId, prof, opts = {}) {
+    const riders = [];
+    const refused = [];
+    if (!prof?.scripted?.length) return { riders, refused };
+    const s = skills.get(skillId);
+    const body = liveScript(s?.script ?? '');
+    const name = prof.name;
+
+    for (const step of prof.scripted) {
+      const label = `${name}'s ${step.stepId ?? 'unnamed'} step`;
+      if (!step.stepId) {
+        refused.push({ step: null, why: `${label} is played only from script and carries no id, so no playStep call can name it` });
+        continue;
+      }
+      const re = new RegExp(`\\bplayStep\\s*\\(\\s*Steps\\.${step.stepId}\\b`, 'g');
+      let rule = null;
+      let why = null;
+      // The gate is a fact about THIS build - a rank the weapon has not reached
+      // or a rune it did not slot - rather than a hole in the model, so it is
+      // reported under its own cause.
+      let gated = false;
+      for (let m; (m = re.exec(body)) && !rule;) {
+        const before = body.slice(0, m.index);
+        const hookAt = before.lastIndexOf('function ');
+        const hook = hookAt >= 0 ? /function\s+([A-Za-z0-9_]+)/.exec(before.slice(hookAt))?.[1] ?? null : null;
+        if (!hook || !RIDER_HOOKS.test(hook)) {
+          why ??= `${label} is played from a ${hook ?? 'top-level'} hook, which is an event this fight does not produce`;
+          continue;
+        }
+        const scope = enclosingBlock(before);
+        // A crit gate and an affinity gate are both evaluable - the fight
+        // computes a crit expectation for every hit it prices, and the host's
+        // own affinity is on the effect - so they are lifted out before the
+        // guard is judged, exactly the way resource income already does it.
+        const critGated = /\bcritical\b|\bisCrit\b/.test(scope);
+        // ...and so is a bleed tick. `dmg.isStatusType(Hemorage)` asks WHICH
+        // damage event this is, the same way isBaseAttack does, and the fight
+        // raises one every time a pool dot hurts the target. Cracking Blood is
+        // the case: its whole payload is a Code step played on that event.
+        const BLEED_EVENT = /\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(Bleed|Hemorage)\s*\)/;
+        const onDotTick = BLEED_EVENT.test(scope);
+        const g = guardOf(
+          (onDotTick ? scope.replace(BLEED_EVENT, ' ') : scope)
+            .replace(/\b(?:critical|isCrit|isPhysical|isMagic)\b/g, ' '), opts);
+        if (!g.fires) { why ??= `${label}: ${g.why}`; gated = true; continue; }
+        if (g.unread) {
+          // ...unless the row is the `consumeCooldown` shape, where the
+          // "unreadable" condition IS the mechanism. Dominion holds a status up
+          // while it is off cooldown, spends it on the combo finisher and calls
+          // consumeCooldown(), so its guard's `hasStatus` is the gate rather
+          // than a question about live state - and `triggerRule` already reads
+          // that shape. Only where the whole row is this one step, so the rule
+          // it derives is unambiguously about the step in hand.
+          const fallback = prof.scripted.length === 1
+            ? triggerRule(skillId, prof, {}, opts) : null;
+          if (fallback && fallback.kind !== 'never' && fallback.kind !== 'conditional') {
+            rule = fallback;
+            break;
+          }
+          why ??= `${label} is played only while ${g.unread}() holds, which is a question about `
+            + 'live state this reader cannot answer';
+          continue;
+        }
+        let chance = 1;
+        const cp = /checkProba\s*\(\s*(?:vars\.([A-Za-z0-9_]+)|(\d*\.?\d+))\s*\)/.exec(scope);
+        if (cp) {
+          const n = cp[1] ? s?.vars?.[cp[1]] : Number(cp[2]);
+          if (!(typeof n === 'number' && n > 0 && n <= 1)) {
+            why ??= `${label} rolls against a number that is not in the data`;
+            continue;
+          }
+          chance = n;
+        }
+        const ev = eventsOf(scope);
+        // `dmg.stepId == Steps.X` naming a step on THIS row means "when my own
+        // cast's X step lands", which is the host's own rate rather than a
+        // separate event.
+        const ownStep = /\bstepId\s*==\s*Steps\.([A-Za-z0-9_]+)/.exec(scope)?.[1];
+        const onOwnCast = OWN_CAST_HOOKS.test(hook)
+          || !!(ownStep && (s?.steps ?? []).some((x) => x.id === ownStep));
+        const roll = chance < 1 ? `, ${Math.round(chance * 100)}% of the time` : '';
+        const crit = critGated ? ' on a critical strike' : '';
+        if (onDotTick) {
+          rule = { kind: 'per-dot-tick', chance, critGated, why: `${label} is played on every tick of a bleed${crit}${roll}` };
+        } else if (ev.has('attack') && ev.has('combo')) {
+          rule = { kind: 'per-attack-or-combo', chance, critGated, why: `${label} is played on a base attack or a combo finisher${crit}${roll}` };
+        } else if (ev.has('combo')) {
+          rule = { kind: 'per-combo', chance, divisor: 1, critGated, why: `${label} is played on the combo finisher${crit}${roll}` };
+        } else if (ev.has('attack')) {
+          rule = { kind: 'per-attack', chance, critGated, why: `${label} is played on a base attack${crit}${roll}` };
+        } else if (ev.has('weapon-skill')) {
+          rule = { kind: 'per-weapon-skill', chance, critGated, why: `${label} is played on every weapon skill you press${crit}${roll}` };
+        } else if (onOwnCast) {
+          // The host's own landing. For a chain link that IS the combo or a
+          // swing; for anything else it is one fire per cast of the host.
+          rule = prof.isCombo
+            ? { kind: 'per-combo', chance, divisor: 1, critGated, why: `${label} is played by the finisher itself${crit}${roll}` }
+            : prof.isFiller
+              ? { kind: 'per-attack', chance, critGated, why: `${label} is played by the swing itself${crit}${roll}` }
+              : {
+                kind: 'per-parent-cast', parent: skillId, chance, divisor: 1, critGated,
+                why: `${label} is played by the cast itself${crit}${roll}`,
+              };
+        } else {
+          why ??= `${label} is played from ${hook} with no event this fight raises`;
+        }
+      }
+      if (rule) riders.push({ step, rule });
+      else {
+        refused.push({
+          step: step.stepId,
+          kind: gated ? 'gated off' : 'no rate',
+          why: why ?? `${label} is played only from script, and nothing in the row says when`,
+        });
+      }
+    }
+    return { riders, refused };
+  }
+
+  /**
+   * A per-cast rider folded back INTO the cast, at the rate the script gives it.
+   *
+   * `Staff_Censer_Skill2` is the case that forces this: its entire damage is one
+   * `on: Code` step played by `onAreaElapsed`, i.e. a delayed detonation, one
+   * fire per cast. Taken out of the cast and left as a separate rider, the skill
+   * carries no damage at all - so it never reaches the rotation, so the rider
+   * has no parent, so the rider never fires either, and a weapon loses its best
+   * skill to a circle. Folded back in, the schedule is identical to the cast's
+   * own and the arithmetic is exact.
+   *
+   * A chance scales it linearly, which is legal for DAMAGE (unlike a status,
+   * whose uptime saturates). The scale rides `baseVal` and every scaling ratio.
+   */
+  function foldRider(effects, scale) {
+    if (scale === 1) return effects;
+    return effects.map((e) => ({
+      ...e,
+      baseVal: (e.baseVal ?? 0) * scale,
+      scaling: (e.scaling ?? []).map((sc) => ({ ...sc, ratio: (sc.ratio ?? 0) * scale })),
+    }));
+  }
+
+  /**
+   * Does this skill carry a damage/heal/shield payload AT ALL - in its cast, or
+   * in a step its own script plays?
+   *
+   * The distinction has to be invisible to the bucketing, or splitting the
+   * script-played steps out silently reclassifies skills. `Warrior_IgnorePain`
+   * is the case: its heal is one `on: Code` step, so with the split it stopped
+   * "carrying", fell through to the passive bucket, and left the rotation - a
+   * defensive cooldown the search had been pressing simply vanished, along with
+   * the buff window every other test in the suite prices against it.
+   */
+  function carriesPayload(prof) {
+    const has = (list) => (list ?? []).some((e) => ['Damage', 'Heal', 'Shield'].includes(e.kind));
+    return has(prof?.effects) || (prof?.scripted ?? []).some((st) => has(st.effects));
+  }
+
+  /** A rider's own profile: the host's, carrying only the step the script plays. */
+  function riderProf(prof, step) {
+    return {
+      ...prof,
+      id: `${prof.id}#${step.stepId}`,
+      name: prof.name,
+      effects: step.effects,
+      // It is not a cast: it costs no time, no cooldown and no resource, and it
+      // is not the base-attack chain even when its host is.
+      occupancy: 0, cooldown: 0, charges: 1, costs: [], isFiller: false, isCombo: false,
+      scripted: [],
     };
   }
 

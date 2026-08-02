@@ -329,9 +329,15 @@ function runFight(spec) {
       // on the base-attack rate and read it several times too fast.
       on: tr.rule.kind === 'per-parent-cast' ? 'parent'
         : tr.rule.kind === 'per-combo' ? 'combo'
-          : tr.rule.kind === 'per-dot-tick' ? 'dot-tick' : 'attack',
+          : tr.rule.kind === 'per-dot-tick' ? 'dot-tick'
+            : tr.rule.kind === 'per-weapon-skill' ? 'weapon-skill'
+              : tr.rule.kind === 'per-attack-or-combo' ? 'attack-or-combo' : 'attack',
       parent: tr.rule.parent ?? null,
-      chance: (tr.rule.chance ?? 1) / Math.max(1, tr.rule.divisor ?? 1),
+      // A crit gate is a rate, not a mystery: the fight already computes a crit
+      // expectation for every hit it prices, so a rider that only plays on a
+      // critical strike fires that fraction as often.
+      chance: (tr.rule.chance ?? 1) / Math.max(1, tr.rule.divisor ?? 1)
+        * (tr.rule.critGated ? critChance : 1),
       // "The first <event> after each cooldown" - Dominion fires its bonus hit
       // on the first combo finisher every 20s. The gate is the authored
       // cooldown; between fires the events pass through untouched.
@@ -748,7 +754,9 @@ function runFight(spec) {
         // A dot-tick proc is raised by `tickTo`, not by a cast or a swing.
         const fires = g.on === 'dot-tick' ? false
           : g.on === 'parent' ? (wasCast && g.parent === skillId)
-            : g.on === 'attack' ? attack : combo;
+            : g.on === 'weapon-skill' ? weaponSkill
+              : g.on === 'attack-or-combo' ? (attack || combo)
+                : g.on === 'attack' ? attack : combo;
         if (!fires) continue;
         if (g.gate > 0) {
           if (at < g.nextReady) continue;

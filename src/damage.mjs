@@ -439,10 +439,47 @@ export function buildCombat(cdb, ctx, assume = {}) {
 
     const effects = [];
     const statusRefs = [];
+    // Steps the CAST does not play.
+    //
+    // `skill@steps.on` has a `Code` case, and it means exactly what it says: the
+    // step is played by `playStep(Steps.<id>)` from the row's own script and by
+    // nothing else. 158 steps in the sheet declare it, 72 of them carry a real
+    // amount, and every single one was being folded into its skill's cast
+    // output - so a rider the game rolls at 15% per swing was billed in full on
+    // every combo finisher.
+    //
+    // GA_Craft_FinalCombo is the case that shows the shape. Its Area step is
+    // 1.43 x Strength on Start - the tooltip's 133 - and its Mono step is 0.3 x
+    // Strength with `id: "Attack"` and `on: Code`, played by
+    //
+    //   function onInflictHit(hit) {
+    //     if( rank >= 3 && hit.isBaseAttack) {
+    //       if(checkProba(vars.chance)) { playStep(Steps.Attack, hit.target); }
+    //     }
+    //   }
+    //
+    // with vars.chance = 0.15, which is the tooltip's "all your attacks have a
+    // 15% chance to deal an additional 28" in as many words. So the cast is
+    // worth 133, not 161, and the 28 is a separate rider on a separate clock -
+    // which is what the model's own audit had flagged as a knowingly-wrong
+    // schedule and what `skills.mjs` now reschedules through the same trigger
+    // machinery every other proc uses.
+    //
+    // `Steps.<name>` is the step's own `id` column, not its type: 139 of the
+    // 141 playStep call sites in the sheet name a step id on their own row.
+    const scripted = [];
     // Amounts a script hands to a `dynVal` effect, keyed by the step it plays.
     const dynFills = scriptDynVals(s, runes);
     for (const st of s.steps ?? []) {
       if (!stepLives(st)) continue;
+      // ...on a SKILL row. A status row is a different animal: it is a thing
+      // that runs a script for as long as it is up, and its script-played steps
+      // ARE its payload - Priest_Talent_Sunlight_Status declares nothing else at
+      // all. So the split is drawn where it means something: a cast plays its
+      // steps once and demonstrably does not play these, while a status has no
+      // cast to exclude them from. What a status's own guard says is a separate
+      // question and it is already named in the audit.
+      const playedByScript = (stepOnNames[st.on ?? -1] ?? null) === 'Code' && !s.props?.status;
 
       const stepType = stepTypeNames[st.type ?? -1] ?? null;
       const hits = hitsOf(s, st, stepType, ownDuration, stepLives);
@@ -452,6 +489,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
 
       if (st.props?.status?.ref) statusRefs.push({ ref: st.props.status.ref, on: stepOnNames[st.on ?? -1] ?? null, target: st.props.status.target ?? null });
 
+      const into = playedByScript ? [] : effects;
       for (const e of st.effects ?? []) {
         const kind = effectNames[e.effect ?? -1] ?? null;
         if (!kind) continue;
@@ -469,7 +507,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // the call. `Last Stand` heals `0.35 x MaxHealth` and read zero.
         const fill = (e.dynVal ?? 0) !== 0 && st.id ? dynFills?.get(st.id + '#' + e.dynVal) : null;
         if (fill?.scaling) for (const sc of fill.scaling) scaling.push(sc);
-        effects.push({
+        into.push({
           kind,
           // WHICH attribute a GainAtb feeds. This was dropped, so the eight
           // GainAtb rows in the database read as effects with no subject and
@@ -507,6 +545,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
           scaleWithStacks: !!((e.flags ?? 0) & 1),
         });
       }
+      // A script-played step is kept, whole, under the id the script names it
+      // by - so `skills.mjs` can read the guard in front of `playStep` and put
+      // the step on the clock the game actually gives it.
+      if (playedByScript && into.length) scripted.push({ stepId: st.id ?? null, effects: into });
     }
 
     // The tick schedule of a status skill, which is what makes it a DoT rather
@@ -598,6 +640,8 @@ export function buildCombat(cdb, ctx, assume = {}) {
       duration: ownDuration,
       periodic,
       statusRefs,
+      // Steps this cast does NOT play - see the note where they are collected.
+      scripted,
     };
     profileCache.set(key, p);
     if (profileCache.size > 20000) profileCache.delete(profileCache.keys().next().value);
@@ -1337,12 +1381,23 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'reproduces every measured tooltip integer regardless; the two decompositions differ only ' +
            'in which inferred drop level fits a single-aptitude line, and a full trace of the bake ' +
            '(its per-row loop and gearRatio) is the named next read.' },
-    { severity: 'assumption', what: 'Brutal Frenzy\'s 0.3-ratio step is billed per finisher, not as its 15%-per-attack rider',
-      why: 'The tooltip says "all your attacks have a 15% chance to deal an additional 28" - a rider ' +
-           'the script rolls on every attack - while the step itself is authored unconditionally on ' +
-           'the finisher. Per cast the model bills 28 x finisher rate; the rider reads 0.15 x 28 x ' +
-           'attack rate. At measured swing and combo rates the two are within a few dps of each other, ' +
-           'so the wrong schedule is kept knowingly rather than half-read.' },
+    { severity: 'verified', what: 'a step whose `on` is Code is played by the script, not by the cast',
+      why: '`skill@steps.on` has a Code case and it means exactly that: the step is played by ' +
+           '`playStep(Steps.<id>)` from the row\'s own script and by nothing else - `Steps.<name>` being ' +
+           'the step\'s `id` column, which 139 of the 141 playStep call sites in the sheet name on their ' +
+           'own row. 158 steps declare it and 72 carry a real amount, and every one of them used to be ' +
+           'folded into its skill\'s cast. Brutal Frenzy is the case that shows the size of it: the cast ' +
+           'is the 1.43 x Strength Area step, the measured 133, while the 0.3 x Strength Mono step is ' +
+           '`id: "Attack", on: Code` played by `if (rank >= 3 && hit.isBaseAttack) if ' +
+           '(checkProba(vars.chance)) playStep(Steps.Attack, hit.target)` at vars.chance 0.15 - the ' +
+           'tooltip\'s "all your attacks have a 15% chance to deal an additional 28" in as many words. ' +
+           'So the cast prices 133 rather than 161, and the 28 goes on the base-attack clock through the ' +
+           'same trigger machinery every other proc uses. A rider whose hook the fight cannot raise ' +
+           '(onGameBeat, onReceiveDamage, onAreaExited, onStop, onStacksChange) or whose guard asks live ' +
+           'state is refused with the hook named. A rider on the host\'s OWN cast - onDamage, onHit, ' +
+           'onStart, onAreaElapsed - is folded back into the cast at its chance, because its schedule IS ' +
+           'the cast\'s and separating them would leave a delayed detonation like Staff_Censer_Skill2 ' +
+           'with no parent to hang off.' },
     { severity: 'unmodelled', what: 'most of what a rune or a talent does, pending the script kernel',
       why: 'Most talent nodes and most runes declare nothing this model reads, but they DO ship hscript ' +
            'bodies calling a small, closed set of host functions - so the gap is the script kernel, not ' +

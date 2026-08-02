@@ -1790,9 +1790,20 @@ group('checked against the game: Cheese Moon');
   const frenzy = eng.combat.profile('GA_Craft_FinalCombo', 3);
   const fOut = eng.combat.castOutput(frenzy, gaSheet, dummy,
     { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength'], weaponMix: mix });
-  // The cast carries both authored steps (1.43 + 0.3); the tooltip's 133 is
-  // the 1.43 step alone, so the whole cast prices (1.43+0.3) x 92.7 = 160.4.
-  near('Brutal Frenzy prices both steps at the measured mix', fOut.damage / gaCritMult, 160.4, 2);
+  // The CAST is the 1.43 step alone, which is the tooltip's 133. The 0.3 step
+  // is `on: Code` - played by `playStep(Steps.Attack)` on a 15% base-attack
+  // roll and by nothing else - so it is not part of the finisher at all, and
+  // billing it there used to price the cast at 161 against a measured 133.
+  near('Brutal Frenzy\'s cast is the measured 133', fOut.damage / gaCritMult, 132.6, 1.5);
+  ok('...and the 0.3 step is not in it',
+    (frenzy.scripted ?? []).length === 1 && frenzy.scripted[0].stepId === 'Attack',
+    JSON.stringify((frenzy.scripted ?? []).map((x) => x.stepId)));
+  // ...and priced on its own it is the tooltip's other number, the 28 the
+  // description calls "an additional 28" on a 15% roll.
+  const rider = eng.combat.castOutput(
+    { ...frenzy, effects: frenzy.scripted[0].effects }, gaSheet, dummy,
+    { assume: { fervorScope: 'skills', mastery: true }, targets: 1, swingAttrs: ['Strength'], weaponMix: mix });
+  near('...it is the tooltip\'s other number, 28', rider.damage / gaCritMult, 27.8, 1);
   // Tear, at the REAL equipped stats (Str 49, Dex 46): 0.45x(0.6x49 +
   // 0.4x123.6) + 0.45x(0.6x46 + 0.4x148.3) = 74.6, measured 75. The real
   // sheet carries the axe's Dexterity half too, which the model's own-half
@@ -2077,7 +2088,9 @@ group('a cooldown-gated proc');
   ok('...gated by its own cooldown', t?.rule.cooldownGate === 15, String(t?.rule.cooldownGate));
   ok('...riding the combo finisher', t?.rule.kind === 'per-combo', t?.rule.kind);
   const ev = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
-  const line = ev.throughput.lines.find((x) => x.id === 'Shield_Craft_Passive');
+  // Dominion's damage is an `on: Code` step, so the line the fight reports is
+  // named for the step its script plays rather than for the passive itself.
+  const line = ev.throughput.lines.find((x) => x.id.startsWith('Shield_Craft_Passive'));
   ok('...and it fires in the fight, no faster than the gate', !!line && line.interval >= 15,
     line ? `every ${line.interval.toFixed(1)}s` : 'no line');
 
@@ -2423,7 +2436,14 @@ group('a talent that needs another talent');
 group('script-injected amounts');
 {
   const eng = createEngine({ quiet: true });
-  const eff = (id, runes) => eng.combat.profile(id, 3, runes ? new Set(runes) : null)?.effects ?? [];
+  // Both halves of a profile: the steps the cast plays, and the ones its own
+  // script plays. Three of the four injections below sit on an `on: Code` step,
+  // which is the only place a rune-supplied amount CAN sit - the rune decides
+  // whether the script runs at all.
+  const eff = (id, runes) => {
+    const p = eng.combat.profile(id, 3, runes ? new Set(runes) : null);
+    return [...(p?.effects ?? []), ...(p?.scripted ?? []).flatMap((st) => st.effects)];
+  };
   const heal = (list) => list.find((x) => x.kind === 'Heal');
   ok('Ignore Pain heals nothing without Last Stand',
     heal(eff('Warrior_IgnorePain'))?.scaling.length === 0
@@ -2457,7 +2477,9 @@ group('a proc on a bleed tick');
   const l = emptyLoadout(eng.cat, 'Warrior', 25);
   l.talents = { Warrior_Hemorrhage: 1, Warrior_Talent_CrackingBlood: 1 };
   const rot = eng.plan.resolve(l, 3);
-  const cb = rot.triggered.find((t) => t.prof.id === 'Warrior_Talent_CrackingBlood');
+  // Its whole payload is one `on: Code` step, so the line is named for the step
+  // the script plays rather than for the node - the node itself casts nothing.
+  const cb = rot.triggered.find((t) => t.prof.id.startsWith('Warrior_Talent_CrackingBlood'));
   ok('Cracking Blood rolls on a bleed tick, not on a swing',
     cb && cb.rule.kind === 'per-dot-tick' && Math.abs(cb.rule.chance - 0.35) < 1e-9,
     JSON.stringify(cb?.rule));

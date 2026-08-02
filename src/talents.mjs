@@ -217,10 +217,18 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
         .filter((st) => st.props?.status?.ref && isBuff(st.props.status.ref))
         .map((st) => st.props.status.ref),
     ].filter((x, i, arr) => x && arr.indexOf(x) === i);
-    const effects = [...(prof?.effects ?? [])];
+    // A talent has no cast, so a damage step it declares is very often an
+    // `on: Code` one - the script IS how a node plays anything. `damage.mjs`
+    // keeps those out of the cast's effects, which is right for pricing and
+    // wrong for the TREE: `bench talents` is answering "does this node declare
+    // something a data-driven model can read", and a step with a ratio on it
+    // does, whatever schedule the fight can or cannot put it on. Whether it is
+    // then SCORED is the unscored list's business, and it says so by name.
+    const stepEffects = (p) => [...(p?.effects ?? []), ...(p?.scripted ?? []).flatMap((st) => st.effects)];
+    const effects = stepEffects(prof);
     for (const g of granted) {
       const gp = combat.profile(g, 3);
-      for (const eff of gp?.effects ?? []) effects.push(eff);
+      for (const eff of stepEffects(gp)) effects.push(eff);
       for (const a of (skills.get(g)?.affixes ?? [])) if (a.target?.attribute && inRank(a.conds)) affixes.push(a);
     }
     // A pool dot is readable now: `Warrior_Hemorrhage` declares `vars.damage`
