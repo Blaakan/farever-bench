@@ -1325,6 +1325,10 @@ const commands = {
       fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
       lookahead: s.fight.lookahead, restarts,
       main: m.id, mainName: m.name, arsenal: a.id, arsenalName: a.name,
+      // The offhand is SEARCHED, not pinned - a one-handed mainhand gets the
+      // best shield the goal can price, skills included - and it belongs in
+      // the summary or the choice reads as if it never happened.
+      offhand: res.loadout.gear?.Slot_OffhandWeapon?.item ?? null,
       score: res.score,
       pinned: { gear: ['Slot_Weapon1', 'Slot_Weapon2'], augments: [], skills: [] },
       build: res.loadout,
@@ -1371,6 +1375,7 @@ const commands = {
             main: m.item.id, mainName: m.item.name ?? m.item.id,
             arsenal: a.item.id, arsenalName: a.item.name ?? a.item.id,
             score: env.score, metrics: env.metrics,
+            offhand: env.build?.gear?.Slot_OffhandWeapon?.item ?? null,
             arsSkills: env.build?.skills?.Slot_Weapon2 ?? [],
             talentCount: Object.keys(env.build?.talents ?? {}).length,
             file,
@@ -1396,6 +1401,7 @@ const commands = {
           arsenal: a.item.id, arsenalName: a.item.name ?? a.item.id,
           score: res.score,
           metrics: envelopeOf(m.item, a.item, res).metrics,
+          offhand: res.loadout.gear?.Slot_OffhandWeapon?.item ?? null,
           arsSkills: res.loadout.skills?.Slot_Weapon2 ?? [],
           talentCount: Object.keys(res.loadout.talents ?? {}).length,
           file,
@@ -1424,16 +1430,17 @@ const commands = {
     const best = rows[0]?.score ?? 0;
     console.log('');
     console.log(f.table(
-      [s.goal.toUpperCase(), 'VS BEST', 'MAIN HAND', 'ARSENAL', 'ARSENAL SKILLS', 'TALENT TREE SPREAD'],
+      [s.goal.toUpperCase(), 'VS BEST', 'MAIN HAND', 'OFFHAND', 'ARSENAL', 'ARSENAL SKILLS', 'TALENTS'],
       rows.map((r) => [
         f.num(r.score, 1),
         r.score >= best ? f.bold('best') : f.signedPct(r.score / best - 1),
         r.mainName,
+        r.offhand ? f.short(r.offhand) : f.dim('-'),
         r.arsenalName,
         (r.arsSkills ?? []).map(f.short).join(', ') || f.dim('-'),
         r.talentCount + ' nodes',
       ]),
-      { align: ['r', 'r', null, null, null, null] },
+      { align: ['r', 'r', null, null, null, null, null] },
     ));
     console.log(f.dim(`  ${rows.length} of ${pairs.length} pairs legal`
       + (resumed ? `, ${resumed} resumed from ${outDir}` : '')
