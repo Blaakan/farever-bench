@@ -46,14 +46,26 @@ const FILLER_TYPES = new Set(['Attack', 'Attack2', 'Attack3', 'Attack4', 'Attack
 const COMBO_TYPES = new Set(['AttackCombo']);
 
 export function buildCombat(cdb, ctx, assume = {}) {
-  // The floor on how fast a chain link swings. Two stopwatch measurements
-  // (Cheese Moon, 10 chains in 28s; Judgement, 10 in ~30s) both land on ~0.70s
-  // a swing: Judgement's authored durations already sit at 0.70-0.85 and match
-  // the watch exactly, while the fast axe's authored 0.25-0.55 are HIT timings
-  // that under-run it by a second a cycle. No constant in the sheet carries
-  // the 0.7 - `Attacks_RecoveryRatio` (0.25) reproduces neither watch - so it
-  // is calibrated, named in the audit, and movable with --swing-floor.
-  const swingFloor = Number.isFinite(assume.swingFloor) ? assume.swingFloor : 0.7;
+  // The floor on how fast a chain link swings. THERE IS NONE, and the 0.70s
+  // that stood here was the largest error in the model.
+  //
+  // It came from two stopwatch readings - Cheese Moon, 10 chains in 28s;
+  // Judgement, 10 in ~30s - and Judgement agreed because its authored durations
+  // already sit at 0.70-0.85. The fast axe's authored 0.25-0.55 were read as
+  // "hit timings that under-run the watch", and the difference was papered over
+  // with a floor rather than chased.
+  //
+  // An instrumented capture settled it: 4,916 logged damage events over an
+  // 88-second dummy session, of which 12 uninterrupted Cheese Moon cycles have
+  // a MEDIAN OF 1903ms (1820-1972) against the floored model's 2850ms - a ratio
+  // of 1.498 - with individual links landing 210-640ms apart, well under the
+  // floor that was supposed to bound them. The authored durations sum to
+  // 1810ms, within 5% of the measured median, so they were right all along and
+  // the stopwatch was measuring interrupted chains.
+  //
+  // Every throughput number in the tool inherited that 1.5x. `--swing-floor`
+  // still moves it, and 0.7 restores the old reading for comparison.
+  const swingFloor = Number.isFinite(assume.swingFloor) ? assume.swingFloor : 0;
   const skills = cdb.byId('skill');
   const affinities = cdb.byId('affinity');
   const effectNames = cdb.enumValues('skill@steps@effects', 'effect');
@@ -1639,12 +1651,22 @@ export function buildCombat(cdb, ctx, assume = {}) {
            '(skillEffectValText@20949) dispatches through the same virtual on the live Hero, so a ' +
            'weapon tooltip\'s range endpoints ceil too. Back-inferring from a displayed integer ' +
            'means raw is in (display-1, display].' },
-    { severity: 'assumption', what: 'a chain link swings no faster than 0.7 seconds',
-      why: 'Calibrated from two stopwatches: ten Cheese Moon chains in 28s where the authored durations ' +
-           'sum to 1.81s - they are hit timings, not swing periods - and ten Judgement chains in ~30s, ' +
-           'exactly the authored 3.00s, at or above the floor throughout. No located constant carries ' +
-           'the 0.7 (Attacks_RecoveryRatio 0.25 reproduces neither watch), so it is measured rather ' +
-           'than read, and --swing-floor moves it.' },
+    { severity: 'verified', what: 'a chain link swings at its authored duration - there is no floor',
+      why: 'The 0.70s floor that stood here was the largest error in the model, and it was calibrated ' +
+           'from two stopwatches: ten Cheese Moon chains timed at 28s against authored durations summing ' +
+           'to 1.81s, and ten Judgement chains at ~30s, which agreed only because Judgement\'s authored ' +
+           'links already sit at 0.70-0.85. The axe\'s fast 0.25-0.55 were written off as "hit timings, ' +
+           'not swing periods" and the gap was papered over with a floor rather than chased. An ' +
+           'INSTRUMENTED CAPTURE settled it: 4,916 logged damage events over an 88-second dummy session, ' +
+           'of which 12 uninterrupted Cheese Moon cycles have a median of 1903ms (1820-1972) against the ' +
+           'floored model\'s 2850ms - a ratio of 1.498 - with individual links landing 210-640ms apart, ' +
+           'well under the floor that was meant to bound them. The authored durations sum to 1810ms, ' +
+           'within 5% of the measured median: they were right all along and the stopwatch was timing ' +
+           'interrupted chains. Every throughput number inherited that 1.5x on any weapon whose links ' +
+           'are faster than 0.7s - the Rogue moved 307 -> 358 and the Mage 223 -> 239, while the Warrior ' +
+           'and Priest did not move at all because their chains are authored above the old floor. ' +
+           '--swing-floor 0.7 restores the old reading for comparison. The residual 5% is unexplained ' +
+           'and named: see docs/GROUND-TRUTH.md.' },
   ];
 
   return {

@@ -45,7 +45,7 @@ export const DEFAULT_ASSUME = {
   // instance exactly.
   dropsScale: true,
   // The measured floor on a chain link's swing period - see buildCombat.
-  swingFloor: 0.7,
+  swingFloor: 0,
 };
 
 export function createEngine({ game, assume = {}, fight = {}, quiet = false, classSkillSlots } = {}) {
