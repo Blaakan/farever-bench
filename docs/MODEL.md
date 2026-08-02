@@ -439,6 +439,39 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**A next-cast register: free, and a guaranteed critical strike.** Something arms
+a one-shot flag and the next cast of ONE named skill spends it. Recognised by a
+**triple**, which a sweep of all 962 scripts matches exactly once — so this is a
+named mechanic, not a class:
+
+```
+onInflictDamageEval   hasStatus(owner, S) && hit.skillId == kind -> hit.critChance = 1
+evalCost              hasStatus(owner, S) -> return 0
+onStop                removeStatus(owner, S)
+```
+
+…plus an applier doing `addStatus(owner, S)` behind `isFinalAttack()` and
+`checkProba(vars.chance)`. That is `Warrior_Talent_SurgeOfViolence`, 25% per
+combo finisher, and it needs **no talent point** —
+`DemonSigil_War_SurgeOfViolence` grants the node from a Head socket, which is why
+`runableSkillIds` (which walks augments) is what feeds the reader.
+
+Carried as the **probability** the register is armed, the same convention crit
+already uses. A finisher does `p += (1 - p) * chance` — a proc landing while it
+is already armed is *wasted*, so it never saturates past 1. Spending costs
+`cost x (1 - p)` and lifts the cast to `(1-p) x rolled + p x forced`, where
+forced is the existing decomposition at p = 1, i.e. `fixed + base x cd`. The pool
+feed follows the same die. Both halves are real: on a bare axe build the sigil
+raises Rage Strike 11% per cast *and* shortens its interval 4.65s → 3.33s,
+because a free cast waits on no Rage income.
+
+*Named, not modelled:* the cost check runs at **press** and the forced-crit check
+at **damage eval**, with `onStop` removing the status in between — and
+`startSkill@6034` builds a fresh `Skill` per press, so the removal is driven by
+the FIRST cast's lifetime. A second cast queued before the first stops therefore
+gets the free cast **without** the crit. This fight casts sequentially and never
+queues, so the split cannot arise here.
+
 **A skill can carry its own damage rider, and three of them were refused.** The
 2026-08-02 capture proved all three fire; shipping without them cost −13.7% to
 −17.5% on the skills that carry one. Each was refused for a different reason:

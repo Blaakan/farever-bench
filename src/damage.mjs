@@ -1377,6 +1377,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       poolFactor,
       goal: live?.goal ?? null,
       chainResets: opts.assume?.chainResets ?? true,
+      empowerments: opts.empowerments ?? [],
       comboWindow: cdb.byId('constant').get('ComboWindow')?.v?.float ?? 0.6,
       swingVariance: cdb.byId('constant').get('WeaponAttack_RandomRange')?.v?.float ?? 0.1,
       poolHealShare: bleedMods.healShare ?? 0,

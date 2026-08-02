@@ -3200,6 +3200,52 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- a next-cast register: free, and a guaranteed crit -----------------------
+// Surge of Violence is the only one in the game, and it needs no talent point -
+// DemonSigil_War_SurgeOfViolence hands the node over from a Head socket. The
+// recognition is a triple (forced crit in onInflictDamageEval, zero cost in
+// evalCost, removeStatus in onStop) and a sweep of all 962 scripts matches
+// exactly one row with it.
+group('a next-cast register is spent for a free crit');
+{
+  const eng = createEngine({ quiet: true });
+  const all = eng.cdb.lines('skill').map((s) => s.id);
+  const found = eng.plan.empowermentsOf(all, { rank: 3 });
+  ok('exactly one skill in the game carries this shape', found.length === 1,
+    JSON.stringify(found));
+  const e = found[0];
+  ok('...and it is Surge of Violence arming Rage Strike off a finisher',
+    e.skill === 'Warrior_Rage_Strike' && e.from === 'Warrior_Talent_SurgeOfViolence'
+      && Math.abs(e.chance - 0.25) < 1e-9 && e.on === 'combo',
+    JSON.stringify(e));
+  // Nothing is armed without the source, so a build that has neither the talent
+  // nor the sigil must read nothing.
+  ok('a build without the node arms nothing',
+    eng.plan.empowermentsOf(['Warrior_Rage_Strike'], { rank: 3 }).length === 0);
+
+  // End to end: the sigil buys BOTH halves - more damage per cast, and more
+  // casts, because the free ones do not wait on Rage income.
+  const build = (sigil) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3, level: 25 };
+    l.gear.Slot_Head = { item: 'Head_RDemon_Fig_Craft', rarity: 'Rare', stars: 0, level: 25 };
+    eng.plan.pruneSelection(l);
+    if (sigil) l.augments = { 'Slot_Head/AugmentDemonSigil': 'DemonSigil_War_SurgeOfViolence' };
+    const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 });
+    return ev.throughput.lines.find((x) => x.id === 'Warrior_Rage_Strike');
+  };
+  const off = build(false), on = build(true);
+  ok('the register raises Rage Strike per cast', on.perCast.damage > off.perCast.damage,
+    `${off.perCast.damage.toFixed(1)} -> ${on.perCast.damage.toFixed(1)}`);
+  ok('...and shortens its interval, because a free cast waits on no income',
+    on.interval < off.interval, `${off.interval.toFixed(2)}s -> ${on.interval.toFixed(2)}s`);
+  // A guaranteed crit is worth exactly `fixed + base x cd`, so the per-cast
+  // lift cannot exceed the crit multiplier itself.
+  ok('...by no more than the crit multiplier allows',
+    on.perCast.damage / off.perCast.damage < 1.6,
+    String(on.perCast.damage / off.perCast.damage));
+}
+
 // --- the three riders that were refused --------------------------------------
 // All three fire in game, proven by the 2026-08-02 capture, and shipping without
 // them cost -13.7% to -17.5% on the skills that carry one. Each was refused for

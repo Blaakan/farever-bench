@@ -178,6 +178,13 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       //     this kit can apply, each at duration/cooldown: independent windows,
       //     so 1 - PROD(1 - u). Nothing here is invented - the durations come
       //     off the applying steps and the cooldowns off the skills.
+      // A NEXT-CAST EMPOWERMENT the build can arm. `runableSkillIds` already
+      // walks the augments, so a sigil-granted talent is in it - which matters,
+      // because Surge of Violence needs no talent point: DemonSigil_War_
+      // SurgeOfViolence hands the node over from a Head socket, and bench's own
+      // Warrior optimum slots exactly that sigil.
+      empowerments: plan.empowermentsOf(talents.runableSkillIds(loadout),
+        { rank, runes: new Set(rot.runes ?? []) }),
       gates: (() => {
         const bleeding = rot.dots?.some((d) => (d.types ?? []).some((t) => /Bleed|Hemorage/i.test(t)))
           ? 1 : 0;

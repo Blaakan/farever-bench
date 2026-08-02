@@ -3073,9 +3073,67 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     return out;
   }
 
+  /**
+   * A NEXT-CAST EMPOWERMENT: something arms a one-shot register, and the next
+   * cast of ONE named skill spends it for a discount and a guaranteed critical
+   * strike. `Warrior_Talent_SurgeOfViolence` is the only one in the game, and
+   * it is reachable without a talent point because `DemonSigil_War_SurgeOfViolence`
+   * grants the node outright from a Head socket.
+   *
+   * The recognition is a TRIPLE, and a sweep of every script in the sheet
+   * matches exactly one row with it - so this is a named mechanic, not a class:
+   *
+   *   onInflictDamageEval   hasStatus(owner, S) && hit.skillId == kind
+   *                           -> hit.critChance = 1        (a LITERAL, not vars)
+   *   evalCost              hasStatus(owner, S) -> return 0
+   *   onStop                removeStatus(owner, S)
+   *
+   * ...plus an applier elsewhere that does `addStatus(owner, S)` behind
+   * `isFinalAttack()` and `checkProba(vars.chance)`.
+   *
+   * Read three ways: `Warrior_Rage_Strike.onInflictDamageEval@44626` ops 20-21
+   * set `critChance = 1`; `evalCost@44627` ops 24-28 return 0; `onStop@44624`
+   * op 10 removes it. The applier is findex 44666, op 3 `isFinalAttack@6047`
+   * (which is `inf.type == 4`, AttackCombo), op 16 `checkProba`, op 29
+   * `addStatus`. `vars.chance` is 0.25 and `props.talent.maxPoints` is 1.
+   */
+  function empowermentsOf(ownedIds, { rank = 1, runes = null } = {}) {
+    const out = [];
+    const consumers = new Map();     // status -> skill that spends it
+    for (const id of ownedIds) {
+      const body = liveScript(skills.get(id)?.script ?? '');
+      if (!body) continue;
+      const forced = /hasStatus\s*\(\s*owner\s*,\s*(\w+)\s*\)[^;{}]*\)?\s*\{?[^;{}]*\.critChance\s*=\s*1\b/.exec(body);
+      if (!forced) continue;
+      if (!new RegExp(`hasStatus\\s*\\(\\s*owner\\s*,\\s*${forced[1]}\\s*\\)`).test(body)) continue;
+      if (!/\bevalCost\b/.test(body) || !/return\s+0/.test(body)) continue;
+      if (!/removeStatus\s*\(\s*owner\s*,/.test(body)) continue;
+      // The status is named through a local alias; resolve it to a real row.
+      const alias = new RegExp(`\\b${forced[1]}\\s*=\\s*(?:Skill\\.)?([A-Za-z0-9_]+)`).exec(body);
+      consumers.set(alias?.[1] ?? forced[1], id);
+    }
+    if (!consumers.size) return out;
+    for (const id of ownedIds) {
+      const body = liveScript(skills.get(id)?.script ?? '');
+      if (!body) continue;
+      for (const [status, skill] of consumers) {
+        const m = new RegExp(`addStatus\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?${status}`).exec(body);
+        if (!m) continue;
+        const line = body.slice(0, m.index);
+        const onFinisher = /isFinalAttack|isFinalCombo/.test(line);
+        const cv = /checkProba\s*\(\s*vars\.(\w+)/.exec(line)?.[1];
+        const chance = cv ? skills.get(id)?.vars?.[cv] : 1;
+        if (!onFinisher || typeof chance !== 'number' || !(chance > 0)) continue;
+        out.push({ status, skill, from: id, chance, on: 'combo' });
+      }
+    }
+    return out;
+  }
+
   return {
     pools, defaultSelection, pruneSelection, resolve, selfBuffs, selfBuffsOf, statusesOf,
     weaponSlotsAt, arsenalSlotsAt, typeOf, baseChain, resourceGainsOf, talentModifiers, maxStacksOf,
+    empowermentsOf,
     mechanicTypes: MECHANIC_TYPES,
   };
 }

@@ -100,7 +100,7 @@ function runFight(spec) {
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
     poolScale = null, poolFactor = null, goal = null, chainResets = true,
-    swingVariance = 0, comboWindow = 0.6,
+    swingVariance = 0, comboWindow = 0.6, empowerments = [],
   } = spec;
   // The objective the derived player maximises - see `goalWeights`.
   const [wDmg, wHeal, wShield] = goalWeights(goal);
@@ -151,10 +151,10 @@ function runFight(spec) {
     const p = pools.get(c.atb);
     return !p || p.value >= c.amount - 1e-9;
   });
-  const pay = (prof) => {
+  const pay = (prof, share = 1) => {
     for (const c of prof.costs ?? []) {
       const p = pools.get(c.atb);
-      if (p) p.value = Math.max(0, p.value - c.amount);
+      if (p) p.value = Math.max(0, p.value - c.amount * share);
     }
   };
   // What is up right now, for the gain factor below. The fight sets this to
@@ -558,6 +558,24 @@ function runFight(spec) {
     // The end of the last COMPLETED basic attack. The chain clock runs from
     // here to the start of the next one, and nothing else refreshes it.
     let lastSwingEnd = -Infinity;
+
+    // A NEXT-CAST REGISTER, carried as the PROBABILITY that it is armed rather
+    // than as a coin - the same convention crit already uses, whose binomial
+    // mean is the deterministic number. A finisher arms it with probability
+    // `chance` and a proc that lands while it is already armed is WASTED, so
+    // the update is `p += (1 - p) * chance` and never saturates past 1.
+    //
+    // Spending it does two things at two different moments, and only the first
+    // is modelled here: the cost check runs at PRESS and the forced-crit check
+    // at DAMAGE EVAL, with `onStop` removing the status in between. A second
+    // Rage Strike queued before the first one stops therefore gets the free
+    // cast WITHOUT the crit - `startSkill@6034` builds a fresh Skill per press,
+    // so the removal is driven by the FIRST cast's lifetime. This fight casts
+    // sequentially and never queues, so that split cannot arise here; it is
+    // named in the audit rather than approximated.
+    const emp = new Map();   // skill id -> { chance, p }
+    for (const e of empowerments ?? []) emp.set(e.skill, { chance: e.chance, p: 0 });
+    const armAll = () => { for (const r of emp.values()) r.p += (1 - r.p) * r.chance; };
     let swings = 0, combos = 0, busy = 0, fillerTime = 0;
 
     // The state everything is priced against, rebuilt only when it changes.
@@ -929,10 +947,34 @@ function runFight(spec) {
         const sparkBefore = gaugePool ? gaugePool.value : 0;
         const sparkCost = gaugePool
           ? (a.prof.costs ?? []).reduce((s, c) => (c.atb === gauge.atb ? s + c.amount : s), 0) : 0;
-        pay(a.prof);
+        // An armed register makes this cast free with probability p, so the
+        // expected spend is `cost x (1 - p)`.
+        const reg = emp.get(a.prof.id);
+        pay(a.prof, reg ? 1 - reg.p : 1);
         if (sparkCost > 0 && conduitTriggers.length && gaugePool.max > 0
           && sparkBefore / gaugePool.max > gauge.ratio + 1e-12) fireConduits(t);
-        const out = hit(a.prof, now);
+        // ...and a GUARANTEED critical strike with the same probability. The
+        // cast decomposes as `fixed + base x (1 + p(cd-1))`, so lifting the
+        // effective crit chance to `p + (1-p) x base` is exactly what a forced
+        // crit is worth in expectation. Spending clears the register whether or
+        // not it was armed - the status is one-shot either way.
+        let out = hit(a.prof, now);
+        if (reg && reg.p > 0 && out.critRoll) {
+          // The cast already decomposes as `fixed + base x (1 + p(cd-1))`, so a
+          // guaranteed crit is that same expression at p = 1 and needs no
+          // second pricing. Blending at the register's probability gives
+          // `(1-p) x rolled + p x forced`, and the pool feed follows the same
+          // die - Hemorrhage takes a share of physical CRITICAL damage, so a
+          // forced crit feeds it too.
+          const cr = out.critRoll;
+          const forced = cr.fixed + cr.base * cr.cd;
+          out = {
+            ...out,
+            damage: out.damage * (1 - reg.p) + forced * reg.p,
+            critRoll: { ...cr, p: reg.p + (1 - reg.p) * cr.p },
+          };
+        }
+        if (reg) reg.p = 0;   // one-shot, spent whether or not it was armed
         a.casts++;
         a.damage += out.damage;
         a.heal += out.heal;
@@ -1003,6 +1045,9 @@ function runFight(spec) {
       }
       chainIndex++;
       if (link.prof.isCombo) combos++; else swings++;
+      // The finisher arms every register the build carries. `isFinalAttack@6047`
+      // is `inf.type == 4` (AttackCombo), which is exactly `isCombo` here.
+      if (link.prof.isCombo && emp.size) armAll();
       // The finisher's flat Spark cost. The chain is NOT gated on it - a Mage
       // with an empty pool keeps swinging, which is what the game does - but
       // the spend is real, and on a naked Mage it is the spend that drives the
