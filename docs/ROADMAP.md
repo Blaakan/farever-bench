@@ -21,31 +21,52 @@ all along.
 **Still open from that document, each with a measured target — this is the live
 work list, ahead of everything in the older sections:**
 
-1. **Crit conversion.** Steady-state crit measures 28.8–34.0% against the
-   computed sheet's 21.39% (p = 2.8e-4). The player has confirmed **no talents
-   beyond the Hemorrhage root and no runes at all**, so every build-side
-   explanation is dead. `ent.UnitAttributes` carries both `critChance` and
-   `critChanceRating`; the conversion between them is a bytecode read waiting to
-   happen.
+1. **Crit conversion — CLOSED.** Never the rating conversion, which reproduces
+   the game to five digits. Two permanent +5 CritChance rows were dropped:
+   Bloodrage Aura's status (`3a99d83`) and `Axe_Boomerang_Combo`'s own affix
+   (`a43c2a6`). Captured build 19.62% → 29.62% against a measured 27.8–28.8%.
 2. **Three refused script riders all fire in game** — the combo's +20% vs a
    bleeding target (dmgMult, not critDmgMult: the clean 1.5325 crit ratio proves
    which), Bonethrow's rank-3 +20% critDmgMult, and Domination against the stun
    window, because **the training dummy IS stunnable**. Riderless numbers run
    −13.7% to −17.5%. Policy to adopt: publish rider-on conditioned on status
    uptime rather than refusing.
-3. **ComboWindow is half wrong.** Chains reset, but a cast does NOT reset a
-   BANKED finisher — decisive sequence at t=47.6→55.0s, where link 3 survived
-   three Rage Strikes and a fully-held Rampage before the finisher fired. Needs
-   a banked-chain concept.
-4. **Rage Strike crits 56.3%** (9/16) against 28.8% for everything else, with no
-   talent to explain it. Read the skill row and script for an authored crit rider.
-5. **Berserk measures ×1.183–1.187, not ×1.20**, composing additively with
-   dmgMult riders. Either the authored value differs or a base is excluded.
-6. **Bleed tick ratio is 0.1023–0.1028, not 0.100** — small and systematic; best
-   candidate is Fervor applied a second time at tick landing.
-7. **The bake's live residuals still need re-checking.** GROUND-TRUTH's Armor
-   +11% / Strength −5.4% were measured at HEAD `947c02f`, which is BEFORE the
-   bake landed in `4b63c44`. Recompute before acting on them.
+3. **ComboWindow — DISPUTED, and the dispute is UNVERIFIED.** A read claims
+   there is no banked finisher at all: `Hero.update@7495` /
+   `isWithinAttackCombo@7459` run the clock from the END of the last basic
+   attack to the START of the next, so casts, idle and runs of short casts all
+   break the chain by the same rule — and the model's per-cast test misses that
+   two 0.4s Rage Strikes break it in game. That would make the t=47.6→55.0s
+   sequence an artefact of swings that landed no damage row rather than a banked
+   link. Its skeptic died before checking it (spend limit), so **verify before
+   acting**, and do not implement a banked-chain concept on this evidence.
+4. **Rage Strike crits 56.3%** (9/16). Surge of Violence is live — the head
+   sigil grants it, see GROUND-TRUTH's correction — but being one-shot it covers
+   at most 5 of the 9; four crits land on casts with no combo finisher since the
+   previous Rage Strike, and that subset still crits 4/10. Open. Separately its
+   damage is ×1.1025 short at current HEAD, which the CritDamage anchor says is
+   NOT a Strength error.
+5. **Berserk is authored at exactly 0.20** in both the cdb row and the compiled
+   script — do NOT retune it to 0.185. What is real is that the game composes
+   dmgMult riders ADDITIVELY (`computeDamage@4841` seeds `modMult` from
+   `hitData.dmgMult`, and every rider is `+=` into that one scalar) while the
+   model compounds them: `runeDamage` at `m *= 1 + rd.amount`, then
+   `damageByAffinity`, then `basicAttack`, on separate lines. Two +20% riders
+   should give ×1.40, not ×1.44. Fix the bracket; carry the 1.25% residual as an
+   open anomaly.
+6. **Bleed tick ratio — CLOSED, measurement-side.** `ceil(round(0.100 × H) / 4)`
+   reproduces 0.1023–0.1028 on its own, because the log ceils like the display.
+   The model's 0.100 is the correct real-damage coefficient. Retire the
+   Fervor-applied-twice hypothesis; what needs fixing is the COMPARISON, which
+   must quantise the same way the engine does before differencing.
+7. **The bake's live residuals, RECHECKED at current HEAD.** Rebuilt from the
+   capture's own inventory dump. CritDamage (⇒ Strength+Intellect, the tightest
+   anchor — three band-less skills agreeing to 0.3%) went +0.24% → **−0.02%**;
+   Armor −10.5% → **−4.3%**. What is left is a UNIFORM ~−6.9% across combo,
+   Bonethrow and Rampage — three different attribute mixes on two weapons, short
+   by the same factor — which is a missing multiplier, not a stat error.
+   `PhysicalMastery` reads 0.00 and shares an additive bracket with Fervor.
+   Probe: `scratchpad/recheck-bake.mjs`.
 
 Also confirmed correct and needing no work: the ±10% band (and the log ceils like
 the display), the crit multiplier to 0.3%, the whole Hemorrhage ledger, status
