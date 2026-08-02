@@ -439,6 +439,49 @@ Where the parent is a weapon **passive**, there is still no rate — those two
 ultimates are armed by a stack counter that banks per damage event — and the
 output says exactly that instead of blaming the link.
 
+**The bake is checked against the game's own return value, not against tooltips.**
+`captures/2026-08-02-v2/bench-probe-bakes.csv` is a postfix on
+`$HItem.generateItemAffixes@20747`: the item, the iLevel it was called with, and
+every affix line that came back. **632 signatures, 2,115 lines, all exact.** Three
+rules took it there from 1,299:
+
+1. **One round per target attribute, not one per row.** Two aptitudes both paying
+   MaxHealth are two rows landing on one line, and rounding each before adding
+   them loses up to a point per row — 87 signatures came out ±1..2. The rows
+   accumulate as floats and the *line* rounds, before the slot factor ceils it.
+2. **Uncommon drops a stat group, and which one depends on the aptitude count** —
+   single-aptitude pays no *primary*, multi-aptitude pays no *vitality*. Nothing
+   authored says so: the `itemType.props.rarities` overrides stop at Common
+   (which zeroes both). Measured on 287 Uncommon keys.
+3. **Generic aptitudes pay like every other aptitude** — all of them, each divided
+   by how many the item names. See below.
+
+Read `bake` rows only when diffing. An `item_affixes` row reports the item's *def*
+iLevel while carrying the *live* affixes, so mixing the two files the live axe's
+iLevel-290 numbers under 260. Two more traps in that comparison: `effectiveLevel`
+adds the rarity's `iLevelBonus` to `level * 10`, so an instance level must be
+handed in net of it; and a shield lists `Slot_Weapon2` before
+`Slot_OffhandWeapon`, so taking `slots[0]` prices every shield at the arsenal's
+40%. The only line that still differs is `Scepter_Start`, which carries authored
+affixes `Vitality +2 / Faith +2` that `generateItemAffixes` does not generate and
+therefore does not log.
+
+**A generic aptitude is not a choice.** The five nameless rows — Crit, ArPen,
+MaPen, Fervor, Vita — used to pay exactly ONE, enumerated as a candidate per
+generic. The measurement that rule rested on was right and the inference was not:
+*"Pendant of Adaptability grants 46 rating, not 184"* correctly killed the naive
+sum, and was read as one row paying 46. The game's own bake for that necklace at
+iLevel 210 is
+
+```
+Vitality 4 | CritChanceRating 11 | ArmorPenetrationRating 11
+          | SpellPenetrationRating 11 | FervorRating 11
+```
+
+— four rating lines summing to **44**, which is the 46 that was measured, each a
+quarter because the item names four aptitudes. `genericChoices` now returns `[]`
+and jewellery appears once as a candidate instead of once per generic.
+
 **A skill's own affix is owed for owning the skill, not for being a passive.**
 `BaseSkill.permaAffixes@6081` (`BaseSkill.hx:850`) returns false for exactly two
 natures — `Status` and `Passive` — and true for every other. `initData@6029` then

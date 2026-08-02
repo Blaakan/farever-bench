@@ -391,26 +391,28 @@ export function buildCatalog(cdb, ctx) {
   // the two modes only differ for generic jewellery.
   //
   // Generic aptitudes - the five nameless rows Crit / ArPen / MaPen / Fervor /
-  // Vita that jewellery uses - still pay exactly ONE: that half of the old
-  // rule was measured on its own ("Pendant of Adaptability" grants 46 rating,
-  // not 184) and stands. WHICH one is a decision, enumerated as a candidate
-  // and printed, never chosen silently.
+  // Vita that jewellery uses - follow the SAME rule as every other aptitude:
+  // all of them pay, each divided by how many the item names. They were read as
+  // "pick exactly one" off a measurement that was right and an inference that
+  // was not - "Pendant of Adaptability grants 46 rating, not 184" correctly
+  // killed the naive sum, and was taken to mean one row paid 46. The game's own
+  // `generateItemAffixes` return, logged for that necklace, is
+  //
+  //   Vitality 4 | CritChanceRating 11 | ArmorPenetrationRating 11
+  //             | SpellPenetrationRating 11 | FervorRating 11
+  //
+  // - four rating lines summing to 44, which is the 46 that was measured, and
+  // each one a quarter of the budget because the item names four aptitudes.
+  // There is no choice to make and never was.
   function payingAptitudes(item, aptitude = null, generic = null, { all = false } = {}) {
-    if (!item.aptitudes.length) return [];
-    if (all) return item.aptitudes;
-    const real = item.aptitudes.filter((a) => !isGeneric(a));
-    const generics = item.aptitudes.filter((a) => isGeneric(a));
-    const out = [...real];
-    if (generics.length) out.push(generic && generics.includes(generic) ? generic : generics[0]);
-    return out;
+    return item.aptitudes.length ? item.aptitudes : [];
   }
 
-  /** The generic aptitudes an item lets you choose between, or []. */
-  function genericChoices(item) {
-    if (!item || !item.aptitudes.length) return [];
-    const generics = item.aptitudes.filter((a) => isGeneric(a));
-    return generics.length > 1 ? generics : [];
-  }
+  /**
+   * Kept as an empty list: nothing about a generic aptitude is a decision any
+   * more, so no caller should be enumerating candidates over one.
+   */
+  function genericChoices() { return []; }
 
   // --- affix application ----------------------------------------------------
   // Which accumulator a row feeds, and how it composes with another of its
@@ -474,6 +476,17 @@ export function buildCatalog(cdb, ctx) {
     const rarities = inherited(item.type, (t) => t?.props?.rarities);
     const ov = (rarities ?? []).find((r) => r.rarity === rarity)?.atbRatio;
     if (ov) Object.assign(ratios, ov);
+
+    // UNCOMMON DROPS ONE GROUP TOO, and which one depends on how many
+    // aptitudes the item names. Nothing in the data says so - the authored
+    // `rarities` rows stop at Common - so this is measured, off the game's own
+    // `generateItemAffixes` return values logged for 632 item/rarity/iLevel
+    // signatures: on 287 Uncommon keys a single-aptitude item pays no PRIMARY
+    // and a multi-aptitude one pays no VITALITY. Without it every Uncommon row
+    // in the game reads 2-5 points high on the group the game does not pay.
+    if (rarity === 'Uncommon' && (item.aptitudes ?? []).length) {
+      ratios[(item.aptitudes ?? []).length > 1 ? 'vitality' : 'primary'] = 0;
+    }
 
     // Accumulated per item, not straight into `mods`, because the slot factor
     // applies to the finished per-stat total - see the ceil() below.
@@ -539,9 +552,13 @@ export function buildCatalog(cdb, ctx) {
         total /= aptCount;
 
         const target = e.sourceAtb ?? e.endAtb;
-        // Each row is rounded on its own before the sum. That is a one-unit
-        // discriminator and the measured tooltips agree with it.
-        const amount = Math.round((total * ratio) / sourceConversion(e.endAtb, e.sourceAtb));
+        // ONE ROUND PER TARGET ATTRIBUTE, not one per row. Two aptitudes both
+        // paying MaxHealth are two rows landing on one line, and rounding each
+        // before adding them loses up to a point per row: 87 of the 632 logged
+        // signatures come out +-1..2 that way. The game accumulates and rounds
+        // the line. Kept as a float here; rounded below, before the slot factor
+        // ceils it.
+        const amount = (total * ratio) / sourceConversion(e.endAtb, e.sourceAtb);
         own.set(target, (own.get(target) ?? 0) + amount);
       }
     }
@@ -552,7 +569,8 @@ export function buildCatalog(cdb, ctx) {
     // combination that reproduces all five - round gives 14 and 7, floor gives
     // 14/7/15/15. It is 0.4 and not 0.5: the ceiling is what makes the small
     // values look nearly halved.
-    for (const [atb, v] of own) {
+    for (const [atb, raw] of own) {
+      const v = Math.round(raw);
       const scaled = affixFactor === 1 ? v : Math.ceil(v * affixFactor);
       mods.flat.set(atb, (mods.flat.get(atb) ?? 0) + scaled);
     }

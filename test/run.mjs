@@ -492,24 +492,40 @@ group('multi-aptitude items');
       `${(sv.physReduction * 100).toFixed(1)}% vs the declared ${(want * 100).toFixed(0)}%`);
   }
 
-  // Craft jewellery names several generic aptitudes and pays exactly one, so
-  // each is a separate candidate rather than a free multiplier.
+  // Craft jewellery names several generic aptitudes and pays ALL of them, each
+  // divided by how many it names - the same rule as every other aptitude.
+  // Measured against the game's own `generateItemAffixes` return, logged for
+  // this exact necklace at iLevel 210: Vit 4, and 11 on each of the four
+  // ratings. The old reading paid one and called the other three a choice; the
+  // "46 rating, not 184" measurement it rested on is the 11+11+11+11 = 44.
   {
     const pendant = cat.itemById.get('Necklace_Z2RCraft');
     ok('the four-generic craft necklace is still in the data',
-      pendant && cat.genericChoices(pendant).length === 4,
+      pendant && pendant.aptitudes.length === 4,
       pendant ? pendant.aptitudes.join('+') : 'Necklace_Z2RCraft missing');
+    ok('...and there is no generic choice left to make',
+      cat.genericChoices(pendant).length === 0,
+      JSON.stringify(cat.genericChoices(pendant)));
     const variants = cat.candidates('Slot_Neck', { aptitude: 'Cleric', charLevel: 25 })
       .filter((c) => c.item.id === 'Necklace_Z2RCraft');
-    ok('and it appears once per generic it can roll', variants.length === 4,
+    ok('so it appears exactly once as a candidate', variants.length === 1,
       variants.map((v) => v.generic).join(', '));
-    const one = new Map();
+
+    // The logged bake, to the integer. `effectiveLevel` adds the Rare bonus to
+    // level*10, so the instance level is handed in net of it to land on 210.
+    const bonus = cdb.byId('rarity').get('Rare')?.props?.iLevelBonus ?? 0;
+    const got = new Map();
     cat.contribute(pendant, 'Slot_Neck',
-      { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: 'Rare', armorReduction: 0.25, generic: 'MaPen' },
-      { flat: one, addRatio: new Map(), mulRatio: new Map() });
-    ok('a chosen generic pays exactly one rating',
-      ratingsOf(one).length === 1 && (one.get('SpellPenetrationRating') ?? 0) > 0,
-      [...one.entries()].map(([k, v]) => k + '=' + v).join(' '));
+      { aptitude: 'Cleric', charLevel: 25, stars: 0, rarity: 'Rare', armorReduction: 0.25,
+        level: (210 - bonus) / 10 },
+      { flat: got, addRatio: new Map(), mulRatio: new Map() });
+    const WANT = { Vitality: 4, CritChanceRating: 11, ArmorPenetrationRating: 11,
+      SpellPenetrationRating: 11, FervorRating: 11 };
+    for (const [k, v] of Object.entries(WANT)) {
+      near(`Pendant of Adaptability pays ${k} ${v}`, got.get(k) ?? 0, v, 1e-9);
+    }
+    ok('...and all four ratings, not one', ratingsOf(got).length === 4,
+      [...got.entries()].map(([k, v]) => k + '=' + v).join(' '));
   }
 }
 
@@ -3182,6 +3198,69 @@ group('a refused payload does not take its aura with it');
   ok('the heal is still refused', !!row, JSON.stringify(row ?? null));
   ok('...and the refusal names what it kept',
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
+}
+
+// --- the bake, against the game's own return value ---------------------------
+// `captures/2026-08-02-v2/bench-probe-bakes.csv` is a postfix on
+// `$HItem.generateItemAffixes@20747`: item, the iLevel it was called with, and
+// every affix line that came back. 632 signatures, 2,115 lines. Not a tooltip
+// reading - the function's own output - so a disagreement is always ours.
+// These are the three rules that took it from 1,299 exact to all of them.
+group('the bake reproduces the game to the integer');
+{
+  const eng = createEngine({ quiet: true });
+  const bake = (itemId, rarity, iLevel, slotId) => {
+    const flat = new Map();
+    const bonus = eng.cdb.byId('rarity').get(rarity)?.props?.iLevelBonus ?? 0;
+    eng.cat.contribute(eng.cat.itemById.get(itemId), slotId,
+      { charLevel: 25, rarity, stars: 0, level: (iLevel - bonus) / 10, armorReduction: 0.4 },
+      { flat, addRatio: new Map(), mulRatio: new Map() });
+    return flat;
+  };
+
+  // (1) ONE ROUND PER TARGET ATTRIBUTE. Two aptitudes both paying MaxHealth are
+  // two rows on one line; rounding each before adding loses up to a point.
+  const axe = bake('Axe_Boomerang', 'Rare', 290, 'Slot_Weapon1');
+  for (const [k, v] of Object.entries({ Vitality: 36, Strength: 15, Dexterity: 18,
+    CritChanceRating: 39, ArmorPenetrationRating: 39 })) {
+    near(`the live axe at iLevel 290 pays ${k} ${v}`, axe.get(k) ?? 0, v, 1e-9);
+  }
+  const ga = bake('GA_Craft', 'Epic', 320, 'Slot_Weapon1');
+  const GA = { Vitality: 49, Strength: 38, ArmorPenetrationRating: 87 };
+  for (const [k, v] of Object.entries(GA)) {
+    near(`the live GA at iLevel 320 pays ${k} ${v}`, ga.get(k) ?? 0, v, 1e-9);
+  }
+  // ...and the same weapon in the ARSENAL, where the player photographed the
+  // tooltip printing "Arsenal stats efficiency: 40%" beside +20 Vit +16 Str
+  // +35 ArPen. `ceil(v * 0.4)` reproduces all three off the mainhand numbers,
+  // which pins the bake and the slot factor against one screenshot.
+  const arsenal = bake('GA_Craft', 'Epic', 320, 'Slot_Weapon2');
+  for (const [k, v] of Object.entries({ Vitality: 20, Strength: 16, ArmorPenetrationRating: 35 })) {
+    near(`...and ${k} ${v} in the arsenal, at ceil(v x 0.4)`, arsenal.get(k) ?? 0, v, 1e-9);
+  }
+
+  // (2) UNCOMMON DROPS A GROUP, and which one depends on the aptitude count.
+  // Nothing authored says so - the `rarities` overrides stop at Common.
+  const uSingle = bake('Waist_Z1U2_Fig', 'Uncommon', 80, 'Slot_Waist');
+  ok('an Uncommon single-aptitude item pays no primary',
+    (uSingle.get('Strength') ?? 0) === 0 && (uSingle.get('Vitality') ?? 0) > 0,
+    [...uSingle].map(([k, v]) => k + '=' + v).join(' '));
+  const uMulti = bake('Waist_Z1U2_FigAss', 'Uncommon', 100, 'Slot_Waist');
+  ok('...and a multi-aptitude one pays no vitality instead',
+    (uMulti.get('Vitality') ?? 0) === 0 && (uMulti.get('Strength') ?? 0) > 0,
+    [...uMulti].map(([k, v]) => k + '=' + v).join(' '));
+  // Common still zeroes BOTH, and that one IS authored - so the new rule must
+  // not have quietly replaced it.
+  const common = bake('Waist_Z1U2_Fig', 'Common', 80, 'Slot_Waist');
+  ok('Common still pays neither primary nor vitality',
+    (common.get('Strength') ?? 0) === 0 && (common.get('Vitality') ?? 0) === 0,
+    [...common].map(([k, v]) => k + '=' + v).join(' '));
+
+  // (3) The mitigation curve, read off the player's own Character Profile:
+  // it prints -40.08% beside Armor 1930.
+  const ctxConsts = eng.ctx.consts;
+  const red = 1930 / (1930 + ctxConsts.resistFormula[0] + ctxConsts.resistFormula[1] * 25);
+  near('armor 1930 mitigates 40.08% at attacker level 25', red * 100, 40.08, 0.005);
 }
 
 // --- a rank override restates vars, not only props ---------------------------
