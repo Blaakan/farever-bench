@@ -254,6 +254,55 @@ it settles on its own: `GS Base Attack`'s **max hit was 604**, which no crit on
 the top of the model's ±10% band can reach (~429), so the geared swing really is
 too small; and **Anger Release fired twice**, which the model scores at zero.
 
+## The gear bake: what is proven, and why half of it must not land
+
+**`gearRatio` is real, and it is measured.** `generateItemAffixes@20747` runs the
+level curve a SECOND time on `GearStatsRatio_Scaling_Bounds` (0.5 → 0.9) and
+multiplies every row that is not flagged `gearOnly` by the result. Four
+independent derivations of the function — one reading the disassembly top-down,
+one working backwards from the measurement, one focused on rounding position, one
+on the level and ratio terms — all reproduced the tooltip of a level-25 Rare
+0★ GS_Nova to the integer:
+
+| | model @ L21 | @ L26 | × gearRatio(26) = 0.6749 | tooltip |
+|---|---|---|---|---|
+| Strength | 27 | 37 | 24.97 → **25** | **25** |
+| Vitality | 35 | 47 | 31.72 → **32** | **32** |
+| CritChanceRating | 57 | **69** | *gearOnly, skipped* | **69** |
+
+Two separate errors, and they partly cancel on the attributes while not
+cancelling at all on the rating — which is why the model looked only 9% off.
+The level is one: the model evaluates the item at its AUTHORED row level (20 →
+iLevel 210 → L 21) where the instance is a level-25 drop (iLevel 260 → L 26).
+`--drops scaled` already computes exactly that, so the default is wrong, not the
+code.
+
+**But landing gearRatio ALONE was tried and reverted, and it must not be tried
+again on its own.** It breaks twelve measured assertions — the Spear_Eruption and
+Cheese Moon tooltips — and no instance level rescues them:
+
+| Spear_Eruption, instance level | Vit / Dex / Faith | Crit / ArPen |
+|---|---|---|
+| 10 (what the model infers today) | 20 / 10 / 9 | **39 / 39 ✓** |
+| 18 | **35 / 18 / 15 ✓** | 53 / 53 |
+| tooltip | 36 / 18 / 15 | 39 / 39 |
+
+The attributes and the ratings want different levels, so a single level plus
+gearRatio cannot satisfy both. The `gearOnly` flags are uniform across every
+aptitude (Primary and Vitality false, Armor and Ratings true), so it is not a
+per-item difference either.
+
+**What separates the two cases is the APTITUDE COUNT.** GS_Nova is single
+(Fighter); Spear_Eruption and Cheese Moon are dual. The bytecode GROUPS the
+surviving rows by `endAtb`, takes the arithmetic MEAN of `start`/`end` across the
+group, evaluates the curve once, and divides by `item.aptitudes.length` — then
+re-adds that one amount once per row. The model instead sums a separately-rounded
+budget per aptitude. On a single-aptitude item the two agree and gearRatio is the
+only difference; on a dual-aptitude item they differ by a factor that gearRatio
+then compounds. So **the grouping, the mean, the aptitude divisor and gearRatio
+have to land in one change**, validated against all three tooltips at once, or
+each half makes the other look wrong.
+
 ## Model verification remainder
 
 - **Gear bake REWRITE** (not a read — the read is done, in the audit). Landing it
