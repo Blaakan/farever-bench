@@ -328,6 +328,19 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
           : mod.scope === 'weaponSkill' ? 'WeaponSkill' : null;
         if (mod.field === 'healShare' && mod.scope === 'bleed') { add(mods.bleed, 'healShare'); scoped('healShare'); }
         else if (mod.scope === 'bleed' && mod.field !== 'cooldownPerTick') { add(mods.bleed, mod.field); scoped(mod.field); }
+        // A modifier scoped to a status type that is NOT a bleed. The reader
+        // has always produced these correctly - `bench talents` prints
+        // "+10% damage dot:Poison" for Rogue_Talent_LethalDose - and the router
+        // then dropped them on the floor, because the only per-dot channel was
+        // called `bleedScoped` and only pool dots read it. The scope names a
+        // real statusType (`Poison` carries the DoT flag and twelve status rows
+        // wear it), so it goes down the same channel with its own type and the
+        // per-dot matcher walks the parent chain exactly as it already does.
+        else if (mod.scope.startsWith('dot:') && mod.field !== 'cooldownPerTick') {
+          mods.bleedScoped.push({
+            statusType: mod.scope.slice(4), field: mod.field, amount: mod.amount,
+          });
+        }
         else if (mod.field === 'critDmgMult' && type) add(mods.critDamageByType, type);
         else if (mod.field === 'critChance' && type) add(mods.critChanceByType, type);
         else if (mod.field === 'dmgMult' && mod.scope === 'physical') add(mods.damageByAffinity, 'Physical');
@@ -619,12 +632,22 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
            'exactly.',
     },
     {
-      severity: 'unmodelled',
-      what: 'whether a `Mono` step carrying an area cleaves',
-      why: '80 Mono steps carry a props.area, and structurally identical rows disagree in their own ' +
-           'descriptions - DM_Base_Attack1 is Mono + Cone(160) "to nearby enemies", Daggers_Base_Attack ' +
-           'is Mono + Cone(150) "to an enemy". Mono is treated as single-target, which is the reading ' +
-           'that agrees with the descriptions on 87% of player skills and the one that cannot flatter.',
+      severity: 'verified',
+      what: 'a `Mono` step never cleaves, whatever area it carries',
+      why: 'Read from AreaStep.areaHit@5972 (SkillStep.hx:1856-1893): hitCount starts at -1 for ' +
+           'unlimited, `if (inf.type == Mono) hitCount = 1`, and the priority hit DECREMENTS it before ' +
+           'the `if (hitCount == 0) return null` at L1892 - so the GameLayer.find shape query at op 229 ' +
+           'is never reached and props.area is dead for that cast. With no priority target the sweep ' +
+           'does run, and L1970-1974 then trims the result to the single NEAREST object. A Mono step ' +
+           'IS an AreaStep at runtime (isAreaStep@5961 returns true for type 0) and does run the ' +
+           'swept-shape routine, which is why the cone matters: it decides WHICH enemy and whether you ' +
+           'connect at all, never how many. The only override is the step-level props.hitCount, and ' +
+           'all six of its occurrences in data.cdb hold the value 1. So all 80 Mono-with-area rows ' +
+           'resolve identically and the two the model used to call contradictory do not: ' +
+           'DM_Base_Attack1\'s "to nearby enemies" is loose flavour text against Daggers_Base_Attack\'s ' +
+           '"to an enemy", and the code agrees with the second. `forceMono`, which the roadmap named as ' +
+           'the read that would settle this, turns out to be a heaps.io audio local (hxd.snd.openal) ' +
+           'with no connection to skill steps at all - a string-table collision.',
     },
     {
       severity: 'verified',

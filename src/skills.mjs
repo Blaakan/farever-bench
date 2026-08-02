@@ -1285,6 +1285,26 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           });
           return;
         }
+        // A CONDUIT has a rate, and it is not one the data withholds - it is
+        // one the fight does not yet produce. Every equipped conduit fires
+        // together when the Spark gauge crosses its threshold, so the number
+        // needed is a gauge simulation, not a missing column. Saying that beats
+        // "no trigger rate can be derived from the data", which points the
+        // reader at the CastleDB when the answer is in the fight model.
+        if (typeOf(id) === 'MageConduit' || extra.mechanic === 'MageConduit'
+          || typeOf(extra.grantedBy ?? '') === 'Talent') {
+          const conduit = typeOf(id) === 'MageConduit';
+          unmodelled.push({
+            id, name: prof.name, source, kind: conduit ? 'no rate' : 'no rate',
+            why: conduit
+              ? 'every equipped conduit fires together when the Spark gauge crosses its threshold, '
+                + 'and this fight spends Spark without simulating the gauge - so the amount is exact '
+                + 'and the rate is a fight-model gap, not a data one'
+              : `${skills.get(extra.grantedBy)?.texts?.name ?? extra.grantedBy} grants it, and its `
+                + 'trigger is the conduit gauge this fight does not simulate',
+          });
+          return;
+        }
         unmodelled.push({
           id, name: prof.name, source, kind: 'no rate',
           why: extra.parent
@@ -1386,7 +1406,16 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       }));
       const runeDesc = runePromises.length
         ? (runePromises.find((r) => r.slotted) ?? runePromises[0]).desc : '';
-      const runeFeedsResource = runePromises.some((r) => /\[(Rage|Spark|ComboPoint)\]/i.test(r.desc));
+      // A rune that promises a resource this build cannot account for. The
+      // NAMED pool matters, and it used to be ignored: the test matched the
+      // word `[ComboPoint]` in a rune's description and filed the skill under
+      // "gated by a pool nothing in this build declares readable income for" -
+      // about a Rogue, whose Combo Point income is read three screens earlier
+      // and is what gives the Finisher its cost. Shadowstep and Death Mark both
+      // came out that way, and the printed reason was simply false.
+      const runePools = runePromises.flatMap((r) =>
+        [...String(r.desc).matchAll(/\[(Rage|Spark|ComboPoint)\]/gi)].map((m) => m[1]));
+      const runeFeedsResource = runePools.some((p) => !tracked.has(p));
 
       // Utility only when nothing - including the rune you actually slotted -
       // gives it a payload.
@@ -1414,8 +1443,23 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // "no rate can be derived", and the report should say which.
       const defenceGated = !!s?.script
         && /GameBeat\.AttackBlock|onReceiveDamage|onReceiveHit/.test(String(s.script));
+      // ...and a defensive payload is the same sentence again. A shield that
+      // absorbs damage nothing deals is worth zero for the same reason a block
+      // proc is, and "its payload is a status that declares nothing readable"
+      // was simply wrong about it: Halos_Demon_Passive's absorb is 0.7 x
+      // Intellect, right there on the status's Refresh step.
+      const shieldOnly = !defenceGated && st.all.length > 0 && !st.dots.length
+        && st.all.some((id2) => {
+          const p2 = combat.profile(id2, rank, runes);
+          return !!p2?.effects.some((e) => e.kind === 'Shield' && (e.baseVal || e.scaling.length));
+        })
+        && !st.all.some((id2) => {
+          const p2 = combat.profile(id2, rank, runes);
+          return !!p2?.effects.some((e) => e.kind === 'Damage' && (e.baseVal || e.scaling.length));
+        });
       const kind = st.unreadable.length ? 'script magnitude'
         : (prof.costs.length || feedsResource || runeFeedsResource) ? 'resource'
+          : shieldOnly ? 'foe is passive'
           : defenceGated ? 'foe is passive'
             : noTick.length ? 'no rate'
             : isUtility ? 'utility'
@@ -1450,6 +1494,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         why = 'it fires when you block or when you are hit, and the simulated foe never attacks - '
           + 'real in game, correctly worth zero here, and the zero is a statement about the fight '
           + 'model rather than about the data';
+      } else if (shieldOnly) {
+        why = `its whole payload is an absorb shield (${st.all.join(', ')}), and a shield is worth `
+          + 'exactly zero against a foe that never attacks - the magnitude IS in the data, so this '
+          + 'is the fight model refusing it rather than the reader failing to find it';
       } else if (noTick.length) {
         why = `applies ${noTick.map((x) => x.name).join(', ')}, which statusType flags as a `
           + `${noTick[0].types.join('/')} - so it ticks - but no step on it carries a loop.tick, `
@@ -1524,6 +1572,23 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       //
       // Only where the rule is one the fight raises. A talent is not cast, so a
       // roll with no event named has no rate and stays unscored.
+      // A talent that GRANTS A SKILL carries its payload one row over, in
+      // `props.subskills` - the same column the weapon follow-ups use, and the
+      // same one `bench talents` already follows to print "grants a skill".
+      // This pass did not, so `bench optimize` filed two Mage conduit talents
+      // under "no effect, no affix and no status anywhere in the row" while
+      // `bench talents` printed a damage effect for them on the same build.
+      // Two readers of the same data disagreeing in one tool is worse than
+      // either answer.
+      for (const x of skills.get(id)?.props?.subskills ?? []) {
+        if (!x.skill) continue;
+        pushTriggered(x.skill, 'talent', { grantedBy: id });
+        // The NODE is not the gap; the row it grants is, and that row now says
+        // so under its own name. Printing both makes one talent appear twice
+        // under two different causes, one of which ("declares nothing") is
+        // false of a node whose whole job is to grant something.
+        accountedLate.add(id);
+      }
       // A talent's damage step is very often an `on: Code` one - the node has no
       // cast, so a step it plays HAS to come from its script - and `profileOf`
       // parks those for the rider pass below with the guard already read.
@@ -1546,6 +1611,13 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const accounted = new Set([
       ...triggered.flatMap((t) => t.rule.accountsFor ?? []),
       ...gains.filter((g) => tracked.has(g.atb)).map((g) => g.from),
+      // `Mage_SparkMaster` is the Spark SPEND hook, and the model spends Spark:
+      // getSparkCost@7986 is read, the costs are attached to every weapon skill
+      // above, and the fight gates casts on the pool. Listing the mechanism as
+      // a skill nobody modelled, while the model is visibly using it, is the
+      // output contradicting itself - the same rule that already accounts for
+      // Priest_Rosary and Warrior_Rage.
+      ...(tracked.has('Spark') ? ['Mage_SparkMaster'] : []),
     ]);
 
     // A status whose applier has no cast rate and whose script guard names an

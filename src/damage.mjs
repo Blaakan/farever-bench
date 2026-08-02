@@ -62,11 +62,19 @@ export function buildCombat(cdb, ctx, assume = {}) {
   const stepTypeNames = cdb.enumValues('skill@steps', 'type');
   const stepOnNames = cdb.enumValues('skill@steps', 'on');
   const PROJECTILE_HIT = stepOnNames.indexOf('ProjectileHit');
-  // Which step types hit everything in a shape rather than one target. `Mono`
-  // steps carry a `props.area` too and it is NOT settled whether they cleave -
-  // structurally identical rows have descriptions saying "nearby enemies" and
-  // "an enemy" - so Mono is treated as single-target and the ambiguity is in
-  // the audit rather than silently resolved in the favourable direction.
+  // Which step types hit everything in a shape rather than one target.
+  //
+  // A `Mono` step carrying a props.area does NOT cleave, and that is settled
+  // rather than assumed: AreaStep.areaHit@5972 pins hitCount to 1 for Mono, the
+  // priority hit decrements it, and the function returns at L1893 before the
+  // shape query runs. With no priority target the sweep runs and is then
+  // trimmed to the single nearest object (L1970-1974). Mono IS an AreaStep at
+  // runtime - isAreaStep@5961 is true for type 0 - so the cone is real; it
+  // decides WHICH enemy, never how many. See the audit for the full read.
+  //
+  // The step-level `props.hitCount` is the one override, and all six of its
+  // occurrences in the sheet hold 1. The tripwire below exists so that a patch
+  // authoring anything else stops being silently single-target.
   const AREA_STEP_TYPES = new Set(['Area', 'Aura']);
 
   // `skill@props@enableCond.flags` - when the skill may be used at all.
@@ -484,7 +492,14 @@ export function buildCombat(cdb, ctx, assume = {}) {
       const stepType = stepTypeNames[st.type ?? -1] ?? null;
       const hits = hitsOf(s, st, stepType, ownDuration, stepLives);
       const area = st.props?.area;
-      const isArea = AREA_STEP_TYPES.has(stepType);
+      // The tripwire. `props.hitCount` is read AFTER the Mono default inside
+      // areaHit, so it WINS - and it is a countdown that the priority hit
+      // decrements, so `hitCount: N` means N hits in total, not N extra. On
+      // this build the disjunct matches nothing (all six authored values are
+      // 1), so every number is byte-identical; on a patch that authors a real
+      // one, the model starts cleaving instead of quietly under-reporting.
+      const isArea = AREA_STEP_TYPES.has(stepType)
+        || (stepType === 'Mono' && st.props?.hitCount != null && st.props.hitCount !== 1);
       const shape = area?.shape ? cdb.custom('AreaShape', area.shape) : null;
 
       if (st.props?.status?.ref) statusRefs.push({ ref: st.props.status.ref, on: stepOnNames[st.on ?? -1] ?? null, target: st.props.status.target ?? null });
@@ -530,6 +545,14 @@ export function buildCombat(cdb, ctx, assume = {}) {
             range: skillVal(st.range, s, 0),
             targetRange: area?.rangeScale?.targetRange ?? null,
             maxTargets: st.props?.hitCount ?? null,
+            // The SECOND cap, which nothing read. `applyHitStrategy@5973`
+            // (SkillStep.hx:1999-2008) keeps `ceil(len x clamp(p, 0, 1))` of
+            // the entities the sweep found, chosen at random. One authored row
+            // exists - SuperEliteDemon_Bomb, Proportion(0.3) - so no player
+            // number moves; it belongs beside maxTargets because it is the same
+            // kind of cap and the next patch may put one on a player skill.
+            hitStrategy: area?.hitStrategy
+              ? cdb.custom('AreaHitStrategy', area.hitStrategy) : null,
             // A splash that explicitly skips the enemy you hit. At one target
             // it lands on nobody, and crediting it a full hit was worth a fifth
             // of `Mace_Benediction_Combo`'s damage against a lone boss.
@@ -912,9 +935,16 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // Only an Area or Aura step reaches the crowd, and `props.hitCount` is a
       // target cap when the row sets one. `ignoreMainTarget` takes the enemy
       // you hit out of the count, so at one target such a step lands on nobody.
-      const targets = e.area
-        ? Math.max(0, Math.min(wantTargets, e.area.maxTargets ?? Infinity) - (e.area.ignoreMainTarget ? 1 : 0))
-        : 1;
+      // The caps compose in the game's own order: the shape's own hitCount
+      // first, then the proportion strategy over what the sweep kept, then the
+      // main target is taken out of the count.
+      let targets = 1;
+      if (e.area) {
+        let n = Math.min(wantTargets, e.area.maxTargets ?? Infinity);
+        const p = e.area.hitStrategy?.case === 'Proportion' ? e.area.hitStrategy.args.prop : null;
+        if (p != null) n = Math.ceil(n * Math.min(1, Math.max(0, p)));
+        targets = Math.max(0, n - (e.area.ignoreMainTarget ? 1 : 0));
+      }
       if (!targets && e.kind === 'Damage') continue;
       if (e.kind === 'Damage') {
         const aff = affinityOf(e.affinity);
@@ -1119,7 +1149,22 @@ export function buildCombat(cdb, ctx, assume = {}) {
       const whole = cast(d.prof, state);
       const ticks = Number.isFinite(d.duration) && d.tick > 0
         ? Math.max(1, Math.floor(d.duration / d.tick + 1e-9)) : 1;
-      return { damage: whole.damage / ticks, heal: whole.heal / ticks };
+      // A talent scoped to a status TYPE reaches an authored dot too, not only
+      // a pool one. `Bloodletting` is +10% on anything ticking and
+      // `Lethal Dose` +10%/+20% on anything typed Poison; both were computed,
+      // matched against the pool dots, and then never offered to the dots the
+      // fight actually schedules. The match walks the statusType parent chain,
+      // so a Bleed guard covers a Hemorage dot and not the other way round.
+      let m = 1, critCh = 0;
+      for (const mod of dotScoped) {
+        if (!coveredBy(mod.statusType, d.types)) continue;
+        if (mod.field === 'dmgMult') m += mod.amount;
+        else if (mod.field === 'critChance') critCh += mod.amount;
+      }
+      // A tick cannot crit on its own (initVars@5150 zeroes it); a talent that
+      // gives it one is a script hook, and this is where it lands.
+      if (critCh > 0) m *= 1 + critCh * ((sheet.get('CritDamage') ?? 100) / 100 - 1);
+      return { damage: (whole.damage / ticks) * m, heal: whole.heal / ticks };
     };
     // The pools this fight tracks, with their caps off the sheet. A resource is
     // only tracked when something in the build declares income for it that the
@@ -1198,6 +1243,9 @@ export function buildCombat(cdb, ctx, assume = {}) {
       return false;
     });
     const bleedScoped = live?.mods?.bleedScoped ?? null;
+    // The same list, seen from the authored-dot side. `dotOutput` reads it (it
+    // is a closure and `simulate` runs after every const here is bound).
+    const dotScoped = bleedScoped ?? [];
     const poolScale = new Map();
     if (bleedScoped) {
       for (const d of rotation.dots ?? []) {
