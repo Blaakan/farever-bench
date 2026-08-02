@@ -3184,6 +3184,30 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- a rank override restates vars, not only props ---------------------------
+// `updateSkillInf@20788` (HSkill.hx:368-373) calls BOTH applyProps and
+// applyVars for every override the rank clears. The model merged props alone,
+// so Domination read its rank-1 0.15 where the game hands it 0.25 from rank 2 -
+// and bench's default rank is the max, where the override is always in scope.
+group('a rank override restates vars too');
+{
+  const eng = createEngine({ quiet: true });
+  const varsAt = (id, rank) => eng.combat.profile(id, rank)?.vars ?? {};
+  near("Domination's rider is the authored 0.15 at rank 1", varsAt('GA_Craft_Passive', 1).var1, 0.15, 1e-9);
+  near('...and the overridden 0.25 from rank 2', varsAt('GA_Craft_Passive', 2).var1, 0.25, 1e-9);
+  near('...and stays there at rank 3', varsAt('GA_Craft_Passive', 3).var1, 0.25, 1e-9);
+  // A row whose override touches ONE field leaves its siblings alone.
+  const bt = varsAt('Axe_Boomerang_Skill1', 3);
+  ok('an override replaces only the fields it names',
+    bt.var3 === 3 && bt.var1 === 0.4 && bt.var2 === 0.2, JSON.stringify(bt));
+
+  // The census, so a patch that adds override vars to a row the model reads is
+  // noticed rather than absorbed silently.
+  const rows = eng.cdb.lines('skill')
+    .filter((s) => (s.props?.rankOverride ?? []).some((o) => o.vars && Object.keys(o.vars).length));
+  ok('98 rows in the game restate vars by rank', rows.length === 98, String(rows.length));
+}
+
 // --- a skill's own affix is owed for owning the skill ------------------------
 // `BaseSkill.permaAffixes@6081` is false for exactly two natures, Status and
 // Passive, and `initData@6029` hands everything else's affix rows to

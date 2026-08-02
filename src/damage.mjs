@@ -417,9 +417,23 @@ export function buildCombat(cdb, ctx, assume = {}) {
     // `props.rankOverride` restates props at a given weapon-skill rank, and
     // cooldown is the one that matters: GA_Craft_Skill1 drops from 16s to 12s at
     // rank 2. Applying the highest matching override keeps `--rank` honest.
+    //
+    // It restates VARS as well, and that half was missing. `updateSkillInf@20788`
+    // (HSkill.hx:368-373) loops the overrides and, for every one whose minRank
+    // the rank clears, calls BOTH `applyProps(r.props)` at ops 54-56 AND
+    // `applyVars(r.vars)` at ops 57-59; `applyVars@20790` Reflect-sets each
+    // field onto the accumulated vars, so a later override wins. 98 rows carry
+    // override vars, and Domination is the one that shows the cost: GA_Craft_
+    // _Passive is `var1: 0.15` with `rankOverride [{minRank: 2, vars: {var1:
+    // 0.25}}]`, so every read of it below rank 2 understates the rider by 1.67x
+    // - and `bench`'s default rank is weaponSkillMaxRank, where the override is
+    // always in scope.
     let props = s.props ?? {};
+    let vars = s.vars ?? {};
     for (const ov of (s.props?.rankOverride ?? []).slice().sort((a, b) => (a.minRank ?? 0) - (b.minRank ?? 0))) {
-      if ((ov.minRank ?? 0) <= rank) props = { ...props, ...(ov.props ?? {}) };
+      if ((ov.minRank ?? 0) > rank) continue;
+      props = { ...props, ...(ov.props ?? {}) };
+      vars = { ...vars, ...(ov.vars ?? {}) };
     }
     // A slotted rune's props win over the skill's own.
     const slotted = [];
@@ -628,6 +642,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // zeroes ctx.critChance) and no attacker fervor/mastery bracket (the
       // tick's SkillContext belongs to the carrier). See castOutput.
       isStatusTick: !!s.props?.status,
+      // The row's vars WITH every rankOverride the build's rank clears already
+      // folded in, so a reader never has to remember to do it. `s.vars` is the
+      // unresolved row and is the wrong thing to read at a rank.
+      vars,
       effects,
       affixes,
       // A skill with no cooldown but a resource cost is gated by income, not by
