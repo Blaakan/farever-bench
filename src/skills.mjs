@@ -1180,6 +1180,19 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           });
           return;
         }
+        // A trigger that only fires when you BLOCK or when you are HIT never
+        // fires here - the simulated foe does not attack - and that is a
+        // statement about the fight model, not about the data.
+        const defGated = !!skills.get(id)?.script
+          && /GameBeat\.AttackBlock|onReceiveDamage|onReceiveHit/.test(String(skills.get(id).script));
+        if (defGated) {
+          unmodelled.push({
+            id, name: prof.name, source, kind: 'foe is passive',
+            why: 'it fires when you block or when you are hit, and the simulated foe never attacks - '
+              + 'real in game, correctly worth zero here',
+          });
+          return;
+        }
         unmodelled.push({
           id, name: prof.name, source, kind: 'no rate',
           why: extra.parent
@@ -1301,9 +1314,18 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // ...and one it types as crowd control is not a gap at all. It is the
       // right answer for a fight whose foe does not act.
       const ccOnly = (st.flaggedCC ?? []).length > 0 && !st.self.length && !st.dots.length;
+      // A skill that fires when you BLOCK or when you are HIT is the same
+      // case from the other side: the simulated foe never attacks, so the
+      // event never happens. Magma Mia's flame cloak and Infused Tusk's
+      // emergency shield are real in game and rightly worth zero here - but
+      // "worth zero because the foe is passive" is a different sentence from
+      // "no rate can be derived", and the report should say which.
+      const defenceGated = !!s?.script
+        && /GameBeat\.AttackBlock|onReceiveDamage|onReceiveHit/.test(String(s.script));
       const kind = st.unreadable.length ? 'script magnitude'
         : (prof.costs.length || feedsResource || runeFeedsResource) ? 'resource'
-          : noTick.length ? 'no rate'
+          : defenceGated ? 'foe is passive'
+            : noTick.length ? 'no rate'
             : isUtility ? 'utility'
               : runeDesc ? 'rune'
                 : ccOnly ? 'crowd control'
@@ -1332,6 +1354,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           + (runePromises.length > 1 ? ` (and ${runePromises.length - 1} more like it)` : '');
       } else if (st.unreadable.length) {
         why = st.unreadable[0].why;
+      } else if (defenceGated) {
+        why = 'it fires when you block or when you are hit, and the simulated foe never attacks - '
+          + 'real in game, correctly worth zero here, and the zero is a statement about the fight '
+          + 'model rather than about the data';
       } else if (noTick.length) {
         why = `applies ${noTick.map((x) => x.name).join(', ')}, which statusType flags as a `
           + `${noTick[0].types.join('/')} - so it ticks - but no step on it carries a loop.tick, `
@@ -1473,12 +1499,20 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const liveDots = [];
     for (const d of byStatus.values()) {
       if (canFire(d)) { liveDots.push(d); continue; }
+      // Same split as the trigger path: an applier that fires on a block or
+      // on being hit is dead because the foe is passive, not because the
+      // data withheld a rate.
+      const applierScript = skills.get(d.from)?.script;
+      const defGated = !!applierScript
+        && /GameBeat\.AttackBlock|onReceiveDamage|onReceiveHit/.test(String(applierScript));
       unmodelled.push({
         id: d.status,
         name: d.name,
         source: d.source,
-        kind: 'no rate',
-        why: `${d.fromName} applies it, but nothing gives ${d.from} a rate this model can price`,
+        kind: defGated ? 'foe is passive' : 'no rate',
+        why: defGated
+          ? `${d.fromName} applies it on a block or on being hit, and the simulated foe never attacks`
+          : `${d.fromName} applies it, but nothing gives ${d.from} a rate this model can price`,
       });
     }
 
@@ -1568,6 +1602,30 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         };
       }
       return null;
+    }
+
+    // "The first <event> after each cooldown" - Dominion's shape. The script
+    // holds a status up while off cooldown, spends it on the event, and calls
+    // consumeCooldown(); the rate is therefore one fire per max(cooldown,
+    // event interval), which the fight produces exactly once it carries the
+    // gate. Only the certain form is claimed - a chance roll on top of a
+    // cooldown gate composes two rates this reader has not verified together.
+    if (s?.script && (prof.cooldown > 0)
+      && /consumeCooldown\s*\(/.test(String(s.script))
+      && !/checkProba/.test(String(s.script))) {
+      const body = liveScript(s.script);
+      const at = body.search(/consumeCooldown\s*\(/);
+      const scope = enclosingBlock(body.slice(0, Math.max(0, at)));
+      const ev = eventsOf(scope);
+      // Only events the trigger machinery rides: a combo or a swing. A
+      // weapon-skill-gated one would silently fire off the wrong event.
+      if (ev.has('combo') || ev.has('attack')) {
+        return {
+          kind: ev.has('combo') ? 'per-combo' : 'per-attack',
+          chance: 1, divisor: 1, cooldownGate: prof.cooldown,
+          why: `its script fires on the first ${[...ev].join('/')} each ${prof.cooldown}s (consumeCooldown)`,
+        };
+      }
     }
 
     // `vars.chance` is the proc rate the data ships. WHAT it rolls against is

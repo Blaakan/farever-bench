@@ -293,6 +293,7 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = 
       ['gated off', 'its script gates it on a rank or a talent this build does not have'],
       ['chain', 'the weapon\'s base-attack chain is shorter than its moveSet declares'],
       ['crowd control', 'a stun, root or slow - worth nothing while the simulated foe does not act'],
+      ['foe is passive', 'it fires on a block or on being hit, and the simulated foe never attacks'],
       ['status', 'its payload is a status that declares nothing readable'],
       ['debuff', 'it only debuffs the target, and nothing it debuffs changes damage'],
       ['script magnitude', 'the amount is computed by a script from the hit that applied it'],

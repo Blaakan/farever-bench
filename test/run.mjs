@@ -2057,6 +2057,39 @@ group('the idle wake');
     `${total.toFixed(0)} damage = ${(total / 100).toFixed(1)} casts`);
 }
 
+// --- a cooldown-gated proc -------------------------------------------------
+// Dominion's passive fires its bonus hit on the FIRST combo finisher each
+// cooldown - `consumeCooldown()` in the script, `props.cooldown` 15 on the
+// row - which is also the shape of the weapon-upgrade star procs. The gate
+// rides the trigger machinery: between fires, events pass through untouched.
+group('a cooldown-gated proc');
+{
+  const eng = createEngine({ quiet: true });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3 };
+  l.gear.Slot_OffhandWeapon = { item: 'Shield_Craft', rarity: 'Rare', stars: 3 };
+  eng.plan.pruneSelection(l);
+  const rot = eng.plan.resolve(l, 3);
+  const t = rot.triggered.find((x) => x.prof.id === 'Shield_Craft_Passive');
+  ok('Dominion\'s passive is a triggered skill now', !!t);
+  ok('...gated by its own cooldown', t?.rule.cooldownGate === 15, String(t?.rule.cooldownGate));
+  ok('...riding the combo finisher', t?.rule.kind === 'per-combo', t?.rule.kind);
+  const ev = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const line = ev.throughput.lines.find((x) => x.id === 'Shield_Craft_Passive');
+  ok('...and it fires in the fight, no faster than the gate', !!line && line.interval >= 15,
+    line ? `every ${line.interval.toFixed(1)}s` : 'no line');
+
+  // Block-gated skills are the same refusal as crowd control, said plainly.
+  const l2 = emptyLoadout(eng.cat, 'Warrior', 25);
+  l2.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3 };
+  l2.gear.Slot_OffhandWeapon = { item: 'Shield_Firebreath', rarity: 'Rare', stars: 3 };
+  eng.plan.pruneSelection(l2);
+  const ev2 = eng.evaluate(l2, { target: eng.combat.foe('boss', 25), rank: 3 });
+  ok('a block-fed passive is refused as "foe is passive", not "no rate"',
+    ev2.throughput.unmodelled.some((u) => u.id === 'Shield_Firebreath_Passive' && u.kind === 'foe is passive'),
+    JSON.stringify(ev2.throughput.unmodelled.filter((u) => /Firebreath/.test(u.id)).map((u) => u.kind)));
+}
+
 // --- a guarded self-buff is refused ----------------------------------------
 // Ram Veil's +5 CritChance / +5 Fervor lands only when a max-stacked
 // Benediction is CONSUMED - `hasStatusMaxStacked` in as many words - and the

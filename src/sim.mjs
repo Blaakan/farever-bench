@@ -332,6 +332,10 @@ function runFight(spec) {
           : tr.rule.kind === 'per-dot-tick' ? 'dot-tick' : 'attack',
       parent: tr.rule.parent ?? null,
       chance: (tr.rule.chance ?? 1) / Math.max(1, tr.rule.divisor ?? 1),
+      // "The first <event> after each cooldown" - Dominion fires its bonus hit
+      // on the first combo finisher every 20s. The gate is the authored
+      // cooldown; between fires the events pass through untouched.
+      gate: tr.rule.cooldownGate ?? 0, nextReady: 0,
       fires: 0, damage: 0, heal: 0, shield: 0,
     });
   }
@@ -493,7 +497,7 @@ function runFight(spec) {
   function runOne(rand) {
     for (const a of actives) { a.casts = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
-    for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; }
+    for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; g.nextReady = 0; }
     for (const p of poolDots) {
       p.fed = 0; p.damage = 0; p.heal = 0; p.ticks = 0; p.expires = -1; p.nextTick = 0;
       p.owed = 0; p.paid = 0; p.perTick = 0;
@@ -701,6 +705,10 @@ function runFight(spec) {
           : g.on === 'parent' ? (wasCast && g.parent === skillId)
             : g.on === 'attack' ? attack : combo;
         if (!fires) continue;
+        if (g.gate > 0) {
+          if (at < g.nextReady) continue;
+          g.nextReady = at + g.gate;
+        }
         const share = rand ? (rand() < g.chance ? 1 : 0) : g.chance;
         if (!share) continue;
         const out = cast(g.prof, now);
