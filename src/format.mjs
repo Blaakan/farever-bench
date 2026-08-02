@@ -192,12 +192,28 @@ export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {
         // affix, no effect and no status - so the objective cannot tell one
         // from another and the socket stayed empty until the search learnt to
         // prefer any sigil over none. Say which of those two this is.
+        // ...and say WHICH talent, and the per-variant truth. The Warrior's
+        // three variants are not one case: Infused Wound is fully readable
+        // (35% of magic crits as a bleed - worth zero on an all-physical
+        // build, which the score already said by tying), Surge of Violence is
+        // a next-cast register the fight does not carry, and Second Wind is
+        // not a tree node at all.
         const tree = engine.talents.treeFor(loadout.class);
         const granted = (aug.skills ?? []).filter((sk) => tree.byId.has(sk));
-        const readable = granted.filter((sk) => engine.talents.readableValue(sk, 1).readable);
-        effect = readable.length
-          ? dim('grants ' + readable.map((sk) => tree.byId.get(sk).name).join(', '))
-          : warn('a free tier-4 talent this model cannot score - taken because free beats empty');
+        const nonTree = (aug.skills ?? []).filter((sk) => !tree.byId.has(sk));
+        if (granted.length) {
+          effect = granted.map((sk) => {
+            const rv = engine.talents.readableValue(sk, 1);
+            const name = tree.byId.get(sk).name;
+            return rv.readable
+              ? dim(`grants ${name} - ${rv.kind}`)
+              : warn(`grants ${name} - nothing this model can read; taken because free beats empty`);
+          }).join(', ');
+        } else if (nonTree.length) {
+          effect = dim(`grants ${nonTree.join(', ')} - a skill, not a tree node`);
+        } else {
+          effect = warn('a free tier-4 talent this model cannot score - taken because free beats empty');
+        }
       }
     } else {
       // An empty socket has two very different meanings, and conflating them is
