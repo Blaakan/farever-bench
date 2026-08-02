@@ -96,7 +96,7 @@ export function simulate(spec) {
 
 function runFight(spec) {
   const {
-    rotation, cast, dotOutput, cdr = 1, cdrWeaponSkill = null, fight = 200, fights = 1,
+    rotation, cast, dotOutput, rollCrit = null, cdr = 1, cdrWeaponSkill = null, fight = 200, fights = 1,
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
     poolScale = null, poolFactor = null, goal = null, chainResets = true,
@@ -504,6 +504,17 @@ function runFight(spec) {
   }
 
   function runOne(rand) {
+    // Crit is a die like any other, and until this it was the one die the
+    // repeated fight did not throw: procs rolled, the ±10% swing band rolled,
+    // and crit stayed at its expectation - so a build whose entire damage
+    // profile is "did the crit land" reported a spread of essentially zero.
+    // `rollCrit` re-rolls one cast's crits without disturbing its mean, so the
+    // deterministic answer is untouched and only the SPREAD changes.
+    //
+    // The pricing cache in damage.mjs is keyed on state, so the roll has to
+    // happen here rather than inside `cast` - a cached roll is the same roll
+    // every time, which is how a die stops being one.
+    const hit = rand && rollCrit ? (prof, st) => rollCrit(cast(prof, st), rand) : cast;
     for (const a of actives) { a.casts = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
     for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; g.nextReady = 0; }
@@ -627,7 +638,7 @@ function runFight(spec) {
         if (g.on !== 'dot-tick') continue;
         const share = rand ? (rand() < g.chance ? 1 : 0) : g.chance;
         if (!share) continue;
-        const out = cast(g.prof, now);
+        const out = hit(g.prof, now);
         g.fires += share;
         g.damage += out.damage * share;
         g.heal += out.heal * share;
@@ -745,7 +756,7 @@ function runFight(spec) {
         }
         const share = rand ? (rand() < g.chance ? 1 : 0) : g.chance;
         if (!share) continue;
-        const out = cast(g.prof, now);
+        const out = hit(g.prof, now);
         g.fires += share;
         g.damage += out.damage * share;
         g.heal += out.heal * share;
@@ -826,7 +837,7 @@ function runFight(spec) {
         // Pay BEFORE the cast pays you, so a skill can never fund itself out of
         // its own gain in the same instant.
         pay(a.prof);
-        const out = cast(a.prof, now);
+        const out = hit(a.prof, now);
         a.casts++;
         a.damage += out.damage;
         a.heal += out.heal;
@@ -887,7 +898,7 @@ function runFight(spec) {
       }
       chainIndex++;
       if (link.prof.isCombo) combos++; else swings++;
-      const swingOut = cast(link.prof, now);
+      const swingOut = hit(link.prof, now);
       // WeaponAttack_RandomRange: observed in play as a symmetric ~±10% on
       // WeaponPower-scaled swings (19-24, 78-95 around their means) - and as
       // NOTHING on the Strength-scaled combo finisher, which read a constant

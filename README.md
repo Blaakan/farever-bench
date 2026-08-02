@@ -251,7 +251,8 @@ is worth the same whether you burst inside it or outside it.
 
 ```bash
 --fight 200      # how long the fight is (default 200s, what a meter reports)
---fights 50      # roll the procs for real and report the mean and the spread
+--fights 50      # roll the procs, the swing band and the crit for real, and
+                 # report the mean and the spread
 --targets 3      # how many enemies stand in an area effect (default 1)
 --lookahead 8    # seconds of rollout when choosing a cast; 0 for a plain
                  # first-available priority list

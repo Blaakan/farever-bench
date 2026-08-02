@@ -2630,6 +2630,61 @@ group('a buff window prices only itself');
     `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s + a chain restart every 50s of a 200s fight`);
 }
 
+// --- crit is a die, and --fights throws it ----------------------------------
+// Procs rolled and the ±10% swing band rolled, but crit stayed at its
+// expectation - so a crit-bleed build, whose entire damage profile is "did the
+// crit land", reported a spread of essentially zero. That read as a claim about
+// the build and was a fact about the model.
+group('rolling the crit');
+{
+  const eng = createEngine({ quiet: true, fight: { seconds: 200, targets: 1 } });
+  const target = eng.combat.foe('boss', 25);
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.profile = 'crit';
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+
+  const ev = eng.evaluate(l, { target, rank: 3 });
+  const sheet = ev.sheet;
+  // The decomposition is an identity, not an approximation: the expected value
+  // of `fixed + base x (1 + (k/n)(cd-1))` over a binomial(n, p) is exactly the
+  // deterministic `damage`. If it is not, --fights moves the answer instead of
+  // measuring its spread.
+  let checked = 0;
+  for (const line of ev.rotation.active) {
+    const out = eng.combat.castOutput(line.prof, sheet, target, { ...eng.opts, targets: 1 });
+    const c = out.critRoll;
+    if (!c || !(c.hits > 0)) continue;
+    near(`${line.prof.id}: fixed + base x (1+p(cd-1)) is the deterministic damage`,
+      c.fixed + c.base * (1 + c.p * (c.cd - 1)), out.damage, Math.max(1e-6, out.damage * 1e-9));
+    ok(`${line.prof.id}: the roll count is at least one hit`, c.hits >= 1, String(c.hits));
+    checked++;
+  }
+  ok('at least one cast decomposes', checked > 0, String(checked));
+
+  // A status tick cannot crit (initVars@5150 zeroes ctx.critChance), so it must
+  // contribute to `fixed` and never to `base` - rolling a die for it would
+  // invent variance the game does not have.
+  const tickProf = (eng.rotation ?? ev.rotation).dots?.find((d) => d.prof && !d.pool)?.prof;
+  if (tickProf) {
+    const out = eng.combat.castOutput({ ...tickProf, isStatusTick: true }, sheet, target,
+      { ...eng.opts, targets: 1 });
+    ok('a status tick has nothing for the die to touch',
+      !out.critRoll || out.critRoll.hits === 0 || out.critRoll.base === 0,
+      JSON.stringify(out.critRoll));
+  }
+
+  // And the fight itself: rolling has to produce a spread where the build has
+  // crit, while leaving the deterministic answer exactly where it was.
+  const det = eng.evaluate(l, { target, rank: 3 }).throughput;
+  const rolledEng = createEngine({ quiet: true, fight: { seconds: 200, targets: 1, count: 60 } });
+  const rolled = rolledEng.evaluate(l, { target, rank: 3 }).throughput;
+  ok('a crit-stacked build now reports a real spread',
+    rolled.dpsSd / rolled.dps > 0.002, `${(100 * rolled.dpsSd / rolled.dps).toFixed(2)}%`);
+  ok('...and the mean is still the deterministic answer',
+    Math.abs(rolled.dps / det.dps - 1) < 0.03,
+    `${rolled.dps.toFixed(2)} rolled vs ${det.dps.toFixed(2)} deterministic`);
+}
+
 // --- the rotation search ----------------------------------------------------
 // What is searched is a POLICY, not a sequence: an ordered list of
 // (skill, condition) that a player could follow, and that transfers across

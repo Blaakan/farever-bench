@@ -835,6 +835,21 @@ export function buildCombat(cdb, ctx, assume = {}) {
     let singleTargetDamage = 0;
     let critPhysical = 0, critMagic = 0;
     let totalPhysical = 0, totalMagic = 0;
+    // The crit decomposition, so a rolled fight can roll the crit instead of
+    // taking its mean. `damage` above stays the EXPECTED value, which is what
+    // every deterministic path reads; this is the extra information a die needs.
+    //
+    // Everything on this cast shares one crit chance and one crit multiplier -
+    // the category bonuses are keyed on `prof`, not on the effect - so the whole
+    // cast decomposes as `fixed + base x (1 + p(cd-1))`, and rolling k crits out
+    // of n independent hits gives `fixed + base x (1 + (k/n)(cd-1))`. The mean of
+    // that over the binomial is exactly `damage`, which is the property that
+    // lets --fights report a spread without moving the answer.
+    const critRoll = {
+      p: 0, cd: 1, hits: 0,
+      base: 0, basePhysical: 0, baseMagic: 0,
+      fixed: 0, fixedPhysical: 0, fixedMagic: 0,
+    };
     // What this cast puts into a resource pool. `Mage_RayOfSpark` returns
     // 0.18 * MaxSpark, so the amount needs the sheet exactly the way damage
     // does - which is why it is computed here rather than at plan time.
@@ -905,6 +920,29 @@ export function buildCombat(cdb, ctx, assume = {}) {
         }
         damage += raw * m * targets;
         singleTargetDamage += raw * m;
+        // Split this effect into the part a die can move and the part it
+        // cannot. `localCrit` is 1 for a status tick, which is exactly the
+        // "cannot" case, so the test is the multiplier itself.
+        {
+          const whole = raw * m * targets;
+          const base = localCrit > 0 ? whole / localCrit : whole;
+          if (localCrit > 1) {
+            critRoll.p = Math.min(1, critChance + chanceBonus);
+            critRoll.cd = (sheet.get('CritDamage') ?? 100) / 100 + critBonus;
+            critRoll.hits += e.hits ?? 1;
+            critRoll.base += base;
+            if (dmgMod > 0) {
+              if (aff.root === 'Physical') critRoll.basePhysical += base / dmgMod;
+              else if (aff.root === 'Magic') critRoll.baseMagic += base / dmgMod;
+            }
+          } else {
+            critRoll.fixed += whole;
+            if (dmgMod > 0) {
+              if (aff.root === 'Physical') critRoll.fixedPhysical += whole / dmgMod;
+              else if (aff.root === 'Magic') critRoll.fixedMagic += whole / dmgMod;
+            }
+          }
+        }
         // How much of that landed at all and how much as a CRITICAL strike, by
         // affinity. A pool dot is a share of the damage that triggered it -
         // Hemorrhage's trigger is a crit, so it needs the crit slice, while
@@ -939,7 +977,48 @@ export function buildCombat(cdb, ctx, assume = {}) {
         shield += raw * shieldMod;
       }
     }
-    return { damage, heal, shield, singleTargetDamage, gains, critPhysical, critMagic, totalPhysical, totalMagic };
+    return {
+      damage, heal, shield, singleTargetDamage, gains,
+      critPhysical, critMagic, totalPhysical, totalMagic,
+      critRoll: critRoll.hits > 0 ? critRoll : null,
+    };
+  }
+
+  /**
+   * The same cast with its crits ROLLED rather than averaged.
+   *
+   * `--fights N` exists to say how much of a build's damage is luck, and until
+   * now the only die in the fight was the ±10% on a plain swing: crit stayed at
+   * its expectation, so a crit-bleed build - the one whose whole damage profile
+   * is "did the crit land" - reported a spread of almost exactly zero. That read
+   * as a claim about the build and was a fact about the model.
+   *
+   * One roll per hit, at the cast's own crit chance. The mean over the binomial
+   * is the deterministic value, so nothing about the default answer moves.
+   */
+  function rollCrit(out, rand) {
+    const c = out.critRoll;
+    if (!c || !(c.hits > 0) || !(c.cd > 1) || !(c.p > 0)) return out;
+    let k = 0;
+    for (let i = 0; i < c.hits; i++) if (rand() < c.p) k++;
+    const share = k / c.hits;
+    const mult = 1 + share * (c.cd - 1);
+    const damage = c.fixed + c.base * mult;
+    // What fed a pool has to follow the same die. Hemorrhage takes 35% of every
+    // physical CRITICAL strike, so a fight that rolled no crit this swing must
+    // feed it nothing - averaging the feed while rolling the damage would put
+    // the spread back where it was.
+    const critPhysical = c.basePhysical * share * c.cd;
+    const critMagic = c.baseMagic * share * c.cd;
+    return {
+      ...out,
+      damage,
+      singleTargetDamage: out.damage > 0 ? out.singleTargetDamage * (damage / out.damage) : out.singleTargetDamage,
+      critPhysical,
+      critMagic,
+      totalPhysical: c.fixedPhysical + c.basePhysical * mult,
+      totalMagic: c.fixedMagic + c.baseMagic * mult,
+    };
   }
 
   // --- throughput ----------------------------------------------------------
@@ -1095,7 +1174,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
     }
 
     return simulate({
-      rotation, cast, dotOutput, cdr, cdrWeaponSkill, resources, poolMultiplier,
+      rotation, cast, dotOutput, rollCrit, cdr, cdrWeaponSkill, resources, poolMultiplier,
       poolScale: bleedScoped ? poolScale : null,
       poolFactor,
       goal: live?.goal ?? null,
@@ -1318,6 +1397,17 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'skills and status ticks all roll nothing, which is why the finisher read a constant 133 in ' +
            'game - and the band covers flat plus attribute (getStepEffectItemScaling@20775 adds the ' +
            'scaling first, then rolls). Deterministic mode keeps the mean; --fights N rolls the swings.' },
+    { severity: 'verified', what: '--fights rolls the crit too, one die per hit, without moving the mean',
+      why: 'Crit used to stay at its expectation while everything else rolled, so a crit-bleed build - the ' +
+           'one whose whole damage profile is "did the crit land" - reported a spread of essentially zero, ' +
+           'which read as a claim about the build and was a fact about the model. A cast decomposes as ' +
+           '`fixed + base x (1 + p(cd-1))` because its crit chance and crit multiplier are properties of the ' +
+           'SKILL, not of the effect - the category riders (Sever, Master-at-arms) key on prof.type - so ' +
+           'rolling k crits out of n hits gives `fixed + base x (1 + (k/n)(cd-1))`, whose binomial mean is ' +
+           'exactly the deterministic number. What fed a pool follows the same die: Hemorrhage takes a share ' +
+           'of physical CRITICAL damage, so a swing that rolled no crit feeds it nothing. Deterministic ' +
+           'output is untouched to the last decimal; only the spread changes, and on a crit corner it went ' +
+           'from 0.2% to 2.5%.' },
     { severity: 'verified', what: 'a status tick cannot crit and skips the attacker\'s fervor/mastery bracket',
       why: 'Read from initVars@5150: ctx.critChance is zeroed for damage-carrying statuses, and the ' +
            'context is built from the status OWNER - the carrier, not the attacker - so the ' +

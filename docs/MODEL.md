@@ -798,6 +798,24 @@ Throughput is not a steady state any more. `sim.mjs` plays out a fight of
   expected fraction — which is the mean, exactly, without sampling. `--fights n`
   rolls them with a seeded PRNG and reports the mean and the standard deviation
   instead.
+- **and so is the crit.** For a long time it was the one die `--fights` did not
+  throw: procs rolled, the ±10% swing band rolled, and crit stayed at its
+  expectation — so a crit-bleed build, whose whole damage profile is *did the
+  crit land*, reported a spread of essentially zero. That read as a claim about
+  the build and was a fact about the model.
+
+  A cast decomposes as `fixed + base × (1 + p(cd−1))`, because its crit chance
+  and its crit multiplier are properties of the **skill** rather than of the
+  effect — the category riders (`Sever` on weapon skills, `Master-at-arms` on
+  attacks) key on `prof.type` — and a status tick, which cannot crit at all
+  (`initVars@5150`), falls entirely into `fixed`. Rolling *k* crits out of *n*
+  hits gives `fixed + base × (1 + (k/n)(cd−1))`, whose binomial mean is exactly
+  the deterministic number, so the default answer does not move by a decimal.
+  What fed a pool follows the same die: Hemorrhage takes a share of physical
+  **critical** damage, so a swing that rolled no crit feeds it nothing —
+  averaging the feed while rolling the damage would have put the spread straight
+  back where it was. On a `crit`-corner Warrior the reported spread went from
+  0.2% to 2.5%.
 
 The denominator is the fight length, not the moment of the last cast. Getting
 that wrong let a build with **no main-hand weapon at all** beat one holding a

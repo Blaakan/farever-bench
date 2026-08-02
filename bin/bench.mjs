@@ -1639,13 +1639,15 @@ const commands = {
       const se = Math.sqrt((a.dpsSd ** 2 + b.dpsSd ** 2) / rolls);
       const diff = b.dps - a.dps;
       // A spread of exactly zero is not a suspiciously clean result, it is a
-      // build with nothing to roll: every proc-applied dot and every triggered
-      // skill is what the dice touch, and a build with neither plays out the
-      // same way every time. Saying "clears the noise" about a fight that has
-      // none would dress a tautology up as a test.
+      // build with nothing to roll: the dice touch every proc-applied dot,
+      // every triggered skill, the +/-10% swing band and - since the crit
+      // decomposition landed - every critical strike. A build with none of
+      // those, which now means one that cannot crit either, plays out the same
+      // way every time, and saying "clears the noise" about a fight that has no
+      // noise would dress a tautology up as a test.
       const deterministic = a.dpsSd < 1e-9 && b.dpsSd < 1e-9;
       console.log('\n' + f.bold('AND WHETHER IT SURVIVES THE DICE')
-        + f.dim(`  - ${rolls} fights each, procs rolled rather than averaged`));
+        + f.dim(`  - ${rolls} fights each, procs and crits rolled rather than averaged`));
       console.log(f.table(['  ', 'MEAN', 'SD', ''], [
         ['  derived order', a.dps.toFixed(1), a.dpsSd.toFixed(2), ''],
         ['  searched rotation', b.dps.toFixed(1), b.dpsSd.toFixed(2), ''],
@@ -1656,9 +1658,10 @@ const commands = {
               : f.warn('INSIDE THE NOISE - not a real edge')],
       ], { align: [null, 'r', 'r'] }));
       if (deterministic) {
-        console.log(f.dim('  This build has nothing for the dice to touch - no proc-applied dot and no\n'
-          + '  triggered skill - so every fight plays out identically and the difference is exact\n'
-          + `  rather than significant. Rolling it ${rolls} times proves that, and nothing more.`));
+        console.log(f.dim('  This build has nothing for the dice to touch - no proc-applied dot, no\n'
+          + '  triggered skill and no crit chance - so every fight plays out identically and the\n'
+          + `  difference is exact rather than significant. Rolling it ${rolls} times proves that,\n`
+          + '  and nothing more.'));
       } else if (Math.abs(diff) <= 2 * se) {
         console.log(f.dim('  The searched rotation is not distinguishable from pressing whatever is ready.\n'
           + '  That is a fact about this build, not a failure of the search: the mechanics that\n'
