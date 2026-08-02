@@ -1558,10 +1558,81 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       }
     }
 
+    // --- cooldown mutations -------------------------------------------------
+    // "Reset Bonethrow when Tear crits" is worth more than most damage riders
+    // on a skill-bound class, and ~50 scripts mutate cooldowns. Wave one reads
+    // the EXPLICIT-target family - resetCooldown(Skill.X) and
+    // reduceCooldown(Skill.X, vars.t) - with the guard read the same way a
+    // proc's is: the event, the roll, the crit gate, the rank gate. A site
+    // whose hook the fight cannot produce (onKill, onAreaExited) or whose
+    // guard asks live state is refused with the reason, not skipped.
+    const cdMutations = [];
+    const CD_MUT = /\b(resetCooldown|reduceCooldown)\s*\(\s*Skill\.([A-Za-z0-9_]+)\s*(?:,\s*vars\.([A-Za-z0-9_]+))?\s*\)/g;
+    const activeIds = new Set(active.map((a) => a.prof.id));
+    const KNOWN_HOOKS = /^on(Damage|DamageEval|InflictDamage|InflictHit|InflictDamageEval|FirstHit|Hit)$/;
+    for (const hostId of seen) {
+      const hs = skills.get(hostId);
+      if (!hs?.script) continue;
+      const body = liveScript(hs.script);
+      CD_MUT.lastIndex = 0;
+      for (let m; (m = CD_MUT.exec(body));) {
+        const [, call, targetId, secVar] = m;
+        if (!activeIds.has(targetId)) continue;      // mutating a skill not in this build
+        const seconds = call === 'reduceCooldown' ? hs.vars?.[secVar] : null;
+        if (call === 'reduceCooldown' && !(typeof seconds === 'number' && seconds > 0)) continue;
+        const before = body.slice(0, m.index);
+        const hookAt = before.lastIndexOf('function on');
+        const hook = hookAt >= 0 ? /function\s+(on[A-Za-z0-9_]*)/.exec(before.slice(hookAt))?.[1] ?? null : null;
+        const scope = enclosingBlock(before);
+        const targetName = skills.get(targetId)?.texts?.name ?? targetId;
+        if (!hook || !KNOWN_HOOKS.test(hook)) {
+          unmodelled.push({
+            id: hostId, name: hs.texts?.name ?? hostId, kind: 'conditional',
+            why: `its script ${call === 'resetCooldown' ? 'resets' : 'shortens'} ${targetName}'s `
+              + `cooldown from a ${hook ?? 'top-level'} hook, an event this fight does not produce`,
+          });
+          continue;
+        }
+        const g = guardOf(scope, { rank, runes, talents });
+        if (!g.fires) continue;                       // rank/talent-gated off: dead for this build
+        if (g.unread && !/^(critical|isCrit)$/.test(g.unread)) {
+          unmodelled.push({
+            id: hostId, name: hs.texts?.name ?? hostId, kind: 'conditional',
+            why: `its script ${call === 'resetCooldown' ? 'resets' : 'shortens'} ${targetName}'s `
+              + `cooldown, but only while ${g.unread}() holds - which this reader cannot evaluate`,
+          });
+          continue;
+        }
+        let chance = 1;
+        const cv = /checkProba\s*\(\s*vars\.([A-Za-z0-9_]+)/.exec(scope)?.[1];
+        if (cv && typeof hs.vars?.[cv] === 'number') chance = hs.vars[cv];
+        const critGated = /\bcritical\b|\bisCrit\b/.test(scope);
+        // Which event carries it: the host's own landing when the hook is
+        // per-skill or the guard names the host's own skillId; otherwise the
+        // events the guard states.
+        const ownHit = /^on(Damage|DamageEval|FirstHit|Hit)$/.test(hook)
+          || new RegExp(`skillId\\s*==\\s*Skill\\.${hostId}`).test(scope);
+        const ev = eventsOf(scope);
+        if (!ownHit && !ev.size) continue;            // no producible event stated
+        cdMutations.push({
+          host: hostId, target: targetId,
+          on: ownHit ? 'host' : ev.has('combo') && ev.has('attack') ? 'attack-or-combo'
+            : ev.has('combo') ? 'combo' : ev.has('attack') ? 'attack' : 'weapon-skill',
+          chance, critGated,
+          kind: call === 'resetCooldown' ? 'reset' : 'reduce',
+          seconds: seconds ?? 0,
+          why: `${hs.texts?.name ?? hostId} ${call === 'resetCooldown' ? 'resets' : `gives back ${seconds}s of`} `
+            + `${targetName}'s cooldown`
+            + (critGated ? ' on a critical strike' : '')
+            + (chance < 1 ? `, ${Math.round(chance * 100)}% of the time` : ''),
+        });
+      }
+    }
+
     return {
       filler, active, triggered, passive, dots: liveDots,
       unmodelled: unmodelled.filter((u) => !accounted.has(u.id)),
-      selection: sel, runes: [...runes], rank, chain,
+      selection: sel, runes: [...runes], rank, chain, cdMutations,
       resources: { gains, tracked: [...tracked] },
     };
   }

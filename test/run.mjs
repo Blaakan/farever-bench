@@ -2090,6 +2090,40 @@ group('a cooldown-gated proc');
     JSON.stringify(ev2.throughput.unmodelled.filter((u) => /Firebreath/.test(u.id)).map((u) => u.kind)));
 }
 
+// --- cooldown mutations ----------------------------------------------------
+// "Reset Bonethrow when Tear crits" is worth more than most damage riders on
+// a skill-bound class. The explicit-target family - resetCooldown(Skill.X),
+// reduceCooldown(Skill.X, vars.t) - is read with the same guard discipline a
+// proc gets, and the fight fires them with deterministic thinning: a
+// 30%-per-combo reset lands once every ~3.3 combos, never "30% of a reset".
+group('cooldown mutations');
+{
+  const eng = createEngine({ quiet: true });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3 };
+  eng.plan.pruneSelection(l);
+  const rot = eng.plan.resolve(l, 3);
+  const mu = (rot.cdMutations ?? []).find((x) => x.target === 'Axe_Boomerang_Skill1');
+  ok('Tear\'s reset of Bonethrow is read', !!mu, JSON.stringify(rot.cdMutations ?? []));
+  ok('...gated on the critical strike its script names', mu?.critGated === true && mu?.kind === 'reset');
+  ok('...riding Tear\'s own hits', mu?.on === 'host' && mu?.host === 'Axe_Boomerang_Combo');
+  const ev = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const bone = ev.throughput.lines.find((x) => x.id === 'Axe_Boomerang_Skill1');
+  ok('...and Bonethrow casts faster than its cooldown alone allows',
+    !!bone && bone.interval < 14.29, bone ? `${bone.interval.toFixed(2)}s` : 'no line');
+
+  // A kill-driven reset (Rampage resets Shockwave at rank 3, onKill) is an
+  // event this fight does not produce, and is refused with that reason.
+  const l2 = emptyLoadout(eng.cat, 'Warrior', 25);
+  l2.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Rare', stars: 3 };
+  eng.plan.pruneSelection(l2);
+  const rot2 = eng.plan.resolve(l2, 3);
+  ok('a kill-driven reset is refused, not invented',
+    !(rot2.cdMutations ?? []).some((x) => x.target === 'GA_Craft_Skill2')
+    && rot2.unmodelled.some((u) => u.id === 'GA_Craft_Skill1' && /onKill/.test(u.why)),
+    JSON.stringify(rot2.unmodelled.filter((u) => u.id === 'GA_Craft_Skill1').map((u) => u.why)));
+}
+
 // --- a guarded self-buff is refused ----------------------------------------
 // Ram Veil's +5 CritChance / +5 Fervor lands only when a max-stacked
 // Benediction is CONSUMED - `hasStatusMaxStacked` in as many words - and the

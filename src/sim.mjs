@@ -340,6 +340,15 @@ function runFight(spec) {
     });
   }
 
+  // Cooldown mutations: "reset Bonethrow when Tear crits". Resolved to the
+  // active they mutate; one whose target is not in the rotation is inert.
+  // Deterministic runs thin the applications the way `put` thins a proc dot -
+  // a 30%-per-combo reset fires once every ~3.3 combos, never "30% of a
+  // reset" - and rolled runs roll.
+  const cdMutations = (rotation.cdMutations ?? [])
+    .map((m) => ({ ...m, targetIdx: actives.findIndex((a) => a.prof.id === m.target), credit: 0 }))
+    .filter((m) => m.targetIdx >= 0);
+
   // Statuses the fight puts up itself, rather than ones already averaged into
   // the sheet it started from.
   const timedIds = new Set(timedBuffs.map((b) => b.status));
@@ -498,6 +507,7 @@ function runFight(spec) {
     for (const a of actives) { a.casts = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
     for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; g.nextReady = 0; }
+    for (const mu of cdMutations) mu.credit = 0;
     for (const p of poolDots) {
       p.fed = 0; p.damage = 0; p.heal = 0; p.ticks = 0; p.expires = -1; p.nextTick = 0;
       p.owed = 0; p.paid = 0; p.perTick = 0;
@@ -696,6 +706,30 @@ function runFight(spec) {
         if (attack) award(income.attack);
         if (combo) award(income.combo);
         if (wasCast) award(onCastGain.get(skillId) ?? []);
+      }
+      // Cooldown riders fire off the same events - the value of "reset
+      // Bonethrow when Tear crits" IS the extra casts the reset buys.
+      for (const mu of cdMutations) {
+        const hit = mu.on === 'host' ? (skillId === mu.host)
+          : mu.on === 'attack' ? attack
+            : mu.on === 'combo' ? combo
+              : mu.on === 'attack-or-combo' ? (attack || combo)
+                : weaponSkill;
+        if (!hit) continue;
+        const p = mu.chance * (mu.critGated ? critChance : 1);
+        if (!(p > 0)) continue;
+        let fire = false;
+        if (rand) fire = rand() < p;
+        else { mu.credit += p; if (mu.credit >= 1) { mu.credit -= 1; fire = true; } }
+        if (!fire) continue;
+        const stT = state[mu.targetIdx];
+        const aT = actives[mu.targetIdx];
+        if (stT.charges >= aT.maxCharges) continue;   // nothing to give back
+        if (mu.kind === 'reset') {
+          if (stT.nextCharge > at) stT.nextCharge = at;
+        } else {
+          stT.nextCharge -= mu.seconds;
+        }
       }
       // Procs ride the same events. Deterministic runs credit the expected
       // fraction of a fire; rolled ones roll. Priced against live state too.
