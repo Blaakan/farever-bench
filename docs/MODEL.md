@@ -794,6 +794,56 @@ Throughput is not a steady state any more. `sim.mjs` plays out a fight of
   overflow of a long debuff on a short cooldown is lost.
 - **the base-attack chain fills the gaps**, one link at a time, because you
   cannot press swing 3 without 1 and 2.
+- **a damage-over-time ticks once per stack.** `$HSkill.getStackFactor@20772`
+  runs as the **last** line of `getStepEffectVal@20775` — after the scaling,
+  after the spread division, after the damage variance — and multiplies the
+  value by `Status.stacks` whenever the running skill is a Status that is
+  *either* a DoT (its `statusType`, or an ancestor of it through the `parent`
+  chain, carries the DoT flag) *or* carries the `ScaleWithStacks` effect flag.
+  It is an **OR evaluated once**: `Daggers_Demondash_Passive_Status` is typed
+  `Burn` *and* flagged, and is multiplied exactly once.
+
+  The count is read **at every tick**, so the per-tick value snapshots at
+  application and the multiplier does not.
+
+  The cap comes off `getMaxStacks@14459`:
+
+  - `props.status.maxStacks`, whose default is **1**, not unlimited;
+  - replaced by any `props.rankOverride` entry at or below the **applying**
+    skill's rank (`Status.get_rank@14428` = `instigatorSkill.rank`) — which is
+    how Hysteria's counter drops from 150 to 100 once the weapon skill is
+    upgraded;
+  - plus exactly one script path: Lethal Poison reads
+    `getStatusMaxStacks(b) = b + getTalentRank(Rogue_Talent_ImprovedMixture)`.
+
+  An application adds exactly **one** stack — `props.status.stacks` is authored
+  on none of the 100 `type: Status` steps — and nothing anywhere decrements a
+  stack on a timer: the whole status expires at once. `DurationBased` is the one
+  exception and it is sampled **only at application**,
+  `ceil(stacks × durationProgress)`, which is why a stack table needs no
+  per-tick decay at all.
+
+  Five stacks of Lethal Poison were being priced as one. That is where the
+  Rogue's **324 → 385** came from.
+
+  `maxStacks <= 0` means **uncapped** — seven rows author `-1` — and that sign
+  was a live trap: the bare `?? 1` it replaced handed the literal `-1` into the
+  affix scale, i.e. a buff worth *minus* its own value. Nothing was visibly
+  wrong because only a foe status carries affixes among the seven, which is the
+  kind of bug that waits for a patch to become one. An uncapped **dot** is held
+  at one stack and named: over a 200-second fight an every-swing application
+  would reach two hundred stacks and print a number that grows with the fight
+  length rather than with the build. Every uncapped dot in the sheet today is a
+  *pool* dot, whose fed/owed ledger already **is** the stack count expressed as
+  damage, so nothing is currently scored at that floor.
+
+  What has **not** landed is the affix side. `applyAffixes@6083` multiplies each
+  affix by `getAffixMultiplier() = stacks` too, and a stat buff is still counted
+  at its cap — right for a weapon enchant refreshed off a proc every few swings
+  (`Enchant_Zealot` saturates), wrong for one whose income the fight cannot
+  derive. The `restat` cache is keyed on `status#stacks`, so a fractional mean
+  has to be quantised before it can go in, or a bounded cache of integer states
+  becomes an unbounded one of float states.
 - **a step whose `on` is `Code` is not part of the cast.** `skill@steps.on` has
   a `Code` case and it means what it says: that step is played by
   `playStep(Steps.<id>)` from the row's own script and by nothing else, where

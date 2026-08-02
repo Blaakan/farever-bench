@@ -453,6 +453,49 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const r = statusTypes.get(typeId);
     return r ? new Set(statusFlagNames.filter((_, i) => ((r.flags ?? 0) >> i) & 1)) : new Set();
   };
+  // ...through the parent chain, the same walk `damage.mjs` uses to decide which
+  // dots a `isStatusType(Bleed)` guard covers. `Hemorage` declares `parent:
+  // Bleed` and only Bleed carries the DoT flag, so a status typed Hemorage is a
+  // DoT only if the walk is taken.
+  const statusTypeFlagsDeep = (typeId) => {
+    const out = new Set();
+    for (let cur = typeId, hops = 0; cur != null && hops < 8; hops++) {
+      for (const f of statusTypeFlags(cur)) out.add(f);
+      cur = statusTypes.get(cur)?.parent ?? null;
+    }
+    return out;
+  };
+
+  /**
+   * How many stacks of a status can be held at once.
+   *
+   * Read from `Status.getMaxStacks@14459`: the base is
+   * `props.status.maxStacks`, DEFAULT 1 - not unlimited - and every
+   * `props.rankOverride` entry at or below the applying skill's rank may
+   * replace it (`updateSkillInf@20788` copies the field through, later wins).
+   *
+   * `maxStacks <= 0` means UNCAPPED, and that sign is a live trap: seven rows
+   * author `-1`, and the `?? 1` this replaces handed a literal -1 straight into
+   * the affix scale, i.e. a buff worth MINUS its own value. Only a foe status
+   * carries affixes among those seven today, so nothing was visibly wrong -
+   * which is exactly the kind of bug that waits for a patch to become one.
+   *
+   * One row needs the script path: `Rogue_Talent_LethalPoison_Status` declares
+   * `getStatusMaxStacks(b) = b + getTalentRank(Rogue_Talent_ImprovedMixture)`.
+   * Every other status returns -1 from the default hook, so the base stands.
+   */
+  const MAX_STACK_SCRIPT = /function\s+getStatusMaxStacks\s*\([^)]*\)\s*\{\s*return\s+\w+\s*\+\s*getTalentRank\s*\(\s*(?:Skill\.)?([A-Za-z0-9_]+)/;
+  function maxStacksOf(statusId, rank = 1, talents = null) {
+    const s = skills.get(statusId);
+    if (!s) return 1;
+    let cap = s.props?.status?.maxStacks ?? 1;
+    for (const ov of s.props?.rankOverride ?? []) {
+      if ((ov.minRank ?? 0) <= rank && ov.props?.maxStacks != null) cap = ov.props.maxStacks;
+    }
+    const m = s.script ? MAX_STACK_SCRIPT.exec(liveScript(s.script)) : null;
+    if (m && talents instanceof Map) cap += talents.get(m[1]) ?? 0;
+    return cap > 0 ? cap : Infinity;
+  }
 
   // Who applies which status, over the whole sheet. Both paths: a `Status` step
   // naming a ref, and an `addStatus` call site in a script (through the local
@@ -832,6 +875,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // slotted and the talents allocated. All three are decisions this build has
     // already made, so a guard that names one is answerable rather than opaque.
     const talents = new Set(Object.keys(loadout.talents ?? {}));
+    // ...and how many POINTS are in each, which one status cap depends on:
+    // Lethal Poison's own script reads `getStatusMaxStacks(b) = b +
+    // getTalentRank(Rogue_Talent_ImprovedMixture)`.
+    const talentRanks = new Map(Object.entries(loadout.talents ?? {}));
     const guardOpts = { rank, runes, talents };
     const usableRule = (r) => !!r && r.kind !== 'never' && r.kind !== 'conditional';
 
@@ -975,7 +1022,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // No declared amount, but it may still grant a stat or leave something
         // ticking on the target.
         const own = (prof.affixes ?? []).filter((a) => a.target?.attribute);
-        const st = statusesOf(id, { runes, rank, talents });
+        const st = statusesOf(id, { runes, rank, talents, talentRanks });
         noteDots(id, st, extra);
         // Same as the prayer case, one bucket over: a skill you PRESS whose
         // payload is the status it applies. `Mage_ShieldOfSpark` is a 30-second
@@ -1043,7 +1090,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // and what it puts UP travels with it - the fight applies a buff or a
       // debuff at the moment the cast lands, and prices what comes after
       // against it.
-      const st2 = statusesOf(id, { runes, rank, talents });
+      const st2 = statusesOf(id, { runes, rank, talents, talentRanks });
       noteDots(id, st2, extra);
       // A skill can be scored for its damage while a buff it grants is
       // refused - Ram Veil's +5 CritChance / +5 Fervor lands only when a
@@ -1206,7 +1253,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
 
       const carries = carriesPayload(prof);
       const ownAffixes = (prof.affixes ?? []).filter((a) => a.target?.attribute);
-      const st = statusesOf(id, { runes, rank, talents });
+      const st = statusesOf(id, { runes, rank, talents, talentRanks });
       noteDots(id, st, { source });
 
       if (carries) {
@@ -1467,7 +1514,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // resolving a talent at the weapon's rank asks a two-point node whether it
     // is at rank 3, and every `minRank: 2` rider on it passes for free.
     for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
-      noteDots(id, statusesOf(id, { runes, rank: nodeRank, talents }), { source: 'talent' });
+      noteDots(id, statusesOf(id, { runes, rank: nodeRank, talents, talentRanks }), { source: 'talent' });
       // ...and a talent that carries a damage step of its OWN, played on an
       // event rather than cast. `Cracking Blood` has one step - 0.15x Faith +
       // 0.15x Intellect of Magic - and its script plays it on a 35% roll every
@@ -1570,7 +1617,21 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     }
     const liveDots = [];
     for (const d of byStatus.values()) {
-      if (canFire(d)) { liveDots.push(d); continue; }
+      if (canFire(d)) {
+        // A DoT whose ticks scale with a stack count the data never caps. It is
+        // scored at one stack, which is the floor rather than the truth, and
+        // saying so beats printing a number that grows with the fight length.
+        if (d.uncappedStacks) {
+          unmodelled.push({
+            id: d.status, name: d.name, source: d.source, kind: 'no rate',
+            why: `${d.name} ticks are multiplied by its stack count (getStackFactor@20772) and its `
+              + 'maxStacks is the authored -1, i.e. uncapped - so how many stacks a fight reaches is '
+              + 'the fight length, not the data. Scored at one stack, which is a floor',
+          });
+        }
+        liveDots.push(d);
+        continue;
+      }
       // Same split as the trigger path: an applier that fires on a block or
       // on being hit is dead because the foe is passive, not because the
       // data withheld a rate.
@@ -2053,12 +2114,16 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * number worth refusing. Those are reported as unmodelled instead.
    */
   const statusCache = new Map();
-  function statusesOf(skillId, { runes = null, rank = 1, talents = null } = {}) {
+  function statusesOf(skillId, { runes = null, rank = 1, talents = null, talentRanks = null } = {}) {
     // The talents belong in the key as much as the runes do: a call site guarded
     // by `hasTalent(X)` resolves differently for a build that took X.
     const key = skillId + '#' + rank
       + (runes?.size ? '@' + [...runes].sort().join('+') : '')
-      + (talents?.size ? '%' + [...talents].sort().join('+') : '');
+      + (talents?.size ? '%' + [...talents].sort().join('+') : '')
+      // The RANK of an allocated talent, not just its presence: one status cap
+      // is `base + getTalentRank(Rogue_Talent_ImprovedMixture)`, so two builds
+      // holding the same nodes at different point counts are not the same key.
+      + (talentRanks?.size ? '~' + [...talentRanks].sort().map(([k, v]) => k + v).join('+') : '');
     let hit = statusCache.get(key);
     if (hit) return hit;
 
@@ -2335,7 +2400,36 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           types,
           tick: sp.periodic.tick,
           duration: life ?? sp.periodic.duration,
-          stacks: st.props?.status?.maxStacks ?? 1,
+          stacks: Number.isFinite(maxStacksOf(statusId, rank, talentRanks))
+            ? maxStacksOf(statusId, rank, talentRanks) : 1,
+          // WHETHER A TICK IS MULTIPLIED BY THE STACK COUNT, which is the whole
+          // of the stack channel on the damage side and was missing entirely.
+          //
+          // `$HSkill.getStackFactor@20772` runs as the LAST line of
+          // `getStepEffectVal@20775` - after the scaling, after the spread
+          // division, after the damage variance - and multiplies the value by
+          // `Status.stacks` when the running skill is a Status that is EITHER a
+          // DoT (its statusType, or an ancestor of it, carries the DoT flag) OR
+          // carries the `ScaleWithStacks` effect flag. It is an OR evaluated
+          // once, so a status that is both - Daggers_Demondash_Passive_Status is
+          // typed Burn AND flagged - is multiplied exactly once.
+          //
+          // Lethal Poison is the size of the gap: five stacks of it were being
+          // priced as one.
+          //
+          // ...EXCEPT where the cap is the authored -1, which means uncapped.
+          // A pool dot handles that with its own ledger - what fed it IS the
+          // count expressed as damage - but an ordinary uncapped DoT applied
+          // every swing would reach two hundred stacks before the bell and
+          // print a number nobody could earn. Nothing in the data bounds it, so
+          // it is held at one stack and NAMED, which is the same rule every
+          // other unbounded quantity here gets.
+          scaleByStacks: (Number.isFinite(maxStacksOf(statusId, rank, talentRanks)) || !!pool)
+            && ([...types].some((t) => statusTypeFlagsDeep(t).has('DoT'))
+              || sp.effects.some((e) => e.scaleWithStacks)),
+          uncappedStacks: !Number.isFinite(maxStacksOf(statusId, rank, talentRanks)) && !pool
+            && ([...types].some((t) => statusTypeFlagsDeep(t).has('DoT'))
+              || sp.effects.some((e) => e.scaleWithStacks)),
           // How a re-application composes with what is already running, from
           // `props.status.stackingPolicy` - `Additive | DurationBased |
           // Override`. Eleven statuses declare one and only FOUR are
@@ -2402,7 +2496,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         from: skillId,
         status: statusId,
         name: st.texts?.name ?? statusId,
-        stacks: st.props?.status?.maxStacks ?? 1,
+        // At the cap, which the audit has always said - but the cap now comes
+        // off `getMaxStacks@14459` rather than off a bare `?? 1`, so a row
+        // declaring the uncapped -1 no longer scales its own affix by MINUS ONE.
+        // An uncapped buff is held at one stack instead: nothing in the data
+        // says how many a fight reaches, and Infinity is not a number to
+        // multiply an affix by.
+        stacks: Number.isFinite(maxStacksOf(statusId, rank, talentRanks))
+          ? maxStacksOf(statusId, rank, talentRanks) : 1,
+        uncapped: !Number.isFinite(maxStacksOf(statusId, rank, talentRanks)),
         stackingPolicy: st.props?.status?.stackingPolicy ?? null,
         duration: st.duration ?? null,
         types,
@@ -2776,7 +2878,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
 
   return {
     pools, defaultSelection, pruneSelection, resolve, selfBuffs, selfBuffsOf, statusesOf,
-    weaponSlotsAt, arsenalSlotsAt, typeOf, baseChain, resourceGainsOf, talentModifiers,
+    weaponSlotsAt, arsenalSlotsAt, typeOf, baseChain, resourceGainsOf, talentModifiers, maxStacksOf,
     mechanicTypes: MECHANIC_TYPES,
   };
 }

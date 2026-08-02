@@ -405,7 +405,11 @@ function runFight(spec) {
     };
     const self = new Map(self0), foe = new Map(foe0);
     const dotsUp = new Map();
-    for (const [d, st] of live0) dotsUp.set(d, { expires: st.expires, nextTick: st.nextTick, out: st.out });
+    for (const [d, st] of live0) {
+      dotsUp.set(d, {
+        expires: st.expires, nextTick: st.nextTick, out: st.out, stacks: st.stacks ?? 1,
+      });
+    }
     // Income from the clock keeps arriving inside the horizon too - without it
     // the rollout judged a Rage-funded cast unaffordable that the real loop
     // would fund - and the chain continues from where the fight actually IS,
@@ -435,7 +439,11 @@ function runFight(spec) {
     // Everything already ticking keeps ticking, at the value it snapshot.
     const tick = (until) => {
       for (const [d, s] of dotsUp) {
-        while (s.nextTick <= Math.min(until, s.expires)) { total += worth(s.out.damage, s.out.heal, 0); s.nextTick += d.tick; }
+        const k = d.scaleByStacks ? s.stacks : 1;
+        while (s.nextTick <= Math.min(until, s.expires)) {
+          total += worth(s.out.damage * k, s.out.heal * k, 0);
+          s.nextTick += d.tick;
+        }
         if (s.expires <= until) dotsUp.delete(d);
       }
     };
@@ -444,7 +452,11 @@ function runFight(spec) {
         const out = dotOutput(d, st ?? at());
         const e = t + (Number.isFinite(d.duration) ? d.duration : fight);
         const cur = dotsUp.get(d);
-        if (cur) { cur.expires = e; cur.out = out; } else dotsUp.set(d, { expires: e, nextTick: t + d.tick, out });
+        if (cur) {
+          cur.expires = e;
+          cur.out = out;
+          cur.stacks = Math.min(d.stacks ?? 1, (cur.stacks ?? 1) + 1);
+        } else dotsUp.set(d, { expires: e, nextTick: t + d.tick, out, stacks: 1 });
       }
     };
 
@@ -613,8 +625,14 @@ function runFight(spec) {
     const tickTo = (until) => {
       for (const [d, st] of live) {
         while (st.nextTick <= Math.min(until, st.expires) && st.nextTick <= fight) {
-          d.damage += st.out.damage;
-          d.heal += st.out.heal;
+          // THE STACK COUNT IS LIVE, not snapshot. `getStackFactor@20772` reads
+          // `Status.stacks` at every tick, downstream of everything else the
+          // value went through - so the per-tick amount is the snapshot times
+          // however many stacks are on the target RIGHT NOW. The value snapshots;
+          // the multiplier does not.
+          const k = d.scaleByStacks ? st.stacks : 1;
+          d.damage += st.out.damage * k;
+          d.heal += st.out.heal * k;
           d.ticks++;
           st.nextTick += d.tick;
         }
@@ -686,6 +704,21 @@ function runFight(spec) {
         // the guess matched nearly every dot in the game, including ones
         // applied on every swing, and took the answer to 44,000 dps.
         if (st) {
+          // One more stack, up to the cap. Read from `addStacks@4562`: the
+          // count carried forward is the current one, EXCEPT under
+          // `DurationBased`, where it is `ceil(stacks x durationProgress)` -
+          // sampled at the moment of application and never continuously, which
+          // is why a stack table needs no per-tick decay. Nothing anywhere
+          // decrements a stack on a timer; the whole status expires at once.
+          //
+          // Every data-driven application is exactly ONE stack:
+          // `props.status.stacks` is authored on none of the 100 Status steps,
+          // so `?? 1` at SkillStep.hx:262 is what every one of them uses.
+          const carried = d.stacking === 'DurationBased'
+            ? Math.ceil(st.stacks * Math.max(0, (st.expires - at) / Math.max(1e-9, st.window)))
+            : st.stacks;
+          st.stacks = Math.min(d.stacks ?? 1, carried + 1);
+          st.window = Math.max(expires, st.expires) - at;
           if (d.stacking === 'DurationBased') {
             const ticks = Math.max(1, Math.round(
               (Number.isFinite(d.duration) ? d.duration : fight) / d.tick));
@@ -699,7 +732,16 @@ function runFight(spec) {
           // left) - a refresh never SHORTENS a status.
           st.expires = Math.max(expires, st.expires);
           st.out = out;
-        } else live.set(d, { expires, nextTick: at + d.tick, out });
+        } else {
+          live.set(d, {
+            expires, nextTick: at + d.tick, out,
+            // A fresh status lands at one stack: `Status.__constructor__` never
+            // sets the field, so `addStacks(1)` takes it from 0 to 1.
+            stacks: 1,
+            // The window a DurationBased carry-over is measured against.
+            window: expires - at,
+          });
+        }
       }
     };
     const applyDots = (skillId, at, ev = {}) => {
@@ -1055,11 +1097,20 @@ function runFight(spec) {
     const e = acc.dot.get(d);
     if (!e || !e.ticks) continue;
     const ticks = e.ticks / rolls;
+    // What a tick was WORTH ON AVERAGE, which since stacks landed is not the
+    // snapshot amount: a tick of Lethal Poison is its own value times however
+    // many stacks were on the target, so printing the one-stack figure beside a
+    // total six times larger reads as an arithmetic error in the tool.
+    const perTick = ticks > 0 ? (e.damage / rolls) / ticks : 0;
+    const meanStacks = d.out.damage > 0 ? perTick / d.out.damage : 1;
     lines.push({
       id: d.status, name: d.name, kind: 'over time', source: d.from,
       perCast: { damage: e.damage / rolls, heal: e.heal / rolls, shield: 0 },
       interval: elapsed, share: 0,
-      why: `${ticks.toFixed(0)} ticks of ${d.out.damage.toFixed(0)} every ${d.tick}s from ${d.fromName}`,
+      why: `${ticks.toFixed(0)} ticks of ${perTick.toFixed(0)} every ${d.tick}s from ${d.fromName}`
+        + (d.scaleByStacks && meanStacks > 1.02
+          ? ` - ${d.out.damage.toFixed(0)} a stack, ${meanStacks.toFixed(1)} stacks on average of ${d.stacks}`
+          : ''),
     });
   }
   for (const p of poolDots) {

@@ -2105,6 +2105,38 @@ group('a cooldown-gated proc');
     JSON.stringify(ev2.throughput.unmodelled.filter((u) => /Firebreath/.test(u.id)).map((u) => u.kind)));
 }
 
+// --- the free node travels with the sigil ----------------------------------
+// The augment hill-climb swaps sigil variants, and the accepted build must
+// carry the NEW sigil's granted talent - not the old one's. A sweep exported
+// a seventeen-point allocation holding Surge of Violence next to an Infused
+// Wounds sigil because acceptance updated the augment and not the grant.
+group('the free node travels with the sigil');
+{
+  const eng = createEngine({ quiet: true });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Legendary', stars: 5 };
+  l.gear.Slot_Weapon2 = { item: 'Spear_Goo', rarity: 'Legendary', stars: 5 };
+  const res = optimize(eng, {
+    loadout: l, pinnedGear: new Set(['Slot_Weapon1', 'Slot_Weapon2']), pinnedAug: new Set(),
+    goal: 'dps', target: eng.combat.foe('boss', 25), rank: 3, restarts: 3,
+    allowEmpty: true, exclude: /^GM_/, rarityRoll: true,
+  });
+  const tree = eng.talents.treeFor('Warrior');
+  const granted = new Set();
+  for (const v of Object.values(res.loadout.augments)) {
+    if (!v) continue;
+    for (const sk of eng.cat.itemById.get(v)?.skills ?? []) if (tree.byId.has(sk)) granted.add(sk);
+  }
+  const paid = Object.entries(res.loadout.talents)
+    .filter(([k]) => !granted.has(k)).reduce((s, [, v]) => s + v, 0);
+  ok('every socketed sigil\'s talent is in the build', [...granted].every((g) => res.loadout.talents[g] >= 1),
+    [...granted].join(','));
+  ok('no stale grant inflates the paid total', paid <= 16, `${paid} paid points`);
+  ok('the allocation is legal against the ACTUAL sigil - granted outright, no threshold',
+    eng.talents.illegalAllocation('Warrior', res.loadout.talents, { level: 25, points: 16, granted }) === null,
+    String(eng.talents.illegalAllocation('Warrior', res.loadout.talents, { level: 25, points: 16, granted })));
+}
+
 // --- cooldown mutations ----------------------------------------------------
 // "Reset Bonethrow when Tear crits" is worth more than most damage riders on
 // a skill-bound class. The explicit-target family - resetCooldown(Skill.X),
@@ -2652,6 +2684,95 @@ group('a buff window prices only itself');
   ok('...and costs about what the clock and the dropped chain say it should',
     (b - a) / b > 0.001 && (b - a) / b < 0.045,
     `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s + a chain restart every 50s of a 200s fight`);
+}
+
+// --- the stack counter ------------------------------------------------------
+// `getStackFactor@20772` runs as the last line of `getStepEffectVal@20775` and
+// multiplies a step effect by `Status.stacks` when the running skill is a
+// Status that is either a DoT or carries the ScaleWithStacks flag. The model
+// tracked whether a status was up and never how many, so five stacks of Lethal
+// Poison were priced as one.
+group('the stack counter');
+{
+  const eng = createEngine({ quiet: true });
+  const cap = (id, rank = 1, ranks = null) => eng.plan.maxStacksOf(id, rank, ranks);
+
+  // The base is `props.status.maxStacks`, DEFAULT 1 - not unlimited.
+  near('Lethal Poison caps at the authored 5', cap('Rogue_Talent_LethalPoison_Status'), 5);
+  // ...and its own script adds the rank of another talent.
+  near('...and one more per point of Improved Mixture',
+    cap('Rogue_Talent_LethalPoison_Status', 1, new Map([['Rogue_Talent_ImprovedMixture', 2]])), 7);
+  // `maxStacks <= 0` is UNCAPPED, and the `?? 1` this replaced handed the
+  // literal -1 into the affix scale - a buff worth minus its own value.
+  ok('an authored -1 reads as uncapped, never as -1',
+    cap('Warrior_Hemorrhage_Status') === Infinity, String(cap('Warrior_Hemorrhage_Status')));
+  const bad = [];
+  for (const s of eng.cdb.lines('skill')) {
+    if (s.props?.status?.maxStacks == null) continue;
+    const v = cap(s.id, 3);
+    if (!(v >= 1)) bad.push(`${s.id}=${v}`);
+  }
+  ok('no status anywhere resolves to a cap below one', bad.length === 0, bad.join(', '));
+
+  // A rank override replaces the cap, which is how Hysteria's counter drops
+  // from 150 to 100 once the weapon skill is upgraded.
+  near('Hysteria needs 150 stacks at rank 1', cap('GS_Nova_Passive_Stack', 1), 150);
+  near('...and 100 from rank 2', cap('GS_Nova_Passive_Stack', 2), 100);
+
+  // The fight: a stacked poison must be worth strictly more than one stack of
+  // it and never more than its cap.
+  const l = emptyLoadout(eng.cat, 'Rogue', 25);
+  l.gear.Slot_Weapon1 = { item: 'Daggers_DuplicatePoison', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const rot = eng.plan.resolve(l, 3);
+  const poison = rot.dots.find((d) => d.status === 'Daggers_DuplicatePoison_PassiveStatus');
+  ok('the probe build really does apply the stacking poison', !!poison,
+    rot.dots.map((d) => d.status).join(','));
+  ok('a Bleed-typed DoT is flagged as scaling with its stacks', poison?.scaleByStacks === true);
+  near('...and carries the cap the fight clamps to', poison?.stacks ?? 0, 5);
+
+  const ev = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const line = ev.throughput.lines.find((x) => x.id === 'Daggers_DuplicatePoison_PassiveStatus');
+  ok('the fight reports it', !!line, ev.throughput.lines.map((x) => x.id).join(','));
+  if (line) {
+    const m = /^(\d+) ticks of (\d+)/.exec(line.why);
+    const ticks = Number(m?.[1] ?? 0);
+    const perTick = Number(m?.[2] ?? 0);
+    const oneStack = poison.prof ? null : null;
+    ok('...at more than one stack a tick', ticks > 0 && perTick > 0
+      && line.perCast.damage > ticks * 1e-9, line.why);
+    ok('...and never above the cap', line.perCast.damage <= ticks * perTick * poison.stacks + 1e-6, line.why);
+    ok('...and the line says how many stacks it averaged, and of how many',
+      /a stack, [\d.]+ stacks on average of 5/.test(line.why), line.why);
+    ok('...which is a number no bigger than the cap',
+      Number(/([\d.]+) stacks on average/.exec(line.why)?.[1] ?? 0) <= 5, line.why);
+    void oneStack;
+  }
+
+  // An uncapped DoT is the one case the count is NOT derivable: nothing in the
+  // data bounds it, and over a 200-second fight an every-swing application
+  // would reach two hundred stacks. Every uncapped DoT in the sheet is either a
+  // pool - whose fed/owed ledger IS the count expressed as damage - or held at
+  // one stack and named.
+  {
+    let checked = 0;
+    for (const s of eng.cdb.lines('skill')) {
+      if (!Number.isFinite(eng.plan.maxStacksOf(s.id, 3))) checked++;
+    }
+    ok('the sheet really does carry uncapped statuses', checked >= 5, String(checked));
+    const l2 = emptyLoadout(eng.cat, 'Warrior', 25);
+    l2.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3 };
+    l2.talents = { Warrior_Hemorrhage: 1 };
+    eng.plan.pruneSelection(l2);
+    const rot2 = eng.plan.resolve(l2, 3);
+    const uncapped = rot2.dots.filter((d) => !Number.isFinite(eng.plan.maxStacksOf(d.status, 3)));
+    ok('this build really does run uncapped dots', uncapped.length > 0,
+      rot2.dots.map((d) => d.status).join(','));
+    ok('...and every one of them is a pool, so the ledger counts them, not a multiplier',
+      uncapped.every((d) => !!d.pool), uncapped.map((d) => `${d.status}:${!!d.pool}`).join(','));
+    ok('...so none of them is ALSO multiplied by a stack count',
+      uncapped.every((d) => d.uncappedStacks !== true), JSON.stringify(uncapped.map((d) => d.status)));
+  }
 }
 
 // --- what a rotation line is allowed to say ---------------------------------

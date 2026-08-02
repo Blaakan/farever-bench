@@ -326,13 +326,18 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       .map(([id, rank]) => ({ n: tree.byId.get(id), rank, granted: granted.has(id) }))
       .sort((a, b) => a.n.tier - b.n.tier);
     for (const { n, rank, granted: free } of inOrder) {
+      // A sigil grants its tier-4 OUTRIGHT - that is the entire value of the
+      // socket. The grant neither needs the branch's threshold nor counts
+      // toward it, so it sits wholly outside the replay: requiring eight
+      // Center points under a granted Infused Wound would refuse the exact
+      // build the sigil exists to enable.
+      if (free) continue;
       const have = cumulative(n.branchIndex);
       const need = tierThreshold(n.tier);
       if (n.tier > 0 && have < need) {
         return `${n.name} is tier ${n.tier} and needs ${need} points at lower tiers in ${n.branch}, `
           + `but only ${have} are there`;
       }
-      if (free) continue;
       if (n.tier === 0) rootPoints += rank;
       else perBranch.set(n.branchIndex, (perBranch.get(n.branchIndex) ?? 0) + rank);
     }

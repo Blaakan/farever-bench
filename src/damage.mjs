@@ -1381,6 +1381,38 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'reproduces every measured tooltip integer regardless; the two decompositions differ only ' +
            'in which inferred drop level fits a single-aptitude line, and a full trace of the bake ' +
            '(its per-row loop and gearRatio) is the named next read.' },
+    { severity: 'verified', what: 'a damage-over-time ticks once per stack, and the count is live',
+      why: 'Read from getStackFactor@20772, which runs as the LAST line of getStepEffectVal@20775 - ' +
+           'after the scaling, after the spread division, after the damage variance - and multiplies ' +
+           'the value by Status.stacks whenever the running skill is a Status that is EITHER a DoT ' +
+           '(its statusType, or an ancestor of it through the parent chain, carries the DoT flag) OR ' +
+           'carries the ScaleWithStacks effect flag. It is an OR evaluated once, so a status that is ' +
+           'both - Daggers_Demondash_Passive_Status is typed Burn AND flagged - is multiplied exactly ' +
+           'once. The count is READ AT EVERY TICK, so the per-tick value snapshots and the multiplier ' +
+           'does not. The cap comes off getMaxStacks@14459: props.status.maxStacks, DEFAULT 1 rather ' +
+           'than unlimited, replaced by any props.rankOverride at or below the applying skill\'s rank, ' +
+           'plus one script path (Lethal Poison reads getStatusMaxStacks(b) = b + ' +
+           'getTalentRank(Rogue_Talent_ImprovedMixture)). Applications add exactly one stack - ' +
+           'props.status.stacks is authored on none of the 100 Status steps - and nothing decrements a ' +
+           'stack on a timer: the whole status expires at once. Five stacks of Lethal Poison were ' +
+           'being priced as one, which is where the Rogue\'s 324 -> 385 came from.' },
+    { severity: 'assumption', what: 'an UNCAPPED stacking dot is held at one stack, and named',
+      why: 'maxStacks <= 0 means uncapped (seven rows author -1), and over a 200-second fight an ' +
+           'every-swing application would reach two hundred stacks and print a number that grows with ' +
+           'the fight length rather than with the build. Every uncapped dot in the sheet today is a ' +
+           'POOL dot, whose fed/owed ledger already IS the stack count expressed as damage, so nothing ' +
+           'is currently scored at the floor - but the guard is there and it says so by name rather ' +
+           'than letting the multiplier run. The same -1 used to reach the affix scale through a bare ' +
+           '`?? 1`, i.e. a buff worth MINUS its own value; only a foe status carries affixes among the ' +
+           'seven, so nothing was visibly wrong, which is the kind of bug that waits for a patch.' },
+    { severity: 'unmodelled', what: 'a stat buff is still counted at its cap, not at a tracked count',
+      why: 'The stack channel landed on the DAMAGE side - a dot\'s ticks now follow a live count - and ' +
+           'not yet on the AFFIX side, where applyAffixes@6083 multiplies each affix by ' +
+           'getAffixMultiplier() = stacks. A buff is still credited at full stacks, which is right for ' +
+           'a weapon enchant refreshed off a proc every few swings (Enchant_Zealot saturates) and ' +
+           'wrong for one whose income the fight cannot derive. The `restat` cache is keyed on ' +
+           'status#stacks, so a fractional mean has to be quantised before it can go in, or a bounded ' +
+           'cache of integer states becomes an unbounded one of float states.' },
     { severity: 'verified', what: 'a step whose `on` is Code is played by the script, not by the cast',
       why: '`skill@steps.on` has a Code case and it means exactly that: the step is played by ' +
            '`playStep(Steps.<id>)` from the row\'s own script and by nothing else - `Steps.<name>` being ' +

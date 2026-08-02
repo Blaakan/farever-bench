@@ -491,8 +491,17 @@ export function optimize(engine, spec) {
           if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
         }
         if (better(bestScore, best)) {
+          // The trial that won carried the swapped grant; `cur` must carry it
+          // too, or the accepted build keeps the OLD sigil's free node next
+          // to the new sigil - a seventeen-point allocation no character can
+          // hold, exported with a straight face.
+          const oldGrants = sock.type === 'AugmentDemonSigil' ? grantedTalents(cur) : null;
           if (bestPick) cur.augments[sock.key] = bestPick;
           else delete cur.augments[sock.key];
+          if (oldGrants) {
+            for (const g of oldGrants) delete cur.talents[g];
+            for (const g of grantedTalents(cur)) cur.talents[g] = 1;
+          }
           best = bestScore;
           improved = true;
         }
@@ -662,7 +671,7 @@ export function optimize(engine, spec) {
   // holds, and it never revisits them; one point in the wrong place was worth 3%
   // on the Warrior. This is the same coordinate ascent the gear gets, applied to
   // the allocation, and every candidate is checked against the real rules.
-  if (refineTalents(winner.loadout, new Set(winner.talentAlloc?.granted ?? grantedTalents(winner.loadout)))) {
+  if (refineTalents(winner.loadout, new Set(grantedTalents(winner.loadout)))) {
     winner.score = scoreOf(winner.loadout);
   }
 
@@ -684,7 +693,7 @@ export function optimize(engine, spec) {
       if (better(after, base.score)) { base.score = after; base.talentAlloc = alloc; cur = base; }
       else base.loadout.talents = ranks;
     }
-    if (refineTalents(base.loadout, new Set(base.talentAlloc?.granted ?? grantedTalents(base.loadout)))) {
+    if (refineTalents(base.loadout, new Set(grantedTalents(base.loadout)))) {
       const after = scoreOf(base.loadout);
       if (better(after, base.score)) { base.score = after; cur = base; }
     }
@@ -703,7 +712,7 @@ export function optimize(engine, spec) {
     reference: refEval,
     talentAlloc: winner.talentAlloc ?? null,
     talentCoverage: engine.talents.coverage(winner.loadout.class, winner.loadout.talents ?? {},
-      { granted: new Set(winner.talentAlloc?.granted ?? []) }),
+      { granted: grantedTalents(winner.loadout) }),
     evaluations: counter,
     trace,
     goal, weights,
