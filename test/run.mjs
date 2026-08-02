@@ -3200,6 +3200,40 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- the damage repartition adds up ------------------------------------------
+// `optimize` now leads with where the damage came from, so the column has to
+// close on the overall. That took a real `total` on every line: reconstructing
+// it as `perCast x fight/interval` reads 30% over, because for the chain
+// `interval` is the CYCLE time while the chain only runs for its share of the
+// clock. A reader adding the old column up was right to find it did not close.
+group('damage per ability sums to the overall');
+{
+  const eng = createEngine({ quiet: true });
+  for (const cls of ['Warrior', 'Rogue', 'Mage', 'Priest']) {
+    const l = emptyLoadout(eng.cat, cls, 25);
+    eng.plan.pruneSelection(l);
+    const t = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 }).throughput;
+    const sum = t.lines.reduce((s, x) => s + (x.total?.damage ?? 0), 0);
+    near(`${cls}: the lines close on dps x fight`, sum, t.dps * t.fight, Math.max(1e-6, t.dps * 1e-9));
+    ok(`${cls}: every line carries a total`,
+      t.lines.every((x) => x.total && Number.isFinite(x.total.damage)),
+      t.lines.filter((x) => !x.total).map((x) => x.id).join(', '));
+  }
+
+  // A pool feed is not a SUBSET of the lines above it - it is a share of their
+  // crits paid out again - so dropping it is what would make the column short.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'Axe_Boomerang', rarity: 'Rare', stars: 3, level: 25 };
+  eng.plan.pruneSelection(l);
+  const t = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 }).throughput;
+  const pooled = t.lines.filter((x) => x.kind === 'over time');
+  ok('this build has a pooled dot to test with', pooled.length > 0);
+  const without = t.lines.filter((x) => x.kind !== 'over time')
+    .reduce((s, x) => s + x.total.damage, 0);
+  ok('...and leaving it out makes the column short',
+    without < t.dps * t.fight - 1, `${without.toFixed(0)} vs ${(t.dps * t.fight).toFixed(0)}`);
+}
+
 // --- the coverage report may not refuse what the model scores ----------------
 // A refusal whose reason is FALSE is a bug, and the two newest channels each
 // made one. `GA_Craft_Passive` was filed under "everything it does lives in its

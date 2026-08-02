@@ -1174,6 +1174,11 @@ function runFight(spec) {
     triggeredLines.push({
       id: g.prof.id, name: g.prof.name, kind: 'triggered', source: g.source,
       perCast: g.out, interval: elapsed / fires, share: 0, why: g.rule.why,
+      total: {
+        damage: (e.damage ?? 0) / rolls,
+        heal: (e.heal ?? 0) / rolls,
+        shield: (e.shield ?? 0) / rolls,
+      },
     });
   }
 
@@ -1190,6 +1195,11 @@ function runFight(spec) {
     lines.push({
       id: a.prof.id, name: a.prof.name, kind: 'active', source: a.source,
       perCast: { damage: e.damage / e.casts, heal: e.heal / e.casts, shield: e.shield / e.casts },
+      // What it dealt over the WHOLE fight. `perCast x fight/interval` is not a
+      // substitute: for the chain those two disagree by the share of the clock
+      // the chain actually gets, and a reader adding the column up was right to
+      // find it 30% over.
+      total: { damage: e.damage / rolls, heal: e.heal / rolls, shield: e.shield / rolls },
       interval: elapsed / casts, share: (casts * a.occupancy) / elapsed,
       casts,
     });
@@ -1203,6 +1213,11 @@ function runFight(spec) {
     lines.push({
       id: '(base attack chain)', name: '(base attack chain)', kind: 'filler',
       perCast: { damage: chainDamage, heal: chainHeal, shield: chainShield },
+      total: {
+        damage: chain.reduce((s, x) => s + (x.total?.damage ?? 0), 0) / rolls,
+        heal: chain.reduce((s, x) => s + (x.total?.heal ?? 0), 0) / rolls,
+        shield: chain.reduce((s, x) => s + (x.total?.shield ?? 0), 0) / rolls,
+      },
       interval: chainTime, share: fillerTime / elapsed,
     });
   }
@@ -1219,6 +1234,9 @@ function runFight(spec) {
     lines.push({
       id: d.status, name: d.name, kind: 'over time', source: d.from,
       perCast: { damage: e.damage / rolls, heal: e.heal / rolls, shield: 0 },
+      // A status's `perCast` IS its whole-fight figure - its interval is the
+      // fight - so the two agree here by construction.
+      total: { damage: e.damage / rolls, heal: e.heal / rolls, shield: 0 },
       interval: elapsed, share: 0,
       why: `${ticks.toFixed(0)} ticks of ${perTick.toFixed(0)} every ${d.tick}s from ${d.fromName}`
         + (d.scaleByStacks && meanStacks > 1.02
@@ -1232,6 +1250,10 @@ function runFight(spec) {
     lines.push({
       id: p.status, name: p.name, kind: 'over time', source: p.from,
       perCast: { damage: e.damage / rolls, heal: (e.heal ?? 0) / rolls, shield: 0 },
+      total: { damage: e.damage / rolls, heal: (e.heal ?? 0) / rolls, shield: 0 },
+      // A pool feed is not a SUBSET of the lines above it - it is a share of
+      // their crits, paid out again on its own schedule - so it belongs in the
+      // repartition and the column closes on the reported total with it in.
       interval: elapsed, share: 0,
       // Say what the guard actually says: Hemorrhage pools physical CRITICAL
       // damage from everyone, Bonethrow pools its OWN damage, crit or not.

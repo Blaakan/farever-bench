@@ -205,9 +205,16 @@ export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {
           effect = granted.map((sk) => {
             const rv = engine.talents.readableValue(sk, 1);
             const name = tree.byId.get(sk).name;
-            return rv.readable
-              ? dim(`grants ${name} - ${rv.kind}`)
-              : warn(`grants ${name} - nothing this model can read; taken because free beats empty`);
+            if (rv.readable) return dim(`grants ${name} - ${rv.kind}`);
+            // `readableValue` looks for an affix, an effect or a status. A node
+            // whose whole payload is a MECHANIC has none of those and is still
+            // scored - Surge of Violence arms a next-cast register - so asking
+            // that one function alone printed "nothing this model can read"
+            // beside a talent the fight was already playing.
+            if (engine.plan.empowermentIds(1).has(sk)) {
+              return dim(`grants ${name} - a next-cast register`);
+            }
+            return warn(`grants ${name} - nothing this model can read; taken because free beats empty`);
           }).join(', ');
         } else if (nonTree.length) {
           effect = dim(`grants ${nonTree.join(', ')} - a skill, not a tree node`);
@@ -264,7 +271,7 @@ export function affixSummary(affixes) {
 // Which of the skills on offer this build actually slotted. A weapon hands you
 // three and you keep two, so this block is as much a part of the answer as the
 // gear table is.
-export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = {}) {
+export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), verbose = true } = {}) {
   const pools = engine.plan.pools(loadout);
   if (!pools.length) return dim('(nothing equipped that offers a skill choice)');
   const skills = engine.cdb.byId('skill');
@@ -323,7 +330,12 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = 
       byKind.get(k).push(u);
     }
     out.push('');
-    out.push(warn(`not scored in this build (${un.length}), by cause:`));
+    // The COUNT always shows - a build with things the model cannot price is
+    // something a reader has to know. The causes and the per-skill reasons are
+    // the explanation, and that is what `--verbose` is for.
+    out.push(warn(`not scored in this build (${un.length})`
+      + (verbose ? ', by cause:' : dim(' - --verbose for what and why'))));
+    if (!verbose) return out.join('\n');
     for (const [kind, blurb] of KINDS) {
       const list = byKind.get(kind);
       if (!list?.length) continue;
@@ -352,7 +364,7 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set() } = 
 
 // The allocated tree, with the honest part attached: which points bought
 // something the model can read, and which were spent only to open a tier.
-export function talentBlock(engine, loadout, alloc, cov) {
+export function talentBlock(engine, loadout, alloc, cov, { verbose = true } = {}) {
   const T = engine.talents;
   const tree = T.treeFor(loadout.class);
   const granted = new Set(alloc.granted ?? []);
@@ -368,7 +380,13 @@ export function talentBlock(engine, loadout, alloc, cov) {
       n?.name ?? id,
       granted.has(id) ? warn("from sigil") : cap > 1 ? `${rank}/${cap}` : "",
       blind.has(id) && rank === 1 ? dim("gate point") : "",
-      v.readable ? (affixSummary(v.affixes) || v.kind) : dim("nothing readable"),
+      // `readableValue` looks for an affix, an effect or a status. A node whose
+      // whole payload is a MECHANIC has none of those and is still scored, so
+      // asking it alone printed "nothing readable" beside a talent the fight
+      // was already playing.
+      v.readable ? (affixSummary(v.affixes) || v.kind)
+        : engine.plan.empowermentIds(1).has(id) ? dim("a next-cast register")
+          : dim("nothing readable"),
     ];
   });
 
@@ -379,12 +397,60 @@ export function talentBlock(engine, loadout, alloc, cov) {
     rows.length
       ? table(["  TIER", "BRANCH", "TALENT", "RANK", "", "GIVES"], rows)
       : dim("  (nothing in this tree declares a value this model can score)"),
-    dim(`  ${cov.readable} of ${cov.spent} spent points bought a readable value. `
-      + `The tree holds ${cov.totalPoints} points across\n  ${cov.total} nodes; `
-      + `${cov.total - cov.totalReadable} of those nodes declare nothing at all, so points that only `
-      + "open\n  a tier are spent blind and marked. See `bench talents`."),
-  ].join("\n");
+    verbose
+      ? dim(`  ${cov.readable} of ${cov.spent} spent points bought a readable value. `
+        + `The tree holds ${cov.totalPoints} points across\n  ${cov.total} nodes; `
+        + `${cov.total - cov.totalReadable} of those nodes declare nothing at all, so points that only `
+        + "open\n  a tier are spent blind and marked. See `bench talents`.")
+      : null,
+  ].filter((x) => x != null).join("\n");
 }
+/**
+ * What the build DEALS, and where it came from. Overall first, then one row per
+ * ability in decreasing damage.
+ *
+ * The column adds up to the overall, which took exposing a real `total` on each
+ * line: `perCast x fight/interval` is not a substitute, because for the chain
+ * `interval` is the cycle time while the chain only runs for its share of the
+ * clock - reconstructing it that way read 30% over, and a reader adding the
+ * column up was right to find it did not close.
+ *
+ * A pool feed belongs in the sum. It is not a SUBSET of the lines above it - it
+ * is a share of their crits, paid out again on its own schedule - so leaving it
+ * out is what would make the column short.
+ */
+export function damageBlock(ev, { verbose = false } = {}) {
+  const t = ev.throughput;
+  const fight = t.fight || 1;
+  const rows = t.lines
+    .map((l) => ({ l, dmg: l.total?.damage ?? 0 }))
+    .filter((x) => x.dmg > 0)
+    .sort((a, b) => b.dmg - a.dmg);
+  const total = rows.reduce((s, x) => s + x.dmg, 0);
+  // A skill and the dot it leaves behind share a name - Bonethrow's cast and
+  // Bonethrow's bleed are two rows - so the kind is appended where the name
+  // alone would print twice.
+  const seen = new Map();
+  for (const x of rows) seen.set(x.l.name, (seen.get(x.l.name) ?? 0) + 1);
+  const label = (l) => (seen.get(l.name) > 1 ? `${l.name} (${l.kind})` : l.name);
+  return [
+    bold('DAMAGE'),
+    table(
+      ['  ', 'DPS', 'DAMAGE', 'SHARE'],
+      [
+        ['  overall', num(t.dps, 1), num(total, 0), ''],
+        ...rows.map((x) => [
+          '  ' + label(x.l),
+          num(x.dmg / fight, 1),
+          num(x.dmg, 0),
+          total > 0 ? pct(x.dmg / total, 1) : '',
+        ]),
+      ],
+      { align: [null, 'r', 'r', 'r'] }
+    ),
+  ].join('\n');
+}
+
 export function throughputBlock(engine, ev, { goal }) {
   const t = ev.throughput;
   const s = ev.survivability;

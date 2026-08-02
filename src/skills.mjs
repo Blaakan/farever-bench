@@ -3201,7 +3201,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   return {
     pools, defaultSelection, pruneSelection, resolve, selfBuffs, selfBuffsOf, statusesOf,
     weaponSlotsAt, arsenalSlotsAt, typeOf, baseChain, resourceGainsOf, talentModifiers, maxStacksOf,
-    empowermentsOf,
+    empowermentsOf, empowermentIds,
     mechanicTypes: MECHANIC_TYPES,
   };
 }

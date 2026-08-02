@@ -948,15 +948,22 @@ const commands = {
     // armour slot filled by a piece that pays it - see `themeSeeds`. Saying
     // which seed won is the interesting half: "the ArmorPenetration set" is a
     // statement about the build, and "restart 2" is not.
+    // The running commentary and the assumption list are the tool explaining
+    // ITSELF, which is worth reading once and not on every run. `--verbose`
+    // brings back the search trace, the per-line notes, the rotation's own
+    // reasoning, and the audit.
+    const verbose = !!args.flags.verbose;
     const won = res.trace.reduce((b, x) => (x.score > b.score ? x : b)).restart;
-    console.log(f.dim(`${res.evaluations} distinct loadouts evaluated in ${((Date.now() - t0) / 1000).toFixed(1)}s ` +
-      `over ${res.trace.length} seeds (${restarts} random, ${res.trace.length - restarts} themed by rating) - ` +
-      `best from ${typeof won === 'number' ? `restart ${won}` : `the ${won} set`}`));
+    if (verbose) {
+      console.log(f.dim(`${res.evaluations} distinct loadouts evaluated in ${((Date.now() - t0) / 1000).toFixed(1)}s ` +
+        `over ${res.trace.length} seeds (${restarts} random, ${res.trace.length - restarts} themed by rating) - ` +
+        `best from ${typeof won === 'number' ? `restart ${won}` : `the ${won} set`}`));
+    }
     console.log('');
     console.log(f.gearBlock(s.engine, res.loadout, {
       pinnedGear: pins.pinnedGear, indifferent: new Set(res.indifferent),
     }));
-    if (res.indifferent.length) {
+    if (verbose && res.indifferent.length) {
       console.log(f.dim(`  no effect: emptying ${res.indifferent.map(f.short).join(', ')} scores exactly the ` +
         `same for ${s.goal}.\n  The pick is the best of equals - a shield grants only armour, so a damage goal\n` +
         '  cannot tell one from another, or from none at all.'));
@@ -966,21 +973,25 @@ const commands = {
     console.log(f.augmentBlock(s.engine, res.loadout, { pinnedAug: pins.pinnedAug }) + '\n');
     if (res.talentAlloc) {
       console.log(f.bold('TALENTS'));
-      console.log(f.talentBlock(s.engine, res.loadout, res.talentAlloc, res.talentCoverage) + '\n');
+      console.log(f.talentBlock(s.engine, res.loadout, res.talentAlloc, res.talentCoverage,
+        { verbose }) + '\n');
     }
     console.log(f.bold('SKILLS'));
-    console.log(f.skillsBlock(s.engine, res.loadout, res.evaluation, { pinnedSkills: pins.pinnedSkills }) + '\n');
+    console.log(f.skillsBlock(s.engine, res.loadout, res.evaluation,
+      { pinnedSkills: pins.pinnedSkills, verbose }) + '\n');
     console.log(f.runeBlock(s.engine, res.loadout, res.evaluation) + '\n');
     console.log(f.sheetBlock(s.engine, res.evaluation, { level: s.level }));
-    console.log(f.throughputBlock(s.engine, res.evaluation, { goal: s.goal }) + '\n');
-
-    // What the search bought over the seed, when the seed had anything in it.
-    const seedScore = s.engine.makeScorer({ ...s, target, ref: res.reference }).scoreFrom(res.reference);
-    if (seedScore > 0) {
-      console.log(f.dim(`starting build scored ${f.num(seedScore, 2)}; this one scores ${f.num(res.score, 2)} ` +
-        `(${f.signedPct(res.score / seedScore - 1)})`) + '\n');
+    console.log(f.damageBlock(res.evaluation) + '\n');
+    if (verbose) {
+      console.log(f.throughputBlock(s.engine, res.evaluation, { goal: s.goal }) + '\n');
+      // What the search bought over the seed, when the seed had anything in it.
+      const seedScore = s.engine.makeScorer({ ...s, target, ref: res.reference }).scoreFrom(res.reference);
+      if (seedScore > 0) {
+        console.log(f.dim(`starting build scored ${f.num(seedScore, 2)}; this one scores ${f.num(res.score, 2)} ` +
+          `(${f.signedPct(res.score / seedScore - 1)})`) + '\n');
+      }
+      console.log(f.auditBlock(s.engine));
     }
-    console.log(f.auditBlock(s.engine));
 
     if (typeof args.flags.json === 'string') {
       writeFileSync(args.flags.json, JSON.stringify({
@@ -2095,6 +2106,11 @@ Stat profiles
 Common flags
   --class <name>          Warrior | Rogue | Mage | Priest
   --level <n>             default: the game's MaxLevel
+  --verbose               optimize prints the build and where its damage came
+                          from. This adds back everything that explains those
+                          numbers: the search trace, the rotation's own
+                          reasoning, the per-skill refusal causes, the talent
+                          coverage note, and the assumptions-and-gaps list
   --goal <g>              dps | hps | sps | ehp | mixed (default dps)
   --weight <g>=<n>        blend goals, e.g. --weight dps=1 --weight ehp=0.25
   --target <t>            dummy | small | trash | big | elite | boss | dungeon
