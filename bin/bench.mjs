@@ -12,7 +12,8 @@
 // install directory.
 // ---------------------------------------------------------------------------
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { createEngine, GOALS, FERVOR_SCOPES } from '../src/engine.mjs';
 import { emptyLoadout, classOf } from '../src/loadout.mjs';
 import { optimize, rankSlot } from '../src/optimize.mjs';
@@ -1294,36 +1295,65 @@ const commands = {
     }
     if (!pairs.length) die('no legal (mainhand, arsenal) pairs to sweep');
 
+    // Every pair's full report goes to DISK as it completes, not to RAM:
+    // a 200-pair sweep holds hundreds of full evaluations otherwise, and a
+    // sweep is exactly the run long enough to want reading before it ends.
+    // Each file is an `optimize --json`-shaped envelope, so `--build` reads
+    // any one of them back directly; `index.json` is rewritten per pair with
+    // the ranking so far. A pair whose file already exists is SKIPPED, which
+    // is what turns a crash, a Ctrl+C or a bigger --restarts into a resume
+    // instead of a restart - `--fresh` recomputes everything.
+    const outDir = typeof args.flags.out === 'string' ? args.flags.out
+      : `bench-layouts-${base.class}-${s.goal}`;
+    mkdirSync(outDir, { recursive: true });
+
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${f.bold(base.class + ' ' + s.level)} - the best full layout for every ordered ` +
       `(mainhand, arsenal) pair, by ${f.bold(s.goal)} vs ${target.name}`);
     console.log(f.dim(`  ${mains.length} mainhands x ${arsenals.length} arsenals = ${pairs.length} pairs, ` +
       `each a full optimize (${restarts} restart${restarts === 1 ? '' : 's'}) over armour, offhand, ` +
       'augments, arsenal skills, talents and runes'));
+    console.log(f.dim(`  reports land in ${outDir}/ as they finish - index.json is the ranking so far, ` +
+      'each pair file reloads with --build, and an existing file resumes instead of recomputing'));
 
+    const envelopeOf = (m, a, res) => ({
+      version: VERSION, cdbSha: s.engine.meta.cdbSha, bootSha: s.engine.meta.bootSha,
+      goal: s.goal, weights: s.weights, target: s.targetName, targetLabel: target.name,
+      fervorScope: s.engine.opts.assume.fervorScope,
+      stars: s.stars, rank: s.rank, level: s.level, mix: s.mix,
+      rarityRoll: s.rarityRoll,
+      fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
+      lookahead: s.fight.lookahead, restarts,
+      main: m.id, mainName: m.name, arsenal: a.id, arsenalName: a.name,
+      score: res.score,
+      pinned: { gear: ['Slot_Weapon1', 'Slot_Weapon2'], augments: [], skills: [] },
+      build: res.loadout,
+      metrics: {
+        dps: res.evaluation.throughput.dps,
+        hps: res.evaluation.throughput.hps,
+        sps: res.evaluation.throughput.sps,
+        ehp: res.evaluation.survivability.ehp,
+      },
+      unmodelled: res.evaluation.throughput.unmodelled,
+    });
+    // What survives in memory per pair: one summary row. The full evaluation
+    // is kept only for the --show best, in a list that never exceeds --show.
     const rows = [];
-    const t0 = Date.now();
-    const checkpoint = () => {
-      if (typeof args.flags.json !== 'string') return;
-      writeFileSync(args.flags.json, JSON.stringify({
+    const keep = [];
+    const fileFor = (m, a) => join(outDir, `${m.id}__${a.id}.json`);
+    const writeIndex = () => {
+      rows.sort((x, y) => y.score - x.score);
+      writeFileSync(join(outDir, 'index.json'), JSON.stringify({
         version: VERSION, cdbSha: s.engine.meta.cdbSha, bootSha: s.engine.meta.bootSha,
-        goal: s.goal, weights: s.weights, target: s.targetName, targetLabel: target.name,
-        stars: s.stars, rank: s.rank, level: s.level,
-        fight: s.fight.seconds, targets: s.fight.targets, restarts,
-        // Each entry's `build` is a loadout `--build` can read back, so any
-        // pair's layout re-derives on its own.
-        pairs: rows.map((r) => ({
-          main: r.main.id, mainName: r.main.name, arsenal: r.ars.id, arsenalName: r.ars.name,
-          score: r.res.score,
-          metrics: {
-            dps: r.res.evaluation.throughput.dps,
-            hps: r.res.evaluation.throughput.hps,
-            ehp: r.res.evaluation.survivability.ehp,
-          },
-          build: r.res.loadout,
-        })),
+        goal: s.goal, target: s.targetName, targetLabel: target.name,
+        level: s.level, rank: s.rank, restarts,
+        done: rows.length, of: pairs.length,
+        pairs: rows,
       }, null, 2));
     };
+
+    const t0 = Date.now();
+    let resumed = 0;
     for (let i = 0; i < pairs.length; i++) {
       const [m, a] = pairs[i];
       if (process.stderr.isTTY) {
@@ -1332,6 +1362,22 @@ const commands = {
         const mb = Math.round(process.memoryUsage().rss / 1048576);
         process.stderr.write(`\r  ${i + 1}/${pairs.length}  ${m.item.id} / ${a.item.id}` +
           `${eta != null ? `  ~${eta}s left` : ''}  ${mb}MB        `);
+      }
+      const file = fileFor(m.item, a.item);
+      if (!args.flags.fresh && existsSync(file)) {
+        try {
+          const env = JSON.parse(readFileSync(file, 'utf8'));
+          rows.push({
+            main: m.item.id, mainName: m.item.name ?? m.item.id,
+            arsenal: a.item.id, arsenalName: a.item.name ?? a.item.id,
+            score: env.score, metrics: env.metrics,
+            arsSkills: env.build?.skills?.Slot_Weapon2 ?? [],
+            talentCount: Object.keys(env.build?.talents ?? {}).length,
+            file,
+          });
+          resumed++;
+          continue;
+        } catch { /* unreadable checkpoint: recompute it */ }
       }
       const loadout = { ...base, gear: {}, augments: {}, skills: {}, runes: {}, talents: {} };
       loadout.gear.Slot_Weapon1 = gearFor(m);
@@ -1344,54 +1390,80 @@ const commands = {
           exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
           talentPoints: s.talentPoints, allowEmpty: true, restarts,
         });
-        rows.push({ main: m.item, ars: a.item, res });
-        // A 20-minute sweep that dies at pair 140 should leave 139 behind.
-        if (i % 5 === 4) checkpoint();
+        writeFileSync(file, JSON.stringify(envelopeOf(m.item, a.item, res), null, 2));
+        rows.push({
+          main: m.item.id, mainName: m.item.name ?? m.item.id,
+          arsenal: a.item.id, arsenalName: a.item.name ?? a.item.id,
+          score: res.score,
+          metrics: envelopeOf(m.item, a.item, res).metrics,
+          arsSkills: res.loadout.skills?.Slot_Weapon2 ?? [],
+          talentCount: Object.keys(res.loadout.talents ?? {}).length,
+          file,
+        });
+        // Only the --show best keep their full evaluation in memory.
+        keep.push({ score: res.score, main: m.item, ars: a.item, res });
+        keep.sort((x, y) => y.score - x.score);
+        if (keep.length > Math.max(1, show)) keep.pop();
+        writeIndex();
       } catch { /* a pair this class cannot legally hold */ }
     }
     if (process.stderr.isTTY) process.stderr.write('\r' + ' '.repeat(70) + '\r');
-    rows.sort((a, b) => b.res.score - a.res.score);
-    checkpoint();
+    rows.sort((x, y) => y.score - x.score);
+    writeIndex();
+    if (typeof args.flags.json === 'string') {
+      // The single-file container, assembled from the per-pair files so it
+      // costs no memory during the sweep.
+      writeFileSync(args.flags.json, JSON.stringify({
+        version: VERSION, goal: s.goal, target: s.targetName, level: s.level,
+        pairs: rows.map((r) => {
+          try { return JSON.parse(readFileSync(r.file, 'utf8')); } catch { return r; }
+        }),
+      }, null, 2));
+    }
 
-    const best = rows[0]?.res.score ?? 0;
+    const best = rows[0]?.score ?? 0;
     console.log('');
     console.log(f.table(
       [s.goal.toUpperCase(), 'VS BEST', 'MAIN HAND', 'ARSENAL', 'ARSENAL SKILLS', 'TALENT TREE SPREAD'],
       rows.map((r) => [
-        f.num(r.res.score, 1),
-        r.res.score >= best ? f.bold('best') : f.signedPct(r.res.score / best - 1),
-        r.main.name ?? r.main.id,
-        r.ars.name ?? r.ars.id,
-        (r.res.loadout.skills?.Slot_Weapon2 ?? []).map(f.short).join(', ') || f.dim('-'),
-        Object.keys(r.res.loadout.talents ?? {}).length + ' nodes',
+        f.num(r.score, 1),
+        r.score >= best ? f.bold('best') : f.signedPct(r.score / best - 1),
+        r.mainName,
+        r.arsenalName,
+        (r.arsSkills ?? []).map(f.short).join(', ') || f.dim('-'),
+        r.talentCount + ' nodes',
       ]),
       { align: ['r', 'r', null, null, null, null] },
     ));
-    console.log(f.dim(`  ${rows.length} of ${pairs.length} pairs legal, ${((Date.now() - t0) / 1000).toFixed(1)}s`));
+    console.log(f.dim(`  ${rows.length} of ${pairs.length} pairs legal`
+      + (resumed ? `, ${resumed} resumed from ${outDir}` : '')
+      + `, ${((Date.now() - t0) / 1000).toFixed(1)}s`));
 
-    for (const r of rows.slice(0, Math.max(0, show))) {
+    // The full blocks for the best pairs COMPUTED THIS RUN. A resumed pair's
+    // report lives in its file; reprinting it exactly means re-running its
+    // optimize, which is what --fresh is for.
+    for (const k of keep.slice(0, Math.max(0, show))) {
       console.log('\n' + '='.repeat(78));
-      console.log(f.bold(`${r.main.name ?? r.main.id}  +  ${r.ars.name ?? r.ars.id} (arsenal)`)
-        + `   ${s.goal} ${f.num(r.res.score, 1)}`);
+      console.log(f.bold(`${k.main.name ?? k.main.id}  +  ${k.ars.name ?? k.ars.id} (arsenal)`)
+        + `   ${s.goal} ${f.num(k.res.score, 1)}`);
       console.log('='.repeat(78) + '\n');
-      console.log(f.gearBlock(s.engine, r.res.loadout, {
+      console.log(f.gearBlock(s.engine, k.res.loadout, {
         pinnedGear: new Set(['Slot_Weapon1', 'Slot_Weapon2']),
-        indifferent: new Set(r.res.indifferent),
+        indifferent: new Set(k.res.indifferent),
       }) + '\n');
       console.log(f.bold('AUGMENTS'));
-      console.log(f.augmentBlock(s.engine, r.res.loadout, { pinnedAug: new Set() }) + '\n');
-      if (r.res.talentAlloc) {
+      console.log(f.augmentBlock(s.engine, k.res.loadout, { pinnedAug: new Set() }) + '\n');
+      if (k.res.talentAlloc) {
         console.log(f.bold('TALENTS'));
-        console.log(f.talentBlock(s.engine, r.res.loadout, r.res.talentAlloc, r.res.talentCoverage) + '\n');
+        console.log(f.talentBlock(s.engine, k.res.loadout, k.res.talentAlloc, k.res.talentCoverage) + '\n');
       }
       console.log(f.bold('SKILLS'));
-      console.log(f.skillsBlock(s.engine, r.res.loadout, r.res.evaluation, { pinnedSkills: new Set() }) + '\n');
-      console.log(f.runeBlock(s.engine, r.res.loadout, r.res.evaluation) + '\n');
-      console.log(f.throughputBlock(s.engine, r.res.evaluation, { goal: s.goal }));
+      console.log(f.skillsBlock(s.engine, k.res.loadout, k.res.evaluation, { pinnedSkills: new Set() }) + '\n');
+      console.log(f.runeBlock(s.engine, k.res.loadout, k.res.evaluation) + '\n');
+      console.log(f.throughputBlock(s.engine, k.res.evaluation, { goal: s.goal }));
     }
-    if (rows.length > show && typeof args.flags.json !== 'string') {
-      console.log('\n' + f.dim(`the other ${rows.length - show} layouts are one --json away, or raise --show`));
-    }
+    console.log('\n' + f.dim(`every layout is in ${outDir}/ - index.json ranks them, and any pair file `
+      + 'loads back with --build'));
     console.log('\n' + f.auditBlock(s.engine));
   },
 
@@ -1946,9 +2018,15 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
   bench weapons    every mainhand, ranked at one of those corners
   bench layouts    the best FULL build for every ordered (mainhand, arsenal)
                    pair - armour, offhand, augments, arsenal skills, talents
-                   and runes searched per pair; --main/--arsenal narrow it,
-                   --restarts <n> trades depth for time (default 3),
-                   --show <n> prints the top layouts in full, --json keeps all
+                   and runes searched per pair. Every report is written to
+                   disk AS IT FINISHES (default bench-layouts-<class>-<goal>/,
+                   --out <dir> moves it): index.json is the live ranking,
+                   each pair file reloads with --build, and re-running skips
+                   pairs already on disk - a crash or Ctrl+C resumes instead
+                   of restarting (--fresh recomputes). --main/--arsenal
+                   narrow the sweep, --restarts <n> trades depth for time
+                   (default 3), --show <n> prints the top layouts in full,
+                   --json <file> additionally collates everything into one
   bench rotation   search for the rotation a weapon wants, and the kit with it
   bench audit      every assumption and gap in the model
 

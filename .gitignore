@@ -12,3 +12,7 @@ node_modules/
 # the game's data is Shiro Games' - the generator ships, its output does not.
 out/
 *.bench.json
+
+# Where `bench layouts` writes one report per weapon pair as the sweep runs.
+# Same rule as above: derived from the player's own game data, never committed.
+bench-layouts-*/
