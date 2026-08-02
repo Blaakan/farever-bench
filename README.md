@@ -77,21 +77,29 @@ bench rotation --class Warrior --profile armorpen \
 ```
 
 ```
-326656 simulated fights in 41.2s over 6 rounds of (rotation, then kit)
+627810 simulated fights in 101.0s over 3 rounds of (rotation, then kit)
+1198882 lists considered - 571072 of them were lists this search had already
+played, and were re-scored from the memo
 
 ROTATION  - walk it top to bottom, press the first line that is ready
-  #  SKILL          WHEN                   PER CAST   EVERY
-  1  Tear Reality   holding.Surging Force     355.5  16.67s
-  2  Shockwave      always                    383.9  20.00s
-  3  Charge         always                    247.5  14.29s
-  4  Rampage        always                   1285.1  10.53s
-  5  Raging Smash   always                    330.7   5.56s
-  6  Surging Force  always                    160.6  40.00s
+  #  SKILL         WHEN                            PER CAST   EVERY
+  1  Tear Reality  always                             212.3  18.18s
+  2  Rampage       always                             457.2  11.11s
+  3  Shockwave     debuff.Tear Reality.remains>=3     139.1  25.00s
+  4  Raging Smash  ready.Shockwave                     75.2   6.45s
+  5  Raging Smash  debuff.Tear Reality.remains>=3      75.2   6.45s
+  not pressed: Ignore Pain, Surging Force - the search found the clock better spent elsewhere
+  anything not listed is never pressed; when no line matches, you swing.
 
-  derived order   336.3
-  searched        338.0     +0.49%
-  107 of 250 independent restarts reached this score; worst reached 312.0.
+  derived order   147.9
+  searched        151.1     +2.22%
+  1 of 250 independent restarts reached this score; worst reached 149.2.
 ```
+
+That last line is worth reading twice: **one** restart in 250 found this list.
+The vocabulary grew when `remains` and `cd` landed, and a richer vocabulary makes
+the basin around the best list narrower, not wider — which is exactly why the
+search kicks the incumbent instead of restarting at random.
 
 **What is searched is a policy, not a sequence.** A sequence is optimal for one
 build against one deterministic fight, transfers to nothing, and learns to dump
@@ -130,23 +138,25 @@ rotation fixed — until neither moves.
 Three things are checked rather than claimed:
 
 ```
-AND WHETHER IT SURVIVES THE DICE  - procs rolled rather than averaged
-  difference  +1.65  -  exact
-  This build has nothing for the dice to touch, so every fight plays out
-  identically and the difference is exact rather than significant.
+AND WHETHER IT SURVIVES THE DICE  - 60 fights each, procs and crits rolled rather than averaged
+                      MEAN        SD
+  derived order      145.9      5.70
+  searched rotation  150.8      5.84
+  difference         +4.97  +/- 1.05  clears the noise
 
-AND WHETHER IT TRANSFERS  - the same rotation at other stat corners
-  zero       93.8 ->  93.5   -0.35%  LOSES to the derived order
-  mid       243.8 -> 245.6   +0.75%  holds
-  full      486.0 -> 484.5   -0.29%  LOSES to the derived order
-  crit      271.2 -> 270.6   -0.23%  LOSES to the derived order
-  armorpen  272.3 -> 273.9   +0.60%  holds   (tuned here)
-  fervor    261.4 -> 263.5   +0.81%  holds
+AND WHETHER IT TRANSFERS  - the same rotation, re-evaluated at other stat corners
+  PROFILE                 DERIVED  THIS ROTATION   GAIN
+  zero                       72.4           73.7  1.77%  holds
+  mid                       144.0          147.6  2.49%  holds
+  crit                      149.0          152.4  2.28%  holds
+  armorpen  (tuned here)    147.5          151.1  2.48%  holds
+  fervor                    147.3          151.0  2.49%  holds
 ```
 
-`--validate` rolls the procs instead of averaging them, and says outright when a
-difference is inside the spread. `--across` re-runs the rotation at other stat
-corners: one that only wins where it was tuned is a rotation for that corner.
+`--validate n` rolls the procs, the ±10% swing band and the crit instead of
+averaging them, and says outright when a difference is inside the spread.
+`--across` re-runs the rotation at other stat corners: one that only wins where
+it was tuned is a rotation for that corner, and this one holds everywhere.
 
 ### Does a stat repartition change the rotation?
 
@@ -156,33 +166,42 @@ the stats — then cross-evaluate every rotation at every corner.
 
 ```
 CORNER    DERIVED  SEARCHED   GAIN  THE ROTATION IT WANTS
-mid          85.6      86.1  0.61%  Rampage[holding.Surging Force] > Raging Smash[debuff.Tear Reality.up] > ...
-strength    155.1     156.4  0.83%  Surging Force > Tear Reality > Rampage[debuff.Tear Reality.up] > ...
-crit         87.7      88.9  1.29%  Rampage[debuff.Tear Reality.up & holding.Charge] > Tear Reality > ...
+mid         144.0     147.5  2.39%  Tear Reality > Rampage > Raging Smash[debuff.Tear Reality.up] > Shockwave[cd.Rampage<=1]
+strength    208.7     213.3  2.22%  Rampage[holding.Shockwave] > Raging Smash[debuff.Tear Reality.remains>=1] > Tear Reality > ...
+crit        149.0     152.4  2.31%  Tear Reality > Rampage > Raging Smash[debuff.Tear Reality.remains>=3] > Raging Smash[cd.Tear Reality<=3 & debuff.Tear Reality.up] > ...
+armorpen    147.5     151.0  2.38%  Tear Reality > Rampage > Raging Smash[debuff.Tear Reality.up] > Shockwave[cd.Rampage<=1]
+fervor      147.3     150.9  2.39%  Tear Reality > Rampage > Raging Smash[debuff.Tear Reality.up] > Shockwave[cd.Rampage<=1]
 
 AND WHAT IT COSTS TO CARRY ONE EVERYWHERE  - % below the best rotation for that corner
   FOUND AT     mid  strength  vitality    crit  armorpen  fervor
-  mid        0.00%     0.10%     0.24%  -1.42%     0.00%   0.00%
-  strength  -0.11%     0.00%     0.08%  -0.56%    -0.11%  -0.11%
-  crit      -1.05%    -1.24%    -0.82%   0.00%    -1.05%  -1.07%
-
-  Carrying one rotation everywhere costs at most 0.56% if you pick the one found
-  at "strength".
+  mid        0.00%    -0.08%    -0.40%  -0.31%     0.00%   0.00%
+  strength   0.08%     0.00%    -0.32%  -0.27%     0.08%   0.08%
+  crit      -0.24%    -0.24%    -0.63%   0.00%    -0.24%  -0.24%
+  fervor     0.00%    -0.08%    -0.40%  -0.31%     0.00%   0.00%
 ```
 
-**Yes, it changes — a little.** Each corner wants a visibly different list, and
-`crit` wants the most conditional one of all (it is the only corner that reached
-for a two-term condition). But the *cost* of ignoring that is bounded: one
-rotation carried everywhere loses at most 0.56%. Whether a distinct list per stat
+**Barely.** Three of the six corners converge on the *same* four-line list, and
+carrying any one of them everywhere costs at most **0.63%**. `crit` is again the
+one that reaches furthest — it is the only corner that wanted a two-term
+condition, `Raging Smash if cd.Tear Reality<=3 & debuff.Tear Reality.up` — and
+`vitality` the one that wants the longest list. Whether a distinct list per stat
 spread is worth writing down is then a decision with a number attached rather
-than a guess.
+than a guess, and the number says no.
 
-**On the size of the number.** +0.5% is small, and honestly so. The mechanics
-worth sequencing around in this game — Ram Veil's five-stack consume, the
-crit-combo cooldown resets, Surge of Violence's free cast — are mostly ones the
-model still refuses, because the fight tracks *which* statuses are up but not
-*how many*, and nothing is allowed to touch cooldown state. `bench audit` names
-them. The search is what will measure those when they land.
+**On the size of the number, and why it moved.** This used to read +0.5%, and
+the reason given was that the mechanics worth sequencing around were ones the
+model refused. Two of those have since landed and the number went to **+2.2%**:
+the rotation language gained *how much of a window is left* (`remains`) and *how
+close a cooldown is* (`cd.X<=n`), and a damage-over-time now ticks once per
+stack instead of once. The winning list uses both — `Shockwave if
+debuff.Tear Reality.remains>=3` is *do not spend it into a window that will
+close first*.
+
+What is still refused is named in `bench audit` and it is still worth something:
+a stat buff is counted at its stack cap rather than at a tracked count, Surge of
+Violence's free cast has no register, and the proc-applied trinket buffs are
+refused entirely. The search is what will measure those when they land, the same
+way it measured these.
 
 ### Comparing weapons without the gear in the way
 

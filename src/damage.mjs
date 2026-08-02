@@ -1426,9 +1426,26 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'row (measured separately). The gear bake (generateItemAffixes@20747, HItem.hx:415) DOES ' +
            'divide each row by the aptitude count - read directly - but for attributes both aptitudes ' +
            'carry, sum-of-halves equals mean-of-fulls, so this model\'s per-aptitude-rounded sum ' +
-           'reproduces every measured tooltip integer regardless; the two decompositions differ only ' +
-           'in which inferred drop level fits a single-aptitude line, and a full trace of the bake ' +
-           '(its per-row loop and gearRatio) is the named next read.' },
+           'reproduces every measured tooltip integer regardless.' },
+    { severity: 'assumption', what: 'the gear bake is traced and reconciled, and the model is still the OTHER decomposition',
+      why: 'generateItemAffixes@20747 (HItem.hx:349-499) is now read end to end and it is NOT a ' +
+           'per-aptitude sum. It GROUPS every surviving aptitude.atbScaling row by endAtb, averages ' +
+           'start/end across the group, evaluates the level curve ONCE at L = iLevel/10, multiplies by ' +
+           'gearRatio = 0.5 x (0.9/0.5)^((L-1)/(earlyMaxLevel-1)) unless the row is gearOnly, divides ' +
+           'by item.aptitudes.length, uses Math.round of THAT only as a `> 0` predicate (there is no ' +
+           'loop - op 288 is a continue, so the "round-as-loop-count" reading was wrong), multiplies ' +
+           'by itemType.atbRatio[statGroup], accumulates into a map keyed by sourceAtb ?? endAtb, ' +
+           'divides by the attribute\'s own scaling scale, and rounds ONCE to emit. This model is the ' +
+           'same expression with aptitudes.length := 1, gearRatio := 1, the group mean replaced by a ' +
+           'per-row sum, and the round moved inside the sum. The two reproduce the same ten measured ' +
+           'integers at DIFFERENT inferred levels - this model at effective level 11, the bytecode ' +
+           'uniquely at iLevel 290 (25x10 + 10 Rare + 3x10 stars) - so the tooltip evidence does not ' +
+           'separate them and the bytecode is authoritative. Three gaps fall out of the trace and are ' +
+           'not yet closed: the Uncommon statGroup rules (Vitality is dropped off a dual-aptitude ' +
+           'Uncommon and Primary off a single-aptitude one), Armor\'s reduction term taking the ITEM\'s ' +
+           'aptitude mean rather than the wearer\'s, and gearRatio being absent entirely. Landing the ' +
+           'rewrite moves every stat in the tool, so it belongs in its own change with the tooltip ' +
+           'integers re-measured against it - it is the named next edit, not a pending read.' },
     { severity: 'verified', what: 'a damage-over-time ticks once per stack, and the count is live',
       why: 'Read from getStackFactor@20772, which runs as the LAST line of getStepEffectVal@20775 - ' +
            'after the scaling, after the spread division, after the damage variance - and multiplies ' +
