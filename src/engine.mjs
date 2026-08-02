@@ -209,6 +209,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // Only the weapons you actually wield: the arsenal grants two chosen skills
     // and its discounted stats, and the upgrade effect is neither.
     const upgradeGaps = [];
+    const upgradeProcs = [];
     for (const slotId of ['Slot_Weapon1', 'Slot_OffhandWeapon']) {
       const g = loadout.gear[slotId];
       if (!g?.item) continue;
@@ -223,6 +224,31 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         && !(a.conds?.maxRank != null && stars > a.conds.maxRank)
         && !(a.conds?.equalRank != null && stars !== a.conds.equalRank));
       if (!rows.length) {
+        // ...but a script proc is not automatically unreadable. Twelve of the
+        // twenty `<Type>_Upgrade` rows carry a script instead of affixes, and
+        // one shape among them is fully in the data:
+        //
+        //   GreatSword_Upgrade, vars.chance 0.04
+        //   "Your [BasicAttack]s have a 4% chance to attack twice."
+        //   onSkillProc(ctx) {
+        //     if (ctx.skill?.isBasicAttack() && checkProba(vars.chance))
+        //       ctx.skill.playStep(null, ctx.skill.getExecStep().index, ...);
+        //   }
+        //
+        // Replaying the executing step IS the hit again, so the whole payload
+        // is a multiplier of (1 + chance) on basic attacks - and `isBasicAttack`
+        // is skill types Attack..Attack4 (BaseSkill.isBasicAttack@6045), which
+        // EXCLUDES the combo finisher. None of these rows carries a cooldown
+        // and none uses the game's own internal-cooldown idiom, so the rate is
+        // plain Bernoulli with nothing to saturate.
+        const body = String(up?.script ?? '');
+        const chance = up?.vars?.chance;
+        if (/isBasicAttack\s*\(\s*\)/.test(body) && /playStep\s*\(/.test(body)
+          && /checkProba\s*\(\s*vars\.chance/.test(body)
+          && typeof chance === 'number' && chance > 0 && chance <= 1) {
+          upgradeProcs.push({ id: upgradeId, slot: slotId, stars, chance });
+          continue;
+        }
         upgradeGaps.push({ id: upgradeId, slot: slotId, stars });
         continue;
       }
@@ -306,6 +332,10 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     const mods = {
       critDamageByType: {}, critChanceByType: {}, damageByAffinity: {},
       armorIgnore: {}, bleed: {}, bleedScoped: [], cooldown: {},
+      // A multiplier on BASIC attacks only - the three or four links of the
+      // chain, never the combo finisher that ends it. The weapon-upgrade
+      // double-attack proc is the only thing that writes it today.
+      basicAttack: upgradeProcs.reduce((s, p) => s + p.chance, 0),
     };
     // Modifiers whose scope this fight does not separate. Named, not dropped.
     const unreadMods = [];

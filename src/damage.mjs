@@ -981,6 +981,12 @@ export function buildCombat(cdb, ctx, assume = {}) {
         m *= 1 + (mods.damageByAffinity?.[aff.root] ?? 0)
           + (mods.damageByAffinity?.all ?? 0)
           + (prof.type === "WeaponSkill" ? (mods.damageByAffinity?.WeaponSkill ?? 0) : 0);
+        // BASIC attacks only. `isBasicAttack` is skill types Attack..Attack4
+        // (BaseSkill.isBasicAttack@6045) and the combo finisher is AttackCombo,
+        // a type outside that set - so a rider that says "your basic attacks"
+        // must not reach the swing that ends the chain. `prof.isFiller` is the
+        // wrong test here: it covers the finisher too.
+        if (mods.basicAttack && /^Attack[234]?$/.test(prof.type ?? '')) m *= 1 + mods.basicAttack;
         // Fervor and the matching mastery share ONE additive bracket -
         // getDamageRatio@4505: (1 + fervor + mastery) x DamageModifier - and
         // neither touches a status tick, whose SkillContext belongs to the
@@ -1471,6 +1477,19 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'than letting the multiplier run. The same -1 used to reach the affix scale through a bare ' +
            '`?? 1`, i.e. a buff worth MINUS its own value; only a foe status carries affixes among the ' +
            'seven, so nothing was visibly wrong, which is the kind of bug that waits for a patch.' },
+    { severity: 'verified', what: 'a weapon-upgrade script proc can be read - the double-attack one is',
+      why: 'Twelve of the twenty `<Type>_Upgrade` rows carry a script instead of affixes and were refused ' +
+           'wholesale. One shape among them is entirely in the data: GreatSword_Upgrade is vars.chance ' +
+           '0.04 and `onSkillProc(ctx) { if (ctx.skill?.isBasicAttack() && checkProba(vars.chance)) ' +
+           'ctx.skill.playStep(null, ctx.skill.getExecStep().index, ...); }` - replaying the executing ' +
+           'step IS the hit again, so the whole payload is x(1 + chance) on basic attacks. ' +
+           '`isBasicAttack` is skill types Attack..Attack4 (BaseSkill.isBasicAttack@6045), which EXCLUDES ' +
+           'the combo finisher, so the rider must not reach the swing that ends the chain - `isFiller` ' +
+           'would have, since it covers the finisher too. None of these rows carries a cooldown and none ' +
+           'uses the game\'s internal-cooldown idiom, so the rate is plain Bernoulli with nothing to ' +
+           'saturate. The upgrade RANK is the star count, not the rarity index: Staff_Upgrade at ' +
+           'minRank 3 is CooldownReduction +4, and a real 3-star Censer tooltip reads "Cooldown ' +
+           'Reduction increased by 4%".' },
     { severity: 'verified', what: 'what you socket raises the host item\'s gear level',
       why: 'Read from Gear.getILevel@8123 (src/st/item/Gear.hx:48-51), which is three lines: the base ' +
            'iLevel plus the rarity bonus (and the flawless bonus, in Item.getILevel@7787), then ' +
