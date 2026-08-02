@@ -7,7 +7,7 @@ remaining items with the reads already done against them, and what "done" means
 per class.
 
 State at handoff (2026-08-02, second pass): **664 checks green**; baselines
-Warrior 520.1, Rogue 399.0, Mage 328.5, Priest 385.6 (`optimize`, level 25,
+Warrior 438.2, Rogue 306.7, Mage 223.0, Priest 296.3 (`optimize`, level 25,
 named boss). Unscored lists: Warrior 5, Priest 7, Rogue 6, Mage 6.
 
 ## The method (proven, in order of preference)
@@ -58,8 +58,11 @@ messages in the repo's voice with **no AI attribution**; caches must stay bounde
   tick by the live stack count. Five stacks of Lethal Poison were priced as one.
 - **`Mono` never cleaves** — settled at the opcode level, promoted from
   `unmodelled` to `verified`, with a patch tripwire on `props.hitCount`.
-- **The gear bake traced and reconciled** — see the audit entry; the rewrite is
-  named below.
+- **The gear bake, LANDED.** Gear ratio, the aptitude divisor, the item's own
+  armour mean, and a drop at your level rather than the authored row level. Three
+  measured tooltips and twelve integers, all exact, with the naked control
+  untouched. It was the largest error in the tool and it moved every baseline by
+  20–30%.
 - **Proc-applied buffs that block their own renewal.** `!owner.hasStatus(<the
   status this very call applies>)` is a readable self-block, not live state. The
   four trinket Stones went from scoring zero to scoring, at `rD/(1+rD)` rather
