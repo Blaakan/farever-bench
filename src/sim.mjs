@@ -331,7 +331,8 @@ function runFight(spec) {
         : tr.rule.kind === 'per-combo' ? 'combo'
           : tr.rule.kind === 'per-dot-tick' ? 'dot-tick'
             : tr.rule.kind === 'per-weapon-skill' ? 'weapon-skill'
-              : tr.rule.kind === 'per-attack-or-combo' ? 'attack-or-combo' : 'attack',
+              : tr.rule.kind === 'per-conduit-trigger' ? 'conduit'
+                : tr.rule.kind === 'per-attack-or-combo' ? 'attack-or-combo' : 'attack',
       parent: tr.rule.parent ?? null,
       // A crit gate is a rate, not a mystery: the fight already computes a crit
       // expectation for every hit it prices, so a rider that only plays on a
@@ -654,6 +655,38 @@ function runFight(spec) {
         }
       }
     };
+    // THE CONDUIT GAUGE. A conduit fires when Spark is SPENT while the pool
+    // BEFORE the spend was strictly above the threshold - all three tiers of
+    // `Mage_Conduit_SparkBounds` are 0.5, so it is all-or-nothing - and when it
+    // fires, EVERY equipped conduit fires at once.
+    //
+    // This is why "one trigger per weapon skill" would have been badly wrong.
+    // In-combat Spark income is 0.65/s against roughly 5/s of spend, so a full
+    // pool buys a handful of triggers at the start of a fight and then the
+    // gauge sits under the threshold for the rest of it. Measured in game: five
+    // triggers from a full 100, and the sixth spend starts at exactly 50, which
+    // is not strictly above it.
+    const gauge = spec.sparkGauge ?? null;
+    const gaugePool = gauge ? pools.get(gauge.atb) : null;
+    const conduitTriggers = triggers.filter((g) => g.on === 'conduit');
+    const fireConduits = (at) => {
+      for (const g of conduitTriggers) {
+        const out = hit(g.prof, now);
+        g.fires += 1;
+        g.damage += out.damage;
+        g.heal += out.heal;
+        g.shield += out.shield;
+      }
+    };
+    /** Spend, then fire if the pool was above the gauge BEFORE the spend. */
+    const spendAndGauge = (amount, at) => {
+      if (!gaugePool || !(amount > 0)) return;
+      const before = gaugePool.value;
+      gaugePool.value = Math.max(0, before - amount);
+      if (conduitTriggers.length && gaugePool.max > 0
+        && before / gaugePool.max > gauge.ratio + 1e-12) fireConduits(at);
+    };
+
     // What a bleed tick sets off. Deterministic runs credit the expected
     // fraction of a fire, rolled ones roll - the same treatment every other
     // proc gets, and priced against whatever is up at the time.
@@ -794,7 +827,7 @@ function runFight(spec) {
       // fraction of a fire; rolled ones roll. Priced against live state too.
       for (const g of triggers) {
         // A dot-tick proc is raised by `tickTo`, not by a cast or a swing.
-        const fires = g.on === 'dot-tick' ? false
+        const fires = g.on === 'dot-tick' || g.on === 'conduit' ? false
           : g.on === 'parent' ? (wasCast && g.parent === skillId)
             : g.on === 'weapon-skill' ? weaponSkill
               : g.on === 'attack-or-combo' ? (attack || combo)
@@ -886,7 +919,12 @@ function runFight(spec) {
         }
         // Pay BEFORE the cast pays you, so a skill can never fund itself out of
         // its own gain in the same instant.
+        const sparkBefore = gaugePool ? gaugePool.value : 0;
+        const sparkCost = gaugePool
+          ? (a.prof.costs ?? []).reduce((s, c) => (c.atb === gauge.atb ? s + c.amount : s), 0) : 0;
         pay(a.prof);
+        if (sparkCost > 0 && conduitTriggers.length && gaugePool.max > 0
+          && sparkBefore / gaugePool.max > gauge.ratio + 1e-12) fireConduits(t);
         const out = hit(a.prof, now);
         a.casts++;
         a.damage += out.damage;
@@ -948,6 +986,12 @@ function runFight(spec) {
       }
       chainIndex++;
       if (link.prof.isCombo) combos++; else swings++;
+      // The finisher's flat Spark cost. The chain is NOT gated on it - a Mage
+      // with an empty pool keeps swinging, which is what the game does - but
+      // the spend is real, and on a naked Mage it is the spend that drives the
+      // gauge: five finishers take a full 100 to 50, and 50 is not strictly
+      // above the threshold.
+      if (link.prof.isCombo && gauge?.finisherCost > 0) spendAndGauge(gauge.finisherCost, t);
       const swingOut = hit(link.prof, now);
       // WeaponAttack_RandomRange: observed in play as a symmetric ~±10% on
       // WeaponPower-scaled swings (19-24, 78-95 around their means) - and as

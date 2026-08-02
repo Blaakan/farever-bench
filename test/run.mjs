@@ -2686,6 +2686,69 @@ group('a buff window prices only itself');
     `${(((b - a) / b) * 100).toFixed(2)}% for 0.5s + a chain restart every 50s of a 200s fight`);
 }
 
+// --- the conduit gauge ------------------------------------------------------
+// A conduit fires when Spark is SPENT from above the gauge threshold, and every
+// equipped conduit fires at once. The model used to refuse all of them as "no
+// trigger rate can be derived from the data" - it was derivable, it just needed
+// the Spark pool simulated rather than a rate invented.
+group('the conduit gauge');
+{
+  const eng = createEngine({ quiet: true });
+  const target = eng.combat.foe('boss', 25);
+  const l = emptyLoadout(eng.cat, 'Mage', 25);
+  l.gear.Slot_Weapon1 = { item: 'Staff_Censer', rarity: 'Epic', stars: 3 };
+  eng.plan.pruneSelection(l);
+  const rot = eng.plan.resolve(l, 3);
+
+  ok('the gauge is read off the constants, not written here', !!rot.sparkGauge,
+    JSON.stringify(rot.sparkGauge));
+  near('the threshold is Mage_Conduit_SparkBounds', rot.sparkGauge.ratio,
+    eng.cdb.constantFloats('Mage_Conduit_SparkBounds')[0]);
+  near('the finisher pays a flat cost with no cooldown term', rot.sparkGauge.finisherCost,
+    eng.cdb.byId('constant').get('Mage_Spark_SpellCDCost_FinalCombo').v.int
+      ?? eng.cdb.byId('constant').get('Mage_Spark_SpellCDCost_FinalCombo').v.float);
+
+  const conduits = rot.triggered.filter((t) => t.rule.kind === 'per-conduit-trigger');
+  ok('every equipped conduit gets the same rule', conduits.length >= 1,
+    rot.triggered.map((t) => `${t.prof.id}:${t.rule.kind}`).join(','));
+
+  // THE MEASUREMENT, reproduced as arithmetic. From a full pool of 100, paying
+  // the finisher's flat 10, the pool reads 100/90/80/70/60 before five
+  // successive spends - all strictly above 50 - and 50 before the sixth, which
+  // is not. Measured in game 2026-08-02: exactly five stacks, then it stopped.
+  {
+    const ev = eng.evaluate(l, { target, rank: 3 });
+    const max = ev.sheet.get('MaxSpark');
+    near('a naked Mage carries 100 MaxSpark', max, 100);
+    const { ratio, finisherCost } = rot.sparkGauge;
+    let pool = max, fires = 0;
+    while (pool / max > ratio + 1e-12) { fires++; pool = Math.max(0, pool - finisherCost); }
+    ok('a full pool buys exactly the five triggers that were measured', fires === 5, String(fires));
+    ok('...and the sixth spend starts at the threshold, which is not above it',
+      Math.abs(pool - max * ratio) < 1e-9, String(pool));
+  }
+
+  // ...and the fight fires them, together, at a rate the income can support.
+  const ev2 = eng.evaluate(l, { target, rank: 3 });
+  const lines = ev2.throughput.lines.filter((x) => /Conduit/.test(x.id));
+  ok('the fight fires the conduits', lines.length >= 1,
+    ev2.throughput.lines.map((x) => x.id).join(','));
+  ok('...far slower than once per weapon skill, which is the whole point',
+    lines.every((x) => x.interval > 10), lines.map((x) => `${x.id} every ${x.interval.toFixed(1)}s`).join(', '));
+
+  // Conduit: Power stacks to 20 - confirmed in game, +10% MagicMastery when the
+  // pool can feed it - but the gauge fires far too slowly to stand there, so
+  // crediting the cap was the largest overstatement left in the class.
+  const powerBuff = ev2.buffs.find((b) => b.status === 'Mage_Conduit_Power_Status');
+  if (powerBuff) {
+    ok('Conduit: Power is not credited at its cap', !(powerBuff.uptime > 0),
+      JSON.stringify({ up: powerBuff.uptime, stacks: powerBuff.stacks }));
+    ok('...and the refusal is named',
+      ev2.throughput.unmodelled.some((u) => u.id === 'Mage_Conduit_Power_Status'),
+      JSON.stringify(ev2.throughput.unmodelled.map((u) => u.id)));
+  }
+}
+
 // --- a proc that refuses to re-apply itself ---------------------------------
 // `!owner.hasStatus(X)` where X is the very status the call applies is not a
 // question about live state - it is the applier declining to renew its own

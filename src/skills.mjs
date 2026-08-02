@@ -1742,6 +1742,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         if (e.kind === 'GainAtb' && e.atb) tracked.add(e.atb);
       }
     }
+    let sparkGauge = null;
     if (loadout.class === 'Mage' && tracked.has('Spark')) {
       const minCost = constNum('Mage_Spark_SpellMinCost', 5);
       const ratio = constNum('Mage_Spark_SpellCDCostRatio', 1);
@@ -1751,6 +1752,19 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         if (!(amount > 0)) continue;
         a.prof = { ...a.prof, costs: [...(a.prof.costs ?? []), { atb: 'Spark', amount }] };
       }
+      // The finisher's own cost is a FLAT constant with no cooldown term, and
+      // it is the spend that actually drives the gauge on a naked Mage: five
+      // finishers take a full pool from 100 to 50 and that is exactly where the
+      // conduits stop. The chain is still not GATED on it - a Mage with no
+      // Spark keeps swinging - but the spend is real and the gauge reads it.
+      const bounds = (() => {
+        try { return cdb.constantFloats('Mage_Conduit_SparkBounds'); } catch { return [0.5]; }
+      })();
+      sparkGauge = {
+        atb: 'Spark',
+        ratio: bounds[0] ?? 0.5,
+        finisherCost: constNum('Mage_Spark_SpellCDCost_FinalCombo', 10),
+      };
     }
     if (loadout.class === 'Rogue' && tracked.has('ComboPoint')) {
       for (const a of active) {
@@ -1839,7 +1853,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // `accountedLate` is filled by passes that run after `accounted` is
       // built, so it is applied here rather than folded in above.
       unmodelled: unmodelled.filter((u) => !accounted.has(u.id) && !accountedLate.has(u.id)),
-      selection: sel, runes: [...runes], rank, chain, cdMutations,
+      selection: sel, runes: [...runes], rank, chain, cdMutations, sparkGauge,
       resources: { gains, tracked: [...tracked] },
     };
   }
@@ -1870,8 +1884,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   // plays its damage when the target LEAVES a leash, and the simulated foe
   // does not move. That zero is real, and it is a statement about the fight
   // model rather than about the data.
-  const RIDER_HOOKS = /^on(InflictHit|InflictDamage|InflictDamageEval|Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed)$/;
-  const OWN_CAST_HOOKS = /^on(Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed)$/;
+  //
+  // `onStartConduit` is the same shape one level out: a conduit has no cast at
+  // all, it IS the trigger, so a step its own script plays on that hook happens
+  // exactly once per conduit fire. `Mage_Talent_ConduitSparkExplosion_Conduit`
+  // keeps its whole 0.25 x Intellect there, and without this the conduit landed
+  // in the rotation carrying nothing while the step it plays was refused beside
+  // it - the same circle Staff_Censer_Skill2 fell into.
+  const RIDER_HOOKS = /^on(InflictHit|InflictDamage|InflictDamageEval|Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed|StartConduit)$/;
+  const OWN_CAST_HOOKS = /^on(Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed|StartConduit)$/;
 
   function scriptedRiders(skillId, prof, opts = {}) {
     const riders = [];
@@ -2052,6 +2073,32 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    */
   function triggerRule(id, prof, extra, opts = {}) {
     const s = skills.get(id);
+
+    // A CONDUIT fires when Spark is SPENT while the pool BEFORE the spend was
+    // strictly above the gauge threshold - `Mage_Conduit_SparkBounds` is
+    // [0.5, 0.5, 0.5] and the test is `bound < ratio`, so all three tiers are
+    // the same number and it is all-or-nothing today. Every equipped conduit
+    // fires at once, so conduit damage is a SUM over the conduits you slotted
+    // rather than one of them.
+    //
+    // This is the rate the model kept refusing as "no trigger rate can be
+    // derived from the data". It was derivable; it needed the Spark pool
+    // simulated rather than a rate invented, and "one per weapon skill" would
+    // have been badly wrong - in-combat regen is 0.65/s against ~5/s of spend,
+    // so the pool spends almost all of a sustained fight below the threshold.
+    //
+    // Measured in game 2026-08-02 on a naked Censer Mage: starting from a full
+    // 100 Spark and paying the finisher's flat 10, the pool reads 100/90/80/70/60
+    // before five successive spends and 50 before the sixth - and the buff
+    // stacked exactly FIVE times before triggers stopped. The threshold is
+    // exact to the integer.
+    if (typeOf(id) === 'MageConduit') {
+      return {
+        kind: 'per-conduit-trigger', chance: 1,
+        why: 'it fires whenever Spark is spent from above the gauge threshold '
+          + '(Mage_Conduit_SparkBounds 0.5), together with every other conduit',
+      };
+    }
 
     // Prayers charge on the combo's final attack (Priest_Rosary's script, and
     // each prayer's own description), and the slotted ones take turns.

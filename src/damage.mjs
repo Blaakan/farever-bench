@@ -1267,6 +1267,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
 
     return simulate({
       rotation, cast, dotOutput, rollCrit, cdr, cdrWeaponSkill, resources, poolMultiplier,
+      sparkGauge: rotation.sparkGauge ?? null,
       poolScale: bleedScoped ? poolScale : null,
       poolFactor,
       goal: live?.goal ?? null,
@@ -1470,6 +1471,21 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'than letting the multiplier run. The same -1 used to reach the affix scale through a bare ' +
            '`?? 1`, i.e. a buff worth MINUS its own value; only a foe status carries affixes among the ' +
            'seven, so nothing was visibly wrong, which is the kind of bug that waits for a patch.' },
+    { severity: 'verified', what: 'a conduit fires when Spark is spent from above the gauge, and they all fire together',
+      why: 'Read from Mage_Conduit_SparkBounds ([0.5, 0.5, 0.5], and the test is `bound < ratio`, so ' +
+           'all three tiers are the same number and the Low/Medium/High tiering is inert): a conduit ' +
+           'fires when Spark is SPENT while the pool BEFORE the spend was strictly above half of ' +
+           'MaxSpark, and every equipped conduit fires at once - so conduit damage is a SUM over the ' +
+           'ones you slotted. The model used to refuse all of them as "no trigger rate can be derived ' +
+           'from the data"; it was derivable, and it needed the Spark pool simulated rather than a ' +
+           'rate invented. "One per weapon skill" would have been badly wrong: in-combat regen is ' +
+           '0.65/s against roughly 5/s of spend, so a full pool buys a handful of triggers and the ' +
+           'gauge then sits under the threshold for the rest of the fight. MEASURED IN GAME ' +
+           '2026-08-02 on a naked Censer Mage, both halves of it: starved of Spark, Conduit: Power ' +
+           'stacked to exactly FIVE and stopped - 100/90/80/70/60 are above 50 and the sixth spend ' +
+           'starts at 50, which is not - and fed Spark it reached the full twenty for +10% ' +
+           'MagicMastery. The threshold is exact to the integer. The finisher\'s flat 10 ' +
+           '(Mage_Spark_SpellCDCost_FinalCombo) is spent but still does not GATE the chain.' },
     { severity: 'verified', what: 'a proc-applied buff that blocks its own renewal never saturates',
       why: 'StoneOfPower rolls `checkProba(vars.chance) && !owner.hasStatus(<the status this very call ' +
            'applies>)` on every damage instance you deal. That guard is not a question about live ' +

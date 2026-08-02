@@ -403,6 +403,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // not read that sheet.
     const buffs = plan.selfBuffs(rot);
     const timed = [];
+    const conduitBuffGaps = [];
     // The two rows that must keep folding in permanent at the cap. Named by id
     // rather than by shape, because every shape-based gate catches something
     // else: "chance < 1" also catches Staff_SummonDemon's rank-3 buff and "is a
@@ -449,6 +450,22 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         b.timed = false;
         b.proc = { chance: b.trigger?.chance ?? 1, blocked: b.reapply === 'blocked', rate: r };
         for (const a of b.affixes) applyAffix(a, b.stacks, b.uptime);
+        continue;
+      }
+      // A buff applied ONCE PER CONDUIT TRIGGER is not permanent, and crediting
+      // it at its cap was the single largest overstatement left in the Mage.
+      // Conduit: Power is +0.5 MagicMastery a stack to a cap of 20, so the cap
+      // reads +10 - and the fight's own conduit stream fires roughly once every
+      // 28 seconds against a 15-second buff, which is under one stack on
+      // average. Measured in game 2026-08-02, both halves: starved of Spark it
+      // stacked to exactly 5 and stopped (the gauge, not the cap), and fed
+      // Spark it reached 20 for +10% MagicMastery. The cap is real; standing at
+      // it is not. Pricing the mean needs the stack counter's affix side, so
+      // this is refused and named rather than kept at the flattering end.
+      if (dur > 0 && !(cd > 0) && b.trigger?.hook === 'onStartConduit') {
+        b.timed = false;
+        b.uptime = 0;
+        conduitBuffGaps.push({ id: b.status, from: b.from, stacks: b.stacks, duration: dur });
         continue;
       }
       b.uptime = (cd > 0 && dur > 0) ? Math.min(1, dur / Math.max(cd, src.occupancy)) : 1;
@@ -536,6 +553,16 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         id: g.id,
         source: g.slot,
         why: `the effect ${g.stars} upgrade star${g.stars === 1 ? '' : 's'} unlock is a script proc, not an affix`,
+      })),
+      ...conduitBuffGaps.map((g) => ({
+        id: g.id,
+        source: 'conduit',
+        kind: 'no rate',
+        why: `it stacks to ${g.stacks} over ${g.duration}s, one stack per conduit trigger - and the `
+          + 'gauge fires roughly once every 28 seconds against that window, so standing at the cap is '
+          + 'not a thing a fight does. Measured in game both ways: starved of Spark it stacked to '
+          + 'exactly five and stopped, fed Spark it reached the full twenty. Pricing the mean needs '
+          + 'the stack counter on the affix side, so it is refused rather than kept at the cap',
       })),
       ...talentDepGaps.map((g) => ({
         id: g.from,

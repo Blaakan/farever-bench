@@ -794,6 +794,33 @@ Throughput is not a steady state any more. `sim.mjs` plays out a fight of
   overflow of a long debuff on a short cooldown is lost.
 - **the base-attack chain fills the gaps**, one link at a time, because you
   cannot press swing 3 without 1 and 2.
+- **a conduit fires when Spark is spent from above the gauge — and they all fire
+  together.** `Mage_Conduit_SparkBounds` is `[0.5, 0.5, 0.5]` and the test is
+  `bound < ratio`, so all three tiers are the same number and the Low/Medium/High
+  tiering is inert. Every equipped conduit fires at once, which makes conduit
+  damage a **sum** over the ones you slotted rather than one of them.
+
+  The model used to refuse all of them as *"no trigger rate can be derived from
+  the data"*. It was derivable — it needed the Spark pool **simulated** rather
+  than a rate invented. "One per weapon skill" would have been badly wrong:
+  in-combat regen is 0.65/s against roughly 5/s of spend, so a full pool buys a
+  handful of triggers and the gauge then sits under the threshold for the rest of
+  the fight.
+
+  **Measured in game, 2026-08-02, on a naked Censer Mage — and it confirms the
+  rule to the integer.** Starved of Spark, `Conduit: Power` stacked to exactly
+  **five** and stopped: from a full 100, the finisher's flat 10 leaves the pool
+  reading 100 / 90 / 80 / 70 / 60 before five successive spends, all strictly
+  above 50, and 50 before the sixth — which is not. Fed Spark, the same buff
+  reached its full **twenty** stacks for +10% MagicMastery. So the five was the
+  *gauge*, not the cap, and the row's `maxStacks: 20` and `duration: 15` are both
+  right.
+
+  That last reading cost the Mage 13%. `Conduit: Power` was being credited at its
+  cap — a permanent **+10 MagicMastery** — where the gauge fires roughly once
+  every 22 seconds against a 15-second buff, which is well under one stack on
+  average. Pricing the mean needs the stack counter's affix side, so it is
+  refused and named rather than kept at the flattering end.
 - **a damage-over-time ticks once per stack.** `$HSkill.getStackFactor@20772`
   runs as the **last** line of `getStepEffectVal@20775` — after the scaling,
   after the spread division, after the damage variance — and multiplies the
