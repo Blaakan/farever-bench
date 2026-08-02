@@ -146,7 +146,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       swingAttrs: mainItem
         ? mainItem.aptitudes.map((a) => combat.primaryAtbFor({ aptitude: a })).filter(Boolean)
         : null,
-      // The mix has NO slot gate - getStepEffectItemScaling@20775 checks only
+      // The mix has NO slot gate - getStepEffectItemScaling@20780 checks only
       // isWeaponBased on the skill type - so the arsenal's weapon skills mix
       // exactly like the mainhand's. Class skills (type 9) stay pure
       // attribute, read straight off BaseSkill.isWeaponBased@6057's set.

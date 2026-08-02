@@ -1342,14 +1342,14 @@ export function buildCombat(cdb, ctx, assume = {}) {
     if (!g?.item) return 0;
     const item = cat.itemById.get(g.item);
     if (!item) return 0;
-    // READ FROM THE BYTECODE (descs@20780 / fn@20784, HSkill.hx): the flat is
+    // READ FROM THE BYTECODE (getStepEffectItemScaling@20780 / fn@20784, HSkill.hx): the flat is
     // 0.4 x the SUM over the item's aptitudes of each aptitude's primary
     // budget at the ITEM's own level. No handedness factor exists anywhere in
     // the damage path - the measured 1H/2H asymmetry is the authored per-type
     // swing ratios (Axe 0.13, GreatAxe 0.7, GreatSword 0.95, DualSwords
     // 0.205...) times the aptitude count (dual-aptitude one-handers sum two
     // budgets). The 0.4 is `WeaponPowerRatio.MainhandWeaponSkill`, clamped in
-    // getMainType@20778, and rarity/stars/iLevel bonuses never enter
+    // getStepEffectScaling@20778, and rarity/stars/iLevel bonuses never enter
     // (fn@20784 consumes only aptitudes, atbScaling bounds and item level).
     // Every measured tooltip flat reproduces: Beefury 13 = 0.13 x 0.4 x
     // (123.6+123.6), Wingsabers 22 = 0.205 x 0.4 x (123.6+148.3), Judgement
@@ -1402,7 +1402,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'belongs to the CARRIER (initVars@5150). Also measured live: finisher 133 -> 151 = ' +
            'x(1 + 0.12 + 0.0158) exactly. --fervor-scope and --no-mastery remain as toggles.' },
     { severity: 'verified', what: 'WeaponPower = 0.4 x the SUM of the item\'s aptitude primary budgets at the item\'s level, plus the MEAN of those attributes',
-      why: 'Read from the bytecode (descs@20780, fn@20784, makeSkillInf@20782): no handedness factor ' +
+      why: 'Read from the bytecode (getStepEffectItemScaling@20780, fn@20784, convertWeaponPowerScaling@20782): no handedness factor ' +
            'exists anywhere in the damage path - the measured 1H/2H asymmetry is the authored per-type ' +
            'swing ratio (Axe 0.13, DualSwords 0.205, GreatAxe 0.7, GreatSword 0.95) times the aptitude ' +
            'count, since a dual-aptitude one-hander SUMS two budgets where Judgement has one. The 0.4 ' +
@@ -1411,7 +1411,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'Beefury 13 = 0.13 x 0.4 x (123.6+123.6), Wingsabers 22 = 0.205 x 0.4 x (123.6+148.3). ' +
            'The level is the gear row\'s own - assumed equal to yours for an unpinned item.' },
     { severity: 'verified', what: 'a weapon skill\'s attribute scaling is 60% attribute + 40% of that attribute\'s own budget curve - from either hand',
-      why: 'Read from getStepEffectItemScaling@20775 and getMainType@20778: itemRatio = ' +
+      why: 'Read from getStepEffectItemScaling@20780 and getStepEffectScaling@20778: itemRatio = ' +
            'WeaponPowerRatio.MainhandWeaponSkill (0.4) for every weapon, the attribute keeps ' +
            '1 - 0.4, and the flat is that attribute\'s own budget at the item\'s level. The gate is ' +
            'isWeaponBased@6057 - a set of skill TYPES with no slot check - so the ARSENAL\'s weapon ' +
@@ -1590,10 +1590,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'same against everything currently in the game. Which one you want is decided by your class and ' +
            'your gear\'s faction, not by the target.' },
     { severity: 'verified', what: 'basic swings vary ±10% over their WHOLE value; nothing else varies at all',
-      why: 'Read from fn@20779 (HSkill.hx:192-201): WeaponAttack_RandomRange (0.1) applies only to ' +
+      why: 'Read from getEffectRange@20779 (HSkill.hx:192-201): WeaponAttack_RandomRange (0.1) applies only to ' +
            'Damage effects on skill types Attack..Attack4 - the combo finisher, weapon skills, class ' +
            'skills and status ticks all roll nothing, which is why the finisher read a constant 133 in ' +
-           'game - and the band covers flat plus attribute (getStepEffectItemScaling@20775 adds the ' +
+           'game - and the band covers flat plus attribute (getStepEffectItemScaling@20780 adds the ' +
            'scaling first, then rolls). Deterministic mode keeps the mean; --fights N rolls the swings.' },
     { severity: 'verified', what: '--fights rolls the crit too, one die per hit, without moving the mean',
       why: 'Crit used to stay at its expectation while everything else rolled, so a crit-bleed build - the ' +
