@@ -6,9 +6,15 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
-State at handoff (2026-08-03): **754 checks green**; baselines Warrior 495.7,
+State at handoff (2026-08-03): **780 checks green**; baselines Warrior 495.7,
 Rogue 354.5, Mage 241.4, Priest 298.4 (`optimize`, level 25, named boss).
-Unscored lists: Warrior 3, Rogue 7, Mage 5, Priest 7.
+Unscored lists: Warrior 3, Rogue 7, Mage 5, Priest 7 — and a GS build went 3 → 1
+when the stack counter landed.
+
+**A pull starts cold.** Any measured fight assumes zero extra resources unless it
+says otherwise: no food, no banked aura stacks, no enchant buff still running
+from the last pull, no pre-cast. It is in the audit, and it is what makes a
+measured pull reproducible.
 
 `optimize` now leads with a DAMAGE block — overall dps and damage, then one row
 per ability in decreasing damage with its dps, damage, share and hit count. The
@@ -74,6 +80,27 @@ Also confirmed correct and needing no work: the ±10% band (and the log ceils li
 the display), the crit multiplier to 0.3%, the whole Hemorrhage ledger, status
 ticks never critting (0/98), and full-charge Rampage as the standing assumption.
 Bonethrow's 269ms pairs are cleave, not a return hit — retire that hypothesis.
+
+### The meter's 705, and what came out of it
+
+The player laddered a damage meter's 705 dps against the model's 436 rung by
+rung and closed it to 0.4 dps — full reconciliation in
+`farever-hlx/captures/DPS-GAP-METER.md`, summarised in GROUND-TRUTH. **Two
+thirds of that gap is the target**: the meter fights were not against
+Ratsar-class armour, which is a comparison artefact and not a model defect. What
+the exercise *did* expose was four ways the tool made itself hard to check
+against, and all four are fixed:
+
+| owed | landed |
+|---|---|
+| score Anger Release from `maxStacks` + the fight's event counter | `44db73a`, analytically — the search is not given a new pressable |
+| the refusal filter must report riders on accounted skills | `2bfdc6a` — `scriptGapsOf` |
+| print the chain per link | `cc53235` — Mania stops being invisible |
+| name the beneficiary in Rampage's conditional refusal | `2bfdc6a` — it gates Shockwave, and says so |
+
+Still unresolved from that document and needing a screenshot each: the live
+talent pane (×1.16 residual under model talents, ×1.25 under none), and the
+weapon tooltips against the Legendary 5★ pin. Neither can rescue Ratsar.
 
 ### What is open now
 

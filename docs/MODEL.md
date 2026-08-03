@@ -483,6 +483,74 @@ per-skill through `runeDamage`, once here at scope `all` across the whole build.
 That read the Warrior **31% high**. Only `cooldownPerTick` comes through from a
 non-talent source.
 
+**A pull starts cold.** Any measured fight assumes **zero extra resources**
+unless it says otherwise — no food buff, no banked stacks of an aura, no enchant
+buff still running from the previous pull, no skill pressed before the combat
+window opens. It is the only convention that makes a measured pull reproducible,
+and it matters most where a counter carries *across* combats, because there the
+flattering reading and the honest one differ by a factor of two:
+`GS_Nova_Passive_Stack` has no authored duration, so a meter showing two Anger
+Release casts in 75 seconds is one earned and one walked in. The model earns
+both. Anything measured on a warm character has to say so.
+
+**A stack counter has a rate, and it was always in the data.** The refusal read
+*"nothing in the data says how many hits arm it"*, and the data says 100.
+`GS_Nova_Passive` banks one stack per non-DoT **physical damage event** and
+converts at `maxStacks` — 150 authored, 100 from rank 2 through `rankOverride` —
+so the rate is `events / cap`. What was missing was a fight that counted its own
+events. A sweep of every script in the sheet matches the shape exactly once:
+
+```
+onInflictDamage(dmg) {
+  if (!dmg.isDoT && dmg.isPhysical && !hasStatus(owner, UltProc)) addStatus(owner, Buff);
+  if (hasStatusMaxStacked(owner, Buff)) { removeStatus(Buff); addStatus(UltProc); }
+}
+```
+
+The follow-up is named by `props.subskills`, not guessed from the id.
+
+It is priced **post-hoc**, deliberately. The rate needs the run's own event count,
+and injecting it as a pressable was measured to send the rotation search to
+*worse* plans (436 → 413/423) — the same local-optimum failure the talent search
+shows. An analytic line gives the search nothing to reorder around. Its damage
+still joins the headline, or the repartition would stop closing on it. `floor` is
+what makes the cold start honest: 99 stacks at the bell are 99 stacks nobody
+spent, the same convention the pool dots' un-ticked tail already follows.
+
+**The chain reports per link.** The aggregate `(base attack chain)` row hid a
+named ability: a damage meter listed **Mania** among its top rows and the model
+appeared not to have it, when `GS_Nova_Combo` is the greatsword chain's fourth
+link and had been scored every cycle with no way to see it. A reconciliation
+against a meter is a per-*row* exercise, and that was the row it could not find.
+
+Each link carries its **own** recurrence, not the cycle's, because they do not
+fire equally often — a chain broken partway pays link 1 more than link 4, which
+is the entire reason a finisher is worth naming separately. On a bare GS pin the
+intervals run 3.92 → 4.65 → 4.88 → 5.41s and the hits 51 → 37. Splitting changes
+no total: the lines still sum exactly to `dps × fight` and the per-link clock
+shares to `fillerShare`, both asserted.
+
+**A refusal inside an accounted skill is still a refusal.** The unscored list is
+per-*skill*, so a clause refused inside a skill the model **does** score landed
+nowhere: the damage was right, one line of the script was worth zero, and nothing
+said so. `GS_Nova_Combo` is the case — the finisher is scored every cycle, and
+its rank-3 `reduceWeaponsCooldown(1.5)` is gated on `hasStatusMaxStacked`,
+correctly refused, and previously silent. Live weapon cooldowns run faster than
+modelled because of it. `scriptGapsOf` walks the same regexes and reports what
+`scopeOf` turned down, with the guard text. It names; it does not price.
+
+Three things it must **not** report, because **dead is not a gap**: a clause
+behind a rune the build did not slot, one behind a rank the weapon has not
+reached, and one `runeDamage` already reads. The first two contribute nothing in
+game either; the third would file Domination as dropped while it is being
+applied.
+
+**A refusal names who loses out.** Rampage's entry read *"its script resets
+Shockwave's cooldown from a onKill hook"*, filed under Rampage — which reads as
+"Rampage is not scored". Rampage is scored, every cast. What is missing is a
+cooldown **Shockwave** never gets back, and a reader asking why Rampage looked
+low was being pointed at the wrong skill.
+
 **A next-cast register: free, and a guaranteed critical strike.** Something arms
 a one-shot flag and the next cast of ONE named skill spends it. Recognised by a
 **triple**, which a sweep of all 962 scripts matches exactly once — so this is a

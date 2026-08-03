@@ -22,33 +22,41 @@ directory, and makes no network connections.
 
 ```
 Priest 25 - maximising dps vs named boss (Ratsar: 0.4/0.4)
-upgrade stars: max for rarity   weapon-skill rank: 3   rarities: all
 pinned: Weapon1   sockets: Weapon1/EnchantWeapon, Weapon1/Demon
 
 SLOT           ITEM                                     RAR        UPG    iLVL  FACTION  GIVES
-Weapon1        Beefury, Blessed Blade of the Farseeker  Legendary  *****   200  Bee      SpellPenetration  pinned
-Weapon2        Amon Ram, the Creator                    Legendary  *****   300  Crimson  Fervor
+Weapon1        Beefury, Blessed Blade of the Farseeker  Legendary  *****   350  Bee      ArmorPenetration+SpellPenetration  pinned
+Weapon2        Censer of Wool Hollow                    Legendary  *****   350  Crimson  CritChance+Fervor                  rolled
 OffhandWeapon  (empty)
-Head           Vision of the Beekeeper                  Rare               260  Bee      SpellPenetration
 ...
 
 AUGMENTS
-SLOT           SOCKET         AUGMENT               EFFECT
-Weapon1        EnchantWeapon  (none)                                          pinned
-Weapon1        Demon          (none)                                          pinned
-Head           DemonSigil     Sigil of Bet'Hatesht  a free tier-4 talent this model cannot score
-Feet           EnchantFeet    Magic Formula: Fervor  +15 FervorRtg
-Neck           Jeweller       Cursed Eye of Vice     +9 CritChanceRtg +9 FervorRtg ...
+SLOT  SOCKET         AUGMENT                EFFECT
+Feet  EnchantFeet    Magic Formula: Fervor  +15 FervorRtg
+Neck  Jeweller       Cursed Eye of Vice     +9 CritChanceRtg +9 FervorRtg ...
 
-METRIC                    VALUE
-damage / s                195.8  <- goal
-time on cooldowns          11.9%  88.0% swinging, 0.1% idle
-fight                      200s  one 200s fight, procs at their expected rate
+DAMAGE
+                        DPS  DAMAGE  SHARE  HITS
+  overall             221.4  44,270          724
+  Hive Bite            50.6  10,114  22.8%    92
+  Prayer: Smite        28.4   5,688  12.8%    31
+  Blinding Light       24.7   4,931  11.1%    11
+  Luon Shackles        17.3   3,470   7.8%    15
+  Hive Swarm           14.3   2,861   6.5%   184
+  Sword_Base_Attack    14.1   2,822   6.4%   102
+  ...
 ```
 
-Every number comes with the target it was computed against, the fight it was
-computed over, the rotation that produced it, and a list of the assumptions
-still in the model.
+The damage column **adds up**: every ability's total sums to the overall, the
+base-attack chain is broken out per link rather than hidden behind one row, and
+HITS counts damage *events* — a dot's tick, each hit of a multi-hit cast, one per
+target of a cleave — which is what a damage meter counts, so the two reconcile
+row by row.
+
+Every number comes with the target it was computed against and the fight it was
+computed over. `--verbose` adds back everything that *explains* a number rather
+than being one: the search trace, the rotation and its reasoning, the cause of
+every refusal, and the assumptions-and-gaps list.
 
 ### Commands
 
