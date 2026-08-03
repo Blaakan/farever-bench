@@ -522,3 +522,16 @@ Nightking" family) confirms. Also noted: questlog gradeOverride/upgradeLevel
 import verified working — the reference build itself carries maxed weapons
 (Legendary 5*) where the live pair was Rare 0* / Epic 4*, so builder-vs-live
 divergence is a real comparison hazard, not an import defect.
+
+**PLAYER CORRECTION, 2026-08-03: the questlog build IS the 703 loadout.** The
+prior note's "builder-vs-live divergence" was wrong — the tooltip set
+photographed earlier (Brutality/Adaptability/Fracture) was a PREVIOUS gear
+state; the meter's 703 was recorded on the questlog build as imported:
+Legendary 5* Martyr + Judgement, Nightking/Zeal pieces included. Consequences:
+(1) the weapons are NOT over-stated; (2) the three level-1-authored armor rows
+at iLVL 11 are an ACTIVE understatement of the player's real build — the
+armor-floor fix above moves from hygiene to load-bearing; (3) the remaining
+561.6 -> 703 gap decomposes onto already-queued rungs: Rampage cadence (model
+1 cast/75s = 18 dps vs live 86), Anger Release steady-vs-bank (12.4 vs 37),
+the armor-floor recovery on three slots, and the x1.16 per-hit residual
+family. Nothing new is needed - land the queue and re-measure.
