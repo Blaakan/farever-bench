@@ -492,3 +492,17 @@ Fix shape: scale (and rarity-roll) Weapon-type only; gear takes
 `authored ?? charLevel` level and authored rarity. Then re-run anything that
 ranked jewelry under the old defaults — the layouts sweep and every recent
 optimize output priced some slots ~4× their legal stats.
+
+**MAGE FIRST-RUN, 2026-08-03 — 239.0 dps is starvation, not mystery.** The
+player ran the first non-Warrior optimize. The low number is the roadmap's own
+"Remaining" list made visible: base Spark regen as time income, the talent
+income family, Foresight's free cast, the chaincast bypass and Reverberate are
+all unmodelled, so the sim funds ~125 weapon-skill casts per 200s on partial
+income and fills the rest with dagger swings (~34 dps across four links).
+Two additions from this look: (1) `Mage_Infusion` is refused as "nothing
+declared" — a class skill named Infusion with an empty row almost certainly
+generates Spark in script or code; read it as part of the income pass, not the
+damage pass. (2) The fastest calibration path for the whole class now exists:
+the v2 bench-probe logs `spark=` on every press row — one 2-minute Mage dummy
+session hands over the complete live Spark ledger (income per swing, per tick,
+per talent) the way the Rage ledger was closed for Warrior in one capture.
