@@ -549,3 +549,17 @@ restart variance could flip pairs. Standing asks: (1) a regression test —
 an empty arsenal must never outrank a real weapon at equal optimization
 (the fixed-gear triple above is the cheap form); (2) the layouts sweep is
 pre-fix vintage — re-run --fresh once the last two rungs land.
+
+**NET PROBE COMPLETED BY THE PLAYER, 2026-08-03.** The symmetric test — net as
+sole weapon in either slot with offhand pinned none — reads 33.7 vs 34.0 dps:
+equal within optimizer shuffle. The earlier 135.8-vs-52.8 asymmetry was
+entirely an OFFHAND LOOPHOLE: `--pin weapon1=none` leaves OffhandWeapon free
+and the optimizer socketed a Legendary Firebreath-family shield (Furnace Roar
+= 58% of that run's damage) — a state the game does not allow (no empty
+mainhand). GUARD NEEDED in the CLI/optimizer: weapon1=none must imply or
+require offhand=none, or refuse outright with a named reason. Separately
+observed and still uncorrected: `weaponPowerFor`'s no-aptitude fallback
+substitutes the class primary budget — the sheet prints WeaponPower 49.43 for
+a butterfly net. Inert in the net case (no swings, no weapon skills — the
+player's symmetric equality proves it) but contrary to the fn@20784 read; a
+one-line bytecode-literal correction awaiting a decision.
