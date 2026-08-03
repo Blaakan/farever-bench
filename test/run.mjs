@@ -3267,6 +3267,37 @@ group('damage per ability sums to the overall');
       t.lines.filter((x) => !x.total).map((x) => x.id).join(', '));
   }
 
+  // THE CHAIN REPORTS PER LINK. The aggregate row hid a named ability: a damage
+  // meter listed "Mania" among its top rows and the model appeared not to have
+  // it, when `GS_Nova_Combo` is the greatsword chain's fourth link and had been
+  // scored all along with no way to see it.
+  {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'GS_Nova', rarity: 'Legendary', stars: 5, level: 25 };
+    eng.plan.pruneSelection(l);
+    const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 });
+    const filler = ev.throughput.lines.filter((x) => x.kind === 'filler');
+    ok('the chain reports one line per link, not one aggregate',
+      filler.length === 4 && !filler.some((x) => x.id === '(base attack chain)'),
+      filler.map((x) => x.id).join(', '));
+    ok('...and Mania is one of them by name',
+      filler.some((x) => x.id === 'GS_Nova_Combo' && x.name === 'Mania'),
+      filler.map((x) => `${x.id}=${x.name}`).join(', '));
+    // The links do not fire equally often - a chain broken partway pays link 1
+    // more than link 4 - so each carries its OWN recurrence, not the cycle's.
+    const first = filler.find((x) => x.id === 'GS_Base_Attack');
+    const last = filler.find((x) => x.id === 'GS_Nova_Combo');
+    ok('a later link fires less often than an earlier one',
+      last.hits < first.hits && last.interval > first.interval,
+      `${first.hits} @ ${first.interval.toFixed(2)}s vs ${last.hits} @ ${last.interval.toFixed(2)}s`);
+    // Splitting must not change what the chain is worth in total.
+    near('the links still sum to the fight',
+      ev.throughput.lines.reduce((s, x) => s + (x.total?.damage ?? 0), 0),
+      ev.throughput.dps * ev.throughput.fight, 1e-6);
+    near('...and their clock shares still sum to fillerShare',
+      filler.reduce((s, x) => s + x.share, 0), ev.throughput.fillerShare, 1e-9);
+  }
+
   // HITS is damage EVENTS, not casts. A dot's tick is one, a multi-hit skill
   // lands several per cast, and a cleave one per target - which is what a
   // damage meter counts and what the instrumented capture logs a row for.

@@ -1065,6 +1065,7 @@ function runFight(spec) {
       const roll = rand && swingVariance > 0 && !link.prof.isCombo
         ? 1 + (rand() * 2 - 1) * swingVariance : 1;
       link.hits = (link.hits ?? 0) + (swingOut.hits ?? 0);
+      link.fires = (link.fires ?? 0) + 1;
       link.damage = (link.damage ?? 0) + swingOut.damage * roll;
       link.heal = (link.heal ?? 0) + swingOut.heal * roll;
       link.shield = (link.shield ?? 0) + swingOut.shield * roll;
@@ -1116,9 +1117,9 @@ function runFight(spec) {
   const totals = [];
   let last = null;
   const acc = { active: new Map(), filler: new Map(), dot: new Map(), trig: new Map(), pool: new Map() };
-  for (const link of chain) link.total = { damage: 0, heal: 0, shield: 0, hits: 0 };
+  for (const link of chain) link.total = { damage: 0, heal: 0, shield: 0, hits: 0, fires: 0 };
   for (let i = 0; i < rolls; i++) {
-    for (const link of chain) { link.damage = 0; link.heal = 0; link.shield = 0; }
+    for (const link of chain) { link.damage = 0; link.heal = 0; link.shield = 0; link.hits = 0; link.fires = 0; }
     last = runOne(rand);
     let damage = 0, heal = 0, shield = 0;
     for (const a of actives) {
@@ -1131,7 +1132,7 @@ function runFight(spec) {
     for (const link of chain) {
       damage += link.damage; heal += link.heal; shield += link.shield;
       link.total.damage += link.damage; link.total.heal += link.heal; link.total.shield += link.shield;
-      link.total.hits += link.hits ?? 0;
+      link.total.hits += link.hits ?? 0; link.total.fires += link.fires ?? 0;
     }
     for (const d of dots) {
       damage += d.damage; heal += d.heal;
@@ -1216,20 +1217,40 @@ function runFight(spec) {
   const fillerTime = mean((x) => x.fillerTime);
   if (chainTime > 0 && fillerTime > 0) {
     const cycles = Math.max(1e-9, fillerTime / chainTime) * rolls;
-    const chainDamage = chain.reduce((s, x) => s + (x.total?.damage ?? 0), 0) / cycles;
-    const chainHeal = chain.reduce((s, x) => s + (x.total?.heal ?? 0), 0) / cycles;
-    const chainShield = chain.reduce((s, x) => s + (x.total?.shield ?? 0), 0) / cycles;
-    lines.push({
-      id: '(base attack chain)', name: '(base attack chain)', kind: 'filler',
-      perCast: { damage: chainDamage, heal: chainHeal, shield: chainShield },
-      total: {
-        damage: chain.reduce((s, x) => s + (x.total?.damage ?? 0), 0) / rolls,
-        heal: chain.reduce((s, x) => s + (x.total?.heal ?? 0), 0) / rolls,
-        shield: chain.reduce((s, x) => s + (x.total?.shield ?? 0), 0) / rolls,
-      },
-      hits: chain.reduce((s2, x) => s2 + (x.total?.hits ?? 0), 0) / rolls,
-      interval: chainTime, share: fillerTime / elapsed,
-    });
+    // ONE LINE PER LINK, not one for the chain. The aggregate row hid a named
+    // ability: a damage meter listed "Mania" among the top rows and the model
+    // appeared not to have it at all, when `GS_Nova_Combo` is the fourth link of
+    // the greatsword chain and had been scored the whole time - 52 hits, 62.7
+    // dps - with no way to see it. A reconciliation against a meter is a
+    // per-ROW exercise, and this is the row it could not find.
+    //
+    // Each link fires once per cycle, so its recurrence IS the cycle time and
+    // its share of the clock is its own occupancy over the cycle. The shares
+    // still sum to `fillerTime / elapsed`, and the totals to what the aggregate
+    // carried.
+    for (const link of chain) {
+      const dmg = (link.total?.damage ?? 0) / rolls;
+      const heal = (link.total?.heal ?? 0) / rolls;
+      const shield = (link.total?.shield ?? 0) / rolls;
+      const fires = link.total?.fires ?? 0;
+      if (!(dmg > 0 || heal > 0 || shield > 0)) continue;
+      lines.push({
+        id: link.prof.id, name: link.prof.name, kind: 'filler', source: link.source,
+        // Its OWN count, not the cycle's. The links do not fire equally often:
+        // a chain broken partway through pays link 1 more than link 4, which is
+        // the whole reason a finisher is worth talking about separately.
+        perCast: {
+          damage: fires > 0 ? (link.total?.damage ?? 0) / fires : 0,
+          heal: fires > 0 ? (link.total?.heal ?? 0) / fires : 0,
+          shield: fires > 0 ? (link.total?.shield ?? 0) / fires : 0,
+        },
+        total: { damage: dmg, heal, shield },
+        hits: (link.total?.hits ?? 0) / rolls,
+        interval: fires > 0 ? elapsed / (fires / rolls) : chainTime,
+        share: (link.prof.occupancy * (fires / rolls)) / elapsed,
+        chainLink: true,
+      });
+    }
   }
   for (const d of dots) {
     const e = acc.dot.get(d);
