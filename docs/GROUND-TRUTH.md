@@ -535,3 +535,17 @@ armor-floor fix above moves from hygiene to load-bearing; (3) the remaining
 1 cast/75s = 18 dps vs live 86), Anger Release steady-vs-bank (12.4 vs 37),
 the armor-floor recovery on three slots, and the x1.16 per-hit residual
 family. Nothing new is needed - land the queue and re-measure.
+
+**NET-ARSENAL PROBE, 2026-08-03 — verified fixed by the week's queue.** The
+player's layouts sweep (old code) ranked Net_Basic — a statless, skill-less
+capture net — surprisingly high as arsenal. Re-tested on current HEAD, three
+tiers: head-to-head at fixed gear GA_Craft 219.3 > net 186.9 ≈ empty 183.4;
+full optimization GA 796.6 > net 715.3; WeaponPower identical across arsenals
+(49.43 — arsenal never touches swing power, matching the bytecode). The old
+anomaly was the arsenal-skill under-pricing family now landed (Rampage
+cadence, rider bracket, Mania visibility, cooldown refunds): when a real
+arsenal's skill package priced at ~15 dps, the net's cost was noise and
+restart variance could flip pairs. Standing asks: (1) a regression test —
+an empty arsenal must never outrank a real weapon at equal optimization
+(the fixed-gear triple above is the cheap form); (2) the layouts sweep is
+pre-fix vintage — re-run --fresh once the last two rungs land.
