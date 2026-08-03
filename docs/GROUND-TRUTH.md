@@ -275,6 +275,17 @@ which survives.
 **New, measured, and owed to the model:** GA_Craft_Skill1 prices attacker state
 at PRESS — 3.2–3.3s projectile flight, ±0.2% under press-state vs ±4.6% at
 damage time — so slow projectiles need a launch-time snapshot.
+
+> **NOT OWED — the model already does this, 2026-08-03.** `runFight` calls
+> `hit(prof, now)` *before* `tickTo(end)` advances the clock, and `setUp(applies)`
+> runs after it, so a cast is priced against the state it was pressed in. The
+> measurement therefore CONFIRMS the model rather than indicting it, and the
+> alternative it rules out — pricing at impact — is the one the model never did.
+> Two corrections to the entry itself: `GA_Craft_Skill1` carries no projectile
+> anywhere in its row (its steps are Cast / Visuals / Dash / Area), so the
+> 3.2–3.3s is its **charge hold**, not flight time. The observable form of the
+> invariant is now a test: a skill that buffs itself must not price its own cast
+> under that buff, which `GA_Craft_FinalCombo` (+4 PhysicalMastery) checks.
 `GS_Nova_Skill2_Buff` is rank ≥2 (+10 PhysicalMastery, additive in the bracket;
 947/866 = 1.09353 vs 1.09168). Domination is rank ≥2 (0.25; the 0.15 hypothesis
 leaves 7.4% residuals) — the rankOverride-restates-vars reading, confirmed in

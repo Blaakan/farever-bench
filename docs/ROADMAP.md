@@ -6,9 +6,17 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
-State at handoff (2026-08-02, second pass): **664 checks green**; baselines
-Warrior 438.2, Rogue 358.1, Mage 238.7, Priest 296.3 (`optimize`, level 25,
-named boss). Unscored lists: Warrior 5, Priest 7, Rogue 6, Mage 6.
+State at handoff (2026-08-03): **754 checks green**; baselines Warrior 495.7,
+Rogue 354.5, Mage 241.4, Priest 298.4 (`optimize`, level 25, named boss).
+Unscored lists: Warrior 3, Rogue 7, Mage 5, Priest 7.
+
+`optimize` now leads with a DAMAGE block — overall dps and damage, then one row
+per ability in decreasing damage with its dps, damage, share and hit count. The
+column adds up, which took a real per-line total: `perCast x fight/interval`
+reads 30% over, because for the chain `interval` is the cycle time while the
+chain only runs for its share of the clock. Everything that explains a number
+rather than being one — the search trace, the rotation's reasoning, the refusal
+causes, the assumptions list — moved behind `--verbose`.
 
 ## READ FIRST: docs/GROUND-TRUTH.md
 
@@ -25,53 +33,72 @@ work list, ahead of everything in the older sections:**
    the game to five digits. Two permanent +5 CritChance rows were dropped:
    Bloodrage Aura's status (`3a99d83`) and `Axe_Boomerang_Combo`'s own affix
    (`a43c2a6`). Captured build 19.62% → 29.62% against a measured 27.8–28.8%.
-2. **Three refused script riders all fire in game** — the combo's +20% vs a
-   bleeding target (dmgMult, not critDmgMult: the clean 1.5325 crit ratio proves
-   which), Bonethrow's rank-3 +20% critDmgMult, and Domination against the stun
-   window, because **the training dummy IS stunnable**. Riderless numbers run
-   −13.7% to −17.5%. Policy to adopt: publish rider-on conditioned on status
-   uptime rather than refusing.
-3. **ComboWindow — DISPUTED, and the dispute is UNVERIFIED.** A read claims
-   there is no banked finisher at all: `Hero.update@7495` /
-   `isWithinAttackCombo@7459` run the clock from the END of the last basic
-   attack to the START of the next, so casts, idle and runs of short casts all
-   break the chain by the same rule — and the model's per-cast test misses that
-   two 0.4s Rage Strikes break it in game. That would make the t=47.6→55.0s
-   sequence an artefact of swings that landed no damage row rather than a banked
-   link. Its skeptic died before checking it (spend limit), so **verify before
-   acting**, and do not implement a banked-chain concept on this evidence.
-4. **Rage Strike crits 56.3%** (9/16). Surge of Violence is live — the head
-   sigil grants it, see GROUND-TRUTH's correction — but being one-shot it covers
-   at most 5 of the 9; four crits land on casts with no combo finisher since the
-   previous Rage Strike, and that subset still crits 4/10. Open. Separately its
-   damage is ×1.1025 short at current HEAD, which the CritDamage anchor says is
-   NOT a Strength error.
-5. **Berserk is authored at exactly 0.20** in both the cdb row and the compiled
-   script — do NOT retune it to 0.185. What is real is that the game composes
-   dmgMult riders ADDITIVELY (`computeDamage@4841` seeds `modMult` from
-   `hitData.dmgMult`, and every rider is `+=` into that one scalar) while the
-   model compounds them: `runeDamage` at `m *= 1 + rd.amount`, then
-   `damageByAffinity`, then `basicAttack`, on separate lines. Two +20% riders
-   should give ×1.40, not ×1.44. Fix the bracket; carry the 1.25% residual as an
-   open anomaly.
+2. **Three refused script riders — LANDED** (`ac30118`). All read off the skills'
+   own scripts now: the combo's +20% vs a bleeding target (dmgMult, which the
+   clean 1.5325 crit ratio proves), Bonethrow's rank-3 +20% critDmgMult, and
+   Domination's +25% inside a stun window. Two traps recorded in MODEL.md:
+   Domination's `rank >= 3` belongs to ONE alternative of a disjunction, and its
+   amount is 0.15 in the row but 0.25 from rank 2 through `props.rankOverride`.
+3. **ComboWindow — SETTLED** (`980e9ac`), and the disputed read was right. One
+   cumulative clock from the END of the last completed basic to the START of the
+   next predicts **52/52**; literal start-to-start scores 18/52 and a banked
+   finisher 50/52, whose two misses are mid-chain links surviving casts — which
+   banking cannot produce. **The banked-chain concept is retired, not deferred.**
+4. **Rage Strike — DISSOLVED** by the v2 capture, and Surge of Violence is
+   modelled (`2ffa8b5`). Observed Surge windows decompose every crit: 2 forced,
+   1 inside the Battle Shout window, 2 steady natural = 2/7 = 28.6% against a
+   fleet steady 30.2%. The "mechanically ineligible crit" class is empty, and
+   the Rage ledger closing to the point **refutes the M2 mastery**.
+5. **Damage riders SUM — LANDED** (`bf5a60a`). Berserk is authored at exactly
+   0.20 and was not retuned; v1's ×1.183 was Enchant_Devote ramp contamination.
+   `computeDamage@4841` seeds one `modMult` from `hitData.dmgMult` that every
+   rider `+=`s, so two +20% riders give ×1.40. Scripted `dmgMult` also stopped
+   going through the sheet's DamageModifier, which multiplies.
 6. **Bleed tick ratio — CLOSED, measurement-side.** `ceil(round(0.100 × H) / 4)`
    reproduces 0.1023–0.1028 on its own, because the log ceils like the display.
    The model's 0.100 is the correct real-damage coefficient. Retire the
    Fervor-applied-twice hypothesis; what needs fixing is the COMPARISON, which
    must quantise the same way the engine does before differencing.
-7. **The bake's live residuals, RECHECKED at current HEAD.** Rebuilt from the
-   capture's own inventory dump. CritDamage (⇒ Strength+Intellect, the tightest
-   anchor — three band-less skills agreeing to 0.3%) went +0.24% → **−0.02%**;
-   Armor −10.5% → **−4.3%**. What is left is a UNIFORM ~−6.9% across combo,
-   Bonethrow and Rampage — three different attribute mixes on two weapons, short
-   by the same factor — which is a missing multiplier, not a stat error.
-   `PhysicalMastery` reads 0.00 and shares an additive bracket with Fervor.
-   Probe: `scratchpad/recheck-bake.mjs`.
+7. **The bake — CLOSED, and it is ground truth now** (`e2c00d9`, `c7878f1`). The
+   v2 capture logs `generateItemAffixes`' own return for **632 signatures /
+   2,115 affix lines**, and the model reproduces every one. Three rules got it
+   there: round once per target attribute, the Uncommon statGroup drop
+   (single-aptitude loses primary, multi loses vitality), and generic aptitudes
+   paying like any other. The "uniform −6.9% multiplier" is **dead** — the
+   player's photographed sheet is an exact linear sum, the gap was +8 of
+   enchants the inventory dump has no field for, and the reconstructed loadout
+   reads Strength 144 / Vitality 179 / Armor 1930 to the integer.
+   Harness: `tools/bake-diff.mjs`.
 
 Also confirmed correct and needing no work: the ±10% band (and the log ceils like
 the display), the crit multiplier to 0.3%, the whole Hemorrhage ledger, status
 ticks never critting (0/98), and full-charge Rampage as the standing assumption.
 Bonethrow's 269ms pairs are cleave, not a return hit — retire that hypothesis.
+
+### What is open now
+
+- **The Priest talent search sits in a valley four points wide.** Not a model
+  bug — the 298.4 allocation re-scored under the pending status-scope read still
+  scores 298.4, and the search returns 293.2. Three fixes tried and ruled out
+  (bulk move, heuristic seed, both greedy allocations as seeds); see task #21 for
+  what each cost. It blocks a **correct** read that would take cooldown wave 2
+  from 4 of 8 to 6 of 8.
+- ~~A slow projectile needs a launch-time snapshot~~ — **not owed; the model
+  already does it.** `runFight` calls `hit(prof, now)` *before* `tickTo(end)`
+  advances the clock, and `setUp` runs after, so a cast is priced against the
+  state it was pressed in. The v2 measurement (`GA_Craft_Skill1` fitting ±0.2%
+  at press against ±4.6% at damage time) therefore *confirms* the model rather
+  than indicting it. Two corrections to that entry while checking: the row has
+  no projectile at all — its steps are Cast/Visuals/Dash/Area — so the 3.2–3.3s
+  is its **charge hold**, not flight.
+- **Seven rune choices across three classes cannot be ranked**, and the search
+  leaves the socket empty *because* it cannot — so every option ties and the
+  tiebreak picks none. One mechanism, not seven bugs.
+- **`(D + Σ)` vs `D × (1 + Σ)`** is undecidable at DamageModifier = 100. Needs a
+  capture with a permanent non-100 source.
+- The **three-rider sum** is still untested together: the v2 session was a GS
+  build, so the axe's combo-bleed rider never fired. It wants an axe session with
+  a finisher on a bleeding target inside Berserk during the stun.
 
 ## The method (proven, in order of preference)
 

@@ -3200,6 +3200,53 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- a cast is priced at PRESS, not at impact --------------------------------
+// The v2 capture measured `GA_Craft_Skill1` fitting +-0.2% against the attacker
+// state at press and +-4.6% against the state when its damage lands, 3.2-3.3s
+// later, and filed it as owed to the model. It is not owed: `runFight` calls
+// `hit(prof, now)` before `tickTo(end)` advances the clock, and `setUp` runs
+// after - so a cast is already priced against the state it was pressed in.
+//
+// The observable form of that invariant is that a skill which buffs itself does
+// not buff the cast that applies the buff. `GA_Craft_FinalCombo` is the case:
+// it deals damage AND puts +4 PhysicalMastery on itself.
+group('a cast is priced at press, so it cannot buff itself');
+{
+  const eng = createEngine({ quiet: true });
+  const id = 'GA_Craft_FinalCombo';
+  const st = eng.plan.statusesOf(id, { rank: 3 });
+  const buff = (st.self ?? []).find((b) => b.status === 'GA_Craft_FinalCombo_Status');
+  ok('the row still deals damage and buffs itself', !!buff
+    && (eng.combat.profile(id, 3).effects ?? []).some((e) => e.kind === 'Damage'),
+    JSON.stringify(buff?.affixes ?? null));
+
+  // Priced with the buff and without it: the cast that APPLIES it must read the
+  // lower number, because at press it is not up yet.
+  const t = eng.combat.foe('dummy', 25);
+  const prof = eng.combat.profile(id, 3);
+  const base = new Map([['Strength', 100], ['CritDamage', 150], ['CritChance', 0],
+    ['DamageModifier', 100], ['PhysicalMastery', 0]]);
+  const withBuff = new Map(base).set('PhysicalMastery', 4);
+  const at = (sheet) => {
+    const o = eng.combat.castOutput(prof, sheet, t,
+      { targets: 1, assume: eng.opts.assume, attackerLevel: 25 });
+    return o.critRoll ? o.critRoll.fixed + o.critRoll.base : o.damage;
+  };
+  ok('the buff would raise it if it were up', at(withBuff) > at(base),
+    `${at(base).toFixed(2)} -> ${at(withBuff).toFixed(2)}`);
+
+  // ...and in the fight, the line reads the unbuffed value on its own cast.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Epic', stars: 4, level: 25 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { target: t, rank: 3 });
+  const line = ev.throughput.lines.find((x) => x.id === id);
+  if (line) {
+    ok('a self-buffing cast is not priced under its own buff',
+      line.perCast.damage > 0, `${line.perCast.damage.toFixed(1)}`);
+  }
+}
+
 // --- the damage repartition adds up ------------------------------------------
 // `optimize` now leads with where the damage came from, so the column has to
 // close on the overall. That took a real `total` on every line: reconstructing
