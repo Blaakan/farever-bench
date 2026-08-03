@@ -3735,6 +3735,56 @@ group("the arsenal's upgrade effect is not discounted away");
     String(crit(1) - crit(0)));
 }
 
+// --- a weapon is generated, gear is authored ---------------------------------
+// The optimizer was offering items the world cannot drop: a level-6 Uncommon
+// necklace as Rare at iLevel 260, four times its legal stats. Two defaults
+// conspired - the drop-scale lifted every authored-level row to character
+// level, and the rarity roll promoted every slot - when the game does both for
+// WEAPONS ONLY. The live bakes settle it: Necklace_Z2RCraft logged iLevel 210
+// on a level-25 character, its authored 20 exactly, while GA_Craft logged 320
+// against an authored level of 4.
+group('only a weapon scales, and only a weapon rolls its rarity');
+{
+  const eng = createEngine({ quiet: true });
+  const cat = eng.cat;
+  const type = (id) => cat.itemById.get(id)?.type;
+
+  ok('the itemType tree splits weapons from gear',
+    cat.isWeaponType(type('GA_Craft')) && cat.isWeaponType(type('Axe_Boomerang'))
+      && cat.isWeaponType(type('Shield_Craft'))
+      && !cat.isWeaponType(type('Necklace_Z2RCraft')) && !cat.isWeaponType(type('Chest_RBee_Fig'))
+      && !cat.isWeaponType(type('Trinket_Kobold')),
+    'roots are MainhandWeapon / OffhandWeapon vs Gear');
+
+  const iLevel = (id) => {
+    const it = cat.itemById.get(id);
+    return cat.effectiveLevel(it, { charLevel: 25, stars: 0, rarity: it.rarity }) * 10;
+  };
+  // The two the live bakes name, to the integer.
+  near('an authored-level necklace keeps its own level', iLevel('Necklace_Z2RCraft'), 210, 1e-9);
+  near('...and an authored-level ring keeps its own', iLevel('Finger_Z2RCraft_CriAP'), 160, 1e-9);
+  // The one the player caught: authored level 6, offered at 260.
+  near('the level-6 necklace prices at 60, not 260', iLevel('Necklace_Z1_Cri'), 60, 1e-9);
+  // A weapon still scales - authored level 4, generated at the character's.
+  near('a weapon still generates at the source level', iLevel('GA_Craft'), 260, 1e-9);
+  // Gear with NO authored level has nothing to keep, so it takes yours.
+  near('gear with no authored level takes the character level',
+    iLevel('Chest_RBee_Fig'), 260, 1e-9);
+
+  // And the roll. With `rarityRoll` on, a weapon expands into one candidate per
+  // attainable rarity; gear must still offer exactly its authored one.
+  const rolled = (slot, id) => cat.candidates(slot, {
+    aptitude: 'Fighter', charLevel: 25, rarityRoll: true,
+  }).filter((c) => c.item.id === id);
+  const neck = rolled('Slot_Neck', 'Necklace_Z1_Cri');
+  ok('a gear row offers only its authored rarity',
+    neck.length > 0 && neck.every((c) => c.rarity === cat.itemById.get('Necklace_Z1_Cri').rarity),
+    neck.map((c) => c.rarity).join(', '));
+  ok('...while a weapon still expands across the roll',
+    rolled('Slot_Weapon1', 'GA_Craft').length > 1,
+    String(rolled('Slot_Weapon1', 'GA_Craft').length));
+}
+
 // --- the bake, against the game's own return value ---------------------------
 // `captures/2026-08-02-v2/bench-probe-bakes.csv` is a postfix on
 // `$HItem.generateItemAffixes@20747`: item, the iLevel it was called with, and

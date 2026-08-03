@@ -79,6 +79,9 @@ function resolve(input, ids, what) {
 // The best rarity a pinned item can actually reach: capped by the slot ceiling
 // and by what the level band can roll, floored at what the row is authored as.
 function bestRarityFor(cat, item, slotId, charLevel) {
+  // ...and only a WEAPON rolls one at all. Gear keeps the rarity on its row,
+  // so a pinned necklace must not be quietly promoted either.
+  if (!cat.isWeaponType(item.type)) return item.rarity;
   const options = cat.attainableRarities(item, charLevel, slotId);
   let best = item.rarity;
   for (const o of options) {
@@ -2154,12 +2157,16 @@ Common flags
   --no-mastery            drop the unverified mastery multipliers
   --chain-persists        let the base-attack chain hold its place through a
                           skill cast (reported from play: it does not)
-  --drops <s>             authored | scaled   (default authored)
-                          whether an unpinned item's stats follow the item
-                          row's own level (verified on a real tooltip) or a
-                          drop at your level (untested hypothesis)
+  --drops <s>             authored | scaled   (default scaled)
+                          whether an unpinned WEAPON's stats follow its own
+                          row's level or a drop at yours. Gear is unaffected
+                          either way: the live bakes show authored-level gear
+                          keeping its level exactly (a level-20 necklace logs
+                          iLevel 210 on a level-25 character) while a weapon
+                          generates at the source's level. Rarity follows the
+                          same split - only a weapon rolls one
   --swing-floor <s>       the measured floor on a chain link's swing period
-                          (default 0.7; 0 trusts the authored durations alone)
+                          (default 0; --swing-floor 0.7 restores the old read)
   --build <file.json>     start from a saved build - either a bare loadout or
                           the envelope --json writes, whose recorded goal,
                           target, level, fight and pins become the defaults

@@ -939,14 +939,20 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
            '~3.0s each, exactly the authored 3.00.',
     },
     {
-      severity: 'assumption',
-      what: 'an item\'s stats follow the level it dropped at; its weapon damage follows its trained level',
-      why: 'Verified on a real Cheese Moon: trained to weapon level 25 it still shows the effective-' +
-           'level-11 stat budget (+36/+15/+18/+39/+39 - the same numbers as the level-10 Spear reading) ' +
-           'while its damage line reads 18-21, the FULL primary budget at the trained level. So "Level ' +
-           '25" on a weapon tooltip is training, not the drop. What a fresh drop at your level carries ' +
-           'is still unmeasured: --drops scaled prices that hypothesis, and a ^N pin names an instance ' +
-           'exactly.',
+      severity: 'verified',
+      what: 'a WEAPON is generated - it takes the source\'s level and rolls its rarity; GEAR is authored and keeps both',
+      why: 'The split is the itemType tree: everything under MainhandWeapon or OffhandWeapon against ' +
+           'everything under Gear. The live bakes settle both halves - Necklace_Z2RCraft logged iLevel ' +
+           '210 on a LEVEL-25 character, its authored 20 exactly, the Z3 craft rings logged 160 for an ' +
+           'authored 15, and GA_Craft logged 320 against an authored level of 4. Applying either rule ' +
+           'to everything is how the optimiser came to recommend items the world cannot drop: a level-6 ' +
+           'Uncommon necklace offered as Rare at iLevel 260, about four times its legal stats. So ' +
+           '`--drops scaled` means "a weapon generates at your level" and gear is unaffected either ' +
+           'way; a pinned gear item is never promoted past its own rarity. Anything ranked before this ' +
+           'has to be re-run - it moved every baseline down 1-3%. A weapon\'s DAMAGE line still follows ' +
+           'its trained level rather than its drop, verified on a real Cheese Moon: trained to weapon ' +
+           'level 25 it shows the effective-level-11 stat budget while its damage line reads 18-21, ' +
+           'the full primary budget at the trained level. A ^N pin still names an instance exactly.',
     },
     {
       severity: 'verified',

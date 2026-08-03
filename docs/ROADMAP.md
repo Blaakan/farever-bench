@@ -6,10 +6,16 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
-State at handoff (2026-08-03): **780 checks green**; baselines Warrior 495.7,
-Rogue 354.5, Mage 241.4, Priest 298.4 (`optimize`, level 25, named boss).
+State at handoff (2026-08-03): **788 checks green**; baselines Warrior 479.7,
+Rogue 350.6, Mage 239.0, Priest 293.8 (`optimize`, level 25, named boss).
 Unscored lists: Warrior 3, Rogue 7, Mage 5, Priest 7 — and a GS build went 3 → 1
 when the stack counter landed.
+
+Those baselines fell 1–3% when **scaling and the rarity roll were confined to
+weapons**. Gear is authored: it keeps its own level and its own rarity. The
+optimizer had been recommending items the world cannot drop — a level-6 Uncommon
+necklace offered as Rare at iLevel 260 — and anything ranked before that fix is
+worth re-running.
 
 **A pull starts cold.** Any measured fight assumes zero extra resources unless it
 says otherwise: no food, no banked aura stacks, no enchant buff still running

@@ -483,6 +483,28 @@ per-skill through `runeDamage`, once here at scope `all` across the whole build.
 That read the Warrior **31% high**. Only `cooldownPerTick` comes through from a
 non-talent source.
 
+**A weapon is generated; gear is authored.** The drop chain rolls a generation
+level *and* a generation rarity for **Weapon-type only** — everything under
+`MainhandWeapon` or `OffhandWeapon` in the `itemType` tree. Everything under
+`Gear` keeps the level and the rarity written on its own row.
+
+The live bakes settle both halves. `Necklace_Z2RCraft` logged iLevel **210** on a
+level-25 character, which is its authored 20 exactly; the Z3 craft rings logged
+**160** for an authored 15; and `GA_Craft` logged **320** against an authored
+level of 4. Fixed-level gear does not scale, and weapons plainly do.
+
+Applying either rule to everything is how the optimizer came to recommend items
+the world cannot drop: a level-6 Uncommon necklace (`Necklace_Z1_Cri`) offered as
+**Rare at iLevel 260** — roughly four times its legal stats — and a level-15 ring
+priced the same way. `--drops scaled` now means "a weapon generates at your
+level"; gear is unaffected either way, and `bestRarityFor` returns a pinned
+gear item's own rarity rather than promoting it.
+
+Anything ranked under the old defaults has to be re-run. Doing so moved every
+baseline down: Warrior 495.7 → 479.7, Rogue 354.5 → 350.6, Mage 241.4 → 239.0,
+Priest 298.4 → 293.8, and the Warrior's neck went from a promoted Rare at 260 to
+an Uncommon at its own 150.
+
 **A pull starts cold.** Any measured fight assumes **zero extra resources**
 unless it says otherwise — no food buff, no banked stacks of an aura, no enchant
 buff still running from the previous pull, no skill pressed before the combat
