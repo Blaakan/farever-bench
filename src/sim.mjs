@@ -100,7 +100,7 @@ function runFight(spec) {
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
     poolScale = null, poolFactor = null, goal = null, chainResets = true,
-    swingVariance = 0, comboWindow = 0.6, empowerments = [],
+    swingVariance = 0, comboWindow = 0.6, empowerments = [], stackProcs = [],
   } = spec;
   // The objective the derived player maximises - see `goalWeights`.
   const [wDmg, wHeal, wShield] = goalWeights(goal);
@@ -578,6 +578,8 @@ function runFight(spec) {
     for (const e of empowerments ?? []) emp.set(e.skill, { chance: e.chance, p: 0 });
     const armAll = () => { for (const r of emp.values()) r.p += (1 - r.p) * r.chance; };
     let swings = 0, combos = 0, busy = 0, fillerTime = 0;
+    // Non-DoT physical damage EVENTS, which is what a stack counter arms on.
+    let physicalHits = 0;
 
     // The state everything is priced against, rebuilt only when it changes.
     let now = bare;
@@ -978,6 +980,7 @@ function runFight(spec) {
         if (reg) reg.p = 0;   // one-shot, spent whether or not it was armed
         a.casts++;
         a.hits = (a.hits ?? 0) + (out.hits ?? 0);
+        physicalHits += out.hitsPhysical ?? 0;
         a.damage += out.damage;
         a.heal += out.heal;
         a.shield += out.shield;
@@ -1065,6 +1068,7 @@ function runFight(spec) {
       const roll = rand && swingVariance > 0 && !link.prof.isCombo
         ? 1 + (rand() * 2 - 1) * swingVariance : 1;
       link.hits = (link.hits ?? 0) + (swingOut.hits ?? 0);
+      physicalHits += swingOut.hitsPhysical ?? 0;
       link.fires = (link.fires ?? 0) + 1;
       link.damage = (link.damage ?? 0) + swingOut.damage * roll;
       link.heal = (link.heal ?? 0) + swingOut.heal * roll;
@@ -1097,7 +1101,7 @@ function runFight(spec) {
 
     // The denominator is the FIGHT, not the moment the last cast happened - a
     // damage meter divides by the clock, and so must this.
-    return { swings, combos, busy, fillerTime, elapsed: fight };
+    return { swings, combos, busy, fillerTime, physicalHits, elapsed: fight };
   }
 
   // --- run it ---------------------------------------------------------------
@@ -1214,6 +1218,39 @@ function runFight(spec) {
       casts,
     });
   }
+  // A STACK COUNTER, priced AFTER the fight rather than played inside it.
+  //
+  // The rate is `qualifying events / maxStacks`, and the fight counts its own
+  // events - so this needs no new castable and, deliberately, gives the
+  // rotation search nothing to reorder around. Injecting it as a pressable
+  // instead was measured to send the search to WORSE plans (436 -> 413/423),
+  // the same local-optimum failure the talent search shows, so the price is
+  // landed analytically on a line of its own.
+  //
+  // THE FIGHT STARTS COLD - no banked stacks. `GS_Nova_Passive_Stack` has no
+  // authored duration, so in game its stacks survive the pull and a meter can
+  // show twice the steady-state rate on a warm character. `floor` is what makes
+  // the cold start honest: 99 stacks at the bell are 99 stacks nobody spent,
+  // the same convention the pool dots' un-ticked tail already follows.
+  const physicalHits = mean((x) => x.physicalHits ?? 0);
+  for (const sp of stackProcs ?? []) {
+    const fires = Math.floor(physicalHits / sp.cap);
+    if (!(fires > 0)) continue;
+    const prof = sp.prof;
+    const out = sp.out;
+    if (!prof || !out) continue;
+    lines.push({
+      id: prof.id, name: prof.name, kind: 'triggered', source: sp.from,
+      perCast: { damage: out.damage, heal: out.heal, shield: out.shield },
+      total: { damage: out.damage * fires, heal: out.heal * fires, shield: out.shield * fires },
+      hits: (out.hits ?? 1) * fires,
+      interval: fires > 0 ? elapsed / fires : Infinity, share: 0,
+      postHoc: true,
+      why: `one per ${sp.cap} physical hits (${Math.round(physicalHits)} in this fight), `
+        + 'from a cold start - no stacks carried in',
+    });
+  }
+
   const fillerTime = mean((x) => x.fillerTime);
   if (chainTime > 0 && fillerTime > 0) {
     const cycles = Math.max(1e-9, fillerTime / chainTime) * rolls;
@@ -1326,11 +1363,20 @@ function runFight(spec) {
 
   const busy = mean((x) => x.busy) / elapsed;
   const idle = Math.max(0, 1 - busy - fillerTime / elapsed);
+  // The post-hoc lines are real damage and belong in the headline, or the
+  // repartition would not close on it. They are added here rather than inside
+  // the run because they are priced from the run's own event count.
+  const extra = lines.filter((l) => l.postHoc)
+    .reduce((a, l) => ({
+      damage: a.damage + (l.total?.damage ?? 0),
+      heal: a.heal + (l.total?.heal ?? 0),
+      shield: a.shield + (l.total?.shield ?? 0),
+    }), { damage: 0, heal: 0, shield: 0 });
 
   return {
-    dps: mean((x) => x.damage) / elapsed,
-    hps: mean((x) => x.heal) / elapsed,
-    sps: mean((x) => x.shield) / elapsed,
+    dps: (mean((x) => x.damage) + extra.damage) / elapsed,
+    hps: (mean((x) => x.heal) + extra.heal) / elapsed,
+    sps: (mean((x) => x.shield) + extra.shield) / elapsed,
     dpsSd: sd((x) => x.damage) / elapsed,
     busy,
     idle,

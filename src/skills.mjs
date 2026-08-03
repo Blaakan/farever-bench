@@ -1362,14 +1362,17 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           });
           return;
         }
+        // A follow-up armed by a STACK COUNTER now has a rate, and it was
+        // always in the data: one stack per qualifying damage event, converting
+        // at `maxStacks`. What was missing was a fight that counted its own
+        // events, and it counts them now.
+        if (stackProcIds(rank, runes).has(id)) return;
         unmodelled.push({
           id, name: prof.name, source, kind: 'no rate',
           why: (extra.parent
             // The parent link IS in the data (props.subskills); what is not is
-            // the counter that arms it. Both ultimates hang off a weapon
-            // passive that banks stacks per damage event and swaps to the
-            // ultimate at the cap - a rate the fight could produce, but only
-            // once something counts damage instances.
+            // the counter that arms it - for the ultimates that bank a stack
+            // per damage event, see `stackProcsOf`, which reads exactly that.
             ? `${skills.get(extra.parent)?.texts?.name ?? extra.parent} unlocks it, and that is a passive - `
               + 'nothing in the data says how many hits arm it'
             : 'declares damage but no trigger rate can be derived from the data')
@@ -1429,6 +1432,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // not appear in the list of skills it does not.
       if ((prof.runeDamage ?? []).length) return;
       if (empowermentIds(rank, runes).has(id)) return;
+      // A follow-up armed by a stack counter is scored from `events / maxStacks`
+      // now, so "nothing in the data says how many hits arm it" stopped being
+      // true. The data says 100.
+      if (stackProcIds(rank, runes).has(id)) return;
 
       // What KIND of gap this is, so a reader can tell a teleport apart from
       // damage the model cannot reach. "Contributes zero" is true of both and
@@ -3236,6 +3243,60 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * visible when both halves are in scope: asking about the applier alone finds
    * nothing. Used to keep the coverage report honest.
    */
+  /**
+   * A STACK COUNTER that arms a follow-up. The shape, in one script:
+   *
+   *   onInflictDamage(dmg) {
+   *     if (!dmg.isDoT && dmg.isPhysical && !hasStatus(owner, UltProc))
+   *       addStatus(owner, Buff);
+   *     if (hasStatusMaxStacked(owner, Buff)) { removeStatus(Buff); addStatus(UltProc); }
+   *   }
+   *
+   * One stack per qualifying damage EVENT, and at the cap it converts. So the
+   * rate is not missing from the data at all - it is `events / maxStacks`, and
+   * the only thing the old refusal ("nothing in the data says how many hits arm
+   * it") was missing is that the fight counts its own events.
+   *
+   * The follow-up is named by `props.subskills`, not guessed from the id.
+   */
+  function stackProcsOf(ownedIds, { rank = 1, runes = null } = {}) {
+    const out = [];
+    for (const id of ownedIds) {
+      const s = skills.get(id);
+      const body = s?.script ? liveScript(s.script) : '';
+      if (!body || !/hasStatusMaxStacked/.test(body) || !/addStatus/.test(body)) continue;
+      const alias = (n) => new RegExp(`\\b${n}\\s*=\\s*Skill\\.([A-Za-z0-9_]+)`).exec(body)?.[1] ?? n;
+      const capped = /hasStatusMaxStacked\s*\(\s*owner\s*,\s*(\w+)/.exec(body)?.[1];
+      if (!capped) continue;
+      const counter = alias(capped);
+      const cap = maxStacksOf(counter, rank);
+      if (!Number.isFinite(cap) || cap <= 1) continue;
+      // What arms it: the guard on the `addStatus` that feeds the counter.
+      const feed = new RegExp(`if\\s*\\(([^)]*)\\)[^;{}]*\\{?[^;{}]*addStatus\\s*\\(\\s*owner\\s*,\\s*${capped}\\b`)
+        .exec(body)?.[1] ?? '';
+      if (!/isPhysical/.test(feed) || !/isDoT/.test(feed)) continue;   // the only shape read
+      const follow = (s.props?.subskills ?? []).map((x) => x.skill ?? x.ref).filter(Boolean);
+      if (!follow.length) continue;
+      out.push({ from: id, counter, cap, skill: follow[0], on: 'physicalHit' });
+    }
+    return out;
+  }
+
+  /** Both halves of every stack-counter pair in the sheet, for the coverage report. */
+  const stackIdCache = new Map();
+  function stackProcIds(rank = 1, runes = null) {
+    const key = rank + '@' + (runes?.size ? [...runes].sort().join('+') : '-');
+    let hit = stackIdCache.get(key);
+    if (!hit) {
+      hit = new Set();
+      for (const p of stackProcsOf([...skills.keys()], { rank, runes })) {
+        hit.add(p.from); hit.add(p.skill);
+      }
+      stackIdCache.set(key, hit);
+    }
+    return hit;
+  }
+
   const empIdCache = new Map();
   function empowermentIds(rank = 1, runes = null) {
     const key = rank + '@' + (runes?.size ? [...runes].sort().join('+') : '-');
@@ -3286,7 +3347,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   return {
     pools, defaultSelection, pruneSelection, resolve, selfBuffs, selfBuffsOf, statusesOf,
     weaponSlotsAt, arsenalSlotsAt, typeOf, baseChain, resourceGainsOf, talentModifiers, maxStacksOf,
-    empowermentsOf, empowermentIds, scriptGapsOf,
+    empowermentsOf, empowermentIds, scriptGapsOf, stackProcsOf,
     mechanicTypes: MECHANIC_TYPES,
   };
 }

@@ -185,6 +185,12 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       // Warrior optimum slots exactly that sigil.
       empowerments: plan.empowermentsOf(talents.runableSkillIds(loadout),
         { rank, runes: new Set(rot.runes ?? []) }),
+      // A stack counter that arms a follow-up. Its rate is `events / maxStacks`
+      // and the fight counts its own events, so the old refusal - "nothing in
+      // the data says how many hits arm it" - was false: the data says 100.
+      stackProcs: plan.stackProcsOf(talents.runableSkillIds(loadout),
+        { rank, runes: new Set(rot.runes ?? []) }),
+      rank,
       gates: (() => {
         const bleeding = rot.dots?.some((d) => (d.types ?? []).some((t) => /Bleed|Hemorage/i.test(t)))
           ? 1 : 0;
@@ -893,6 +899,18 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
            'nothing anywhere says how many enemies stand inside it. `unitGroup` describes spawn points ' +
            'and the `spawner` sheet is empty because placement is level data. So --targets is an input, ' +
            'never a derived number, and only Area and Aura steps scale with it.',
+    },
+    {
+      severity: 'assumption',
+      what: 'a fight starts COLD: no banked stacks, no food, no pre-cast, nothing carried in from a previous pull',
+      why: 'The player\'s convention, and the only one that makes a measured pull reproducible: any pull '
+        + 'assumes zero extra resources unless it says otherwise - a food buff, extra stacks of an aura, '
+        + 'an enchant buff still running from the last fight, a skill pressed before the combat window. '
+        + 'It matters most where a counter carries ACROSS combats, because there the flattering reading '
+        + 'and the honest one differ by a factor of two: GS_Nova_Passive_Stack has no authored duration, '
+        + 'so its stacks survive the pull, and a meter showing two Anger Release casts in 75s is one '
+        + 'earned and one walked in. The model earns both. Anything measured against a warm character '
+        + 'has to say so.',
     },
     {
       severity: 'verified',

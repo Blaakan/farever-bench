@@ -967,7 +967,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
 
     let damage = 0, heal = 0, shield = 0;
     let singleTargetDamage = 0;
-    let hitCount = 0;
+    let hitCount = 0, hitCountPhysical = 0;
     let critPhysical = 0, critMagic = 0;
     let totalPhysical = 0, totalMagic = 0;
     // The crit decomposition, so a rolled fight can roll the crit instead of
@@ -1105,6 +1105,9 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // not it: that one only counts CRITTABLE hits, so a status tick - which
         // can never crit - contributes nothing to it.
         hitCount += (e.hits ?? 1) * targets;
+        // Physical, non-tick events specifically: that is what a stack counter
+        // keyed on `!dmg.isDoT && dmg.isPhysical` arms on.
+        if (aff.root === 'Physical' && !statusTick) hitCountPhysical += (e.hits ?? 1) * targets;
         // Split this effect into the part a die can move and the part it
         // cannot. `localCrit` is 1 for a status tick, which is exactly the
         // "cannot" case, so the test is the multiplier itself.
@@ -1163,7 +1166,8 @@ export function buildCombat(cdb, ctx, assume = {}) {
       }
     }
     return {
-      damage, heal, shield, singleTargetDamage, gains, hits: hitCount,
+      damage, heal, shield, singleTargetDamage, gains,
+      hits: hitCount, hitsPhysical: hitCountPhysical,
       critPhysical, critMagic, totalPhysical, totalMagic,
       critRoll: critRoll.hits > 0 ? critRoll : null,
     };
@@ -1384,6 +1388,14 @@ export function buildCombat(cdb, ctx, assume = {}) {
       goal: live?.goal ?? null,
       chainResets: opts.assume?.chainResets ?? true,
       empowerments: opts.empowerments ?? [],
+      // Priced with the sheet, so the profile and its output are resolved here
+      // and the sim only has to multiply by the count it measured.
+      stackProcs: (opts.stackProcs ?? []).map((sp) => {
+        const prof = profile(sp.skill, opts.rank ?? 1);
+        return prof
+          ? { ...sp, prof, out: castOutput(prof, sheet, target, opts, NO_DEBUFF, live?.mods ?? NO_MODS) }
+          : sp;
+      }).filter((sp) => sp.prof),
       comboWindow: cdb.byId('constant').get('ComboWindow')?.v?.float ?? 0.6,
       swingVariance: cdb.byId('constant').get('WeaponAttack_RandomRange')?.v?.float ?? 0.1,
       poolHealShare: bleedMods.healShare ?? 0,

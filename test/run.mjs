@@ -3200,6 +3200,50 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- a stack counter has a rate, and it was always in the data ---------------
+// "Nothing in the data says how many hits arm it" was false. `GS_Nova_Passive`
+// banks one stack per non-DoT physical damage EVENT and converts at maxStacks -
+// 100 from rank 2 - so the rate is `events / 100`, and the only thing missing
+// was a fight that counted its own events.
+group('a stack counter arms its follow-up at a readable rate');
+{
+  const eng = createEngine({ quiet: true });
+  const all = eng.cdb.lines('skill').map((s) => s.id);
+  const found = eng.plan.stackProcsOf(all, { rank: 3 });
+  ok('exactly one row in the game carries this shape', found.length === 1, JSON.stringify(found));
+  const p = found[0];
+  ok('...and it is Hysteria arming Anger Release at 100',
+    p.from === 'GS_Nova_Passive' && p.skill === 'GS_Nova_Ultimate' && p.cap === 100,
+    JSON.stringify(p));
+  // The cap is rank-gated: 150 authored, 100 from rank 2 via rankOverride.
+  near('the cap is the authored 150 at rank 1',
+    eng.plan.stackProcsOf(all, { rank: 1 })[0].cap, 150, 1e-9);
+
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GS_Nova', rarity: 'Legendary', stars: 5, level: 25 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 });
+  const line = ev.throughput.lines.find((x) => x.id === 'GS_Nova_Ultimate');
+  ok('it is scored in the fight', !!line && line.total.damage > 0, JSON.stringify(line ?? null));
+  ok('...and no longer in the unscored list',
+    !(ev.rotation.unmodelled ?? []).some((u) => u.id === 'GS_Nova_Ultimate'),
+    (ev.rotation.unmodelled ?? []).map((u) => u.id).join(', '));
+
+  // A COLD START. `floor` is what makes that honest: stacks short of the cap at
+  // the bell are stacks nobody spent, and the status has no authored duration,
+  // so in game they would have carried in from the previous pull.
+  const hits = ev.throughput.lines.reduce((s, x) => s + (x.hits ?? 0), 0);
+  ok('the fire count floors the events over the cap',
+    Math.abs(line.total.damage / line.perCast.damage - Math.floor(line.total.damage / line.perCast.damage)) < 1e-6,
+    `${line.total.damage} / ${line.perCast.damage}`);
+  ok('...and the line says the start was cold', /cold start/.test(line.why ?? ''), line.why ?? '');
+  // It is priced post-hoc, so it must still be inside the headline.
+  near('a post-hoc line still counts toward dps',
+    ev.throughput.lines.reduce((s, x) => s + (x.total?.damage ?? 0), 0),
+    ev.throughput.dps * ev.throughput.fight, 1e-6);
+  ok('there are enough events in a 200s fight to fire it', hits > 100, String(hits));
+}
+
 // --- a refusal inside an accounted skill is still a refusal ------------------
 // The unscored list is per-SKILL, so a clause refused inside a skill the model
 // DOES score landed nowhere: the damage was right, one line of the script was
