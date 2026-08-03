@@ -447,8 +447,12 @@ export function optimize(engine, spec) {
       // damage effect, and a skill with no damage effect never reaches the
       // rotation - so asking the rotation meant such a rune could never be
       // found.
-      if (!pinnedRunes.size) {
-        const pools = engine.talents.runePools(cur);
+      {
+        // PER POOL, not all-or-nothing. Pinning one rune used to freeze every
+        // other rune slot in the build, which is not what a pin means anywhere
+        // else in this tool: pinning a chest does not stop the boots being
+        // searched.
+        const pools = engine.talents.runePools(cur).filter((p) => !pinnedRunes.has(p.skill));
         for (const pool of shuffled(pools, rand)) {
           let bestPick = cur.runes[pool.skill] ?? null;
           let bestScore = best;
@@ -710,7 +714,21 @@ export function optimize(engine, spec) {
     indifferent: indifferentSlots(winner.loadout, winner.score),
     evaluation: finalEval,
     reference: refEval,
-    talentAlloc: winner.talentAlloc ?? null,
+    // A PINNED allocation still has to be printed. `allocateTalents` returns
+    // null when the tree is pinned - it did not choose anything - and the
+    // caller took that to mean there was nothing to show, so `--talent` fixed
+    // an allocation and then hid it.
+    talentAlloc: winner.talentAlloc ?? (spec.pinnedTalents
+      ? {
+        ranks: winner.loadout.talents ?? {},
+        spent: Object.entries(winner.loadout.talents ?? {})
+          .filter(([id]) => !grantedTalents(winner.loadout).has(id))
+          .reduce((n, [, r]) => n + r, 0),
+        budget: engine.talents.pointsAt(winner.loadout.level, spec.talentPoints ?? null),
+        unspent: 0, blind: [], pinned: true,
+        granted: [...grantedTalents(winner.loadout)],
+      }
+      : null),
     talentCoverage: engine.talents.coverage(winner.loadout.class, winner.loadout.talents ?? {},
       { granted: grantedTalents(winner.loadout) }),
     evaluations: counter,

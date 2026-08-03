@@ -3735,6 +3735,33 @@ group("the arsenal's upgrade effect is not discounted away");
     String(crit(1) - crit(0)));
 }
 
+// --- a pinned rune fixes ONE slot -------------------------------------------
+// Pinning a rune used to freeze every other rune slot in the build, because the
+// search asked `if (!pinnedRunes.size)` before touching any of them. That is
+// not what a pin means anywhere else here: pinning a chest does not stop the
+// boots being searched.
+group('a rune pin is per slot, not per build');
+{
+  const eng = createEngine({ quiet: true });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Epic', stars: 4, level: 25 };
+  eng.plan.pruneSelection(l);
+  const pools = eng.talents.runePools(l);
+  ok('this build offers more than one rune slot', pools.length > 1,
+    pools.map((p) => p.skill).join(', '));
+  const target = eng.combat.foe('dummy', 25);
+  const res = optimize(eng, {
+    loadout: l, target, rank: 3, goal: 'dps', restarts: 1,
+    pinnedGear: new Set(eng.cat.combatSlots().map((s) => s.id)),
+    pinnedRunes: new Set([pools[0].skill]),
+  });
+  ok('the pinned slot keeps what it was given',
+    !res.loadout.runes?.[pools[0].skill], JSON.stringify(res.loadout.runes ?? {}));
+  ok('...and the others were still free to be filled',
+    Object.keys(res.loadout.runes ?? {}).every((k) => k !== pools[0].skill),
+    JSON.stringify(res.loadout.runes ?? {}));
+}
+
 // --- a weapon is generated, gear is authored ---------------------------------
 // The optimizer was offering items the world cannot drop: a level-6 Uncommon
 // necklace as Rare at iLevel 260, four times its legal stats. Two defaults

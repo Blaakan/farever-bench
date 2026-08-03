@@ -28,7 +28,7 @@ export const VERSION = '0.1.0';
 
 function parseArgs(argv) {
   const out = { _: [], flags: {}, repeated: {} };
-  const REPEATABLE = new Set(['pin', 'no-augment', 'weight', 'skills']);
+  const REPEATABLE = new Set(['pin', 'no-augment', 'weight', 'skills', 'rune', 'talent']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('-')) { out._.push(a); continue; }
@@ -247,7 +247,54 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
   // Saved skill pins hold whatever the file already put in `loadout.skills`.
   for (const key of savedSkillPins) if (loadout.skills[key]?.length) pinnedSkills.add(key);
 
-  return { pinnedGear, pinnedAug, pinnedSkills };
+  // --- runes, one pool at a time -------------------------------------------
+  // `--rune <skill>=<rune>`. The pool is named by the skill that owns it, which
+  // is how `runePools` keys them, and every other slot stays searchable.
+  const pinnedRunes = new Set();
+  loadout.runes ??= {};
+  for (const spec of args.repeated.rune ?? []) {
+    if (spec === true) die('--rune needs a value, e.g. --rune Warrior_Charge=Warrior_Charge_M1');
+    const eq = String(spec).indexOf('=');
+    if (eq < 0) die(`--rune "${spec}" needs the form skill=rune`);
+    const pools = engine.talents.runePools(loadout);
+    if (!pools.length) die('--rune: nothing equipped or allocated offers a rune choice yet');
+    const skill = resolve(spec.slice(0, eq), pools.map((p) => p.skill), 'skill with a rune slot');
+    const pool = pools.find((p) => p.skill === skill);
+    const rhs = spec.slice(eq + 1);
+    if (/^(none|empty|-)$/i.test(rhs)) { delete loadout.runes[skill]; pinnedRunes.add(skill); continue; }
+    loadout.runes[skill] = resolve(rhs, pool.options.map((r) => r.id), `rune for ${f.short(skill)}`);
+    pinnedRunes.add(skill);
+  }
+
+  // --- talents --------------------------------------------------------------
+  // `--talent <node>=<rank>`. Naming ANY node fixes the WHOLE allocation: the
+  // tree has tier thresholds, so a half-pinned allocation is not a constraint
+  // the greedy can satisfy without re-deciding which branches are even
+  // reachable. Say so rather than silently searching around the pin.
+  let pinnedTalents = false;
+  const talentSpecs = args.repeated.talent ?? [];
+  if (talentSpecs.length) {
+    const tree = engine.talents.treeFor(loadout.class);
+    const ids = tree.nodes.map((n) => n.skill);
+    loadout.talents = {};
+    for (const spec of talentSpecs) {
+      if (spec === true) die('--talent needs a value, e.g. --talent Warrior_Hemorrhage=1');
+      const eq = String(spec).indexOf('=');
+      const node = resolve(eq < 0 ? spec : spec.slice(0, eq), ids, `talent in the ${loadout.class} tree`);
+      const rank = eq < 0 ? 1 : Number(spec.slice(eq + 1));
+      if (!Number.isFinite(rank) || rank < 1) die(`--talent "${spec}": rank must be a positive number`);
+      loadout.talents[node] = rank;
+    }
+    const bad = engine.talents.illegalAllocation(loadout.class, loadout.talents, {
+      level: loadout.level,
+      points: engine.talents.pointsAt(loadout.level, null),
+      granted: new Set(),
+    });
+    if (bad) die(`--talent: ${bad}`);
+    pinnedTalents = true;
+  }
+
+  return { pinnedGear, pinnedAug, pinnedSkills, pinnedRunes, pinnedTalents };
 }
 
 function parseWeights(args) {
@@ -2142,6 +2189,15 @@ Common flags
                           Six exist per class, at levels 3/5/10/15/20/30, so a
                           level-25 character has learned five and slots four.
                           That count is not in the game data.
+  --rune <skill>=<rune>   fix one rune slot; repeatable, and PER SLOT - every
+                          other rune is still searched. Use =none to force it
+                          empty
+  --talent <node>=<rank>  fix the talent tree; repeatable. Naming ANY node fixes
+                          the WHOLE allocation, because the tree has tier
+                          thresholds and a half-pinned allocation is not
+                          something the search can complete legally. The
+                          allocation is checked against the real rules, so a
+                          combination a character could not have is refused
   --talent-points <n>     talent points to spend  (default: the full allowance)
   --talent-points <n>     points to spend in the tree (default: the full 16)
   --rarity-cap <r>        highest rarity a roll may reach (default: derived
