@@ -538,7 +538,7 @@ function runFight(spec) {
     // happen here rather than inside `cast` - a cached roll is the same roll
     // every time, which is how a die stops being one.
     const hit = rand && rollCrit ? (prof, st) => rollCrit(cast(prof, st), rand) : cast;
-    for (const a of actives) { a.casts = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
+    for (const a of actives) { a.casts = 0; a.hits = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
     for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; g.nextReady = 0; }
     for (const mu of cdMutations) mu.credit = 0;
@@ -977,6 +977,7 @@ function runFight(spec) {
         }
         if (reg) reg.p = 0;   // one-shot, spent whether or not it was armed
         a.casts++;
+        a.hits = (a.hits ?? 0) + (out.hits ?? 0);
         a.damage += out.damage;
         a.heal += out.heal;
         a.shield += out.shield;
@@ -1063,6 +1064,7 @@ function runFight(spec) {
       // deterministic fight keeps the mean either way.
       const roll = rand && swingVariance > 0 && !link.prof.isCombo
         ? 1 + (rand() * 2 - 1) * swingVariance : 1;
+      link.hits = (link.hits ?? 0) + (swingOut.hits ?? 0);
       link.damage = (link.damage ?? 0) + swingOut.damage * roll;
       link.heal = (link.heal ?? 0) + swingOut.heal * roll;
       link.shield = (link.shield ?? 0) + swingOut.shield * roll;
@@ -1114,20 +1116,22 @@ function runFight(spec) {
   const totals = [];
   let last = null;
   const acc = { active: new Map(), filler: new Map(), dot: new Map(), trig: new Map(), pool: new Map() };
-  for (const link of chain) link.total = { damage: 0, heal: 0, shield: 0 };
+  for (const link of chain) link.total = { damage: 0, heal: 0, shield: 0, hits: 0 };
   for (let i = 0; i < rolls; i++) {
     for (const link of chain) { link.damage = 0; link.heal = 0; link.shield = 0; }
     last = runOne(rand);
     let damage = 0, heal = 0, shield = 0;
     for (const a of actives) {
       damage += a.damage; heal += a.heal; shield += a.shield;
-      const e = acc.active.get(a) ?? { casts: 0, damage: 0, heal: 0, shield: 0 };
-      e.casts += a.casts; e.damage += a.damage; e.heal += a.heal; e.shield += a.shield;
+      const e = acc.active.get(a) ?? { casts: 0, hits: 0, damage: 0, heal: 0, shield: 0 };
+      e.casts += a.casts; e.hits += a.hits ?? 0;
+      e.damage += a.damage; e.heal += a.heal; e.shield += a.shield;
       acc.active.set(a, e);
     }
     for (const link of chain) {
       damage += link.damage; heal += link.heal; shield += link.shield;
       link.total.damage += link.damage; link.total.heal += link.heal; link.total.shield += link.shield;
+      link.total.hits += link.hits ?? 0;
     }
     for (const d of dots) {
       damage += d.damage; heal += d.heal;
@@ -1179,6 +1183,7 @@ function runFight(spec) {
         heal: (e.heal ?? 0) / rolls,
         shield: (e.shield ?? 0) / rolls,
       },
+      hits: fires * ((g.out?.hits ?? 0) || 1),
     });
   }
 
@@ -1200,6 +1205,10 @@ function runFight(spec) {
       // the chain actually gets, and a reader adding the column up was right to
       // find it 30% over.
       total: { damage: e.damage / rolls, heal: e.heal / rolls, shield: e.shield / rolls },
+      // Damage EVENTS, not casts: a multi-hit skill and a cleave both land more
+      // than one, and that is what a meter counts and what the capture logs a
+      // row for.
+      hits: (e.hits ?? 0) / rolls,
       interval: elapsed / casts, share: (casts * a.occupancy) / elapsed,
       casts,
     });
@@ -1218,6 +1227,7 @@ function runFight(spec) {
         heal: chain.reduce((s, x) => s + (x.total?.heal ?? 0), 0) / rolls,
         shield: chain.reduce((s, x) => s + (x.total?.shield ?? 0), 0) / rolls,
       },
+      hits: chain.reduce((s2, x) => s2 + (x.total?.hits ?? 0), 0) / rolls,
       interval: chainTime, share: fillerTime / elapsed,
     });
   }
@@ -1237,6 +1247,7 @@ function runFight(spec) {
       // A status's `perCast` IS its whole-fight figure - its interval is the
       // fight - so the two agree here by construction.
       total: { damage: e.damage / rolls, heal: e.heal / rolls, shield: 0 },
+      hits: ticks,   // a tick IS the damage event
       interval: elapsed, share: 0,
       why: `${ticks.toFixed(0)} ticks of ${perTick.toFixed(0)} every ${d.tick}s from ${d.fromName}`
         + (d.scaleByStacks && meanStacks > 1.02
@@ -1251,6 +1262,7 @@ function runFight(spec) {
       id: p.status, name: p.name, kind: 'over time', source: p.from,
       perCast: { damage: e.damage / rolls, heal: (e.heal ?? 0) / rolls, shield: 0 },
       total: { damage: e.damage / rolls, heal: (e.heal ?? 0) / rolls, shield: 0 },
+      hits: (e.ticks ?? 0) / rolls,
       // A pool feed is not a SUBSET of the lines above it - it is a share of
       // their crits, paid out again on its own schedule - so it belongs in the
       // repartition and the column closes on the reported total with it in.

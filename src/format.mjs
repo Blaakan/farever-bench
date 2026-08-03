@@ -436,17 +436,23 @@ export function damageBlock(ev, { verbose = false } = {}) {
   return [
     bold('DAMAGE'),
     table(
-      ['  ', 'DPS', 'DAMAGE', 'SHARE'],
+      ['  ', 'DPS', 'DAMAGE', 'SHARE', 'HITS'],
       [
-        ['  overall', num(t.dps, 1), num(total, 0), ''],
+        ['  overall', num(t.dps, 1), num(total, 0), '',
+          num(rows.reduce((s, x) => s + (x.l.hits ?? 0), 0), 0)],
         ...rows.map((x) => [
           '  ' + label(x.l),
           num(x.dmg / fight, 1),
           num(x.dmg, 0),
           total > 0 ? pct(x.dmg / total, 1) : '',
+          // HITS is damage EVENTS, not casts: a multi-hit skill lands several
+          // per cast, a cleave one per target, and a dot one per tick. That is
+          // what a damage meter counts and what the instrumented capture logs a
+          // row for, which is what makes the two comparable.
+          num(x.l.hits ?? 0, 0),
         ]),
       ],
-      { align: [null, 'r', 'r', 'r'] }
+      { align: [null, 'r', 'r', 'r', 'r'] }
     ),
   ].join('\n');
 }

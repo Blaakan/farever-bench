@@ -967,6 +967,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
 
     let damage = 0, heal = 0, shield = 0;
     let singleTargetDamage = 0;
+    let hitCount = 0;
     let critPhysical = 0, critMagic = 0;
     let totalPhysical = 0, totalMagic = 0;
     // The crit decomposition, so a rolled fight can roll the crit instead of
@@ -1099,6 +1100,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
         }
         damage += raw * m * targets;
         singleTargetDamage += raw * m;
+        // HOW MANY DAMAGE EVENTS this cast produces, which is what a damage
+        // meter counts and what the capture logs a row for. `critRoll.hits` is
+        // not it: that one only counts CRITTABLE hits, so a status tick - which
+        // can never crit - contributes nothing to it.
+        hitCount += (e.hits ?? 1) * targets;
         // Split this effect into the part a die can move and the part it
         // cannot. `localCrit` is 1 for a status tick, which is exactly the
         // "cannot" case, so the test is the multiplier itself.
@@ -1157,7 +1163,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       }
     }
     return {
-      damage, heal, shield, singleTargetDamage, gains,
+      damage, heal, shield, singleTargetDamage, gains, hits: hitCount,
       critPhysical, critMagic, totalPhysical, totalMagic,
       critRoll: critRoll.hits > 0 ? critRoll : null,
     };

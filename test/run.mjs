@@ -3220,6 +3220,37 @@ group('damage per ability sums to the overall');
       t.lines.filter((x) => !x.total).map((x) => x.id).join(', '));
   }
 
+  // HITS is damage EVENTS, not casts. A dot's tick is one, a multi-hit skill
+  // lands several per cast, and a cleave one per target - which is what a
+  // damage meter counts and what the instrumented capture logs a row for.
+  {
+    const t2 = eng.evaluate(
+      (() => { const b = emptyLoadout(eng.cat, 'Warrior', 25); eng.plan.pruneSelection(b); return b; })(),
+      { target: eng.combat.foe('dummy', 25), rank: 3 }).throughput;
+    ok('every damaging line carries a hit count',
+      t2.lines.filter((x) => (x.total?.damage ?? 0) > 0)
+        .every((x) => Number.isFinite(x.hits) && x.hits > 0),
+      t2.lines.filter((x) => (x.total?.damage ?? 0) > 0 && !(x.hits > 0)).map((x) => x.id).join(', '));
+    // A status ticking on a 2s grid for the whole fight lands fight/2 of them,
+    // which is the arithmetic anyone would check first.
+    for (const l of t2.lines.filter((x) => x.kind === 'over time')) {
+      ok(`${l.name}: ticks are plausible for a ${t2.fight}s fight`,
+        l.hits > 0 && l.hits <= t2.fight, `${l.hits} over ${t2.fight}s`);
+    }
+  }
+  // ...and a multi-hit cast counts every hit, not the cast.
+  {
+    const p = eng.combat.profile('GS_Nova_Skill1', 3);
+    const declared = (p.effects ?? []).filter((e) => e.kind === 'Damage')
+      .reduce((s, e) => s + (e.hits ?? 1), 0);
+    const o = eng.combat.castOutput(p,
+      new Map([['Strength', 100], ['CritDamage', 150], ['CritChance', 0], ['DamageModifier', 100]]),
+      eng.combat.foe('dummy', 25),
+      { targets: 1, assume: eng.opts.assume, attackerLevel: 25 });
+    ok('a multi-hit cast reports every hit', o.hits === declared && declared > 1,
+      `${o.hits} vs ${declared} declared`);
+  }
+
   // A pool feed is not a SUBSET of the lines above it - it is a share of their
   // crits paid out again - so dropping it is what would make the column short.
   const l = emptyLoadout(eng.cat, 'Warrior', 25);
