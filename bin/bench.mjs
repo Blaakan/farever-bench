@@ -3,13 +3,16 @@
 // bench - a gear bench for Farever.
 //
 //   bench optimize --class Priest --pin weapon1=Sword_Swarm --no-augment weapon1
+//   bench optimize https://questlog.gg/farever/en/character-builder/<slug>
 //
 // Reads the CastleDB out of your own copy of the game, computes what every
 // item is worth for your class and level, and fills whatever you did not pin
 // with the best legal combination it can find.
 //
-// Nothing here touches the game process, the network, or any file inside the
-// install directory.
+// Nothing here touches the game process or any file inside the install
+// directory. The network is reached in exactly one case: you handed it a
+// questlog.gg link, which is fetched, translated into pins, and then treated
+// as if you had typed them.
 // ---------------------------------------------------------------------------
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -20,6 +23,7 @@ import { optimize, rankSlot } from '../src/optimize.mjs';
 import {
   makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel,
 } from '../src/rotation.mjs';
+import { slugOf, endpoints, normalize, translate } from '../src/questlog.mjs';
 import * as f from '../src/format.mjs';
 
 export const VERSION = '0.1.0';
@@ -2240,6 +2244,29 @@ Pinning
   --pin neck=Necklace_Z2RCraft+MaPen   craft jewellery pays ONE of the generic
                                        aptitudes it names; this picks which
 
+A questlog.gg build, as pins
+  Hand any command a character-builder link and it is fetched, translated into
+  the pins above, and run. The class and the level come from the link, so
+  neither has to be typed, and anything you DO type wins over what the link
+  said - so the last line below asks what that build looks like at level 20
+  with a different trinket.
+
+  bench sheet     https://questlog.gg/farever/en/character-builder/<slug>
+  bench optimize  https://questlog.gg/farever/en/character-builder/<slug>
+  bench optimize  <link> --level 20 --pin trinket=Trinket_Kobold
+
+  --questlog <slug>        the same thing by slug, when a link is awkward
+  --questlog-build <n>     which of the character's builds, from 0  (default 0)
+
+  Whatever questlog records and the bench cannot take is printed before the
+  run rather than dropped - the cosmetic slots, per-skill arsenal ranks, runes
+  on skills the build has no slot for, and the class-skill bar, which questlog
+  does not store at all. That last one is why an imported build is not quite
+  fully pinned: the bench still searches which class skills are on the bar.
+  This is the ONLY thing in the tool that touches the network.
+  To see the translation without running it:
+    node tools/questlog-import.mjs <link>
+
 Skill selection
   --skills weapon1=Skill1,Passive      slot two of the three a weapon offers
   --skills prayers=Smite,Life          choose the prayer sequence
@@ -2250,7 +2277,65 @@ Example
   bench optimize --class Priest --pin weapon1=Sword_Swarm --no-augment weapon1
 `;
 
-function main(argv) {
+// --- a questlog.gg link, as pins -------------------------------------------
+// The one place the bench reaches the network. A link is turned into the same
+// --pin/--skills/--talent/--rune flags a person would have typed, and pushed
+// in FRONT of the ones they did type - so anything named on the command line
+// overrides what the link said rather than fighting it.
+const QUESTLOG_LINK = /questlog\.gg|character-builder/i;
+
+async function getJson(url) {
+  const r = await fetch(url, { headers: { accept: 'application/json' } });
+  if (!r.ok) throw new Error(`questlog answered ${r.status} ${r.statusText}\n  ${url}`);
+  return r.json();
+}
+
+async function applyQuestlog(args) {
+  const flagged = typeof args.flags.questlog === 'string' ? args.flags.questlog : null;
+  const positional = args._.slice(1);
+  const link = flagged ?? positional.find((a) => QUESTLOG_LINK.test(a)) ?? null;
+  // A second positional has never meant anything, so anything else there is a
+  // mistake worth naming rather than ignoring.
+  const stray = positional.filter((a) => a !== link);
+  if (stray.length) {
+    die(`unexpected argument "${stray[0]}"\n` +
+      '  the only thing a second argument can be is a questlog.gg build link');
+  }
+  if (!link) return;
+
+  const slug = slugOf(link);
+  const character = await getJson(endpoints(slug).character);
+  const authorSlug = character?.result?.data?.character?.user?.slug;
+  if (!authorSlug) throw new Error('the questlog payload names no author, so its talents cannot be reached');
+  const talents = await getJson(endpoints(slug, authorSlug).talents);
+
+  const which = args.flags['questlog-build'];
+  const buildIndex = which == null || which === true ? 0 : Number(which);
+  if (!Number.isInteger(buildIndex) || buildIndex < 0) die('--questlog-build needs a whole number from 0');
+
+  const build = normalize(character, talents, { buildIndex });
+  const out = translate(build, createEngine({ quiet: true }));
+
+  // The link carries a class and a level, so neither has to be typed - but a
+  // typed one still wins, which is what makes "this build at level 20" work.
+  if (typeof args.flags.class !== 'string') args.flags.class = out.class;
+  if (args.flags.level == null || args.flags.level === true) args.flags.level = String(out.level);
+
+  const ahead = (key, vals) => {
+    if (vals.length) args.repeated[key] = [...vals, ...(args.repeated[key] ?? [])];
+  };
+  ahead('pin', out.pins.filter((p) => !p.isSkills).map((p) => p.arg));
+  ahead('skills', out.pins.filter((p) => p.isSkills).map((p) => p.arg));
+  ahead('talent', out.talentPins.map((t) => t.arg));
+  ahead('rune', out.runePins.map((r) => r.arg));
+
+  console.log(f.bold(build.name) + f.dim('  by ' + (build.author ?? '?') + '  -  questlog.gg/'
+    + slug + (build.buildCount > 1 ? '  (build ' + (buildIndex + 1) + '/' + build.buildCount + ')' : '')));
+  for (const w of out.warnings) console.log(f.warn('  ' + w));
+  console.log();
+}
+
+async function main(argv) {
   const args = parseArgs(argv);
   const cmd = args._[0];
   if (!cmd || args.flags.help || args.flags.h) { console.log(USAGE); return; }
@@ -2258,6 +2343,7 @@ function main(argv) {
   const fn = commands[cmd];
   if (!fn) die(`unknown command "${cmd}"\n\n${USAGE}`);
   try {
+    await applyQuestlog(args);
     fn(args);
   } catch (e) {
     die(`\n${e.message}\n` + (process.env.BENCH_DEBUG ? '\n' + e.stack : f.dim('\n(BENCH_DEBUG=1 for a stack trace)')));

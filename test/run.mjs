@@ -22,6 +22,9 @@ import { simulate } from '../src/sim.mjs';
 import {
   makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel, conjoin, contradictory,
 } from '../src/rotation.mjs';
+import { slugOf, normalize, translate, commandLine } from '../src/questlog.mjs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 let pass = 0;
 const failures = [];
@@ -4056,6 +4059,127 @@ group('the rotation search');
   ok('the search never returns worse than the derived order',
     got.score >= asDerived - 1e-6, `${got.score.toFixed(2)} vs ${asDerived.toFixed(2)}`);
   ok('...and reports how many fights it took', got.evaluations > 50, String(got.evaluations));
+}
+
+// --- questlog import -------------------------------------------------------
+// questlog.gg stores a build as the game's own `data.cdb` ids, so the importer
+// is a renaming job and what is under test is the mapping, not the content.
+// The fixture is therefore BUILT FROM THE CATALOG rather than written out: a
+// patch that renames an item or reorders the rarity ladder cannot fail this,
+// and the end-to-end case still proves the emitted syntax is one the real pin
+// parser accepts.
+group('questlog import');
+{
+  const engine = createEngine();
+  const rarities = cat.cdb.lines('rarity').map((r) => r.id);
+  const usable = (i) => cat.usableBy(i, 'Fighter') && !/^GM_/.test(i.id) && (i.level ?? 0) <= 25;
+  const weapon = cat.items.find((i) => i.slots.includes('Slot_Weapon1') && usable(i)
+    && cat.socketsFor(i).includes('AugmentEnchantWeapon'));
+  const neck = cat.items.find((i) => i.slots.includes('Slot_Neck') && usable(i)
+    && cat.socketsFor(i).includes('AugmentJeweller'));
+  const gem = cat.augmentCandidates('AugmentJeweller')[0];
+  const pool = engine.talents.runePools(emptyLoadout(cat, 'Warrior', 25))[0];
+  const root = [...engine.talents.treeFor('Warrior').byId.entries()].find(([, n]) => n.tier === 0)[0];
+
+  const payload = { result: { data: {
+    character: { name: 'fixture', classId: 'fighter', desc: '', user: { name: 'x', slug: 'author' } },
+    builds: [{
+      level: 25, talentBuildId: 7,
+      equipment: {
+        mainHand: {
+          // gradeOverride is 1-based, so the LAST rarity is `rarities.length`.
+          // That is the whole reason the reference build's `5` reads Legendary
+          // and not off the end of a five-entry ladder.
+          id: weapon.id, level: 25, upgradeLevel: 3, gradeOverride: rarities.length,
+          enchant: null, corruptedGift: null,
+        },
+        neck: { id: neck.id, upgradeLevel: 0, gradeOverride: null, enchant: { id: gem.id }, corruptedGift: null },
+        offHand: { id: '', upgradeLevel: 0, gradeOverride: null, enchant: null, corruptedGift: null },
+        mount: { id: 'Some_Mount', upgradeLevel: 0, gradeOverride: null, enchant: null, corruptedGift: null },
+        legs: { id: 'Not_An_Item', upgradeLevel: 0, gradeOverride: null, enchant: null, corruptedGift: null },
+      },
+    }],
+  } } };
+  const talentPayload = { result: { data: { builds: [
+    { id: 6, name: 'wrong one', talents: {}, runes: {} },
+    { id: 7, name: 'right one', talents: { [root]: { rank: 1 } },
+      runes: { [pool.skill]: pool.options[0].id, Not_A_Skill: 'Not_A_Rune' } },
+  ] } } };
+
+  ok('a builder URL yields its slug',
+    slugOf('https://questlog.gg/farever/en/character-builder/HandWithTheFullTeam') === 'HandWithTheFullTeam');
+  ok('a bare slug passes through', slugOf('HandWithTheFullTeam') === 'HandWithTheFullTeam');
+  let threw = false;
+  try { slugOf('https://example.com/nope'); } catch { threw = true; }
+  ok('some other URL is refused rather than guessed at', threw);
+
+  const build = normalize(payload, talentPayload);
+  ok('the talent page is paired by id, not by position', build.talentName === 'right one');
+  ok('...and its allocation comes across', build.talents[root]?.rank === 1);
+
+  const out = translate(build, engine);
+  // questlog's four classIds are `characterBuilder.getClasses`: assassin,
+  // cleric, fighter, wizard -> Rogue, Priest, Warrior, Mage. They are the
+  // bench's aptitude names lowercased, which is the whole mapping - so what is
+  // asserted is that every class stays reachable that way, not a table of four.
+  ok('a questlog classId maps through the aptitude', out.class === 'Warrior', out.class);
+  ok('...and every class is reachable the same way, not just this one',
+    cat.classes.every((c) => translate({ ...build, classId: c.aptitude.toLowerCase() }, engine).class === c.unit));
+  const argOf = (slot) => out.pins.find((p) => p.slot === slot && !p.socket && !p.isSkills)?.arg;
+
+  ok('a weapon carries instance level, rarity and stars',
+    argOf('Slot_Weapon1') === `weapon1=${weapon.id}^25@${rarities[rarities.length - 1]}*3`,
+    argOf('Slot_Weapon1'));
+  // Gear does not roll a rarity and has no upgrade path, so it takes neither.
+  ok('gear takes the bare id', argOf('Slot_Neck') === `neck=${neck.id}`, argOf('Slot_Neck'));
+  ok('an empty combat slot is pinned empty, not left open',
+    argOf('Slot_OffhandWeapon') === 'offhandweapon=none');
+
+  // Which socket an augment goes in is derived by intersecting the host's
+  // sockets with the types that list it, so no socket table is kept in sync.
+  const aug = out.pins.find((p) => p.socket);
+  ok('an augment finds its socket on the host',
+    aug?.arg === `neck/AugmentJeweller=${gem.id}`, aug?.arg);
+
+  ok('talents come across with their ranks',
+    out.talentPins.length === 1 && out.talentPins[0].arg === `${root}=1`);
+  ok('a rune the build offers a slot for is kept',
+    out.runePins.length === 1 && out.runePins[0].arg === `${pool.skill}=${pool.options[0].id}`);
+
+  const said = (re) => out.warnings.some((w) => re.test(w));
+  ok('a rune with no slot in this build is named, not silently dropped', said(/Not_A_Skill/));
+  ok('an item the catalog does not have is named', said(/Not_An_Item/));
+  ok('a cosmetic slot with something in it is named', said(/Some_Mount/));
+  ok('the class-skill bar is always reported as not recorded', said(/class skills/));
+  ok('nothing unreadable reached the pins',
+    !out.pins.some((p) => /Not_An_Item|Some_Mount/.test(p.arg)));
+
+  // The point of the whole exercise: the command it writes is one the real pin
+  // parser takes. `sheet` is the cheapest verb that applies every pin.
+  const bench = (...a) => spawnSync(process.execPath,
+    [fileURLToPath(new URL('../bin/bench.mjs', import.meta.url)), ...a], { encoding: 'utf8' });
+  const run = bench(...commandLine(out, { verb: 'sheet' }).slice(1));
+  ok('the emitted command is one the bench accepts', run.status === 0,
+    (run.stderr || run.stdout || '').trim().split('\n').slice(-3).join(' | '));
+  ok('...and it equips what questlog named', run.stdout.includes(weapon.name)
+    && run.stdout.includes(neck.name));
+
+  // The CLI itself, which nothing else in this suite loads. USAGE is one big
+  // template literal, and a stray backtick inside it has twice parsed fine and
+  // broken every invocation - so the cheapest possible check that the file
+  // still runs is worth having.
+  const help = bench('--help');
+  ok('the CLI parses and prints its usage', help.status === 0,
+    (help.stderr || '').trim().split('\n').slice(-2).join(' | '));
+  ok('...including how to hand it a questlog link',
+    /questlog/i.test(help.stdout) && /--questlog-build/.test(help.stdout));
+
+  // A second positional has never meant anything but a build link, so a typo
+  // in that position is an error rather than something silently ignored.
+  const stray = bench('optimize', '--class', 'Warrior', 'wibble');
+  ok('a second argument that is not a build link is refused', stray.status !== 0);
+  ok('...and the message names what was not understood',
+    /wibble/.test(stray.stderr + stray.stdout));
 }
 
 // --- summary ---------------------------------------------------------------

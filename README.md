@@ -13,8 +13,10 @@ node bin/bench.mjs optimize --class Priest --pin weapon1=Sword_Swarm --no-augmen
 > everything else."*
 
 Read-only. It parses `data.cdb` out of your own copy of the game and does
-arithmetic. It never touches the game process, writes nothing to the install
-directory, and makes no network connections.
+arithmetic. It never touches the game process and writes nothing to the install
+directory. It makes no network connections either, with one opt-in exception:
+handing it a [questlog.gg build link](#importing-a-build-from-questloggg)
+fetches that build and pins it.
 
 ---
 
@@ -329,6 +331,64 @@ optimised around it.
 Slot and item names are matched loosely: `chest`, `Chest`, `Slot_Chest` and
 `fingerleft` all work. Ambiguity is an error that lists the candidates rather
 than a silent guess.
+
+### Importing a build from questlog.gg
+
+[questlog.gg](https://questlog.gg/farever/) stores a character-builder link as
+the game's own ids — `"mainHand":{"id":"GS_Nova"}`, `"Warrior_Talent_Sever":
+{"rank":1}` — so translating one into pins is a renaming job, not a matching
+one. Hand any command a link:
+
+```bash
+bench optimize https://questlog.gg/farever/en/character-builder/<slug>
+```
+
+The class and the level come from the link, so neither has to be typed, and
+every other flag works as normal. Every id is resolved against the catalog
+first, so a renamed item is an error naming the item and not a silently missing
+slot.
+
+The link's pins go in *front* of the ones you type, so anything you name wins —
+which is what makes "that build, but at level 20 and without the trinket" a
+one-liner:
+
+```bash
+bench optimize <link> --level 20 --pin trinket=none
+```
+
+`--questlog <slug>` takes the slug instead of the URL, and `--questlog-build
+<n>` picks between a character's builds (numbered from 0). **This is the only
+thing in the tool that touches the network.**
+
+To see the translation without running it — a table of what it read, and the
+command line that reproduces it:
+
+```bash
+node tools/questlog-import.mjs <link>
+```
+
+That tool also takes `--verb sheet`, `--build <n>`, and `--save f.json` /
+`--from f.json` to keep and re-read the raw payload so a build can be
+translated again offline.
+
+Four things questlog records do not survive the trip, and all four are printed
+before the run rather than dropped:
+
+- the **cosmetic slots** (mount, glider, sickle, job tool, pickaxe), which have
+  no combat slot at all;
+- **per-skill arsenal ranks** — questlog stores a rank per arsenal skill, the
+  bench has one global `--rank`, so nothing is emitted when they disagree;
+- **runes on skills the build offers no slot for**, named individually —
+  questlog lets a rune be set on any skill of the class regardless of level, so
+  a level-25 Warrior reference build carries one for Burst of Anger, which
+  unlocks at 30;
+- the **class-skill bar**, which questlog does not store at all — so the bench
+  still searches that choice, and the imported build is not quite fully pinned.
+
+Rarity is the one place the two disagree in form rather than content:
+questlog's `gradeOverride` indexes the rarity ladder from 1, so its `5` is
+Legendary. Weapons come across with `^level@rarity*stars` spelled out; gear
+takes the bare id, because gear neither rolls a rarity nor has an upgrade path.
 
 ### Which skills to slot
 
