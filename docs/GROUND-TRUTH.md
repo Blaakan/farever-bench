@@ -357,6 +357,88 @@ More settlements riding along:
   Melain's Golden Greaves (Feet 25): 239 Armor, +9 Vit +7 Str +22 ArPen; Magic Formula +15 ArPen.
   Set Eye of Fracture (Ring 25, ×2): +6 Vit +39 ArPen; Cursed Eye of Brutality +9 Crit +9 Fervor +9 ArPen −9 MagPen.
   Pendant of Adaptability (Neck 20): above; plus the same Cursed Eye augment.
+
+## The meter's 705, laddered — 2026-08-03
+
+The player ran the pew-pew-meter on the fully-geared pin: two ~75-second
+encounters, 703 and 708 dps, against the model's 436.0. Every rung between the
+two numbers is now named, and the ladder closes to 0.4 dps of rounding. Full
+reconciliation with per-skill tables: `farever-hlx/captures/DPS-GAP-METER.md`.
+First, the mapping that made it possible: every meter row resolves to a data id
+— **Mania is `GS_Nova_Combo`, the chain's own 4th link**, scored all along
+inside "(base attack chain)" (52 hits, 62.7 dps) and hidden only by the
+aggregate row at `sim.mjs:1223`; the GS Base Attacks print raw ids because
+their `texts.name` is authored false, which means the meter reads the same
+sheet we do.
+
+```
+ 436.0  the model, vs Ratsar 0.4/0.4, as pinned
++173.3  the target: the meter fights were not against Ratsar-class armour
+=609.3  the same build, same engine, vs a dummy-class target
+ +64.2  Rampage at the live cadence, 3-4 full-charge presses per 75s
+ +35.5  Anger Release: ~18 steady-state, ~18 walked in as banked stacks
+  +9.8  the below-the-cut trio (Shockwave/Whirlwind/Surging Force), live-priced
+ +10.3  Raging Smash's concentrated, Strength-shaped excess
+  +2.3  Hemorrhage, bottom of the residual band
+ −25.5  the chain repays the clock those presses consumed
+=705.9  against the meter's 705.5 (703 and 708)
+```
+
+**The target rung is 64% of the whole gap, and it is not a model defect.** The
+model's mitigation is one uniform ×1.397 on every physical line, so per-skill
+consistency cannot pick the target — residual size does: vs Ratsar every row
+runs ×1.43–1.81 (no mechanism supplies a uniform +60%); vs the dummy every row
+runs ×1.02–1.30, mean ×1.16, inside the documented live-over-model family. The
+meter fights were on an unmitigated target. And the early comfort that "the
+base chain matches absolutely" was a mispairing — live 3 visible links against
+the model's 4-link aggregate; the honest subtotal is 207.5, and nothing
+matches absolutely vs Ratsar.
+
+**Rampage's rung is a rotation-search story, not a mechanics one.** The single
+modelled cast is the opener, chosen at every fight length from 4s to 200s;
+spamming loses 23.3 dps at model prices because full-charge density (988.2 per
+3s hold) is breakeven against the chain cycle (967.9 per 3.00s) before billing
+the forfeited Rage, finisher progress, and crit volume. The cooldown machinery
+is right and even generous. At live per-hit prices the same press is a clear
+win — the defect is the inverted relative price, downstream of per-hit
+calibration, plus one true omission: Mania's rank-3
+`reduceWeaponsCooldown(1.5s)` refund is dropped without a word (the refusal
+filter suppresses riders on accounted skills), so live weapon cooldowns run
+faster than modelled and nothing says so.
+
+**Anger Release's refusal is stale, and half its meter line is a bank.** The
+arming count is authored: 1 stack per non-DoT Physical damage event,
+`GS_Nova_Passive_Stack` maxStacks 150 with rankOverride 100 at rank ≥2, cap →
+consume → 10s proc in the SignatureSkill slot. Steady state = hit rate over
+100: one cast per 69s in the model fight (627.0 per cast, +9.1 gross), one per
+76–82s live. The stack status has no authored duration — stacks carry across
+combats, the player's own fact, sitting in the data — so the observed 2 casts
+per encounter is ~2× steady state and half this rung walks in from previous
+pulls.
+
+**The negative rung is the same clock, honestly kept**: live chain throughput
+0.84/0.95 links/s against the model's 1.12, and the missing 16–25% is exactly
+the Rampage holds and Anger casts above. The meter's own header convicts its
+list of truncation — rows sum 671/679 against totals 703/708 — so ~30 dps of
+Shockwave/Whirlwind/Surging Force live below the cut, and the player likely
+presses what the model slots after all.
+
+Fixes owed, in order: (1) score Anger Release from maxStacks plus the fight's
+own event counter — but land the price analytically; naive injection flips
+the rotation search to worse plans (436.0 → 413/423), the known search bug
+class; (2) the refusal filter must report riders on accounted skills; (3)
+print the chain per-link so the next meter reconciles without an
+instrumented copy; (4) name the beneficiary in Rampage's conditional refusal
+(it gates Shockwave's reset, not Rampage's cast). Unresolved and named: the
+live talent pane (×1.16 residual under model talents, ×1.25 under none) and
+the weapon tooltips against the Legendary 5★ pin — one screenshot each, and
+neither can rescue Ratsar.
+
+Why are we still far? Because the model is simulating a different fight, not
+mis-multiplying this one: two-thirds of the distance is armour the live
+target never wore, most of the rest is a rotation the player weaves and the
+model prices at par or refuses — half of one ultimate arriving pre-banked —
+and the last slice is the familiar ×1.16 the residual family already owns.
   Raclette Pan (Trinket 25): +32 ArPen; equipped effect: attacks grant 0.5% Critical 10s, stacking ×10.
 
 **The one survivor, sharpened:** live steady combat crit 30.2% vs sheet 17.3%
