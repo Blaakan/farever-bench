@@ -781,6 +781,23 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         why: `it modifies ${u.field} for ${u.scope} damage, which is a category this fight does not separate`,
       });
     }
+    // A CLAUSE REFUSED ON A SKILL THE MODEL DOES SCORE. The unscored list is
+    // per-SKILL, so a refusal inside an accounted skill lands nowhere: the
+    // damage is right, one line of the script is worth zero, and nothing says
+    // so. `GS_Nova_Combo` is the case - the greatsword finisher is scored every
+    // cycle, and its rank-3 `reduceWeaponsCooldown(1.5)` is gated on
+    // `hasStatusMaxStacked`, correctly refused, and previously silent. Live
+    // weapon cooldowns run faster than modelled because of it.
+    for (const e of [...(rot.filler ?? []), ...(rot.active ?? []), ...(rot.triggered ?? []),
+      ...(rot.passive ?? [])]) {
+      for (const g of plan.scriptGapsOf(e.prof.id, rank, { runes: new Set(rot.runes ?? []) })) {
+        extraGaps.push({
+          id: g.id, name: g.name, source: 'script', kind: 'rider not read',
+          why: `${g.name} is scored, but one clause of its script is not: `
+            + `${g.field} ${g.amount} behind \`${g.guard}\`, which this reader cannot answer`,
+        });
+      }
+    }
     if (extraGaps.length) tp.unmodelled = [...tp.unmodelled, ...extraGaps];
     return { ...r, target: tgt, weaponPower, profile, rotation: rot, buffs, throughput: tp, survivability: sv };
   }

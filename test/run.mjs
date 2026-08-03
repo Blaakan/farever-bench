@@ -3200,6 +3200,64 @@ group('a refused payload does not take its aura with it');
     /CritChance it grants IS scored/.test(row?.why ?? ''), row?.why ?? '(none)');
 }
 
+// --- a refusal inside an accounted skill is still a refusal ------------------
+// The unscored list is per-SKILL, so a clause refused inside a skill the model
+// DOES score landed nowhere: the damage was right, one line of the script was
+// worth zero, and nothing said so. `GS_Nova_Combo` is the case - the greatsword
+// finisher is scored every cycle and its rank-3 `reduceWeaponsCooldown(1.5)` is
+// gated on `hasStatusMaxStacked`, correctly refused, and previously silent.
+group('a clause refused inside a scored skill is reported');
+{
+  const eng = createEngine({ quiet: true });
+  const build = (rank) => {
+    const l = emptyLoadout(eng.cat, 'Warrior', 25);
+    l.gear.Slot_Weapon1 = { item: 'GS_Nova', rarity: 'Legendary', stars: 5, level: 25 };
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank });
+  };
+  const ev = build(3);
+  const gaps = (ev.throughput.unmodelled ?? []).filter((u) => u.kind === 'rider not read');
+  ok("Mania's refused cooldown refund is now reported",
+    gaps.some((g) => g.id === 'GS_Nova_Combo' && /cooldownPerTick 1\.5/.test(g.why)),
+    gaps.map((g) => g.why).join(' | '));
+  ok('...and the sentence says the skill itself IS scored',
+    gaps.every((g) => /is scored, but/.test(g.why)), gaps.map((g) => g.why).join(' | '));
+  ok('...while the skill stays out of the unscored list',
+    !(ev.rotation.unmodelled ?? []).some((u) => u.id === 'GS_Nova_Combo'),
+    (ev.rotation.unmodelled ?? []).map((u) => u.id).join(', '));
+
+  // DEAD IS NOT A GAP. That rider is `rank >= 3`; at rank 1 it contributes
+  // nothing in game either, so reporting it would be noise.
+  ok('a rank-dead clause is not reported as a gap',
+    !(build(1).throughput.unmodelled ?? []).some((u) => u.kind === 'rider not read'
+      && u.id === 'GS_Nova_Combo'), 'reported at rank 1');
+  // Nor is one behind a rune the build did not slot.
+  const m3 = eng.plan.scriptGapsOf('Warrior_Rage_Strike', 3, { runes: new Set() });
+  ok('a rune-gated clause is not a gap without the rune', m3.length === 0, JSON.stringify(m3));
+  ok('...and is one with it',
+    eng.plan.scriptGapsOf('Warrior_Rage_Strike', 3,
+      { runes: new Set(['Warrior_RageStrike_M3']) }).length === 1);
+}
+
+// --- a refusal names who loses out -------------------------------------------
+// Rampage's entry read "its script resets Shockwave's cooldown from a onKill
+// hook", filed under Rampage - which reads as "Rampage is not scored". Rampage
+// is scored, every cast. What is missing is a cooldown SHOCKWAVE never gets.
+group('a conditional refusal names the beneficiary');
+{
+  const eng = createEngine({ quiet: true });
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Epic', stars: 4, level: 25 };
+  eng.plan.pruneSelection(l);
+  const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 });
+  const row = (ev.rotation.unmodelled ?? []).find((u) => u.id === 'GA_Craft_Skill1');
+  ok('Rampage still carries the entry', !!row, JSON.stringify(row ?? null));
+  ok('...but it says Rampage itself is scored', /Rampage's own damage IS scored/.test(row?.why ?? ''),
+    row?.why ?? '');
+  ok('...and names Shockwave as the one that loses out',
+    /Shockwave comes back slower/.test(row?.why ?? ''), row?.why ?? '');
+}
+
 // --- a cast is priced at PRESS, not at impact --------------------------------
 // The v2 capture measured `GA_Craft_Skill1` fitting +-0.2% against the attacker
 // state at press and +-4.6% against the state when its damage lands, 3.2-3.3s

@@ -1874,10 +1874,20 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const scope = enclosingBlock(before);
         const targetName = skills.get(targetId)?.texts?.name ?? targetId;
         if (!hook || !KNOWN_HOOKS.test(hook)) {
+          // NAME WHO LOSES OUT, and say the host is fine. This entry is filed
+          // under the skill whose SCRIPT carries the call, which reads as "this
+          // skill is not scored" - and Rampage is scored, every cast of it. What
+          // is missing is a cooldown Shockwave never gets back. A reader
+          // checking why Rampage looked low was being pointed at the wrong
+          // skill entirely.
+          const hostName = hs.texts?.name ?? hostId;
           unmodelled.push({
-            id: hostId, name: hs.texts?.name ?? hostId, kind: 'conditional',
-            why: `its script ${call === 'resetCooldown' ? 'resets' : 'shortens'} ${targetName}'s `
-              + `cooldown from a ${hook ?? 'top-level'} hook, an event this fight does not produce`,
+            id: hostId, name: hostName, kind: 'conditional',
+            why: `${hostName}'s own damage IS scored; what is not is the cooldown it gives `
+              + `${targetName} - its script ${call === 'resetCooldown' ? 'resets' : 'shortens'} `
+              + `${targetName}'s cooldown from ${/^[aeiou]/i.test(hook ?? 'top') ? 'an' : 'a'} `
+              + `${hook ?? 'top-level'} hook, an event this fight does not produce, so `
+              + `${targetName} comes back slower here than in game`,
           });
           continue;
         }
@@ -2962,6 +2972,81 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * nothing multiplies by it. A non-talent caller passes  and
    * gets the amount once, with the rank spent answering the guard instead.
    */
+  /**
+   * What a skill's script DECLARES that the guard reader then refused.
+   *
+   * A refusal on a skill the model does not score at all shows up in the
+   * unscored list. A refusal on a skill it DOES score shows up nowhere: the
+   * skill is accounted, its damage is right, and one clause of its script is
+   * quietly worth zero. `GS_Nova_Combo` is the case that found this - the
+   * greatsword finisher is scored every cycle, and its rank-3
+   * `reduceWeaponsCooldown(1.5)` is gated on `hasStatusMaxStacked`, correctly
+   * refused, and never mentioned. Live weapon cooldowns therefore run faster
+   * than modelled and the tool says nothing.
+   *
+   * This does not price anything. It names what was dropped, which is the
+   * difference between a gap and a silent one.
+   */
+  const gapCache = new Map();
+  function scriptGapsOf(skillId, rank = 1, { asTalent = false, runes = null } = {}) {
+    const key = skillId + '@' + rank + (asTalent ? '' : '#skill')
+      + (runes?.size ? '@' + [...runes].sort().join('+') : '');
+    let hit = gapCache.get(key);
+    if (hit) return hit;
+    hit = [];
+    const s = skills.get(skillId);
+    const body = s?.script ? liveScript(s.script) : '';
+    if (body) {
+      const vars = asTalent ? s.vars : (combat.profile(skillId, rank)?.vars ?? s.vars);
+      // A damage rider `runeDamage` already reads is not a gap - that reader
+      // answers guards `scopeOf` refuses (a rank clause, a target-state one)
+      // and applies them per-skill. Without this check Domination would be
+      // reported as dropped while it is being applied.
+      const read = combat.profile(skillId, rank)?.runeDamage ?? [];
+      const look = (re, field) => {
+        re.lastIndex = 0;
+        for (let m; (m = re.exec(body));) {
+          const name = field === 'cooldown' ? m[1] : m[2];
+          const amount = vars?.[name];
+          if (typeof amount !== 'number' || amount === 0) continue;
+          if (field !== 'cooldown'
+            && read.some((r) => r.field === m[1] && Math.abs(r.amount - amount) < 1e-9)) continue;
+          const guard = enclosingBlock(body.slice(0, m.index));
+          if (scopeOf(guard, asTalent ? null : rank)) continue;   // read, not a gap
+          // DEAD IS NOT A GAP. A clause behind a rune you did not slot, or
+          // behind a rank this weapon has not reached, contributes nothing in
+          // game either - reporting it as something the reader could not answer
+          // would fill the list with things that are correctly worth zero.
+          const needsRune = /hasMastery\s*\(\s*(?:Mastery\.)?([A-Za-z0-9_]+)/.exec(guard)?.[1];
+          if (needsRune && !runes?.has(needsRune)) continue;
+          let rankDead = false;
+          for (const r of String(guard).matchAll(/\brank\s*(>=|<=|==|!=|>|<)\s*(\d+)/g)) {
+            const n = Number(r[2]);
+            const ok = r[1] === '>=' ? rank >= n : r[1] === '<=' ? rank <= n
+              : r[1] === '>' ? rank > n : r[1] === '<' ? rank < n
+                : r[1] === '==' ? rank === n : rank !== n;
+            if (!ok) rankDead = true;
+          }
+          if (rankDead) continue;
+          // The first `if` only, on one line. `enclosingBlock` hands back
+          // everything up to the call, and one of these rows carries four
+          // statements and a loop between the guard and the payload.
+          const first = /\bif\s*\(([^{]*)\)/.exec(String(guard))?.[1] ?? '';
+          const cond = first.replace(/\s+/g, ' ').trim().slice(0, 90);
+          hit.push({
+            id: skillId, name: s.texts?.name ?? skillId,
+            field: field === 'cooldown' ? 'cooldownPerTick' : m[1],
+            amount, guard: cond || '(none)',
+          });
+        }
+      };
+      look(/reduce(?:Weapons)?Cooldown\s*\(\s*vars\.([A-Za-z0-9_]+)\s*(?:,\s*[\w.?]+\s*)?\)/g, 'cooldown');
+      look(new RegExp(DMG_FIELD.source, 'g'), 'damage');
+    }
+    gapCache.set(key, hit);
+    return hit;
+  }
+
   function talentModifiers(skillId, rank = 1, { asTalent = true } = {}) {
     const key = skillId + '@' + rank + (asTalent ? '' : '#skill');
     let hit = modCache.get(key);
@@ -3201,7 +3286,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   return {
     pools, defaultSelection, pruneSelection, resolve, selfBuffs, selfBuffsOf, statusesOf,
     weaponSlotsAt, arsenalSlotsAt, typeOf, baseChain, resourceGainsOf, talentModifiers, maxStacksOf,
-    empowermentsOf, empowermentIds,
+    empowermentsOf, empowermentIds, scriptGapsOf,
     mechanicTypes: MECHANIC_TYPES,
   };
 }
