@@ -468,3 +468,27 @@ one point (stars−1? capped at rarity-max−1?); the discriminator is the
 player's Rare 3★ Axe_Boomerang tooltip — +2 settles stars−1, +3 settles
 something subtler. Until then, model the rider at stars−1 with the Axe read
 as the pending check, and keep the resting sheet pinned to 17.3.
+
+**ITEM LOGIC, 2026-08-03 — the optimizer recommends jewelry that cannot
+exist.** Player report, verified: `bench optimize` slots "Amulet of Precision"
+(`Necklace_Z1_Cri`, authored level 6, authored rarity Uncommon, WorldLoot) as
+Rare at iLVL 260, and "Signet of the Fighter" (`Finger_Z2RCraft_CriAP`,
+authored level 15) at 260. Two compounding defects:
+
+1. `src/engine.mjs:46` defaults `dropsScale: true` while `--drops` help still
+   says "default authored". With scale on, `effectiveLevel` takes
+   `max(authored, charLevel×10)` and lifts every authored-level row to
+   character level. The live bakes rule on this: `Necklace_Z2RCraft` logged
+   iLevel **210 = authored 20 exactly** on a level-25 character, and the
+   Z3 craft rings 260 = authored 25 — fixed-level gear does NOT scale.
+   Meanwhile GA_Craft at eff 320 proves weapons DO generate at source level
+   above their authored 4. The scale hypothesis is weapon-true, gear-false.
+2. `rarityRoll` defaults on for every slot, but the drop chain read from the
+   bytecode (`st.Player.dropLoot@3836`, acquisition study) rolls generation
+   rarity for **Weapon-type only** — gear keeps its authored row rarity. An
+   Uncommon-authored necklace offered at Rare is an illegal item.
+
+Fix shape: scale (and rarity-roll) Weapon-type only; gear takes
+`authored ?? charLevel` level and authored rarity. Then re-run anything that
+ranked jewelry under the old defaults — the layouts sweep and every recent
+optimize output priced some slots ~4× their legal stats.
