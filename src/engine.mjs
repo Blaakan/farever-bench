@@ -686,6 +686,35 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     const combatBase = evaluateLoadout(cat, loadout, {
       baseStatsFor, injectFlat: inject, injectAddRatio: addRatio, injectMulRatio: mulRatio, force,
     });
+    // A status its own build EXTENDS while it runs lasts longer than the row
+    // says. Battle Fury (`Warrior_BattleShout_M1`) adds 0.25s to Battle Shout
+    // on every critical strike you deal, so the fifteen seconds the row
+    // declares are not the fifteen seconds a critting build gets.
+    //
+    // While the buff is up it loses one second per second and gains `e`, so the
+    // effective duration is D/(1-e) - a closed form, and the same shape as the
+    // renewal uptimes above. The rate is the DISPLAY swing cadence, which is a
+    // FLOOR: a multi-hit cast and a bleed tick both raise onInflictDamage and
+    // are not counted, so the real extension is at least this. The crit
+    // fraction comes off the permanent sheet, which excludes the buff's own
+    // CritChance - the feedback loop is real and crediting it here would be the
+    // flattering direction.
+    for (const b of timed) {
+      if (!b.extend || !(b.duration > 0)) continue;
+      const src = combat.profile(b.from, rank, new Set(rot.runes ?? []));
+      const cd = src?.cooldown ?? 0;
+      if (!(cd > 0)) continue;
+      const crit = Math.min(1, Math.max(0, (combatBase.sheet.get('CritChance') ?? 0) / 100));
+      const rate = (1 / swingPeriod) * (b.extend.critOnly ? crit : 1);
+      const e = rate * b.extend.amount;
+      // e >= 1 means the build adds time faster than the status spends it, so
+      // it never drops once it is up. That is a real answer, not an overflow.
+      const dur = e >= 1 ? Math.max(cd, src.occupancy) : b.duration / (1 - e);
+      b.extended = { from: b.duration, to: dur, rate, perEvent: b.extend.amount, permanent: e >= 1 };
+      b.duration = dur;
+      b.uptime = Math.min(1, dur / Math.max(cd, src.occupancy));
+    }
+
     // Snapshot the three accumulators HERE, while they still hold only the
     // permanent layer. The averaged sheet below folds every timed buff into
     // these same maps at its uptime, and `restat` - which re-prices a cast
@@ -855,11 +884,18 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     ...combat.audit.filter((a) => !(a.what.startsWith('Fervor') && opts.assume.fervorScope === 'none')),
     {
       severity: 'assumption',
-      what: 'a self-buff is worth duration/cooldown of itself, at full stacks',
-      why: 'A buff on a cooldown is credited at min(1, duration / cooldown) - Priest_BlessingOfFervor is ' +
-           '15s on 120s, so 13%. One with no cooldown behind it keeps 100%: a 15-second enchant buff ' +
-           'refreshed by a 30%-per-attack proc does sit at its cap in sustained combat. Stacks are ' +
-           'still counted at the cap, which a short or movement-heavy fight would not reach.',
+      what: 'a self-buff is worth duration/cooldown on the SHEET; the fight presses it instead',
+      why: 'The averaged sheet credits a buff on a cooldown at min(1, duration / cooldown) - ' +
+           'Priest_BlessingOfFervor is 15s on 120s, so 13% - and that is a display number. The FIGHT ' +
+           'casts the skill and opens a real window, which is what dps is computed from, so bursting ' +
+           'inside the window is worth more than the average. That split only became true for every ' +
+           'such skill once the bucketing was fixed: a cooldown whose payload is a timed self-buff ' +
+           'used to be filed as a PASSIVE unless its status carried a one-shot amount, so the fight ' +
+           'never pressed it and the window never opened - Battle Shout, Berserk, Blessing of Fervor ' +
+           'and Smoke Bomb all read as dead bar slots, worth NEGATIVE because they occupied one. ' +
+           'A buff with no cooldown behind it still keeps 100%: a 15-second enchant refreshed by a ' +
+           '30%-per-attack proc does sit at its cap in sustained combat. Stacks are still counted at ' +
+           'the cap, which a short or movement-heavy fight would not reach.',
     },
     {
       severity: 'assumption',

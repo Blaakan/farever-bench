@@ -4061,6 +4061,96 @@ group('the rotation search');
   ok('...and reports how many fights it took', got.evaluations > 50, String(got.evaluations));
 }
 
+// --- a cooldown whose payload is a timed buff is a CAST ---------------------
+// `passive` is the bucket for things that are simply true. A skill you press
+// does not belong in it, however little damage it does: the fight never casts a
+// passive, so its window never opens and the buff it applies sits in the timed
+// list waiting for a `setUp` that cannot come. Battle Shout, Berserk, Blessing
+// of Fervor and Smoke Bomb all read as dead bar slots that way - worth NEGATIVE,
+// because they occupied a slot and did nothing.
+group('a timed self-buff on a cooldown is a cast');
+{
+  const engine = createEngine();
+  // The invariant, over every class rather than the one that found it.
+  for (const c of cat.classes) {
+    const rot = engine.plan.resolve(emptyLoadout(cat, c.unit, 25), 3);
+    const stranded = (rot.passive ?? []).filter(
+      (p) => p.prof?.cooldown > 0 && (p.buffs ?? []).some((b) => b.duration > 0));
+    ok(`${c.unit}: no cooldown with a timed self-buff is stranded in passive`,
+      stranded.length === 0, stranded.map((p) => p.prof.id).join(','));
+  }
+
+  const lo = emptyLoadout(cat, 'Warrior', 25);
+  lo.skills['class/ClassSkill'] = ['Warrior_BattleShout', 'Warrior_Berserk',
+    'Warrior_SurgingForce', 'Warrior_IgnorePain'];
+  const rot = engine.plan.resolve(lo, 3);
+  const active = new Map((rot.active ?? []).map((a) => [a.prof.id, a]));
+  ok('Battle Shout is a cast the fight can press', active.has('Warrior_BattleShout'));
+  ok('...and so is Berserk', active.has('Warrior_Berserk'));
+  ok('...and it carries the buff it applies, or the window has nothing in it',
+    (active.get('Warrior_BattleShout')?.applies?.self ?? []).some((b) => b.duration > 0));
+
+  // A PERMANENT self-buff still belongs in the sheet: it needs no cast to be
+  // true, which is the case `passive` exists for. Nothing that reaches `active`
+  // here may be one with no duration and no cooldown.
+  ok('a permanent buff is not promoted into the rotation',
+    !(rot.active ?? []).some((a) => !(a.prof.cooldown > 0)
+      && (a.applies?.self ?? []).length && (a.applies.self).every((b) => !(b.duration > 0))));
+}
+
+// --- a rune's vars, and the durations it extends ---------------------------
+// `updateSkillInf@20788` runs applyVars per slotted mastery ON TOP of the row's
+// own, so where both name a key the RUNE wins. The reader had it the other way
+// round, which is why Execution printed its base row's numbers instead of the
+// ones its tooltip shows.
+group('rune vars and duration extension');
+{
+  const engine = createEngine();
+
+  // The tripwire: which rows override a key their base row also defines. If a
+  // patch empties this set the precedence rule is untestable and somebody
+  // should know, rather than the test quietly passing on nothing.
+  const clashes = [];
+  for (const r of cat.cdb.lines('skill')) {
+    for (const m of r.mastery ?? []) {
+      if (!m.vars || !r.vars) continue;
+      for (const k of Object.keys(m.vars)) {
+        if (k in r.vars && r.vars[k] !== m.vars[k]) clashes.push({ skill: r.id, rune: m.id, key: k });
+      }
+    }
+  }
+  ok('some rune overrides a var its own skill row also declares', clashes.length > 0,
+    String(clashes.length));
+
+  // Battle Fury is the readable end of the same mechanism: its amount lives
+  // ONLY on the rune, so a reader that consults the skill row alone sees
+  // nothing at all.
+  const shout = 'Warrior_BattleShout';
+  const withRune = engine.plan.selfBuffsOf(shout, { runes: new Set(['Warrior_BattleShout_M1']), rank: 3 });
+  const without = engine.plan.selfBuffsOf(shout, { runes: new Set(), rank: 3 });
+  const ext = withRune.find((b) => b.extend)?.extend;
+  ok('a duration extension is read off the rune that gates it', !!ext, JSON.stringify(withRune.map((b) => b.status)));
+  ok('...with the amount the RUNE declares, not the row', ext?.amount === 0.25, String(ext?.amount));
+  ok('...gated on a crit, which is a rate and not an unreadable condition', ext?.critOnly === true);
+  ok('...off a damage hook, the only one that carries a rate', ext?.hook === 'onInflictDamage', ext?.hook);
+  ok('a build without the rune reads no extension at all',
+    without.every((b) => !b.extend));
+
+  // And the engine turns the rate into an effective duration. While the buff is
+  // up it loses a second a second and gains `e`, so it lasts D/(1-e) - longer
+  // than the row says, never shorter, and never infinite below e = 1.
+  const lo = emptyLoadout(cat, 'Warrior', 25);
+  lo.skills['class/ClassSkill'] = ['Warrior_BattleShout', 'Warrior_Berserk', 'Warrior_SurgingForce', 'Warrior_IgnorePain'];
+  lo.runes[shout] = 'Warrior_BattleShout_M1';
+  const ev = engine.evaluate(lo, { target: engine.combat.foe('dummy', 25), rank: 3 });
+  const b = (ev.buffs ?? []).find((x) => x.status === 'Warrior_BattleShoutStatus');
+  ok('the engine extends the status it was told about', !!b?.extended, JSON.stringify(b?.extended));
+  ok('...to strictly longer than the row declares, and finitely so',
+    b.extended.to > b.extended.from && Number.isFinite(b.extended.to), JSON.stringify(b.extended));
+  ok('...and the uptime follows the extended duration',
+    Math.abs(b.uptime - Math.min(1, b.duration / 120)) < 1e-6, `${b.uptime} vs ${b.duration}/120`);
+}
+
 // --- questlog import -------------------------------------------------------
 // questlog.gg stores a build as the game's own `data.cdb` ids, so the importer
 // is a renaming job and what is under test is the mapping, not the content.

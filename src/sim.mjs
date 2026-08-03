@@ -359,6 +359,22 @@ function runFight(spec) {
   // Statuses the fight puts up itself, rather than ones already averaged into
   // the sheet it started from.
   const timedIds = new Set(timedBuffs.map((b) => b.status));
+  // How long each one actually lasts, which is NOT always what the buff object
+  // reached by `applies.self` says. `timedBuffs` is the resolved list - the one
+  // the engine has already extended for a build whose own script adds time back
+  // while the status runs (Battle Fury) - and it is a DIFFERENT object from the
+  // one the rotation entry carries, because the two are built under different
+  // statusesOf keys. Reading the entry's own field is how an extension that was
+  // computed correctly changed nothing at all.
+  // Only the EXTENDED ones override. The two objects agree on duration in every
+  // other case, and preferring the resolved list wholesale would quietly change
+  // which of two copies wins wherever they ever disagreed for some other
+  // reason - a much wider blast radius than this fix is entitled to.
+  const timedDur = new Map(timedBuffs.filter((b) => b.extended).map((b) => [b.status, b.duration]));
+  const lifeOf = (b) => {
+    const d = timedDur.get(b.status) ?? b.duration;
+    return d > 0 ? d : fight;
+  };
 
   /**
    * What the next `lookahead` seconds are worth if you press `pick` now, then
@@ -436,7 +452,7 @@ function runFight(spec) {
     };
     const putUp = (applies) => {
       for (const b of applies?.self ?? []) {
-        if (timedIds.has(b.status)) { self.set(b, t + (b.duration > 0 ? b.duration : fight)); dirty = true; }
+        if (timedIds.has(b.status)) { self.set(b, t + lifeOf(b)); dirty = true; }
       }
       for (const d of applies?.target ?? []) { foe.set(d, t + (d.duration > 0 ? d.duration : fight)); dirty = true; }
     };
@@ -597,7 +613,7 @@ function runFight(spec) {
     const setUp = (applies, at) => {
       for (const b of applies?.self ?? []) {
         if (!timedIds.has(b.status)) continue;
-        upSelf.set(b, at + (b.duration > 0 ? b.duration : fight));
+        upSelf.set(b, at + lifeOf(b));
         stateDirty = true;
       }
       for (const d of applies?.target ?? []) {

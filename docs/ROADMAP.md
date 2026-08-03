@@ -6,8 +6,11 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
-State at handoff (2026-08-03): **788 checks green**; baselines Warrior 479.7,
-Rogue 350.6, Mage 239.0, Priest 293.8 (`optimize`, level 25, named boss).
+State at handoff (2026-08-03): **832 checks green**; baselines Warrior 617.5,
+Rogue 351.8, Mage 238.3, Priest 316.5 (`optimize`, level 25, named boss). The
+Warrior and the Priest moved when the buff-cooldown bucketing was fixed — see
+"What is open now" — and the earlier 479.7 the Warrior read is itself suspect,
+so treat pre-2026-08-03 baselines as unverified rather than as a comparison.
 Unscored lists: Warrior 3, Rogue 7, Mage 5, Priest 7 — and a GS build went 3 → 1
 when the stack counter landed.
 
@@ -110,6 +113,19 @@ weapon tooltips against the Legendary 5★ pin. Neither can rescue Ratsar.
 
 ### What is open now
 
+- **The Warrior baseline reads 488.6, and `467c32c`'s message says 479.7.** The
+  same command, against the same `cdb b7a48efb / boot 90b98741`, read 479.7
+  three times earlier on 2026-08-03 and reads 488.6 now. That claim in the
+  commit message does not reproduce, and the cause is NOT any of: uncommitted
+  work (stashed, still 488.6), the CLI change that commit carried (the parent's
+  own `bin/bench.mjs` gives 488.6), search nondeterminism (three consecutive
+  identical runs, and `src/` is untouched between the two commits), a data patch
+  (both hashes unchanged), or CPU contention (488.6 with the suite running
+  alongside — the leading hypothesis, and it is wrong). Until it is explained,
+  **no baseline in this document should be trusted to a tenth**, and any change
+  measured against 479.7 wants re-measuring. Priest is 296.3 clean and 296.3
+  with the current working tree, so whatever moved it is not the current work.
+
 - **The Priest talent search sits in a valley four points wide.** Not a model
   bug — the 298.4 allocation re-scored under the pending status-scope read still
   scores 298.4, and the search returns 293.2. Three fixes tried and ruled out
@@ -127,6 +143,46 @@ weapon tooltips against the Legendary 5★ pin. Neither can rescue Ratsar.
 - **Seven rune choices across three classes cannot be ranked**, and the search
   leaves the socket empty *because* it cannot — so every option ties and the
   tiebreak picks none. One mechanism, not seven bugs.
+- **TODO — Execution (`Warrior_RageStrike_M3`) is an execute the fight cannot
+  see.** `onDamageEval` adds `vars.damage` when `hit.targetUnit.healthRatio <=
+  vars.threshold`, and the rune's own `vars` override those of the row it sits
+  on: **+25% below 35%**, not the base row's 0.5/0.2. The fight tracks no target
+  health at all, so the gate is unanswerable — a fight-model change, not a read.
+  One thing still to fix with it: the mastery `vars` override now reaches
+  `amountOf`, but not the REFUSAL TEXT, which still quotes the base row and so
+  prints 0.5/0.2 for a rider that is 0.25/0.35.
+
+  A var read only inside a clause gated on the rune that overrides it can never
+  be observed at its base value. Rage Strike shows both halves of that: nothing
+  can see `damage 0.5` or `threshold 0.2`, and `var1` is not on the base row at
+  all — `evalCost` reads it and only `M2` supplies it. So a row's `vars` are
+  defaults, not values, and six rows in the sheet have one replaced.
+- ~~The fight never presses a pure-buff skill~~ — **FIXED, and it was the
+  largest thing left on the Warrior.** Not a rotation-search problem at all: a
+  bucketing one. A pressable skill with a cooldown was only kept as a cast if
+  its status carried a ONE-SHOT amount (a shield, a lump heal); a status
+  carrying an AFFIX fell past that test into `passive`, the bucket for things
+  that are simply true. So the fight never cast it, the window never opened,
+  and the buff sat in `timedBuffs` waiting for a `setUp` that could not come —
+  the skill read as worth NEGATIVE, because it occupied a bar slot and did
+  nothing. Four skills across three classes: **Battle Shout** and **Berserk**
+  (Warrior), **Blessing of Fervor** (Priest) — the audit's own worked example
+  of a self-buff at 13% uptime — and **Smoke Bomb** (Rogue).
+
+  Priced in isolation on one fixed build, Berserk is +4.7% (613.4 against
+  585.9) and Battle Shout +4.8%, both consistent with ~22% uptime of what they
+  declare. The free Warrior optimum moved much further, 488.6 → 617.5, because
+  two dead bar slots becoming real cooldowns changes which KIT wins, not just
+  what the old one scores.
+- **`bench talents` undercounts what the model reads.** The READS AS column
+  calls `talents.readableValue()`, which only sees declared affixes, effects and
+  statuses, so `Warrior_Talent_SurgeOfViolence` prints "nothing" while the same
+  run's augment line prints "grants Surge of Violence - a next-cast register".
+  Measured on the questlog build: granting it is worth **+20.6 dps** (629.3 vs
+  608.7), 44 Raging Smash casts against 34 and a higher figure per cast, so both
+  halves of the register — the cost waiver and the forced crit — are live. A
+  refusal whose reason is false is a bug (see `src/skills.mjs:1425`); this is
+  the same class, in the talent table rather than the coverage list.
 - **`(D + Σ)` vs `D × (1 + Σ)`** is undecidable at DamageModifier = 100. Needs a
   capture with a permanent non-100 source.
 - The **three-rider sum** is still untested together: the v2 session was a GS
@@ -163,6 +219,19 @@ messages in the repo's voice with **no AI attribution**; caches must stay bounde
 (see "A cache that never evicts is a leak with a hit rate").
 
 ## What landed in this pass
+
+- **A rune's vars OVERRIDE its skill's, and the fight now reads the resolved
+  duration.** Three things in one mechanism. `applyVars` runs per slotted
+  mastery on top of the row, so `amountOf` had the precedence backwards — six
+  rows across four classes declare a key their rune replaces, and Execution is
+  the visible one (the row says +50% below 20%, the rune says the tooltip's
+  +25% below 35%). `extendStatusDuration` is now a channel: three rows call it,
+  one per class, and Battle Fury's whole body is one of them. And the fight was
+  reading `b.duration` off the ROTATION ENTRY's copy of a buff, which is a
+  different object from the one in `timedBuffs` because the two are built under
+  different `statusesOf` keys — so a duration computed correctly reached
+  nothing. Found by forcing a 120-second duration and watching the dps not move
+  by a single digit.
 
 - **Crit rolls in `--fights`.** A cast decomposes as `fixed + base × (1+p(cd−1))`
   because crit chance and multiplier are properties of the *skill*; rolling *k*

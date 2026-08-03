@@ -124,6 +124,9 @@ const STATUS_TARGETS = ['Self', 'Target', 'Group'];
 // is a real exclusion that stops the Warrior's own Rage spender from paying for
 // itself.
 const ADD_RESOURCE = /\b(addAtb|addResource)\s*\(\s*(?:owner\s*,\s*)?(?:Attribute\.)?([A-Za-z0-9_]+)\s*,\s*([^;]*?)\)\s*;/g;
+// `extendStatusDuration(owner, Skill.X, vars.n)` - time added to a status that
+// is ALREADY running. Distinct from addStatus, which re-applies or stacks.
+const EXTEND_STATUS = /\bextendStatusDuration\s*\(\s*owner\s*,\s*Skill\.([A-Za-z0-9_]+)\s*,\s*([^),]+)\)/g;
 
 // `hit.dmgMult += vars.damage` - a damage multiplier a STATUS confers, written
 // in script because no affix row can express it.
@@ -275,10 +278,16 @@ function amountOf(expr, vars, runeVars = null) {
   if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
   const m = /^(-?)\s*vars\.([A-Za-z0-9_]+)$/.exec(t);
   if (!m) return null;
-  // A rune can supply the number the skill itself does not declare:
-  // Warrior_Charge reads `vars.var1` and its own vars have no var1 - the value
-  // lives on the mastery row that gates the call.
-  const v = vars?.[m[2]] ?? runeVars?.[m[2]];
+  // A rune can supply the number the skill itself does not declare -
+  // Warrior_Charge reads `vars.var1` and its own vars have no var1 - and it can
+  // also REPLACE one the skill does declare. `updateSkillInf@20788` runs
+  // applyProps and applyVars per slotted mastery on top of the row's own, so
+  // the rune wins wherever both name the same key; reading the base row instead
+  // is how Execution (`Warrior_RageStrike_M3`) printed the row's 0.5 above 0.2
+  // when the rune it is gated on says 0.25 above 0.35 - the tooltip's numbers.
+  // Six rows in the sheet override a key their base row also defines, one in
+  // each class plus two on the Mage, so this is a mechanism and not one item.
+  const v = runeVars?.[m[2]] ?? vars?.[m[2]];
   return typeof v === 'number' ? (m[1] ? -v : v) : null;
 }
 
@@ -1078,6 +1087,26 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
             }
             return;
           }
+        }
+        // A COOLDOWN WHOSE PAYLOAD IS A TIMED SELF-BUFF IS A CAST. The branch
+        // above only rescues a status carrying a one-shot amount - a shield, a
+        // lump heal - and a status carrying an AFFIX fell past it into
+        // `passive`, which is the bucket for things that are simply true. So
+        // the fight never pressed it, its window never opened, and the buff sat
+        // in `timedBuffs` waiting for a `setUp` that could not come: Battle
+        // Shout is fifteen seconds of +20 CritChance on a hundred-and-twenty
+        // second cooldown and it read as a dead bar slot, worth negative
+        // because it occupied one. Berserk went the same way.
+        //
+        // Only TIMED buffs qualify. A permanent one is already in the sheet and
+        // needs no cast to be true, which is the case `passive` exists for.
+        if (bucket === active && prof.cooldown > 0 && st.self.some((b) => b.duration > 0)) {
+          bucket.push({
+            ...extra,
+            prof: { ...prof, isFiller: false, isCombo: false },
+            applies: { self: st.self, target: st.onTarget },
+          });
+          return;
         }
         if (own.length || st.self.length || st.dots.length) {
           passive.push({ prof, source: extra.source, affixes: own, buffs: st.self, debuffs: st.onTarget, dots: st.dots });
@@ -2471,6 +2500,47 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       }
     }
 
+    // Which statuses this script EXTENDS while they run, and by how much per
+    // event. `extendStatusDuration(owner, Skill.X, vars.n)` adds to the time
+    // left on a status that is already up - it is not a re-application and not
+    // a stack, so neither the renewal reader nor the stack channel sees it, and
+    // a rune whose whole body is one of these used to read as doing nothing.
+    //
+    // Three rows in the sheet call it, one per class: Battle Fury
+    // (`Warrior_BattleShout_M1`) adds 0.25s to Battle Shout on every critical
+    // strike you deal, and the Rogue and Mage rows are the same shape. The
+    // amount is only ever on the RUNE, which is why this had to wait for
+    // `amountOf` to prefer the rune's vars over the row's.
+    const extendPer = new Map();
+    if (s?.script) {
+      const ebody = liveScript(s.script);
+      const runeVars = (s.mastery ?? []).find((m) => runes?.has(m.id))?.vars ?? null;
+      EXTEND_STATUS.lastIndex = 0;
+      for (let mm; (mm = EXTEND_STATUS.exec(ebody));) {
+        const [, target, expr] = mm;
+        const amount = amountOf(expr, s.vars, runeVars);
+        if (amount == null || !(amount > 0)) continue;
+        const before = ebody.slice(0, mm.index);
+        const scope = enclosingBlock(before);
+        const critOnly = /\bcritical\b|\bisCrit\b/.test(scope);
+        // The gate is the ordinary one - `hasMastery(Warrior_BattleShout_M1)`
+        // is evaluable against the slotted runes, so a build without the rune
+        // gets nothing rather than a silent credit. A CRIT gate is not an
+        // unreadable condition - the fight computes a crit expectation for
+        // every hit it prices - so it is lifted out before the guard is judged,
+        // exactly as the resource channel does it.
+        const judged = scope.replace(/\b(?:critical|isCrit|isPhysical|isMagic)\b/g, ' ');
+        const g = guardOf(judged, { rank, runes, talents });
+        if (!g.fires || g.unread) continue;
+        const hookAt = before.lastIndexOf('function on');
+        const hook = hookAt >= 0
+          ? /function\s+(on[A-Za-z0-9_]*)/.exec(before.slice(hookAt))?.[1] ?? null : null;
+        // Only the damage hooks carry a rate this model can put a number on.
+        if (!/^on(InflictDamage|InflictHit|Damage|Hit)$/.test(hook ?? '')) continue;
+        extendPer.set(target, { amount, critOnly, hook, from: skillId });
+      }
+    }
+
     // Which statuses this script applies as a SHARE of the hit, and how big a
     // share. Resolved through a local, because that is how the scripts write it.
     const poolFraction = new Map();
@@ -2719,6 +2789,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         uncapped: !Number.isFinite(maxStacksOf(statusId, rank, talentRanks)),
         stackingPolicy: st.props?.status?.stackingPolicy ?? null,
         duration: st.duration ?? null,
+        // Time this build's own script adds back while the status runs, per
+        // event. `engine.mjs` turns it into an effective duration; it stays a
+        // rate here because the rate is the fight's business, not the sheet's.
+        extend: extendPer.get(statusId) ?? null,
         types,
         to: wearer,
         affixes,
@@ -3004,12 +3078,28 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const s = skills.get(skillId);
     const body = s?.script ? liveScript(s.script) : '';
     if (body) {
-      const vars = asTalent ? s.vars : (combat.profile(skillId, rank)?.vars ?? s.vars);
+      // The SLOTTED rune's vars go on top, or the reported magnitude is the
+      // row's default rather than the one the clause would actually add.
+      // Execution is gated on `hasMastery(Warrior_RageStrike_M3)` and that same
+      // rune replaces both numbers it reads, so the gap used to be printed as
+      // "dmgMult 0.5 ... healthRatio <= vars.threshold" - 0.5 above 0.2 - for a
+      // rider whose tooltip says 25% below 35%. A var read only inside a clause
+      // gated on the rune that overrides it has no observable base value at all.
+      const runeVars = (s?.mastery ?? []).filter((m) => runes?.has(m.id))
+        .reduce((acc, m) => ({ ...acc, ...(m.vars ?? {}) }), null);
+      const own = asTalent ? s.vars : (combat.profile(skillId, rank, runes ?? undefined)?.vars ?? s.vars);
+      const vars = runeVars ? { ...own, ...runeVars } : own;
       // A damage rider `runeDamage` already reads is not a gap - that reader
       // answers guards `scopeOf` refuses (a rank clause, a target-state one)
       // and applies them per-skill. Without this check Domination would be
       // reported as dropped while it is being applied.
-      const read = combat.profile(skillId, rank)?.runeDamage ?? [];
+      // WITH THE RUNES. A rune-gated rider only appears in `runeDamage` when
+      // the rune is passed, so resolving this bare made the dedup miss and the
+      // gap list claim a rider that is being applied: Concentrated Impact's
+      // +40% at one target is read, printed in the rune table as read, and was
+      // simultaneously reported as not scored. A refusal whose reason is false
+      // is a bug - the same rule as the comment above `runeDamage` in resolve().
+      const read = combat.profile(skillId, rank, runes ?? undefined)?.runeDamage ?? [];
       const look = (re, field) => {
         re.lastIndex = 0;
         for (let m; (m = re.exec(body));) {
