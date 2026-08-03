@@ -563,3 +563,24 @@ substitutes the class primary budget — the sheet prints WeaponPower 49.43 for
 a butterfly net. Inert in the net case (no swings, no weapon skills — the
 player's symmetric equality proves it) but contrary to the fn@20784 read; a
 one-line bytecode-literal correction awaiting a decision.
+
+**THE NET PROBE'S TRUE FINDING, 2026-08-03 — a search-quality defect, measured.**
+The player pressed past the offhand loophole and was right to: on current HEAD,
+full optimization ranks Net_Basic (715.3) ABOVE Mace_Benediction (669.9) and
+Shield_Craft (714.3) as arsenal to a GS_Nova mainhand, while FIXED-GEAR
+evaluate prices the same items sanely (Mace 188.7 > Net 186.9 > empty 183.4 <
+GA 219.3). The damage layer is exonerated; the optimizer is convicted by
+dominance: a mace-pinned optimum can always adopt the net-build's entire
+configuration and decline to cast mace skills, so its true optimum is >= the
+net's 715.3 - the search returns 669.9, leaving >=45 dps (6.4%) in
+deterministic bad local optima (numbers repeat run to run). Same family as the
+documented "naive injection flips the rotation search to worse plans" class,
+and as the player's 33.7-vs-34.0 asymmetry on a nothing item (equivalent
+states, different ascent paths). Two regression invariants to encode:
+(1) SLOT SYMMETRY - a statless, skill-less item pinned as sole weapon in
+either slot (offhand pinned none) must produce THE SAME optimized build and
+score; (2) ARSENAL DOMINANCE - for any real weapon W, optimize(pin W2=W) >=
+optimize(pin W2=Net_Basic) within tolerance, because the W-plan set strictly
+contains net-equivalent plans. The full ladder for the test bank: Axe 806.2,
+GA 796.6, Sword_Start 767.8, Spear 758.4, Net 715.3, Shield_Craft 714.3,
+Mace 669.9 (GS_Nova mainhand, dummy, 75s, restarts 3).
