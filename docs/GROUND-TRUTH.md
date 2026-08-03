@@ -506,3 +506,19 @@ damage pass. (2) The fastest calibration path for the whole class now exists:
 the v2 bench-probe logs `spark=` on every press row — one 2-minute Mage dummy
 session hands over the complete live Spark ledger (income per swing, per tick,
 per talent) the way the Rage ledger was closed for Warrior in one capture.
+
+**CORRECTION to the item-logic fix, 2026-08-03 — armor is not jewelry.** The
+questlog import of the player's reference build exposed the over-reach in
+235c4db/16f6b77: three armor rows authored at level 1 (Head_RDemon_FigWiz,
+Shoulders_RDemon_Fig, Feet_RDemon_Fig) now evaluate at iLVL 11 — near-zero
+stats — while the player's live armor of the same faction families sits at
+level 25 with 239-358 Armor per piece. The jewelry evidence (bake rows at
+authored exactly) proves FIXED level for GearNeck/GearFinger/GearTrinket; for
+ARMOR the bytecode's UseItemLevel semantics read authored level as a MINIMUM
+(loot-entry minLvl), and armor drops at source level. Refine the split:
+jewelry fixed at authored; armor (and weapons) scale to source with authored
+as floor. One tooltip of any level-1-authored armor piece ("Horns of
+Nightking" family) confirms. Also noted: questlog gradeOverride/upgradeLevel
+import verified working — the reference build itself carries maxed weapons
+(Legendary 5*) where the live pair was Rare 0* / Epic 4*, so builder-vs-live
+divergence is a real comparison hazard, not an import defect.
