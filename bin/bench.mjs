@@ -2114,12 +2114,32 @@ const commands = {
     // and it carries the talents the dump has no field for. Use one when the
     // probe has written one, unless --dump says otherwise.
     const snaps = args.flags.dump ? { snapshots: [] } : await snapshots(capturePath, { source: character });
-    // Pick the build with the most damage recorded under it, not the most
-    // recent one - the last snapshot of a session is written as the player logs
-    // out and has nothing after it.
-    const usable = snaps.snapshots.filter((s) => (s.gear ?? []).length && s.events > 0);
+    // Choosing between snapshots takes two rules, and they are in this order for
+    // a reason.
+    //
+    // FIRST, how much of a build it actually describes - counted as gear that
+    // resolves to something wearable in a combat slot. An early probe build read
+    // the backpack instead of the equipment, so a capture can hold snapshots
+    // whose "build" is one net and a pile of soulstones. Those are not builds,
+    // and no amount of damage recorded under them makes them one.
+    //
+    // ONLY THEN, how much damage was recorded under it - because the last
+    // snapshot of a session is written as the player logs out and has nothing
+    // after it at all.
+    const combatSlots = new Set(engine.cat.combatSlots().map((s) => s.id));
+    const describes = (s) => (s.gear ?? []).reduce((n, g) => {
+      const item = engine.cat.itemById.get(g.kind);
+      return n + ((item?.slots ?? []).some((x) => combatSlots.has(x)) ? 1 : 0);
+    }, 0);
+
+    const usable = snaps.snapshots
+      .map((s) => ({ s, slots: describes(s) }))
+      .filter((c) => c.slots >= 5);
     const snap = usable.length
-      ? usable.reduce((best, s) => (s.events > best.events ? s : best))
+      ? usable.reduce((best, c) => (
+        c.slots !== best.slots ? (c.slots > best.slots ? c : best)
+          : (c.s.events > best.s.events ? c : best)
+      )).s
       : null;
     // Falling back is fine; falling back QUIETLY is not. A capture that holds
     // snapshots for this character which none of them can be used is a probe

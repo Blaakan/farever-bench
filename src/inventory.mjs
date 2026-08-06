@@ -42,7 +42,12 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
     inventory: {
       equipped: (snap.gear ?? []).map((g) => ({
         kind: g.kind,
-        level: g.ilevel ?? 0,
+        // `level` is the item's own level, the same number the modkit dump
+        // reports - 25 on Emsey's daggers. `ilevel` is a different scale
+        // entirely (280 on the same daggers) and feeding it here priced a
+        // level-25 build at 9e17 dps. The snapshot carries both; only one of
+        // them is what the catalog means by a level.
+        level: g.level ?? 0,
         upgrade: g.upgrade ?? 0,
         // The snapshot reports the authored rarity name; the dump reports an
         // index and -1 for "never rolled one". Leaving it out lets the catalog
@@ -71,6 +76,14 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
   }
 
   built.talents = talents;
+  // And into the loadout the engine actually scores. A talent tree node is
+  // keyed by its skill id - `Rogue_Talent_VirulentMagic` - which is exactly
+  // what the snapshot reports, so this is the whole wiring. Capturing talents
+  // and not handing them over would leave them in the MISSING column looking
+  // like a coverage hole, which is the opposite of what they now are.
+  built.loadout.talents = Object.fromEntries(
+    talents.filter((t) => t.rank > 0).map((t) => [t.id, t.rank])
+  );
   built.arsenals = snap.arsenals ?? [];
   built.attrs = snap.attrs ?? {};
   built.hattrs = snap.hattrs ?? {};
