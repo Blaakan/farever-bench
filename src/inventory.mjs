@@ -117,15 +117,35 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
   // Anything that does not resolve is named rather than dropped.
   built.affixes = snap.affixes ?? [];
   built.sockets = snap.sockets ?? [];
+  // Two of the same item wear two different sockets. Resolving the host slot
+  // with a `find` returns the first match every time, so Emsey's second
+  // Finger_Z3RCraft_Ap and Emsai's silently handed their jewel to the left
+  // ring and the right one went bare - eleven augments placed out of twelve.
+  //
+  // The snapshot gives each socket a host id and an index within that host, so
+  // group by host and hand the nth occurrence of a given index to the nth slot
+  // that item occupies.
   const unplacedSockets = [];
+  const byHost = new Map();
   for (const sk of built.sockets) {
-    const aug = cat.itemById.get(sk.augment);
-    const hostSlot = built.placed.find((p) => p.item === sk.host)?.slot;
-    if (!aug || !hostSlot || !aug.augmentType) {
-      unplacedSockets.push(sk.augment);
-      continue;
+    if (!byHost.has(sk.host)) byHost.set(sk.host, []);
+    byHost.get(sk.host).push(sk);
+  }
+  for (const [host, list] of byHost) {
+    const slots = built.placed.filter((p) => p.item === host).map((p) => p.slot);
+    const usedPerIndex = new Map();
+    for (const sk of list) {
+      const aug = cat.itemById.get(sk.augment);
+      const idx = sk.index ?? 0;
+      const nth = usedPerIndex.get(idx) ?? 0;
+      usedPerIndex.set(idx, nth + 1);
+      const hostSlot = slots[nth];
+      if (!aug || !hostSlot || !aug.augmentType) {
+        unplacedSockets.push(sk.augment);
+        continue;
+      }
+      built.loadout.augments[`${hostSlot}/${aug.augmentType}`] = aug.id;
     }
-    built.loadout.augments[`${hostSlot}/${aug.augmentType}`] = aug.id;
   }
 
   built.gaps = [
