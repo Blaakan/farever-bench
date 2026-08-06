@@ -2140,14 +2140,21 @@ const commands = {
     const usable = snaps.snapshots
       .map((s) => ({ s, slots: describes(s) }))
       .filter((c) => c.slots >= 5);
-    // Then prefer one that carries affixes, because that is the only kind that
-    // can check the sheet, and only then the one with the most damage under it.
+    // Then by how COMPLETE the description is - sockets and affixes each count,
+    // because each was added by a later probe build and a capture spans several.
+    // A snapshot missing either cannot be scored properly: without sockets the
+    // model loses the augments and the item levels they carry, and without
+    // affixes the sheet cannot be checked at all.
+    //
+    // Only then by how much damage was recorded under it, since the last
+    // snapshot of a session is written as the player logs out.
+    const richness = (x) => ((x.sockets ?? []).length ? 1 : 0) + ((x.affixes ?? []).length ? 1 : 0);
     const snap = usable.length
       ? usable.reduce((best, c) => {
         if (c.slots !== best.slots) return c.slots > best.slots ? c : best;
-        const ca = (c.s.affixes ?? []).length > 0;
-        const ba = (best.s.affixes ?? []).length > 0;
-        if (ca !== ba) return ca ? c : best;
+        const cr = richness(c.s);
+        const br = richness(best.s);
+        if (cr !== br) return cr > br ? c : best;
         return c.s.events > best.s.events ? c : best;
       }).s
       : null;
