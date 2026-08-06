@@ -916,14 +916,18 @@ export function buildCombat(cdb, ctx, assume = {}) {
     if (aff.root === 'Raw') return 1;
     if (!aff.resist) return foe.taken;
     const resist = (aff.resist === 'MagicArmor' ? target.magicArmor * foe.magicArmor : target.armor * foe.armor);
-    // `armorIgnore` is penetration by another name - Exposed Essence ignores 5%
-    // of a bleeding enemy's armour - so it lands on the same lever, in points
-    // of percent, alongside whatever the sheet already carries.
-    const ignore = (mods.armorIgnore?.[aff.root] ?? 0) * 100;
-    const pen = (aff.pen ? (sheet.get(aff.pen) ?? 0) : 0) + ignore;
+    // `armorIgnore` is NOT penetration by another name. Exposed Essence ignores
+    // 5% of a bleeding enemy's armour on its own multiply, and penetration
+    // takes its cut of what is left - getAffinityDamageReduction@4510 reduces
+    // the pool at ops 133-147 (physical) or 80-95 (magic) and again at ops
+    // 259-263, each with its own clamp. Adding them into one lever overstates
+    // damage by 2-3% wherever a build carries both.
+    const ignoreRatio = mods.armorIgnore?.[aff.root] ?? 0;
+    const pen = aff.pen ? (sheet.get(aff.pen) ?? 0) : 0;
     const red = damageReduction({
       resist,
       penetrationPct: pen,
+      ignoreRatio,
       // The STRIKER's level feeds the divisor (getAffinityDamageReduction@4510
       // op 237), not the target's. Identical at level parity - every reference
       // foe sits at the character's level - and wrong off-level.

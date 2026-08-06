@@ -76,10 +76,31 @@ export function resistForReduction(level, red, [a, b]) {
 // @src/ent/GameObject.hx:748-802). Note the level is the ATTACKER's, the flat
 // affinity reductions are added to the resulting fraction rather than to the
 // resist pool, and the result is floored at 0 but never capped at 1.
-export function damageReduction({ resist, penetrationPct, attackerLevel, flatReduction = 0, formula }) {
+//
+// The pool is reduced TWICE, by two levers that never meet:
+//
+//   ops 133-147  resist *= (1 - clamp(hit.armorIgnore, 0, 1))       [physical]
+//   ops  80- 95  resist *= (1 - clamp(hit.magicArmorIgnore, 0, 1))  [magic]
+//   ops 259-263  resist *= (1 - clamp(pen, 0, 100) / 100)
+//
+// The first two are mutually exclusive - `isMagic` at op 75 and `isPhysical`
+// at op 127 select one branch per hit - so any single hit takes exactly one
+// ignore multiply and then the penetration multiply.
+//
+// Folding `ignore` into `pen` cannot express this. Additively the model
+// computes (1 - a - b) where the game computes (1 - a)(1 - b), which
+// OVERSTATES damage whenever both are non-zero, and the two clamps are
+// independent: clamping the SUM lets a large pen mask an out-of-range ignore.
+// The forms agree exactly when either term is zero, which is why every
+// calibration to date could have passed - no captured build had an
+// armorIgnore source live.
+export function damageReduction({
+  resist, penetrationPct, attackerLevel, flatReduction = 0, ignoreRatio = 0, formula,
+}) {
   const [a, b] = formula;
   const pen = Math.min(100, Math.max(0, penetrationPct ?? 0));
-  const r = (resist ?? 0) * (1 - pen / 100);
+  const ignore = Math.min(1, Math.max(0, ignoreRatio ?? 0));
+  const r = (resist ?? 0) * (1 - ignore) * (1 - pen / 100);
   let red = r / (r + a + b * attackerLevel);
   red += flatReduction;
   return Math.max(0, red);

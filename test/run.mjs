@@ -110,6 +110,46 @@ ok('penetration is clamped, not extrapolated',
 ok('mitigation is never negative',
   damageReduction({ resist: 0, penetrationPct: 0, attackerLevel: 25, formula: K.resistFormula }) >= 0);
 
+// armorIgnore and penetration are TWO multiplies on the pool, not one sum.
+// getAffinityDamageReduction@4510 reduces the resist pool at ops 133-147
+// (physical) or 80-95 (magic), and again at ops 259-263 for penetration. The
+// model folded the first into the second, computing (1 - a - b) where the game
+// computes (1 - a)(1 - b) - exact when either is zero, which is why no
+// calibrated build ever caught it, and 2-3% high whenever both are live.
+{
+  const [a, b] = K.resistFormula;
+  const at = (resist, ignoreRatio, penetrationPct, L = 25) =>
+    damageReduction({ resist, ignoreRatio, penetrationPct, attackerLevel: L, formula: K.resistFormula });
+  const expect = (resist, ig, pen, L = 25) => {
+    const r = resist * (1 - ig) * (1 - pen / 100);
+    return r / (r + a + b * L);
+  };
+
+  near('ignore and penetration each take their own cut of the pool',
+    at(2000, 0.10, 40), expect(2000, 0.10, 40), 1e-12);
+  near('the same pair read additively is a different, larger number',
+    at(2000, 0, 50), expect(2000, 0, 50), 1e-12);
+  ok('the additive reading overstates damage - it mitigates less than the game does',
+    at(2000, 0.10, 40) > damageReduction({
+      resist: 2000, penetrationPct: 0.10 * 100 + 40, attackerLevel: 25, formula: K.resistFormula,
+    }));
+
+  // Exposed Essence rank 2 on a bleeding target, against a 0.40 elite.
+  near('Exposed Essence 10% ignore composes with 40% penetration',
+    at(1923.33, 0.10, 40), expect(1923.33, 0.10, 40), 1e-12);
+
+  // Independent clamps. Folding the two levers together let a large
+  // penetration mask an out-of-range ignore, and vice versa.
+  near('a full ignore empties the pool by itself', at(2000, 1, 0), 0, 1e-12);
+  ok('ignore is clamped to 1, not extrapolated', at(2000, 4, 0) === 0);
+  near('a negative ignore is clamped to 0, leaving penetration alone',
+    at(2000, -3, 40), expect(2000, 0, 40), 1e-12);
+  near('ignore and penetration clamp independently',
+    at(2000, 2, 500), 0, 1e-12);
+  near('omitting ignore is exactly the old one-lever behaviour',
+    at(1500, 0, 35), expect(1500, 0, 35), 1e-12);
+}
+
 // The authored Armor columns are dead at runtime, but three of the four
 // classes still agree with their props.armorReduction - so a disagreement in
 // the OTHER direction (a class whose authored numbers start matching, or a new
