@@ -318,6 +318,16 @@ export async function snapshots(path, { source = null } = {}) {
   const out = [];
 
   const receipt = await streamCapture(path, (r) => {
+    // Damage attributed to whichever build was standing when it landed. Counted
+    // here because this pass is already reading every row, and because picking a
+    // snapshot by recency picks the one written as the player logged out - which
+    // has no damage after it at all. A build description is only useful in
+    // proportion to the evidence it covers.
+    if (r.event === 'inflict') {
+      const cur = open.get(r.source);
+      if (cur) { cur.events++; cur.damage += r.amount ?? 0; }
+      return;
+    }
     if (!r.event || !r.event.startsWith('snap')) return;
     if (source && r.source !== source) return;
 
@@ -335,6 +345,8 @@ export async function snapshots(path, { source = null } = {}) {
         hattrs: {},
         sheet: {},
         errors: [],
+        events: 0,
+        damage: 0,
       };
       open.set(r.source, s);
       out.push(s);

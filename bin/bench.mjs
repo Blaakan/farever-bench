@@ -2114,8 +2114,13 @@ const commands = {
     // and it carries the talents the dump has no field for. Use one when the
     // probe has written one, unless --dump says otherwise.
     const snaps = args.flags.dump ? { snapshots: [] } : await snapshots(capturePath, { source: character });
-    const usable = snaps.snapshots.filter((s) => (s.gear ?? []).length);
-    const snap = usable.length ? usable[usable.length - 1] : null;
+    // Pick the build with the most damage recorded under it, not the most
+    // recent one - the last snapshot of a session is written as the player logs
+    // out and has nothing after it.
+    const usable = snaps.snapshots.filter((s) => (s.gear ?? []).length && s.events > 0);
+    const snap = usable.length
+      ? usable.reduce((best, s) => (s.events > best.events ? s : best))
+      : null;
     // Falling back is fine; falling back QUIETLY is not. A capture that holds
     // snapshots for this character which none of them can be used is a probe
     // problem, and the run must not read as though no snapshot was ever taken.
@@ -2155,7 +2160,11 @@ const commands = {
     if (since === null && snap) {
       since = snap.ts;
       until = snap.until;
-      window = { fromSnapshot: true, seconds: until ? (until - snap.ts) / 1000 : null };
+      window = {
+        fromSnapshot: true,
+        events: snap.events,
+        seconds: until ? (until - snap.ts) / 1000 : null,
+      };
     }
     if (since === null) {
       const s = await sessions(capturePath, { source: character, gapMs: 120_000 });
@@ -2192,7 +2201,10 @@ const commands = {
     console.log(f.bold(`${character} - ${built.unit} ${built.level}`) + f.dim(
       `  ${built.placed.length} slots from ${snap ? 'the capture\'s own snapshot' : 'the modkit dump'}`));
     if (snapNote) console.log(f.warn(snapNote));
-    if (window) {
+    if (window?.fromSnapshot) {
+      console.log(f.dim(`window: the snapshot's own span - ${window.events.toLocaleString()} events`
+        + (window.seconds ? ` over ${Math.round(window.seconds)}s` : ', open-ended')));
+    } else if (window) {
       console.log(f.dim(`window: last ${window.count} of ${window.of} sessions, `
         + `${Math.round(window.seconds)}s of recorded combat`));
     }

@@ -74,7 +74,23 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
   built.arsenals = snap.arsenals ?? [];
   built.attrs = snap.attrs ?? {};
   built.hattrs = snap.hattrs ?? {};
-  built.sheet = snap.sheet ?? {};
+  // UnitAttributes.attributes is keyed by the attribute's POSITION in the cdb
+  // sheet, not by name, so it arrives as {63: 1105}. Resolve it.
+  //
+  // Two things this is not. It is not the full sheet - only 12 of 78 attributes
+  // appear, and neither Strength nor CritChance is among them, so it reads as a
+  // sparse override map rather than the character's stats. And the named
+  // scalars on the same object (snap_attr) are base values: critChance 5 on a
+  // geared level-25 hero. Where the live sheet actually lives is still open, so
+  // this is carried as a cross-check and never as an input.
+  const attrRows = cat.cdb.lines('attribute');
+  const sheet = {};
+  for (const [k, v] of Object.entries(snap.sheet ?? {})) {
+    const i = Number(k);
+    const row = Number.isInteger(i) ? attrRows[i] : null;
+    sheet[row?.id ?? k] = v;
+  }
+  built.sheet = sheet;
   built.snapshotTs = snap.ts;
   built.until = snap.until ?? null;
 
@@ -84,6 +100,9 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
       : 'the snapshot recorded no readable talents - either none are taken or the probe could not reach them',
     rejected.length
       ? `${rejected.length} snapshot row(s) named something that is not a skill (${rejected.slice(0, 4).join(', ')}) - an old probe build reporting proxy internals; re-capture`
+      : null,
+    built.unusable?.length
+      ? `${built.unusable.length} item(s) in the snapshot this class cannot wear (${built.unusable.slice(0, 3).join(', ')}) - the probe read a backpack rather than the equipment; skipped`
       : null,
     ...(snap.errors ?? []).map((e) => `the probe reported it could not read ${e.what}: ${e.why}`),
     'sockets and enchants are still not captured',
@@ -169,11 +188,19 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
   const ignored = [];
   const unknown = [];
 
+  const clsRow = cat.classes.find((c) => c.unit === cls);
+  const unusable = [];
+
   for (const e of equipped) {
     const item = cat.itemById.get(e.kind);
     if (!item) { unknown.push(e.kind); continue; }
     const legal = (item.slots ?? []).filter((s) => slots.includes(s));
     if (!legal.length) { ignored.push(e.kind); continue; }
+    // A build description is not a promise that every item in it is wearable.
+    // A capture snapshot can hand over a backpack, and a Rogue's backpack may
+    // hold a Wizard staff - which is a thing to skip and name, not a reason to
+    // refuse to score the character at all.
+    if (clsRow && !cat.usableBy(item, clsRow.aptitude)) { unusable.push(item.id); continue; }
     const free = legal.find((s) => !taken.has(s));
     if (!free) { ignored.push(e.kind); continue; }
 
@@ -198,6 +225,7 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
     placed,
     ignored,
     unknown,
+    unusable,
     // What a capture-verify run must not treat as zero. Each of these is a real
     // input the dump cannot see, and each has been measured to move a headline
     // number, so they are carried to the report rather than assumed away.
