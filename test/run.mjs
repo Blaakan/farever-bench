@@ -1234,18 +1234,52 @@ group('reference targets');
     engine.combat.foe('reference', 25).physReduction < red('boss'),
     `${engine.combat.foe('reference', 25).physReduction} vs ${red('boss')}`);
 
-  // Physical and magical reduction are EQUAL on every real foe, which is why
-  // ArmorPenetration and SpellPenetration are interchangeable in value. If a
-  // patch splits them, penetration choice starts depending on the fight - and
-  // that is exactly when this tool needs to be told.
-  let split = 0;
+  // Physical and magical reduction are equal on every real foe EXCEPT the
+  // golems, and that exception is the whole reason armour inheritance had to be
+  // read properly. Golem_Base declares an Armor multiplier of 1.6 and no
+  // MagicArmor at all, so a golem is harder to hit than to burn: 0.4068 against
+  // 0.30 off a W_Base parent, 0.5161 against 0.40 off an elite one.
+  //
+  // This was invisible while the model followed only the first `inherit` entry,
+  // which found the archetype base and never Golem_Base - so every foe looked
+  // symmetric and ArmorPenetration and SpellPenetration looked interchangeable.
+  // Against a golem they are not.
+  //
+  // The tripwire is kept, narrowed to the shape rather than deleted: if a patch
+  // splits something that is NOT a golem, penetration choice starts depending
+  // on the fight in a way this tool does not yet model, and it needs to say so.
+  const split = [];
   for (const [id, i] of engine.combat.targetsByUnit) {
     if (/Dummy|PunchingBag/.test(id)) continue;      // dev targets deliberately split
     if (i.phys == null || i.mag == null) continue;
-    if (i.phys !== i.mag) split++;
+    if (i.phys !== i.mag) split.push(id);
   }
-  ok('no real foe splits physical and magical reduction', split === 0,
-    `${split} units do - penetration is no longer target-independent`);
+  // The rule is not "is a golem" - it is "inherits Golem_Base", which is where
+  // the Armor multiplier lives. Four of the twenty-one golems do NOT: the elite
+  // variants inherit [W_Base_Elite] alone and come out symmetric at 0.40, even
+  // though the non-elite version of the same creature carries Golem_Base. That
+  // looks like an authoring slip in the game's data, and the model's job is to
+  // report it rather than smooth it over.
+  const unitsById = engine.cdb.byId('unit');
+  const inheritsGolemBase = (id, seen = new Set()) => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    const u = unitsById.get(id);
+    return (u?.inherit ?? []).some((i) => i.ref === 'Golem_Base' || inheritsGolemBase(i.ref, seen));
+  };
+
+  ok('the split is exactly the units that inherit Golem_Base',
+    split.length > 0 && split.every((id) => inheritsGolemBase(id)),
+    `${split.length} split; not from Golem_Base: ${split.filter((id) => !inheritsGolemBase(id)).join(', ') || 'none'}`);
+  ok('...and every one of them is tougher physically than magically',
+    [...engine.combat.targetsByUnit]
+      .filter(([id]) => inheritsGolemBase(id))
+      .every(([, i]) => i.phys != null && i.mag != null && i.phys > i.mag));
+  ok('...while a golem that does not inherit it stays symmetric',
+    ['Golem_Z1W_Earth_E', 'Golem_Z2W_FireExplosive_E'].every((id) => {
+      const i = engine.combat.targetsByUnit.get(id);
+      return i && i.phys === i.mag;
+    }));
   ok('a real unit id works as a target', engine.combat.foe('Ratsar', 25).armor > 0);
   ok('most units resolve an intent through inheritance', engine.combat.targetsByUnit.size > 100,
     String(engine.combat.targetsByUnit.size));
@@ -4312,6 +4346,67 @@ group('questlog import');
   ok('a second argument that is not a build link is refused', stray.status !== 0);
   ok('...and the message names what was not understood',
     /wibble/.test(stray.stderr + stray.stdout));
+}
+
+// --- unit inheritance ------------------------------------------------------
+group('a unit inherits from every parent, not the first');
+{
+  const engine = createEngine();
+  const intent = engine.combat.armourIntent;
+
+  // 305 of 516 unit rows declare more than one parent, and the shape is
+  // consistently (archetype, species) - so following only inherit[0] finds the
+  // world-trash base and never the animal.
+  const units = engine.cdb.lines('unit');
+  const multi = units.filter((u) => (u.inherit ?? []).length > 1);
+  ok('the data really does use multiple inheritance', multi.length > 100,
+    `${multi.length} of ${units.length}`);
+
+  // The declared bases, unchanged by any of this.
+  near('W_Base mitigates its authored 0.30', intent('W_Base').phys, 0.30, 1e-9);
+  near('W_Base_Unique mitigates its authored 0.35', intent('W_Base_Unique').phys, 0.35, 1e-9);
+
+  // Golem_Base declares Armor with `multiplier: 1.6` and nothing else - no
+  // value, no levelScaling, no specScaling. A golem inheriting
+  // [W_Base, Golem_Base] takes W_Base's 0.30 curve and Golem_Base's multiplier
+  // (loadUnit@18967 ops 179-185 fill a null multiplier from the parent), and
+  // the multiplier scales the resist POOL, so the reduction it comes back as is
+  // 1.6*0.3 / (1.6*0.3 + 1 - 0.3) = 0.4068.
+  const golem = intent('Golem_Z1W_Earth1');
+  near('a golem mitigates more than the base it inherits', golem.phys, 0.48 / 1.18, 1e-9);
+  ok('...which is strictly above the 0.30 that reading one parent would give',
+    golem.phys > 0.30, String(golem.phys));
+  near('...while its magic armour, which no golem multiplies, stays 0.30',
+    golem.mag, 0.30, 1e-9);
+
+  // A unique golem compounds the same multiplier onto the 0.35 base.
+  near('the multiplier composes with whichever base was inherited',
+    intent('Golem_Z2W_U').phys, (1.6 * 0.35) / (1.6 * 0.35 + 1 - 0.35), 1e-9);
+
+  // The pool multiplier folds back into a reduction with the level cancelling,
+  // which is why one number describes a target at every level.
+  {
+    const [a, b] = K.resistFormula;
+    const red = (L, base, m) => {
+      const R = m * resistForReduction(L, base, K.resistFormula);
+      return R / (R + a + b * L);
+    };
+    for (const L of [1, 25, 50]) {
+      near(`the scaled reduction is level-independent at L${L}`,
+        red(L, 0.30, 1.6), golem.phys, 1e-9);
+    }
+  }
+
+  // Named targets the rest of the suite and the README depend on.
+  near('Ratsar still reads the 0.40 the meter was calibrated against',
+    intent('Ratsar').phys, 0.40, 1e-9);
+
+  ok('every unit that resolves an intent resolves a finite one',
+    units.every((u) => {
+      const i = intent(u.id);
+      return (i.phys === null || (i.phys >= 0 && i.phys < 1))
+        && (i.mag === null || (i.mag >= 0 && i.mag < 1));
+    }));
 }
 
 // --- reading the capture ---------------------------------------------------

@@ -760,33 +760,120 @@ export function buildCombat(cdb, ctx, assume = {}) {
   //
   // Two things worth knowing, both straight out of that table:
   //
-  //   * Physical and magical reduction are EQUAL on every real foe. Only the
-  //     dev punching bags split them (PunchingBagArmor is 0.5/0, PunchingBagMagicRes
-  //     is 0/0.5). So ArmorPenetration and SpellPenetration are worth the same
-  //     against everything currently in the game; which one you want is decided
-  //     by your class and your gear's faction, not by what you are fighting.
+  //   * Physical and magical reduction are equal on every real foe EXCEPT the
+  //     golems. Golem_Base declares an Armor multiplier of 1.6 and no
+  //     MagicArmor, so all 17 golems are harder to hit than to burn - 0.4068
+  //     against 0.30 off a W_Base parent, 0.4628 off a Unique one, 0.5161 off
+  //     an Elite. The dev punching bags also split, deliberately
+  //     (PunchingBagArmor is 0.5/0, PunchingBagMagicRes is 0/0.5).
+  //     So ArmorPenetration and SpellPenetration are worth the same against
+  //     everything in the game but golems, and against a golem physical
+  //     penetration is worth materially more.
+  //
+  //     This paragraph used to say they were equal everywhere. That was an
+  //     artefact of following only the first `inherit` entry, which found the
+  //     archetype base and never Golem_Base.
   //   * `Armor_ExpectedReduction` (0.25) is well below what you actually fight.
   //     At level 25, 50% penetration is worth +14% damage against 0.25 and +25%
   //     against a 0.40 boss, so a reference target understates penetration by
   //     nearly half against the content that matters.
   const units = cdb.byId('unit');
-  function unitChain(id) {
-    const o = [];
-    for (let c = units.get(id); c;) { o.push(c); const p = (c.inherit ?? [])[0]?.ref; c = p ? units.get(p) : null; }
-    return o;
-  }
 
-  // The nearest declaration up the inheritance chain, which is how a mob that
-  // declares nothing still has armour.
-  function armourIntent(unitId) {
-    let phys = null, mag = null;
-    for (const c of unitChain(unitId)) {
-      for (const s of c.stats ?? []) {
-        if (s.attribute === 'Armor' && phys == null && s.specScaling?.armorReduction != null) phys = s.specScaling.armorReduction;
-        if (s.attribute === 'MagicArmor' && mag == null && s.specScaling?.magicReduction != null) mag = s.specScaling.magicReduction;
+  // A unit's effective `stats`, resolved the way the game resolves them.
+  //
+  // `DataCache.initUnits@18912` builds the closure at @18967 and runs it over
+  // every unit row. That closure iterates EVERY entry of `inherit` (ops 12-17),
+  // not just the first - and 305 of the 516 unit rows declare two or three.
+  // The shape is consistently (archetype, species): Boar_Z2W_2 inherits
+  // [W_Base, Boar_Z1W], so following only the first parent finds the world-trash
+  // base and never the boar.
+  //
+  // Each parent is resolved first (op 51 recurses), then merged field-wise:
+  //
+  //   no matching attribute        -> deep-copy the parent's row      (ops 129-136)
+  //   the child's row is a MODIFIER-ONLY stub - no value, no
+  //   levelScaling, no specScaling - -> drop the stub, take the parent's
+  //                                   row, and MULTIPLY the two
+  //                                   multipliers together             (ops 137-171)
+  //   otherwise                    -> the child's row stands, except
+  //                                   that a null multiplier or
+  //                                   levelMultiplier is filled from
+  //                                   the parent                       (ops 179-192)
+  //
+  // Because the merge only ever fills what is still null, a child beats its
+  // parents and an earlier `inherit` entry beats a later one.
+  const statsCache = new Map();
+  function mergedStats(id, seen = new Set()) {
+    const hit = statsCache.get(id);
+    if (hit) return hit;
+    const u = units.get(id);
+    if (!u) return [];
+    // The game throws on a unit inheriting itself (ops 32-39). Cycles through
+    // a longer path are not checked there and would hang here, so they stop.
+    if (seen.has(id)) return (u.stats ?? []).map((s) => ({ ...s }));
+    seen.add(id);
+
+    const out = (u.stats ?? []).map((s) => ({ ...s }));
+    for (const inh of u.inherit ?? []) {
+      // A text-only parent contributes names and descriptions, never stats
+      // (ops 52-57 jump past the whole numeric merge).
+      if (inh?.textOnly) continue;
+      if (!inh?.ref) continue;
+      for (const ps of mergedStats(inh.ref, seen)) {
+        const at = out.findIndex((x) => x.attribute === ps.attribute);
+        if (at < 0) { out.push({ ...ps }); continue; }
+        const existing = out[at];
+        const modifierOnly = existing.value == null
+          && (existing.levelScaling ?? []).length === 0
+          && existing.specScaling == null;
+        if (modifierOnly) {
+          const copy = { ...ps };
+          copy.multiplier = (ps.multiplier ?? 1) * (existing.multiplier ?? 1);
+          if (copy.levelMultiplier == null && existing.levelMultiplier != null) {
+            copy.levelMultiplier = existing.levelMultiplier;
+          }
+          out[at] = copy;
+        } else {
+          if (existing.multiplier == null && ps.multiplier != null) existing.multiplier = ps.multiplier;
+          if (existing.levelMultiplier == null && ps.levelMultiplier != null) {
+            existing.levelMultiplier = ps.levelMultiplier;
+          }
+        }
       }
     }
-    return { phys, mag };
+    seen.delete(id);
+    statsCache.set(id, out);
+    return out;
+  }
+
+  // A stat's `multiplier` scales the resist POOL, not the reduction fraction it
+  // was authored as. Converting back is level-independent, which is worth
+  // knowing because it means one number describes the target at every level:
+  //
+  //   R    = r/(1-r) * K      (resistForReduction, K = a + b*level)
+  //   R'   = m * R
+  //   red' = R'/(R'+K) = m*r / (m*r + 1 - r)
+  //
+  // Golem_Base declares Armor with `multiplier: 1.6` and nothing else, and
+  // W_Base declares `armorReduction: 0.3`. A golem inheriting [W_Base,
+  // Golem_Base] therefore mitigates 0.4068, not 0.30 - and following only the
+  // first parent, or ignoring the multiplier, gets 0.30.
+  function scaledReduction(base, multiplier) {
+    if (base == null) return null;
+    const m = multiplier ?? 1;
+    if (!(m > 0) || m === 1) return base;
+    return (m * base) / (m * base + 1 - base);
+  }
+
+  // What a unit actually mitigates, after the whole inheritance merge.
+  function armourIntent(unitId) {
+    const stats = mergedStats(unitId);
+    const arm = stats.find((s) => s.attribute === 'Armor');
+    const mag = stats.find((s) => s.attribute === 'MagicArmor');
+    return {
+      phys: scaledReduction(arm?.specScaling?.armorReduction ?? null, arm?.multiplier),
+      mag: scaledReduction(mag?.specScaling?.magicReduction ?? null, mag?.multiplier),
+    };
   }
 
   // Every unit whose intent is declared or inherited, so `--target <unitId>`
