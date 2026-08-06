@@ -2302,10 +2302,19 @@ const commands = {
           .filter((a) => (a.scaling ?? []).length)
           .map((a) => a.id)
       );
+      // The same floor the sheet applies. An attribute whose row says it cannot
+      // go negative does not, in the game either: Emsey's Corrupted Gifts sum
+      // SpellPenetrationRating to -83 and the character screen shows Magic
+      // Penetration 0%. Comparing an unclamped sum against a clamped sheet
+      // reported a -100% error against a model that was right.
+      const attrById = new Map((engine.ctx.attrTable?.attrs ?? []).map((a) => [a.id, a]));
       const rows = [];
       for (const [attr, sum] of sums) {
         if (derived.has(attr)) continue;
-        const live = (base.get(attr) ?? 0) + sum;
+        let live = (base.get(attr) ?? 0) + sum;
+        const row = attrById.get(attr);
+        if (row && !row.negativeAllowed && live < 0) live = 0;
+        if (row?.roundUp) live = Math.round(live);
         const model = ev.sheet.get(attr);
         if (model == null || Math.abs(live) < 1e-9) continue;
         rows.push({ attr, live, model, rel: (model - live) / live });
