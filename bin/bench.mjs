@@ -2116,6 +2116,13 @@ const commands = {
     const snaps = args.flags.dump ? { snapshots: [] } : await snapshots(capturePath, { source: character });
     const usable = snaps.snapshots.filter((s) => (s.gear ?? []).length);
     const snap = usable.length ? usable[usable.length - 1] : null;
+    // Falling back is fine; falling back QUIETLY is not. A capture that holds
+    // snapshots for this character which none of them can be used is a probe
+    // problem, and the run must not read as though no snapshot was ever taken.
+    const snapNote = (!snap && snaps.snapshots.length)
+      ? `${snaps.snapshots.length} snapshot(s) for ${character} are in the capture but carry no gear `
+        + '- an older probe build. Falling back to the login dump; re-capture to use them.'
+      : null;
 
     let built;
     if (snap) {
@@ -2183,7 +2190,8 @@ const commands = {
 
     console.log(f.header(engine, VERSION) + '\n');
     console.log(f.bold(`${character} - ${built.unit} ${built.level}`) + f.dim(
-      `  ${built.placed.length} slots from the modkit dump`));
+      `  ${built.placed.length} slots from ${snap ? 'the capture\'s own snapshot' : 'the modkit dump'}`));
+    if (snapNote) console.log(f.warn(snapNote));
     if (window) {
       console.log(f.dim(`window: last ${window.count} of ${window.of} sessions, `
         + `${Math.round(window.seconds)}s of recorded combat`));

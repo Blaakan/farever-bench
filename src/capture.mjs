@@ -333,6 +333,8 @@ export async function snapshots(path, { source = null } = {}) {
         arsenals: [],
         attrs: {},
         hattrs: {},
+        sheet: {},
+        errors: [],
       };
       open.set(r.source, s);
       out.push(s);
@@ -343,14 +345,30 @@ export async function snapshots(path, { source = null } = {}) {
     if (!s) return;   // a burst whose marker was rotated out of this file
     const x = parseExtra(r.extra);
     switch (r.event) {
-      case 'snap_gear':
+      case 'snap_gear': {
+        const num = (v) => (v === '' || v === undefined ? null : Number(v));
         s.gear.push({
           kind: r.skill,
-          upgrade: x.upgrade === '' || x.upgrade === undefined ? null : Number(x.upgrade),
+          upgrade: num(x.upgrade),
+          level: num(x.level),
           rarity: x.rarity === '' || x.rarity === undefined ? null : x.rarity,
-          ilevel: x.ilevel === '' || x.ilevel === undefined ? null : Number(x.ilevel),
+          ilevel: num(x.ilevel),
           flawless: x.flawless === '1',
         });
+        break;
+      }
+      // The live stat sheet, off UnitAttributes.attributes. Distinct from
+      // snap_attr, which reads the named scalars on the same object and was
+      // observed returning BASE values - critChance 5 and every attribute 0 on
+      // a fully geared level-25 hero. Where the two disagree, this one is the
+      // sheet the game was actually fighting with.
+      case 'snap_sheet':
+        s.sheet[r.skill] = r.amount;
+        break;
+      // The probe could not read something and said so rather than inventing a
+      // row. Carried through to the report: a named gap is a result.
+      case 'snap_err':
+        s.errors.push({ what: r.skill, why: r.extra });
         break;
       case 'snap_talent':
         s.talents.push({ id: r.skill, rank: r.stacks ?? null });

@@ -56,15 +56,36 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
   };
 
   const built = toLoadout(cat, dumpish, { level: level ?? snap.level ?? null, unit });
-  built.talents = snap.talents ?? [];
+
+  // A talent id is a `skill` row like any other, so one that does not resolve is
+  // not a talent. This is not fussiness: the first probe build could not reach
+  // into hxbit's map proxy and reported the proxy's own struct fields, so a
+  // capture on disk contains talents named `map`, `obj` and `bit`. Feeding those
+  // to the model would be worse than having no talents at all, because the model
+  // would look them up, miss, and carry on.
+  const talents = [];
+  const rejected = [];
+  for (const t of snap.talents ?? []) {
+    if (t?.id && cat.cdb.has('skill', t.id)) talents.push(t);
+    else if (t?.id) rejected.push(t.id);
+  }
+
+  built.talents = talents;
   built.arsenals = snap.arsenals ?? [];
   built.attrs = snap.attrs ?? {};
   built.hattrs = snap.hattrs ?? {};
+  built.sheet = snap.sheet ?? {};
   built.snapshotTs = snap.ts;
   built.until = snap.until ?? null;
-  // The snapshot closes three of the four gaps the dump leaves open.
+
   built.gaps = [
-    (snap.talents ?? []).length ? null : 'the snapshot recorded no talents - either none are taken or the probe could not read them',
+    talents.length
+      ? null
+      : 'the snapshot recorded no readable talents - either none are taken or the probe could not reach them',
+    rejected.length
+      ? `${rejected.length} snapshot row(s) named something that is not a skill (${rejected.slice(0, 4).join(', ')}) - an old probe build reporting proxy internals; re-capture`
+      : null,
+    ...(snap.errors ?? []).map((e) => `the probe reported it could not read ${e.what}: ${e.why}`),
     'sockets and enchants are still not captured',
     'consumables and persistent buffs are still not captured',
   ].filter(Boolean);
