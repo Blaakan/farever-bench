@@ -2140,11 +2140,16 @@ const commands = {
     const usable = snaps.snapshots
       .map((s) => ({ s, slots: describes(s) }))
       .filter((c) => c.slots >= 5);
+    // Then prefer one that carries affixes, because that is the only kind that
+    // can check the sheet, and only then the one with the most damage under it.
     const snap = usable.length
-      ? usable.reduce((best, c) => (
-        c.slots !== best.slots ? (c.slots > best.slots ? c : best)
-          : (c.s.events > best.s.events ? c : best)
-      )).s
+      ? usable.reduce((best, c) => {
+        if (c.slots !== best.slots) return c.slots > best.slots ? c : best;
+        const ca = (c.s.affixes ?? []).length > 0;
+        const ba = (best.s.affixes ?? []).length > 0;
+        if (ca !== ba) return ca ? c : best;
+        return c.s.events > best.s.events ? c : best;
+      }).s
       : null;
     // Falling back is fine; falling back QUIETLY is not. A capture that holds
     // snapshots for this character which none of them can be used is a probe
@@ -2260,6 +2265,56 @@ const commands = {
       if (r.status === 'MISSING') console.log(f.warn(line));
       else if (r.status === 'PHANTOM') console.log(f.warn(line));
       else console.log(line);
+    }
+
+    // The sheet, checked against the game's own arithmetic.
+    //
+    // A capture's affix rows ARE the game's derivation: one row per applied
+    // affix, carrying the value the sheet was built from and the item or skill
+    // that applied it. Base stats plus that sum reproduces the in-game sheet to
+    // within rounding on every attribute of every class tested - so where the
+    // model disagrees, the model is wrong, and by exactly this much.
+    //
+    // It belongs in this report because a damage delta means nothing until the
+    // sheet behind it is known. A skill reading 20% low on a sheet that is
+    // itself 12% low is not a 20% damage error.
+    if (built.affixes?.length) {
+      const base = engine.baseStatsFor(built.unit, built.level);
+      const sums = new Map();
+      for (const a of built.affixes) {
+        const m = /^ETAttribute:(.+)$/.exec(String(a.target ?? ''));
+        if (!m || a.value == null) continue;
+        sums.set(m[1], (sums.get(m[1]) ?? 0) + a.value);
+      }
+      // Only attributes affixes fully determine. A derived one - CritChance is
+      // computed from CritChanceRating, ArmorPenetration from its rating - is
+      // not base-plus-affixes, and comparing it that way invents a discrepancy
+      // out of the conversion the model is supposed to be doing.
+      const derived = new Set(
+        (engine.ctx.attrTable?.attrs ?? [])
+          .filter((a) => (a.scaling ?? []).length)
+          .map((a) => a.id)
+      );
+      const rows = [];
+      for (const [attr, sum] of sums) {
+        if (derived.has(attr)) continue;
+        const live = (base.get(attr) ?? 0) + sum;
+        const model = ev.sheet.get(attr);
+        if (model == null || Math.abs(live) < 1e-9) continue;
+        rows.push({ attr, live, model, rel: (model - live) / live });
+      }
+      rows.sort((a, b) => a.rel - b.rel);
+      const off = rows.filter((r) => Math.abs(r.rel) > 0.01);
+      console.log('');
+      console.log(f.bold(`SHEET  ${rows.length - off.length}/${rows.length} within 1% of the game's own affix arithmetic`));
+      for (const r of off.slice(0, 10)) {
+        console.log(`  ${r.attr.padEnd(24)}${r.live.toFixed(1).padStart(9)}${r.model.toFixed(1).padStart(9)}`
+          + `${((r.rel > 0 ? '+' : '') + (100 * r.rel).toFixed(1) + '%').padStart(9)}`);
+      }
+      if (off.length) {
+        console.log(f.dim('  game (base + its own affixes) vs model. A damage delta on a wrong sheet\n'
+          + '  is not a damage error - fix the sheet first.'));
+      }
     }
 
     console.log('');
