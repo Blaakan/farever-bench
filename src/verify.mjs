@@ -72,11 +72,31 @@ export function compare({ modelLines = [], captureGroups = [], only = null } = {
     const damage = l.total?.damage ?? 0;
     // A line the fight never played is not a claim about anything.
     if (hits <= 0 && damage <= 0) continue;
-    const prev = model.get(l.id);
-    // The same id can appear as both an active and a triggered line; the
-    // capture cannot tell those apart, so neither may we.
-    if (prev) { prev.hits += hits; prev.damage += damage; }
-    else model.set(l.id, { id: l.id, name: l.name ?? l.id, hits, damage, interval: l.interval ?? null });
+    // A script rider carries the id `<host>#<step>`, because the model prices
+    // the step separately from the cast that played it. The game does not: the
+    // probe logs `dmg.baseSkill`, so every step a skill plays lands under that
+    // skill's name. Folding is therefore not a convenience - reporting the
+    // rider on its own line would show it as damage the game never recorded
+    // AND leave the host looking short by the same amount, which is two wrong
+    // answers from one naming difference.
+    const id = l.id.includes('#') ? l.id.slice(0, l.id.indexOf('#')) : l.id;
+    const prev = model.get(id);
+    // The same id can also appear as both an active and a triggered line; the
+    // capture cannot tell those apart either, so neither may we.
+    if (prev) {
+      prev.hits += hits;
+      prev.damage += damage;
+      if (l.id !== id) prev.parts.push(l.id.slice(l.id.indexOf('#') + 1));
+    } else {
+      model.set(id, {
+        id,
+        name: l.name ?? id,
+        hits,
+        damage,
+        interval: l.interval ?? null,
+        parts: l.id !== id ? [l.id.slice(l.id.indexOf('#') + 1)] : [],
+      });
+    }
   }
 
   const live = new Map();
@@ -127,6 +147,9 @@ export function compare({ modelLines = [], captureGroups = [], only = null } = {
     rows.push({
       id, name: m.name, status: 'BOTH',
       modelHits: m.hits, modelDamage: m.damage, modelMean, modelShare,
+      // Which script-played steps were folded into this row, so a reader can
+      // see that the model's hit count is a cast plus its riders.
+      parts: m.parts,
       liveHits: c.hits, liveDamage: c.total, liveMean: c.mean, liveShare,
       liveCrit: c.critRate, liveP05: c.p05, liveP95: c.p95,
       liveIntegrality: c.integrality,

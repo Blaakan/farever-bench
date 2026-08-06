@@ -2006,7 +2006,14 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   // keeps its whole 0.25 x Intellect there, and without this the conduit landed
   // in the rotation carrying nothing while the step it plays was refused beside
   // it - the same circle Staff_Censer_Skill2 fell into.
-  const RIDER_HOOKS = /^on(InflictHit|InflictDamage|InflictDamageEval|Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed|StartConduit)$/;
+  // `onInflictStatusEval` earns its place here on measurement, not taste. Held
+  // against a live capture, skills declaring it carried 35.6% of a Rogue's
+  // damage - Daggers_DuplicatePoison_Skill1 alone was 24.9%, priced by this
+  // model at eighteen hits where the game recorded two thousand eight hundred,
+  // because the hook that produces them was never an event this reader
+  // believed in. It fires when a status the owner applied deals damage, which
+  // is a tick, and the fight already raises one of those.
+  const RIDER_HOOKS = /^on(InflictHit|InflictDamage|InflictDamageEval|InflictStatusEval|Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed|StartConduit)$/;
   const OWN_CAST_HOOKS = /^on(Damage|DamageEval|FirstHit|Hit|Start|CastEnd|AreaElapsed|StartConduit)$/;
 
   function scriptedRiders(skillId, prof, opts = {}) {
@@ -2048,11 +2055,36 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // damage event this is, the same way isBaseAttack does, and the fight
         // raises one every time a pool dot hurts the target. Cracking Blood is
         // the case: its whole payload is a Code step played on that event.
-        const BLEED_EVENT = /\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(Bleed|Hemorage)\s*\)/;
-        const onDotTick = BLEED_EVENT.test(scope);
+        // `x.isDoT()` asks the same question as isStatusType(Bleed): is this
+        // damage event a tick? It is how the poison weapons phrase it.
+        const BLEED_EVENT = /\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(Bleed|Hemorage)\s*\)|\w+\.isDoT\s*\(\s*\)/;
+        // onInflictStatusEval only ever fires because a status dealt damage, so
+        // the hook itself is the tick event even when the body does not restate
+        // it.
+        const onDotTick = BLEED_EVENT.test(scope) || hook === 'onInflictStatusEval';
+
+        // `target.hasStatus(Skill.X)` where X is a status THIS skill applies is
+        // not a question about live state the reader cannot answer - the host
+        // puts it there. Blanked the way the tick event is, and the assumption
+        // it carries (that the status is up when the tick lands) is named in
+        // `why` rather than hidden, because a host on a long cooldown will not
+        // hold its own status through the whole fight.
+        const applied = new Set();
+        for (const st of s?.steps ?? []) {
+          for (const e of st.effects ?? []) if (e.status) applied.add(e.status);
+        }
+        const SELF_STATUS = /(\w+)\.hasStatus\s*\(\s*(?:Skill\.)?([A-Za-z0-9_]+)\s*\)/g;
+        let selfHeld = null;
+        let cleaned = onDotTick ? scope.replace(BLEED_EVENT, ' ') : scope;
+        SELF_STATUS.lastIndex = 0;
+        for (let sm; (sm = SELF_STATUS.exec(scope));) {
+          if (!applied.has(sm[2])) continue;
+          selfHeld = sm[2];
+          cleaned = cleaned.replace(sm[0], ' ');
+        }
+
         const g = guardOf(
-          (onDotTick ? scope.replace(BLEED_EVENT, ' ') : scope)
-            .replace(/\b(?:critical|isCrit|isPhysical|isMagic)\b/g, ' '), opts);
+          cleaned.replace(/\b(?:critical|isCrit|isPhysical|isMagic)\b/g, ' '), opts);
         if (!g.fires) { why ??= `${label}: ${g.why}`; gated = true; continue; }
         if (g.unread) {
           // ...unless the row is the `consumeCooldown` shape, where the
@@ -2092,7 +2124,8 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const roll = chance < 1 ? `, ${Math.round(chance * 100)}% of the time` : '';
         const crit = critGated ? ' on a critical strike' : '';
         if (onDotTick) {
-          rule = { kind: 'per-dot-tick', chance, critGated, why: `${label} is played on every tick of a bleed${crit}${roll}` };
+          const held = selfHeld ? `, while ${selfHeld} is on the target - which this skill applies itself, and which the model assumes is up whenever a tick lands` : '';
+          rule = { kind: 'per-dot-tick', chance, critGated, why: `${label} is played on every tick of a bleed${crit}${roll}${held}` };
         } else if (ev.has('attack') && ev.has('combo')) {
           rule = { kind: 'per-attack-or-combo', chance, critGated, why: `${label} is played on a base attack or a combo finisher${crit}${roll}` };
         } else if (ev.has('combo')) {

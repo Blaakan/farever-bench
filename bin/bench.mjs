@@ -2094,7 +2094,12 @@ const commands = {
   // bench BELIEVES; this one reports where that belief disagrees with what the
   // game actually did, per skill, signed.
   async verify(args) {
-    const { engine } = commonSetup(args);
+    // `rank` is weapon mastery, and it is not decoration: a script that opens
+    // `if (rank >= 3)` is invisible below it. Daggers_DuplicatePoison_Skill1's
+    // whole bonus-damage hook is behind that gate, and evaluating at the
+    // default rank of 1 silently priced a quarter of the build's damage at
+    // zero. Every other command takes this from commonSetup; so does this one.
+    const { engine, rank, mix } = commonSetup(args);
     const game = requireGame(args._);
     const character = args.flags.character ?? args.flags.char;
     if (typeof character !== 'string') {
@@ -2205,7 +2210,7 @@ const commands = {
       since,
       until,
     });
-    const ev = engine.evaluate(built.loadout, {});
+    const ev = engine.evaluate(built.loadout, { rank, mix });
     const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups });
 
     if (args.flags.json) {
