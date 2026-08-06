@@ -24,7 +24,10 @@ import {
 } from '../src/rotation.mjs';
 import { slugOf, normalize, translate, commandLine } from '../src/questlog.mjs';
 import { compare } from '../src/verify.mjs';
-import { parseExtra, archetype } from '../src/capture.mjs';
+import { parseExtra, archetype, snapshots, aggregate } from '../src/capture.mjs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -4427,6 +4430,66 @@ group('capture: the probe log');
     && Object.keys(parseExtra(undefined)).length === 0);
   ok('a bare flag in extra reads as true', parseExtra('crit;hits=2').crit === true);
   ok('a value containing = keeps it', parseExtra('why=a=b').why === 'a=b');
+
+  // Build snapshots, as bench-probe v3 writes them. Exercised against a
+  // synthetic log rather than a live capture, so the reader is testable before
+  // the probe that produces them has ever been deployed.
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'bench-capture-'));
+    const path = join(dir, 'snap.csv');
+    const rows = [
+      'ts_ms,event,source,target,skill_id,amount,crit,stacks,max_stacks,extra',
+      '1000,snap,Emsey,,,,,,,level=25;key=abc',
+      '1000,snap_gear,Emsey,,Daggers_Demondash,,,,,upgrade=3;rarity=Epic;ilevel=300;flawless=1',
+      '1000,snap_gear,Emsey,,Daggers_DuplicatePoison,,,,,upgrade=4;rarity=Epic;ilevel=300',
+      '1000,snap_talent,Emsey,,Rogue_Talent_VirulentMagic,,,2,,',
+      '1000,snap_attr,Emsey,,critChance,18.6,,,,',
+      '1000,snap_hattr,Emsey,,comboPoint,3,,,,',
+      '1500,inflict,Emsey,Ratsar#1,Rogue_Sig_Finisher,240,1,,,affinity=Physical;hits=1',
+      '2000,snap,Emsey,,,,,,,level=25;key=def',
+      '2000,snap_gear,Emsey,,Bow_BigGame,,,,,upgrade=0;ilevel=260',
+      '2500,inflict,Emsey,Ratsar#1,Bow_BigGame_Skill1,180,0,,,affinity=Physical;hits=1',
+      '',
+    ].join('\n');
+    writeFileSync(path, rows);
+
+    const s = await snapshots(path, { source: 'Emsey' });
+    ok('both build snapshots are read', s.snapshots.length === 2, String(s.snapshots.length));
+
+    const first = s.snapshots[0];
+    ok('a snapshot collects the gear that followed its marker', first.gear.length === 2);
+    ok('...with the upgrade parsed as a number', first.gear[0].upgrade === 3);
+    ok('...and flawless read as a flag, not a string',
+      first.gear[0].flawless === true && first.gear[1].flawless === false);
+    near('...and the item level parsed', first.gear[0].ilevel, 300, 1e-9);
+
+    // The whole reason the snapshot exists.
+    ok('talents are captured, which the modkit dump cannot do',
+      first.talents.length === 1 && first.talents[0].id === 'Rogue_Talent_VirulentMagic');
+    near('...with their rank', first.talents[0].rank, 2, 1e-9);
+    near('the live sheet rides along', first.attrs.critChance, 18.6, 1e-9);
+    near('...including the hero-side resource block', first.hattrs.comboPoint, 3, 1e-9);
+
+    // A snapshot stands until the next one, which is what makes it a window.
+    near('a snapshot is bounded by the next one', first.until, 2000, 1e-9);
+    ok('the last snapshot is open-ended', s.snapshots[1].until === null);
+    ok('a later build does not inherit the earlier build\'s gear',
+      s.snapshots[1].gear.length === 1 && s.snapshots[1].gear[0].kind === 'Bow_BigGame');
+
+    // And the window actually selects the right damage.
+    const inWindow = await aggregate(path, {
+      source: 'Emsey', groupBy: 'skill', since: first.ts, until: first.until,
+    });
+    ok('the snapshot window selects only the damage that build did',
+      inWindow.groups.length === 1 && inWindow.groups[0].key === 'Rogue_Sig_Finisher',
+      inWindow.groups.map((g) => g.key).join(','));
+
+    // Snapshot rows must not pollute the damage stream.
+    const all = await aggregate(path, { source: 'Emsey', groupBy: 'skill' });
+    ok('snap rows are not counted as damage', all.groups.length === 2);
+
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // --- the model against the record ------------------------------------------

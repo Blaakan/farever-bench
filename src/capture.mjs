@@ -298,6 +298,89 @@ export async function aggregate(path, {
   };
 }
 
+// Build snapshots, as bench-probe v3 writes them.
+//
+// The probe emits a `snap` marker whenever the local character's build changes,
+// then a burst of `snap_gear` / `snap_talent` / `snap_arsenal` / `snap_attr` /
+// `snap_hattr` rows describing it. The name rides in `skill_id`; the value in
+// `amount`, `stacks` or `extra`.
+//
+// These are the only description of a build that is contemporaneous with the
+// damage it produced. The modkit's inventory dump is written at login and
+// carries gear alone, so a capture spanning days compared against it reads
+// every weapon since swapped out as damage the model cannot see - and every
+// talent as missing, permanently, because the dump has no field for one.
+//
+// A snapshot's `ts` is therefore also a boundary: the build it describes stands
+// until the next marker for the same actor.
+export async function snapshots(path, { source = null } = {}) {
+  const open = new Map();   // actor -> the snapshot currently being filled
+  const out = [];
+
+  const receipt = await streamCapture(path, (r) => {
+    if (!r.event || !r.event.startsWith('snap')) return;
+    if (source && r.source !== source) return;
+
+    if (r.event === 'snap') {
+      const x = parseExtra(r.extra);
+      const s = {
+        actor: r.source,
+        ts: r.ts,
+        key: x.key ?? '',
+        level: x.level != null ? Number(x.level) : null,
+        gear: [],
+        talents: [],
+        arsenals: [],
+        attrs: {},
+        hattrs: {},
+      };
+      open.set(r.source, s);
+      out.push(s);
+      return;
+    }
+
+    const s = open.get(r.source);
+    if (!s) return;   // a burst whose marker was rotated out of this file
+    const x = parseExtra(r.extra);
+    switch (r.event) {
+      case 'snap_gear':
+        s.gear.push({
+          kind: r.skill,
+          upgrade: x.upgrade === '' || x.upgrade === undefined ? null : Number(x.upgrade),
+          rarity: x.rarity === '' || x.rarity === undefined ? null : x.rarity,
+          ilevel: x.ilevel === '' || x.ilevel === undefined ? null : Number(x.ilevel),
+          flawless: x.flawless === '1',
+        });
+        break;
+      case 'snap_talent':
+        s.talents.push({ id: r.skill, rank: r.stacks ?? null });
+        break;
+      case 'snap_arsenal':
+        s.arsenals.push({ id: r.skill, value: x.value ?? null });
+        break;
+      case 'snap_attr':
+        s.attrs[r.skill] = r.amount;
+        break;
+      case 'snap_hattr':
+        s.hattrs[r.skill] = r.amount;
+        break;
+      default:
+        break;
+    }
+  });
+
+  // Each snapshot stands until the next one for the same actor.
+  const byActor = new Map();
+  for (const s of out) {
+    const prev = byActor.get(s.actor);
+    if (prev) prev.until = s.ts;
+    byActor.set(s.actor, s);
+    s.until = null;
+  }
+
+  return { ...receipt, snapshots: out };
+}
+
 // Split one actor's events into sessions - contiguous stretches of activity
 // separated by more than `gapMs` of silence. A capture is many play sessions;
 // a fight is a stretch inside one. Rates computed across the whole file are

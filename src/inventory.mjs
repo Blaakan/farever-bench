@@ -27,6 +27,50 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { emptyLoadout } from './loadout.mjs';
 
+// A loadout from a capture's own build snapshot, which is strictly better
+// evidence than the login-time dump: it was written while the damage rows were
+// being written, and it carries the talents the dump has no field for.
+//
+// The gear list arrives as item ids in equipment order, exactly as the dump's
+// does, so slot assignment is shared. What is new is `talents`, which the
+// caller can hand to the model, and `attrs` - the hero's live sheet, which is
+// what a stat-level disagreement should be checked against rather than
+// re-derived.
+export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
+  const dumpish = {
+    character: snap.actor,
+    inventory: {
+      equipped: (snap.gear ?? []).map((g) => ({
+        kind: g.kind,
+        level: g.ilevel ?? 0,
+        upgrade: g.upgrade ?? 0,
+        // The snapshot reports the authored rarity name; the dump reports an
+        // index and -1 for "never rolled one". Leaving it out lets the catalog
+        // fall back to the item's own rarity, which is the same answer.
+        rarity: -1,
+      })),
+    },
+    // Runes are not in the snapshot - the class has to come from somewhere, so
+    // an explicit --class wins and otherwise the caller supplies the dump's.
+    jobs: null,
+  };
+
+  const built = toLoadout(cat, dumpish, { level: level ?? snap.level ?? null, unit });
+  built.talents = snap.talents ?? [];
+  built.arsenals = snap.arsenals ?? [];
+  built.attrs = snap.attrs ?? {};
+  built.hattrs = snap.hattrs ?? {};
+  built.snapshotTs = snap.ts;
+  built.until = snap.until ?? null;
+  // The snapshot closes three of the four gaps the dump leaves open.
+  built.gaps = [
+    (snap.talents ?? []).length ? null : 'the snapshot recorded no talents - either none are taken or the probe could not read them',
+    'sockets and enchants are still not captured',
+    'consumables and persistent buffs are still not captured',
+  ].filter(Boolean);
+  return built;
+}
+
 export function inventoryPath(game, character) {
   return join(game, `farever-inventory-${character}.json`);
 }

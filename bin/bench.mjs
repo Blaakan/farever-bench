@@ -24,9 +24,9 @@ import {
   makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel,
 } from '../src/rotation.mjs';
 import { slugOf, endpoints, normalize, translate } from '../src/questlog.mjs';
-import { aggregate, sessions } from '../src/capture.mjs';
+import { aggregate, sessions, snapshots } from '../src/capture.mjs';
 import { compare } from '../src/verify.mjs';
-import { readDump, toLoadout, listCharacters } from '../src/inventory.mjs';
+import { readDump, toLoadout, listCharacters, fromSnapshot } from '../src/inventory.mjs';
 import { requireGame } from '../src/lib/game.mjs';
 import * as f from '../src/format.mjs';
 
@@ -2106,10 +2106,30 @@ const commands = {
       ? args.flags.capture
       : join(game, 'hlx', 'logs', 'bench-probe.csv');
 
-    const built = toLoadout(engine.cat, readDump(game, character), {
-      level: args.flags.level != null && args.flags.level !== true ? Number(args.flags.level) : null,
-      unit: typeof args.flags.class === 'string' ? args.flags.class : null,
-    });
+    const wantLevel = args.flags.level != null && args.flags.level !== true ? Number(args.flags.level) : null;
+    const wantClass = typeof args.flags.class === 'string' ? args.flags.class : null;
+
+    // A build snapshot written INTO the capture beats the modkit's login-time
+    // dump on every axis that matters: it is contemporaneous with the damage,
+    // and it carries the talents the dump has no field for. Use one when the
+    // probe has written one, unless --dump says otherwise.
+    const snaps = args.flags.dump ? { snapshots: [] } : await snapshots(capturePath, { source: character });
+    const usable = snaps.snapshots.filter((s) => (s.gear ?? []).length);
+    const snap = usable.length ? usable[usable.length - 1] : null;
+
+    let built;
+    if (snap) {
+      // The snapshot has no runes, so the class still comes from the dump when
+      // there is one - same character, and the class does not change.
+      let unit = wantClass;
+      if (!unit) {
+        try { unit = toLoadout(engine.cat, readDump(game, character)).unit; } catch { unit = null; }
+      }
+      if (!unit) die(`${character} has a capture snapshot but no rune list to name the class - pass --class.`);
+      built = fromSnapshot(engine.cat, snap, { level: wantLevel, unit });
+    } else {
+      built = toLoadout(engine.cat, readDump(game, character), { level: wantLevel, unit: wantClass });
+    }
 
     // A capture is many hours across many builds; the dump is one instant. The
     // default window is the character's last few play sessions, because that is
@@ -2119,7 +2139,17 @@ const commands = {
     const wantSessions = args.flags.sessions != null && args.flags.sessions !== true
       ? Number(args.flags.sessions) : 3;
     let since = args.flags.since != null && args.flags.since !== true ? Number(args.flags.since) : null;
+    let until = null;
     let window = null;
+    // A snapshot IS the window: the build it describes stands from the moment it
+    // was written until the next one. That is a far better boundary than "the
+    // last few sessions", which was only ever a guess at when the gear last
+    // changed.
+    if (since === null && snap) {
+      since = snap.ts;
+      until = snap.until;
+      window = { fromSnapshot: true, seconds: until ? (until - snap.ts) / 1000 : null };
+    }
     if (since === null) {
       const s = await sessions(capturePath, { source: character, gapMs: 120_000 });
       const real = s.sessions.filter((x) => x.seconds >= 30);
@@ -2137,6 +2167,7 @@ const commands = {
       target: typeof args.flags.target === 'string' ? args.flags.target : null,
       groupBy: 'skill',
       since,
+      until,
     });
     const ev = engine.evaluate(built.loadout, {});
     const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups });
