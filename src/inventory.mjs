@@ -49,10 +49,14 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
         // them is what the catalog means by a level.
         level: g.level ?? 0,
         upgrade: g.upgrade ?? 0,
-        // The snapshot reports the authored rarity name; the dump reports an
-        // index and -1 for "never rolled one". Leaving it out lets the catalog
-        // fall back to the item's own rarity, which is the same answer.
-        rarity: -1,
+        // The ROLLED rarity, which is emphatically not the authored one - this
+        // line used to discard it on the assumption that they agreed.
+        // Daggers_Demondash is authored Rare and Emsey's instance is Epic, and
+        // that costs twice: Rare's iLevelBonus is 10 against Epic's 30, so the
+        // weapon comes out two effective levels light and every stat line on it
+        // with it; and Rare permits three upgrades against Epic's four, so a
+        // four-star instance silently loses its fourth.
+        rarity: g.rarity ?? null,
       })),
     },
     // Runes are not in the snapshot - the class has to come from somewhere, so
@@ -238,11 +242,16 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
     if (!free) { ignored.push(e.kind); continue; }
 
     taken.add(free);
+    // Rarity arrives two ways. The modkit dump writes an index with -1 for
+    // "never rolled one"; a capture snapshot writes the rolled rarity's id
+    // ("Epic"). Only the id is usable - it is what the catalog keys on - so a
+    // number is treated as the dump's sentinel and dropped, and the item's
+    // authored rarity stands in.
+    const rolled = typeof e.rarity === 'string' && e.rarity ? e.rarity : null;
     loadout.gear[free] = {
       item: item.id,
       stars: e.upgrade ?? 0,
-      // -1 is the dump's "never rolled one"; the item's authored rarity stands.
-      ...(e.rarity !== undefined && e.rarity >= 0 ? { rarity: e.rarity } : {}),
+      ...(rolled ? { rarity: rolled } : {}),
       ...(e.level ? { level: e.level } : {}),
     };
     placed.push({ slot: free, item: item.id, stars: e.upgrade ?? 0 });
