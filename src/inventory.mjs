@@ -107,7 +107,28 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
   built.snapshotTs = snap.ts;
   built.until = snap.until ?? null;
 
+  // Sockets, at last. The snapshot reports the augment in each host's slot
+  // list; the loadout keys them `<slot>/<augmentType>`, so the augment's own
+  // row says which socket type it occupies and the host says which slot.
+  // Anything that does not resolve is named rather than dropped.
+  built.affixes = snap.affixes ?? [];
+  built.sockets = snap.sockets ?? [];
+  const unplacedSockets = [];
+  for (const sk of built.sockets) {
+    const aug = cat.itemById.get(sk.augment);
+    const hostSlot = built.placed.find((p) => p.item === sk.host)?.slot;
+    if (!aug || !hostSlot || !aug.augmentType) {
+      unplacedSockets.push(sk.augment);
+      continue;
+    }
+    built.loadout.augments[`${hostSlot}/${aug.augmentType}`] = aug.id;
+  }
+
   built.gaps = [
+    unplacedSockets.length
+      ? `${unplacedSockets.length} socketed augment(s) could not be placed (${unplacedSockets.slice(0, 3).join(', ')})`
+      : null,
+    built.sockets.length ? null : 'the snapshot recorded no sockets - either none are slotted or the probe could not reach them',
     talents.length
       ? null
       : 'the snapshot recorded no readable talents - either none are taken or the probe could not reach them',
@@ -118,7 +139,6 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
       ? `${built.unusable.length} item(s) in the snapshot this class cannot wear (${built.unusable.slice(0, 3).join(', ')}) - the probe read a backpack rather than the equipment; skipped`
       : null,
     ...(snap.errors ?? []).map((e) => `the probe reported it could not read ${e.what}: ${e.why}`),
-    'sockets and enchants are still not captured',
     'consumables and persistent buffs are still not captured',
   ].filter(Boolean);
   return built;

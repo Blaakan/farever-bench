@@ -344,6 +344,8 @@ export async function snapshots(path, { source = null } = {}) {
         attrs: {},
         hattrs: {},
         sheet: {},
+        affixes: [],
+        sockets: [],
         errors: [],
         events: 0,
         damage: 0,
@@ -377,6 +379,40 @@ export async function snapshots(path, { source = null } = {}) {
       case 'snap_sheet':
         s.sheet[r.skill] = r.amount;
         break;
+      // Every affix applied to the hero, with the value the sheet was built
+      // from. `skill_id` is the affix row id, `target` is what it modifies
+      // (ETAttribute:Dexterity and so on), `amount` is the applied value.
+      //
+      // Provenance has a documented limit: a base item affix and a socketed
+      // augment's affix both report source EItem(<host item>), because the
+      // gem's id is a lookup key that is discarded before application. These
+      // rows say what is applied and by which piece; snap_socket says which
+      // gems are in that piece.
+      case 'snap_affix': {
+        const x2 = parseExtra(r.extra);
+        s.affixes.push({
+          id: r.skill,
+          target: r.target,
+          value: r.amount,
+          uid: x2.uid ?? null,
+          source: x2.src ?? null,
+          target2: x2.tgt2 ?? null,
+        });
+        break;
+      }
+      // What is socketed where - gems and enchants alike, they are the same
+      // mechanism. `skill_id` is the augment's item id, `stacks` its index in
+      // the host's slot list.
+      case 'snap_socket': {
+        const x2 = parseExtra(r.extra);
+        s.sockets.push({
+          augment: r.skill,
+          index: r.stacks ?? null,
+          host: x2.host ?? null,
+          hostFlawless: x2.host_flawless === '1',
+        });
+        break;
+      }
       // The probe could not read something and said so rather than inventing a
       // row. Carried through to the report: a named gap is a result.
       case 'snap_err':
