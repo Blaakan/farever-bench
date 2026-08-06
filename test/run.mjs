@@ -23,6 +23,8 @@ import {
   makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel, conjoin, contradictory,
 } from '../src/rotation.mjs';
 import { slugOf, normalize, translate, commandLine } from '../src/questlog.mjs';
+import { compare } from '../src/verify.mjs';
+import { parseExtra, archetype } from '../src/capture.mjs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -4310,6 +4312,110 @@ group('questlog import');
   ok('a second argument that is not a build link is refused', stray.status !== 0);
   ok('...and the message names what was not understood',
     /wibble/.test(stray.stderr + stray.stdout));
+}
+
+// --- reading the capture ---------------------------------------------------
+group('capture: the probe log');
+{
+  // Targets carry an instance suffix and sources do not, so the same function
+  // has to be safe on both columns.
+  ok('a target archetype drops its instance uid',
+    archetype('Spirit_Z2W_Claws#9279') === 'Spirit_Z2W_Claws');
+  ok('a player handle is left alone', archetype('Emsey') === 'Emsey');
+  ok('a name with no uid is unchanged', archetype('Ratsar') === 'Ratsar');
+
+  // `extra` is a ";"-separated bag, and it is the only column that may itself
+  // contain a comma - so it is parsed, never split on.
+  const x = parseExtra('affinity=Magic;hits=1');
+  ok('extra decodes its key=value pairs', x.affinity === 'Magic' && x.hits === '1');
+  ok('an absent extra is an empty bag', Object.keys(parseExtra('')).length === 0
+    && Object.keys(parseExtra(undefined)).length === 0);
+  ok('a bare flag in extra reads as true', parseExtra('crit;hits=2').crit === true);
+  ok('a value containing = keeps it', parseExtra('why=a=b').why === 'a=b');
+}
+
+// --- the model against the record ------------------------------------------
+group('verify: the model against the record');
+{
+  // A capture group as capture.mjs reports one, and a sim line as sim.mjs
+  // emits one. Kept literal rather than built from the real files, because the
+  // point of these is the JOIN - a test that needs a 400 MB log to run is a
+  // test nobody runs.
+  const grp = (key, hits, total, extra = {}) => ({
+    key, hits, total, mean: total / hits, critRate: 0, p05: null, p50: null, p95: null,
+    meanGapMs: null, integrality: 1, ...extra,
+  });
+  const line = (id, hits, damage, extra = {}) => ({
+    id, name: id, hits, total: { damage }, interval: null, ...extra,
+  });
+
+  const r = compare({
+    modelLines: [line('A', 100, 1000), line('B', 10, 500), line('Ghost', 5, 250)],
+    captureGroups: [grp('A', 100, 1000), grp('B', 10, 250), grp('Unseen', 20, 400)],
+  });
+  const row = (id) => r.rows.find((x) => x.id === id);
+
+  ok('a skill both sides know is BOTH', row('A').status === 'BOTH');
+  near('...and an exact agreement reads as a zero per-hit delta', row('A').perHitDelta, 0, 1e-12);
+  ok('...and is verdicted MATCH', row('A').verdict === 'MATCH');
+
+  ok('a skill only the model claims is PHANTOM', row('Ghost').status === 'PHANTOM');
+  ok('a skill only the game recorded is MISSING', row('Unseen').status === 'MISSING');
+
+  // Signs are the whole point: the rows have to add into a ledger.
+  near('the model claiming twice the damage per hit reads +100%',
+    row('B').perHitDelta, 1, 1e-12);
+  ok('a model overclaim is positive and an underclaim is negative',
+    row('B').perHitDelta > 0 && compare({
+      modelLines: [line('A', 100, 500)], captureGroups: [grp('A', 100, 1000)],
+    }).rows[0].perHitDelta < 0);
+
+  // Coverage is the number that belongs beside a dps figure.
+  near('coverage is the share of RECORDED damage the model has any line for',
+    r.totals.coverage, 1250 / 1650, 1e-12);
+  near('unmodelled damage is counted, not ignored', r.totals.missingDamage, 400, 1e-12);
+
+  ok('coverage holes outrank tuning errors in the ordering',
+    r.rows[0].status === 'MISSING');
+
+  // Share is in percentage points, not a ratio: a skill at 2% claimed at 4% is
+  // 2pp out, and calling that "+100%" would rank it above things that matter.
+  {
+    const s = compare({
+      modelLines: [line('Big', 10, 960), line('Small', 10, 40)],
+      captureGroups: [grp('Big', 10, 980), grp('Small', 10, 20)],
+    });
+    near('share delta is a difference in percentage points',
+      s.rows.find((x) => x.id === 'Small').shareDelta, 0.04 - 0.02, 1e-12);
+  }
+
+  // The same id can arrive as both an active and a triggered line. The capture
+  // cannot tell those apart, so the join must not either.
+  {
+    const m = compare({
+      modelLines: [line('Split', 5, 50), line('Split', 5, 50)],
+      captureGroups: [grp('Split', 10, 100)],
+    });
+    ok('a skill on two model lines is folded into one row', m.rows.length === 1);
+    near('...and its per-hit is the pooled one', m.rows[0].perHitDelta, 0, 1e-12);
+  }
+
+  // A line the fight never played is not a claim about anything, so it must not
+  // turn into a PHANTOM the reader has to dismiss by hand.
+  ok('an unplayed model line is not reported as PHANTOM',
+    compare({ modelLines: [line('Never', 0, 0)], captureGroups: [grp('A', 1, 1)] })
+      .totals.phantom === 0);
+
+  ok('an empty capture leaves coverage undefined rather than 100%',
+    compare({ modelLines: [line('A', 1, 1)], captureGroups: [] }).totals.coverage === null);
+
+  // `only` scopes the comparison to a build's own kit.
+  ok('the only-set scopes which recorded skills are considered',
+    compare({
+      modelLines: [line('A', 1, 1)],
+      captureGroups: [grp('A', 1, 1), grp('Other', 9, 9)],
+      only: new Set(['A']),
+    }).totals.missing === 0);
 }
 
 // --- summary ---------------------------------------------------------------

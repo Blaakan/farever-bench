@@ -24,6 +24,10 @@ import {
   makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel,
 } from '../src/rotation.mjs';
 import { slugOf, endpoints, normalize, translate } from '../src/questlog.mjs';
+import { aggregate, sessions } from '../src/capture.mjs';
+import { compare } from '../src/verify.mjs';
+import { readDump, toLoadout, listCharacters } from '../src/inventory.mjs';
+import { requireGame } from '../src/lib/game.mjs';
 import * as f from '../src/format.mjs';
 
 export const VERSION = '0.1.0';
@@ -2085,6 +2089,117 @@ const commands = {
     console.log(f.auditBlock(engine));
     console.log('\n' + f.dim('See docs/MODEL.md for where each formula came from.'));
   },
+
+  // Hold the model against the record. Every other command reports what the
+  // bench BELIEVES; this one reports where that belief disagrees with what the
+  // game actually did, per skill, signed.
+  async verify(args) {
+    const { engine } = commonSetup(args);
+    const game = requireGame(args._);
+    const character = args.flags.character ?? args.flags.char;
+    if (typeof character !== 'string') {
+      die('verify needs --character <Name> - the character the capture recorded.\n'
+        + `Known in this install: ${listCharacters(game).join(', ') || '(none)'}`);
+    }
+
+    const capturePath = typeof args.flags.capture === 'string'
+      ? args.flags.capture
+      : join(game, 'hlx', 'logs', 'bench-probe.csv');
+
+    const built = toLoadout(engine.cat, readDump(game, character), {
+      level: args.flags.level != null && args.flags.level !== true ? Number(args.flags.level) : null,
+      unit: typeof args.flags.class === 'string' ? args.flags.class : null,
+    });
+
+    // A capture is many hours across many builds; the dump is one instant. The
+    // default window is the character's last few play sessions, because that is
+    // the stretch most likely to have been played in the gear they are wearing
+    // now. Comparing against the whole file reads their entire back catalogue
+    // of weapons as missing coverage - the first run of this command did.
+    const wantSessions = args.flags.sessions != null && args.flags.sessions !== true
+      ? Number(args.flags.sessions) : 3;
+    let since = args.flags.since != null && args.flags.since !== true ? Number(args.flags.since) : null;
+    let window = null;
+    if (since === null) {
+      const s = await sessions(capturePath, { source: character, gapMs: 120_000 });
+      const real = s.sessions.filter((x) => x.seconds >= 30);
+      if (!real.length) {
+        die(`${character} has no recorded damage in ${capturePath}.\n`
+          + 'Either the probe never saw this character, or the name is wrong.');
+      }
+      const take = real.slice(-Math.max(1, wantSessions));
+      since = take[0].startTs;
+      window = { count: take.length, of: real.length, seconds: take.reduce((a, x) => a + x.seconds, 0) };
+    }
+
+    const cap = await aggregate(capturePath, {
+      source: character,
+      target: typeof args.flags.target === 'string' ? args.flags.target : null,
+      groupBy: 'skill',
+      since,
+    });
+    const ev = engine.evaluate(built.loadout, {});
+    const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups });
+
+    if (args.flags.json) {
+      console.log(JSON.stringify({
+        character, unit: built.unit, level: built.level,
+        capture: capturePath, since, window, gaps: built.gaps,
+        modelDps: ev.throughput.dps, ...cmp,
+      }, null, 2));
+      return;
+    }
+
+    console.log(f.header(engine, VERSION) + '\n');
+    console.log(f.bold(`${character} - ${built.unit} ${built.level}`) + f.dim(
+      `  ${built.placed.length} slots from the modkit dump`));
+    if (window) {
+      console.log(f.dim(`window: last ${window.count} of ${window.of} sessions, `
+        + `${Math.round(window.seconds)}s of recorded combat`));
+    }
+    console.log(f.dim(`capture: ${cap.matched.toLocaleString()} events over ${cap.groups.length} skills`
+      + `   model: ${ev.throughput.dps.toFixed(1)} dps`));
+    console.log('');
+
+    const t = cmp.totals;
+    const pctOf = (x) => (x === null ? '-' : `${(100 * x).toFixed(1)}%`);
+    console.log(f.bold(`coverage ${pctOf(t.coverage)}`) + f.dim(
+      `  of the damage the game recorded, the model has a line for.`));
+    console.log(`  matched ${t.matched}   MISSING ${t.missing}   PHANTOM ${t.phantom}`
+      + `   per-hit: ${t.verdicts.match} match / ${t.verdicts.close} close / ${t.verdicts.miss} miss`);
+    console.log('');
+
+    const n = (x, d = 1) => (x === null || x === undefined ? '-' : x.toFixed(d));
+    const sd = (x) => (x === null || x === undefined ? '-' : `${x > 0 ? '+' : ''}${(100 * x).toFixed(1)}%`);
+    console.log(
+      f.dim('SKILL'.padEnd(38) + 'STATUS'.padEnd(9) + 'MODEL'.padStart(8) + 'LIVE'.padStart(8)
+        + 'PER-HIT'.padStart(9) + 'SHARE'.padStart(8) + 'HITS'.padStart(8) + 'CRIT'.padStart(7))
+    );
+    for (const r of cmp.rows) {
+      const line = r.id.slice(0, 37).padEnd(38) + r.status.padEnd(9)
+        + n(r.modelMean).padStart(8) + n(r.liveMean).padStart(8)
+        + sd(r.perHitDelta).padStart(9) + sd(r.shareDelta).padStart(8)
+        + String(Math.round(r.liveHits || r.modelHits)).padStart(8)
+        + (r.liveCrit === undefined ? '-' : pctOf(r.liveCrit)).padStart(7);
+      if (r.status === 'MISSING') console.log(f.warn(line));
+      else if (r.status === 'PHANTOM') console.log(f.warn(line));
+      else console.log(line);
+    }
+
+    console.log('');
+    console.log(f.dim(
+      'PER-HIT and SHARE are model MINUS capture, so a positive number is the model\n'
+      + 'claiming too much. Read PER-HIT first: it needs no clock and no fight boundary,\n'
+      + 'so a disagreement there is a formula error and nothing else.\n'
+      + 'MISSING is damage the game did and the bench cannot see. PHANTOM is damage the\n'
+      + 'bench claims and the game never recorded. Both outrank any delta.'));
+    if (built.gaps.length) {
+      console.log('\n' + f.warn('the dump cannot see:'));
+      for (const g of built.gaps) console.log(f.warn(`  - ${g}`));
+      console.log(f.dim('  Damage from any of these arrives as MISSING and is not evidence\n'
+        + '  that a formula is wrong.'));
+    }
+  },
 };
 
 // --- entry -----------------------------------------------------------------
@@ -2115,6 +2230,14 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
                    --json <file> additionally collates everything into one
   bench rotation   search for the rotation a weapon wants, and the kit with it
   bench audit      every assumption and gap in the model
+  bench verify     hold the model against a recorded capture and print the
+                   per-skill difference, signed. Needs --character <Name>,
+                   whose gear comes from the modkit's own inventory dump and
+                   whose damage comes from the HLX probe's log. Defaults to
+                   the last 3 play sessions (--sessions n, --since <ms>),
+                   optionally one target archetype (--target). --json emits
+                   the whole ledger. This is the only command that can report
+                   the model wrong without a person deciding that it is.
 
 Searching a rotation
   What is searched is a POLICY, not a sequence: an ordered list of (skill,
@@ -2344,7 +2467,9 @@ async function main(argv) {
   if (!fn) die(`unknown command "${cmd}"\n\n${USAGE}`);
   try {
     await applyQuestlog(args);
-    fn(args);
+    // `verify` streams a capture, so a command may be async now. Awaiting a
+    // non-promise is free, and without it a rejection would escape this catch.
+    await fn(args);
   } catch (e) {
     die(`\n${e.message}\n` + (process.env.BENCH_DEBUG ? '\n' + e.stack : f.dim('\n(BENCH_DEBUG=1 for a stack trace)')));
   }
