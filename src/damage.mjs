@@ -550,7 +550,17 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // steps once and demonstrably does not play these, while a status has no
       // cast to exclude them from. What a status's own guard says is a separate
       // question and it is already named in the audit.
-      const playedByScript = (stepOnNames[st.on ?? -1] ?? null) === 'Code' && !s.props?.status;
+      // A STATUS row's Code steps are its tick payload only when the status
+      // actually ticks - a looping status plays its step per tick and the dot
+      // pricing consumes it folded. A status with NO loop that plays Code
+      // steps is a different creature: an event rider worn as a buff.
+      // Sunlight's status deals 0.6x Faith on the combo finisher and Purging
+      // Strikes' 0.15x Faith per swing, and folding those into `effects` left
+      // them in a bucket nothing reads - the one place damage still vanished
+      // without a word.
+      const rowLoops = (s.steps ?? []).some((x) => x.props?.loop?.tick != null);
+      const playedByScript = (stepOnNames[st.on ?? -1] ?? null) === 'Code'
+        && (!s.props?.status || !rowLoops);
 
       const stepType = stepTypeNames[st.type ?? -1] ?? null;
       const hits = hitsOf(s, st, stepType, ownDuration, stepLives);

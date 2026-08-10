@@ -1699,6 +1699,20 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // is at rank 3, and every `minRank: 2` rider on it passes for free.
     for (const [id, nodeRank] of Object.entries(loadout.talents ?? {})) {
       noteDots(id, statusesOf(id, { runes, rank: nodeRank, talents, talentRanks }), { source: 'talent' });
+      // A talent-applied STATUS can carry a script of its own, and that script
+      // can play damage steps on events the fight raises. Sunlight's status
+      // deals 0.6x Faith on every combo finisher while it is worn; Purging
+      // Strikes' status deals 0.15x Faith on every swing and finisher. Both
+      // fell through every bucket without a word - not a dot (no tick), not a
+      // buff (no affix) - which made them the one place the model still
+      // dropped damage silently. `profileOf` runs the status through the same
+      // scripted-rider reader every skill gets, and parks what it finds for
+      // the rider pass below. The uptime assumption - the status is up when
+      // the event lands - is the same one every self-applied gate already
+      // makes, and the applier is this very talent.
+      for (const stId of statusIdsOf(id, { runes, rank: nodeRank, talents, talentRanks })) {
+        profileOf(stId, nodeRank);
+      }
       // ...and a talent that carries a damage step of its OWN, played on an
       // event rather than cast. `Cracking Blood` has one step - 0.15x Faith +
       // 0.15x Intellect of Magic - and its script plays it on a 35% roll every
@@ -2071,12 +2085,35 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       for (let m; (m = re.exec(body)) && !rule;) {
         const before = body.slice(0, m.index);
         const hookAt = before.lastIndexOf('function ');
-        const hook = hookAt >= 0 ? /function\s+([A-Za-z0-9_]+)/.exec(before.slice(hookAt))?.[1] ?? null : null;
+        let hook = hookAt >= 0 ? /function\s+([A-Za-z0-9_]+)/.exec(before.slice(hookAt))?.[1] ?? null : null;
+        let scope = enclosingBlock(before);
+        // ONE indirection through onStep. Sunlight's shape: onInflictDamage
+        // plays Steps.Trigger, and onStep - gated `s.kind == Steps.Trigger` -
+        // plays Steps.Damage. The Damage step's real event is wherever Trigger
+        // was played from, so the chain is followed one hop: find which step
+        // kind this onStep body is gated on, find where THAT step is played,
+        // and read the hook and guard there instead, keeping this scope's own
+        // conditions (a hasSkill gate on the inner hop still gates).
+        if (hook === 'onStep') {
+          const kindGate = /\w+\.kind\s*==\s*Steps\.([A-Za-z0-9_]+)/.exec(scope);
+          const parentStep = kindGate?.[1];
+          const site = parentStep
+            ? new RegExp(`\\bplayStep\\s*\\(\\s*Steps\\.${parentStep}\\b`).exec(body)
+            : null;
+          if (site) {
+            const before2 = body.slice(0, site.index);
+            const hookAt2 = before2.lastIndexOf('function ');
+            const hook2 = hookAt2 >= 0 ? /function\s+([A-Za-z0-9_]+)/.exec(before2.slice(hookAt2))?.[1] ?? null : null;
+            if (hook2 && hook2 !== 'onStep') {
+              hook = hook2;
+              scope = enclosingBlock(before2) + ' ' + scope.replace(kindGate[0], ' ');
+            }
+          }
+        }
         if (!hook || !RIDER_HOOKS.test(hook)) {
           why ??= `${label} is played from a ${hook ?? 'top-level'} hook, which is an event this fight does not produce`;
           continue;
         }
-        const scope = enclosingBlock(before);
         // A crit gate and an affinity gate are both evaluable - the fight
         // computes a crit expectation for every hit it prices, and the host's
         // own affinity is on the effect - so they are lifted out before the
