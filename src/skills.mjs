@@ -1108,6 +1108,22 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           });
           return;
         }
+        // The same rule for a cast whose whole payload is a DOT. Swirling
+        // Embers is an 18-second-cooldown cast whose only step applies an
+        // 8-second aura that ticks 0.25x(Dex+Faith); Depth Shield's cast
+        // applies orbs that strike on their own clock. Filing those in
+        // `passive` left the dot with no applier the fight could fire -
+        // "nothing gives Spear_Eruption_Skill1 a rate this model can price" -
+        // when the rate was the cooldown sitting right on the row. A quarter
+        // of the Priest's recorded damage was behind this one triage line.
+        if (bucket === active && prof.cooldown > 0 && st.dots.length) {
+          bucket.push({
+            ...extra,
+            prof: { ...prof, isFiller: false, isCombo: false },
+            applies: { self: st.self, target: st.onTarget },
+          });
+          return;
+        }
         if (own.length || st.self.length || st.dots.length) {
           passive.push({ prof, source: extra.source, affixes: own, buffs: st.self, debuffs: st.onTarget, dots: st.dots });
           return;

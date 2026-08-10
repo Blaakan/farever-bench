@@ -213,10 +213,17 @@ function runFight(spec) {
   for (const { prof, source, applies } of rotation.active) {
     const out = cast(prof, bare);
     const setsUp = (applies?.self?.length ?? 0) + (applies?.target?.length ?? 0);
+    // A cast whose entire payload is a DOT is worth pressing even though the
+    // cast itself outputs nothing: Swirling Embers deals zero on the press and
+    // 0.25x(Dex+Faith) per second for eight seconds after it. The dot fires
+    // off this skill's own cast event, so dropping the cast dropped the dot
+    // with it - a quarter of the Priest's recorded damage, refused as "nothing
+    // gives it a rate" while the rate was its own cooldown.
+    const appliesDot = (rotation.dots ?? []).some((d) => d.from === prof.id && d.on === 'cast');
     // Worth nothing TOWARD THE GOAL and sets nothing up: not in this rotation.
     // A dps fight does not spend GCDs on a pure heal; an hps fight does not
     // spend them on a nuke. A buff-applier stays - the lookahead prices it.
-    if (!worth(out.damage, out.heal, out.shield) && !setsUp) continue;
+    if (!worth(out.damage, out.heal, out.shield) && !setsUp && !appliesDot) continue;
     const cooldown = Math.max(prof.cooldown / cdrFor(prof), 0);
     actives.push({
       prof, source, out, applies,
