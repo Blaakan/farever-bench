@@ -655,7 +655,33 @@ export function buildCombat(cdb, ctx, assume = {}) {
     // than declaring one, so gating on `ownDuration` here made the fallback in
     // skills.mjs unreachable and dropped those statuses entirely.
     const looping = (s.steps ?? []).find((st) => st.props?.loop?.tick != null);
-    const periodic = looping
+    // A DETECTOR loop is not a payout clock. Depth Shield's orb status loops
+    // at 0.1s, but the looping step carries NO effects - it exists to notice a
+    // foe - and the script consumes one of the status's own stacks per hit,
+    // playing an Area step that carries the real damage. Pricing that as a
+    // 0.1s-tick DoT spread 0.55x Faith over a lifetime of detector polls and
+    // printed 0.7 a tick against the game's 152 a strike. The shape is: no
+    // periodic at all, and the Area pulses fire once per stack per
+    // application, so the pulse effects are multiplied by the stacks they
+    // spend. (The rank-3 last-orb double is not carried - one pulse of the
+    // stack's worth is credited plain, which understates rank 3 by that
+    // pulse and is stated here rather than hidden.)
+    const detector = !!looping
+      && !(looping.effects ?? []).length
+      && new RegExp(`consumeStatus\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?${s.id}\\b`)
+        .test(String(s.script ?? ''));
+    if (detector) {
+      const pulses = Math.max(1, s.props?.status?.maxStacks ?? 1);
+      // The effects list already carries every pulse-shaped Code step once -
+      // Depth Shield has two, Area and LastOrbArea - so each is scaled to its
+      // share of the stack count rather than multiplied by all of it.
+      const pulseSteps = Math.max(1, (s.steps ?? [])
+        .filter((x) => (stepOnNames[x.on ?? -1] ?? null) === 'Code' && (x.effects ?? []).length).length);
+      for (const e of effects) {
+        if (e.kind === 'Damage' || e.kind === 'Heal') e.hits = (e.hits || 1) * pulses / pulseSteps;
+      }
+    }
+    const periodic = (looping && !detector)
       ? {
         tick: skillVal(looping.props.loop.tick, s, 0.5),
         duration: ownDuration > 0 ? ownDuration : Infinity,
