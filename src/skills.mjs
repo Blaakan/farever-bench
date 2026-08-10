@@ -1256,8 +1256,22 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const g = loadout.gear[slot.id];
       if (!g?.item) continue;
       const item = cat.itemById.get(g.item);
+      // The block family is EXCLUSIVE: a hero has one block slot and the
+      // shield's wins (Hero.refreshSkills@7364 fills one slot per skill kind,
+      // first match, and the capture shows exactly one BlockMitigation affix
+      // per character - always the shield's when one is worn). The model used
+      // to grant a weapon's PhysicalBlock AND the shield's ShieldBlock and
+      // read 110 against the game's 60. The weapon's copy arrives BOTH ways -
+      // GA_Craft lists PhysicalBlock in its own item.skills and the GreatAxe
+      // itemType inherits it too - so the skip guards both loops. Dual
+      // same-class weapons were only ever safe because `seen` deduped.
+      const hasShield = Object.values(loadout.gear ?? {}).some((x) => {
+        const it2 = x?.item ? cat.itemById.get(x.item) : null;
+        return it2 && /Shield/i.test(String(it2.type ?? ''));
+      });
+      const blockShadowed = (id) => hasShield && /^(Physical|Magic)Block$/.test(id);
       for (const id of item?.skills ?? []) {
-        if (seen.has(id)) continue;
+        if (seen.has(id) || blockShadowed(id)) continue;
         const t = typeOf(id);
         if (FILLER_TYPES.has(t) || t === 'WeaponSkill' || t === 'WeaponPassive' || t === 'WeaponSubSkill') continue;
         if (INERT_TYPES.has(t)) continue;
@@ -1268,6 +1282,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       for (const s of cat.inherited(item?.type, (t) => t?.skills) ?? []) {
         const id = s.skill ?? s.ref;
         if (!id || seen.has(id) || INERT_TYPES.has(typeOf(id))) continue;
+        if (blockShadowed(id)) continue;
         pushTriggered(id, slot.id);
       }
     }
@@ -2370,8 +2385,31 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // both are Warrior talents.
       const BLEED_EVENT = /\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(Bleed|Hemorage)\s*\)/;
       const onDotTick = BLEED_EVENT.test(script);
+      let scope2 = onDotTick ? script.replace(BLEED_EVENT, ' ') : script;
+      // `!hasStatus(target, Skill.X)` where the SAME script does
+      // `addStatus(..., Skill.X)` is not a question about live state - it is
+      // "do not reapply while my own status is up". The dot machinery already
+      // treats a reapplication as a refresh, so the roll rate stands as
+      // authored and the gate is stripped rather than refused. The demon
+      // trinket is the case: 3% per damage event, unless its burn is already
+      // burning - and that guard kept 47-a-tick out of the model entirely.
+      let noReapply = null;
+      {
+        const own = new Set();
+        const SELF_APPLY = /(?:addStatus|enforceStatus|setStatus)\s*\(\s*[^,()]+,\s*(?:Skill\.)?([A-Za-z0-9_]+)/g;
+        for (let m; (m = SELF_APPLY.exec(full));) own.add(m[1]);
+        const HAS_OWN = /!?\s*hasStatus\s*\(\s*[^,()]+,\s*(?:Skill\.)?([A-Za-z0-9_]+)\s*\)/g;
+        for (let m; (m = HAS_OWN.exec(scope2));) {
+          if (!own.has(m[1])) continue;
+          noReapply = m[1];
+          scope2 = scope2.replace(m[0], ' ');
+        }
+      }
+      const reapplyNote = noReapply
+        ? `; its "not while ${noReapply} is up" gate is a refresh the dot model already absorbs`
+        : '';
       // ...and the rest of that guard decides whether the rate applies at all.
-      const g = guardOf(onDotTick ? script.replace(BLEED_EVENT, ' ') : script, opts);
+      const g = guardOf(scope2, opts);
       if (!g.fires) return { kind: 'never', why: g.why };
       if (!g.unread && onDotTick) {
         return {
@@ -2392,10 +2430,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       if (/isFinalCombo|isFinalAttack|isComboAttack/.test(script)) {
         return {
           kind: 'per-combo', chance, divisor: 1,
-          why: `vars.chance = ${chance}, and its script gates on the combo finisher`,
+          why: `vars.chance = ${chance}, and its script gates on the combo finisher${reapplyNote}`,
         };
       }
-      return { kind: 'per-attack', chance, why: `vars.chance = ${chance} on a base-attack proc` };
+      return { kind: 'per-attack', chance, why: `vars.chance = ${chance} on a base-attack proc${reapplyNote}` };
     }
 
     return null;

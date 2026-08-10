@@ -2223,7 +2223,14 @@ const commands = {
       until,
     });
     const ev = engine.evaluate(built.loadout, { rank, mix });
-    const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups });
+    // What the player actually pressed in this window, so a model line with no
+    // recorded damage can be told apart from an invented one: a skill never
+    // pressed is a rotation the human did not play, not a phantom source.
+    const pressAgg = await aggregate(capturePath, {
+      source: character, event: 'press', groupBy: 'skill', since, until,
+    });
+    const pressed = new Set(pressAgg.groups.map((g) => g.key));
+    const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed });
 
     if (args.flags.json) {
       console.log(JSON.stringify({
@@ -2254,6 +2261,7 @@ const commands = {
     console.log(f.bold(`coverage ${pctOf(t.coverage)}`) + f.dim(
       `  of the damage the game recorded, the model has a line for.`));
     console.log(`  matched ${t.matched}   MISSING ${t.missing}   PHANTOM ${t.phantom}`
+      + (t.notPressed ? `   not-pressed ${t.notPressed}` : '')
       + `   per-hit: ${t.verdicts.match} match / ${t.verdicts.close} close / ${t.verdicts.miss} miss`);
     console.log('');
 
@@ -2269,8 +2277,8 @@ const commands = {
         + sd(r.perHitDelta).padStart(9) + sd(r.shareDelta).padStart(8)
         + String(Math.round(r.liveHits || r.modelHits)).padStart(8)
         + (r.liveCrit === undefined ? '-' : pctOf(r.liveCrit)).padStart(7);
-      if (r.status === 'MISSING') console.log(f.warn(line));
-      else if (r.status === 'PHANTOM') console.log(f.warn(line));
+      if (r.status === 'MISSING' || r.status === 'PHANTOM') console.log(f.warn(line));
+      else if (r.status === 'NOT-PRESSED') console.log(f.dim(line));
       else console.log(line);
     }
 
@@ -2287,10 +2295,25 @@ const commands = {
     // itself 12% low is not a 20% damage error.
     if (built.affixes?.length) {
       const base = engine.baseStatsFor(built.unit, built.level);
+      // A snap_affix row sourced from a STATUS skill is combat state the probe
+      // caught live - Emsey logged one Devote stack mid-fight (+6 FervorRating)
+      // and Emsai was mid-dash (+0.3 MoveSpeedFactor) - and the model predicts
+      // the STANDING sheet. Both sides therefore exclude statuses: the model
+      // stopped folding them in, and the live sum drops the ones the snapshot
+      // happened to catch.
+      const skillRows = engine.cat.cdb.byId('skill');
+      const natures = engine.cat.cdb.enumValues('skill', 'nature');
+      const isStatusRow = (a) => {
+        const s = /^ESkill:(.+)$/.exec(String(a.source ?? ''));
+        if (!s) return false;
+        const row = skillRows.get(s[1]);
+        return row != null && natures[row.nature] === 'Status';
+      };
       const sums = new Map();
       for (const a of built.affixes) {
         const m = /^ETAttribute:(.+)$/.exec(String(a.target ?? ''));
         if (!m || a.value == null) continue;
+        if (isStatusRow(a)) continue;
         sums.set(m[1], (sums.get(m[1]) ?? 0) + a.value);
       }
       // Only attributes affixes fully determine. A derived one - CritChance is

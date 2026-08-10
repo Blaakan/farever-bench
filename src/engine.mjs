@@ -622,6 +622,17 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     const swingPeriod = rot.filler?.length
       ? rot.filler.reduce((s, x) => s + Math.max(x.prof.occupancy, 0.05), 0) / rot.filler.length
       : 2;
+    // THE STANDING SHEET STOPS HERE. Everything accumulated so far - gear,
+    // WeaponPower, upgrade riders, permanent affix rows, talents - is on the
+    // sheet the game shows out of combat. Everything the loop below adds is a
+    // STATUS a skill applies, and a status is only up once something applied
+    // it. Folding those into the sheet `bench verify` checks against the
+    // game's own standing arithmetic read every Devote enchant as +30
+    // FervorRating of model error - the fight was right to price it, and the
+    // character sheet was wrong to show it.
+    const standFlat = new Map(inject);
+    const standAddRatio = new Map(addRatio);
+    const standMulRatio = new Map(mulRatio);
     for (const b of buffs) {
       const src = combat.profile(b.from, rank, new Set(rot.runes ?? []));
       const cd = src?.cooldown ?? 0;
@@ -679,6 +690,23 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       else {
         mods.damageByAffinity.all = (mods.damageByAffinity.all ?? 0) + scriptDmgMult(b, 1);
         for (const a of b.affixes) if (!isScriptDmgMult(a)) applyAffix(a, b.stacks, 1);
+        // A status with NO duration is an aura you wear, not a state you
+        // enter: the Boomerang's crit aura is applied by wielding the axe and
+        // never expires, and the game's standing sheet shows it. A status with
+        // a duration - Devote's 15-second stacks - exists only once combat
+        // applies it, however permanent the fight makes it. Duration is the
+        // split, and it is the game's own.
+        if (!(dur > 0)) {
+          for (const a of b.affixes) {
+            if (isScriptDmgMult(a)) continue;
+            const atb = a.target?.attribute;
+            const kind = ctx.affix.kindOf(a.ref);
+            if (!atb || !kind) continue;
+            if (kind === 'flat') standFlat.set(atb, (standFlat.get(atb) ?? 0) + (a.val ?? 0) * b.stacks);
+            else if (kind === 'addRatio') standAddRatio.set(atb, (standAddRatio.get(atb) ?? 0) + (a.val ?? 0) * b.stacks);
+            else standMulRatio.set(atb, ctx.affix.composeMul(a.ref, standMulRatio.get(atb) ?? 1, a.val ?? 0));
+          }
+        }
       }
     }
 
@@ -738,7 +766,19 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     //
     // So both are computed and both are reported: `sheet` is what the game
     // shows you standing still, `averaged` is what the fight sees.
-    const resting = combatBase;
+    // What the game shows you standing still: the pre-status accumulators.
+    // `combatBase` keeps the permanent statuses at cap - that is what the
+    // FIGHT prices against, and the entire value of an enchant slot - but it
+    // is not the character sheet, and reporting it as one made every
+    // always-on status read as sheet error.
+    const standing = evaluateLoadout(cat, loadout, {
+      baseStatsFor,
+      injectFlat: standFlat,
+      injectAddRatio: standAddRatio,
+      injectMulRatio: standMulRatio,
+      force,
+    });
+    const resting = { ...combatBase, sheet: standing.sheet };
     for (const b of timed) {
       mods.damageByAffinity.all = (mods.damageByAffinity.all ?? 0) + scriptDmgMult(b, b.uptime);
       for (const a of b.affixes) if (!isScriptDmgMult(a)) applyAffix(a, b.stacks, b.uptime);

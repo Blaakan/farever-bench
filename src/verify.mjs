@@ -64,14 +64,18 @@ const rel = (model, live) => (live ? (model - live) / live : null);
 //
 // Returns the per-skill rows plus the totals that let a reader see whether the
 // gap is spread across everything or concentrated in a few lines.
-export function compare({ modelLines = [], captureGroups = [], only = null } = {}) {
+export function compare({ modelLines = [], captureGroups = [], only = null, pressed = null } = {}) {
   const model = new Map();
   for (const l of modelLines) {
     if (!l?.id) continue;
     const hits = l.hits ?? 0;
     const damage = l.total?.damage ?? 0;
-    // A line the fight never played is not a claim about anything.
-    if (hits <= 0 && damage <= 0) continue;
+    // A line the fight never played is not a claim about anything - and
+    // neither is a line that deals no damage. A heal or a shield cast has
+    // hits, but the capture's damage stream never sees it, so keeping it made
+    // every Priest prayer a PHANTOM: damage the model "claimed" and the game
+    // "never recorded", when nothing damage-shaped was ever claimed at all.
+    if (damage <= 0) continue;
     // A script rider carries the id `<host>#<step>`, because the model prices
     // the step separately from the cast that played it. The game does not: the
     // probe logs `dmg.baseSkill`, so every step a skill plays lands under that
@@ -114,12 +118,18 @@ export function compare({ modelLines = [], captureGroups = [], only = null } = {
     const c = live.get(id);
 
     if (!c) {
+      // Two different absences. If the player never PRESSED the skill in this
+      // window, the model simply played a rotation the human did not - that is
+      // a divergence to know about, not an invented damage source. PHANTOM is
+      // reserved for the damning case: pressed, and no damage ever recorded.
+      const neverPressed = pressed instanceof Set && !pressed.has(id);
+      const status = neverPressed ? 'NOT-PRESSED' : 'PHANTOM';
       rows.push({
-        id, name: m.name, status: 'PHANTOM',
+        id, name: m.name, status,
         modelHits: m.hits, modelDamage: m.damage,
         modelShare: modelTotal ? m.damage / modelTotal : 0,
         liveHits: 0, liveDamage: 0, liveShare: 0,
-        perHitDelta: null, shareDelta: null, critDelta: null, verdict: 'PHANTOM',
+        perHitDelta: null, shareDelta: null, critDelta: null, verdict: status,
       });
       continue;
     }
@@ -165,8 +175,11 @@ export function compare({ modelLines = [], captureGroups = [], only = null } = {
   }
 
   // Worst first, but coverage holes above tuning errors: an unmodelled skill is
-  // a bigger problem than a mispriced one, however small its share.
-  const rank = (r) => (r.status === 'MISSING' ? 3 : r.status === 'PHANTOM' ? 2 : 1);
+  // a bigger problem than a mispriced one, however small its share. A skill the
+  // player simply did not press sorts below everything - it is a note about the
+  // rotation, not about the model.
+  const rank = (r) => (r.status === 'MISSING' ? 3 : r.status === 'PHANTOM' ? 2
+    : r.status === 'NOT-PRESSED' ? 0 : 1);
   rows.sort((a, b) => {
     if (rank(a) !== rank(b)) return rank(b) - rank(a);
     return (b.liveDamage || b.modelDamage) - (a.liveDamage || a.modelDamage);
@@ -174,6 +187,7 @@ export function compare({ modelLines = [], captureGroups = [], only = null } = {
 
   const missing = rows.filter((r) => r.status === 'MISSING');
   const phantom = rows.filter((r) => r.status === 'PHANTOM');
+  const notPressed = rows.filter((r) => r.status === 'NOT-PRESSED');
   const both = rows.filter((r) => r.status === 'BOTH');
 
   return {
@@ -186,6 +200,7 @@ export function compare({ modelLines = [], captureGroups = [], only = null } = {
       matched: both.length,
       missing: missing.length,
       phantom: phantom.length,
+      notPressed: notPressed.length,
       // The share of what the game actually did that the model has any line
       // for. This is the number that belongs next to a dps figure: a model
       // explaining 78% of observed damage should never print three digits of
