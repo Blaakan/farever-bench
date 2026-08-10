@@ -2109,7 +2109,7 @@ const commands = {
     // whole bonus-damage hook is behind that gate, and evaluating at the
     // default rank of 1 silently priced a quarter of the build's damage at
     // zero. Every other command takes this from commonSetup; so does this one.
-    const { engine, rank, mix } = commonSetup(args);
+    const { engine, rank, mix, targetLevel } = commonSetup(args);
     const game = requireGame(args._);
     const character = args.flags.character ?? args.flags.char;
     if (typeof character !== 'string') {
@@ -2232,7 +2232,16 @@ const commands = {
       since,
       until,
     });
-    const ev = engine.evaluate(built.loadout, { rank, mix });
+    // PRICE AGAINST WHAT WAS HIT. `--target Dummy` filtered the capture to
+    // dummy hits and then priced the model against the default reference foe
+    // (0.25/0.25 mitigation) - so every skill read 15-25% low against a target
+    // that mitigates nothing, across three classes, and the deficit wore the
+    // costume of a formula error. The model's target is now the same one the
+    // capture was filtered to.
+    const verifyTarget = typeof args.flags.target === 'string'
+      ? engine.combat.foe(args.flags.target, built.level, targetLevel)
+      : undefined;
+    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget });
     // What the player actually pressed in this window, so a model line with no
     // recorded damage can be told apart from an invented one: a skill never
     // pressed is a rotation the human did not play, not a phantom source.

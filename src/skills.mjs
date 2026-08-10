@@ -2566,6 +2566,18 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // that survives every row is: an explicit Target/Group wins, and otherwise
     // the recipient is the step's natural subject - whoever was hit for a Hit
     // or ProjectileHit step, the caster for a Start or CastEnd one.
+    // A TALENT's steps are only ever reached through its script - the node has
+    // no cast - so a status its steps apply takes its trigger from the script's
+    // own playStep site, not from the 'applied by the cast itself' default that
+    // a talent can never satisfy. Acidic Splatter's poison cloud is the case:
+    // playStep(Steps.Area) sits behind "the signature finisher's first hit, at
+    // vars.chance x combo points", and that is a rate the fight raises.
+    const scriptSiteTrigger = (() => {
+      if (typeOf(s?.id) !== 'Talent' || !s?.script) return null;
+      const body = liveScript(s.script);
+      const m = /playStep\s*\(\s*Steps\./.exec(body);
+      return m ? triggerOf(body.slice(0, m.index), s) : null;
+    })();
     for (const st of s?.steps ?? []) {
       if (!stepLives(st)) continue;
       const ref = st.props?.status?.ref;
@@ -2589,10 +2601,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // A Status step can also carry the lifetime for a status that declares
         // none of its own - Scepter_Flamie_S2 gives its flame `dur2` = 8s while
         // Scepter_Flamie_P gives the same status -1, i.e. forever.
-        note(ref, to, undefined, st.duration);
+        note(ref, to, scriptSiteTrigger ?? undefined, st.duration);
       }
       // An effect can carry one too, and that one rides the hit.
-      for (const e of st.effects ?? []) if (e.status) note(e.status, 'Target');
+      for (const e of st.effects ?? []) if (e.status) note(e.status, 'Target', scriptSiteTrigger ?? undefined);
     }
 
     // Path 2: the script names it, possibly through a local alias.
@@ -3043,8 +3055,31 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const n = v ? skill?.vars?.[v] : null;
       if (typeof n === 'number' && n > 0 && n <= 1) chance = n;
     }
-    const combo = /isFinalCombo|isFinalAttack|isComboAttack/.test(scope);
+    // `hit.skillId == Skill.X` where X is the class's signature finisher IS
+    // the combo event by another name - Acidic Splatter gates on
+    // Rogue_Sig_Finisher and isFirstHit, which is once per finisher, i.e.
+    // exactly the event the fight already raises per combo.
+    const sigGate = /\bskillId\s*==\s*(?:Skill\.)?([A-Za-z0-9_]+)/.exec(scope)?.[1] ?? null;
+    const sigCombo = sigGate != null && typeOf(sigGate) === 'SignatureSkill';
+    const combo = sigCombo || /isFinalCombo|isFinalAttack|isComboAttack/.test(scope);
     const attack = /isBaseAttack|isBasicAttack/.test(scope);
+    // `checkProba(vars.X * cp)` where cp was read off the ComboPoint pool: the
+    // roll scales with the points the finisher spends. Priced at the CAP, with
+    // the assumption stated - a finisher build presses at full points, and at
+    // 0.2 x 4 the roll is 80%.
+    if (/checkProba\s*\(\s*vars\.[A-Za-z0-9_]+\s*\*\s*\w+/.test(scope) && /ComboPoint/.test(scope)) {
+      const v = /checkProba\s*\(\s*vars\.([A-Za-z0-9_]+)/.exec(scope)?.[1];
+      const n = v ? skill?.vars?.[v] : null;
+      if (typeof n === 'number' && n > 0) {
+        let cap = 4;
+        for (const u of cdb.lines('unit')) {
+          for (const st of u.stats ?? []) {
+            if (st.attribute === 'MaxComboPoint' && typeof st.value === 'number') { cap = st.value; break; }
+          }
+        }
+        chance = Math.min(1, n * cap);
+      }
+    }
     let on = 'cast';
     let why = `${hook ?? 'its script'} applies it`;
     // Both, when the guard is an OR of the two. `Rogue_Talent_LethalPoison`
@@ -3054,6 +3089,22 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     else if (combo) { on = 'combo'; why = 'on the combo finisher'; }
     else if (attack) { on = 'attack'; why = 'on a base attack'; }
     else if (/isWeaponSkill/.test(scope)) { on = 'weapon-skill'; why = 'on every weapon skill you press'; }
+    else if (/^onInflict(Damage|Hit)$/.test(hook ?? '') && chance < 1) {
+      // A ROLL with no predicate rides every damage instance the owner deals.
+      // The fight has no per-instance event, so it goes on the swing-and-
+      // finisher clock as a FLOOR - multi-hit casts and dot ticks also raise
+      // onInflictDamage in game, so the true rate is at least this. The demon
+      // trinket is the shape: 3% per damage instance.
+      //
+      // ONLY where a roll bounds it. An UNCONDITIONAL application on every
+      // damage instance was briefly floored too, and the optimizer showed why
+      // that cannot stand within the hour: builds stacking such statuses read
+      // 4.6x their previous total, because "at least once per swing" is a
+      // wild overclaim for appliers the game fires far more selectively than
+      // the reader understood. No roll, no floor - refused, as before.
+      on = 'attack-or-combo';
+      why = 'on every damage instance - floored to the swing and finisher clock';
+    }
     if (chance < 1) why += `, ${Math.round(chance * 100)}% of the time`;
     // A condition on live state sits on top of the event and the roll, and it
     // can only make the status land LESS often than this says. Carrying the
@@ -3077,11 +3128,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // That is a number, and refusing a number is not the same discipline as
     // refusing a guess.
     let reapply = null;
+    // ...and the target-flavoured spelling of the same rule. The demon trinket
+    // writes `!hasStatus(dmg.target, Skill.X)` - do not re-apply while MY burn
+    // is already on the victim - which is the identical no-reapply gate with
+    // the recipient named instead of the owner.
     if (unread === 'hasStatus' && appliedId
-      && new RegExp(`!\\s*(?:\\w+\\.)?hasStatus\\s*\\(\\s*(?:owner\\s*,\\s*)?(?:Skill\\.)?${appliedId}\\b`)
+      && new RegExp(`!\\s*(?:\\w+\\.)?hasStatus\\s*\\(\\s*(?:[\\w.]+\\s*,\\s*)?(?:Skill\\.)?${appliedId}\\b`)
         .test(scope.replace(/\s+/g, ' '))) {
       unread = (UNREAD_COND.exec(scope.replace(
-        new RegExp(`!\\s*(?:\\w+\\.)?hasStatus\\s*\\(\\s*(?:owner\\s*,\\s*)?(?:Skill\\.)?${appliedId}\\s*\\)`), ' '),
+        new RegExp(`!\\s*(?:\\w+\\.)?hasStatus\\s*\\(\\s*(?:[\\w.]+\\s*,\\s*)?(?:Skill\\.)?${appliedId}\\s*\\)`), ' '),
       ) ?? [null])[1] ?? null;
       reapply = 'blocked';
     }

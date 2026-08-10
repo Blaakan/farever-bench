@@ -857,11 +857,20 @@ group('statuses that tick');
     perTick > raw * 0.2 && perTick < raw * 3,
     `${perTick.toFixed(1)} per tick against a raw ${raw.toFixed(1)}`);
 
-  // A status is applied by an event; one whose event this model cannot price
-  // must be named, not silently dropped and not silently counted.
-  ok('a status nothing can trigger is reported rather than dropped',
-    rot.unmodelled.some((u) => u.id === 'Sword_Swarm_Passive_Poison'),
-    rot.unmodelled.map((u) => u.id).join(', '));
+  // A status applied "on every damage instance you deal" used to be a refusal;
+  // it is a FLOOR now - the swing-and-finisher clock, stated as such - because
+  // onInflictDamage with no predicate is an event the fight raises at least
+  // that often. The Swarm's rank-3 poison is the shape: 25% per Swarm hit in
+  // game, priced at 25% per swing/finisher here, and the capture holds 39 live
+  // ticks of it that the refusal was worth exactly nothing against.
+  {
+    const poison = rot.dots.find((d) => d.status === 'Sword_Swarm_Passive_Poison');
+    ok('an inflict-gated status is floored to the swing clock, not refused',
+      !!poison && poison.on === 'attack-or-combo' && poison.chance === 0.25,
+      poison ? `on=${poison.on} chance=${poison.chance}` : rot.unmodelled.map((u) => u.id).join(', '));
+    ok('...and it no longer sits in the refusal list',
+      !rot.unmodelled.some((u) => u.id === 'Sword_Swarm_Passive_Poison'));
+  }
 
   // A buff on a two-minute cooldown is not a permanent buff.
   const fervor = engine.evaluate(l, { rank: 3 }).buffs
