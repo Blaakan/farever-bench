@@ -900,7 +900,18 @@ export function buildCombat(cdb, ctx, assume = {}) {
     dungeon: { unit: 'D_Base_Big', label: 'dungeon mob' },
   };
 
-  function foe(name, level) {
+  // `level` is the ATTACKER's level; `targetLevel` is the level the foe
+  // actually spawned at, and they are separate dials because the game's
+  // formula uses both. getResistanceLevelScaling@20663 builds the resist POOL
+  // from the authored reduction at the TARGET's level - R = red*(385+100*L)/
+  // (1-red) - and getAffinityDamageReduction@4510 divides by 385+100*striker.
+  // So "authored 0.40" only means 40% at level parity, which is the default
+  // here because it matches every calibration to date, and because the boss
+  // rows' own `lvl` column is contradicted by measurement: Ratsar's row says
+  // 10, and inverting the clean magic channel of a real fight puts him at
+  // ~18-25 - world bosses spawn at zone level, set by world data the model
+  // does not read. A caller who knows the spawn level passes it.
+  function foe(name, level, targetLevel = null) {
     let phys, mag, label;
     const named = NAMED[name];
     if (named?.unit) {
@@ -920,10 +931,12 @@ export function buildCombat(cdb, ctx, assume = {}) {
         'Any unit id with a declared armour intent also works - see `bench targets`.'
       );
     }
+    const at = targetLevel ?? level;
     return {
-      name: label, physReduction: phys, magicReduction: mag, level,
-      armor: resistForReduction(level, phys, ctx.consts.resistFormula),
-      magicArmor: resistForReduction(level, mag, ctx.consts.resistFormula),
+      name: label + (targetLevel != null && targetLevel !== level ? ` @L${targetLevel}` : ''),
+      physReduction: phys, magicReduction: mag, level, spawnLevel: at,
+      armor: resistForReduction(at, phys, ctx.consts.resistFormula),
+      magicArmor: resistForReduction(at, mag, ctx.consts.resistFormula),
     };
   }
 
@@ -1576,7 +1589,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
       const p2 = (a2?.atbScaling ?? []).find((e) => (e.statGroup ?? 0) === 0);
       if (p2) sum += budget(loadout.level, p2.start, p2.end, ctx.consts.earlyMaxLevel);
     }
-    if (!sum) sum = budget(loadout.level, primary.start, primary.end, ctx.consts.earlyMaxLevel);
+    // No aptitudes, no WeaponPower - the sum IS the formula. The old fallback
+    // substituted the class primary's budget and handed a butterfly net the
+    // exact WeaponPower of a Legendary greatsword (0.4 x 123.6 = 49.43, found
+    // by pinning Net_Basic as mainhand and reading the sheet). fn@20784
+    // consumes only the item's own aptitudes; an empty list sums to zero.
     return 0.4 * sum;
   }
 

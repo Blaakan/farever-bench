@@ -467,6 +467,16 @@ function commonSetup(args) {
     ? (/^[A-Za-z0-9_]+$/.test(env.target) ? env.target : (/\(([A-Za-z0-9_]+):/.exec(env.target)?.[1] ?? null))
     : null;
   const targetName = String(args.flags.target ?? savedTarget ?? 'boss');
+  // The level the target SPAWNED at, when it differs from yours. The resist
+  // pool is built at the target's level and the divisor at the striker's -
+  // two dials, and "authored 0.40" is only 40% when they agree. Default is
+  // parity, which matches every calibration to date and what world bosses
+  // actually do (they spawn at zone level, whatever their unit row claims).
+  const targetLevel = args.flags['target-level'] != null && args.flags['target-level'] !== true
+    ? Number(args.flags['target-level']) : null;
+  if (targetLevel !== null && !(Number.isFinite(targetLevel) && targetLevel > 0)) {
+    die('--target-level needs a positive number');
+  }
   const rank = Number(from('rank', 'rank', engine.ctx.consts.weaponSkillMaxRank));
   const mix = Number(from('mix', 'mix', 0.5));
   const exPattern = args.flags['include-all'] ? null
@@ -503,7 +513,7 @@ function commonSetup(args) {
     profileValues[key] = v;
   }
   return {
-    engine, stars, rarities, goal, targetName, rank, mix, exclude, rarityCap, talentPoints,
+    engine, stars, rarities, goal, targetName, targetLevel, rank, mix, exclude, rarityCap, talentPoints,
     saved, fight, numFlag, profile, profileValues,
     // A bare loadout carries its own level, and the foe, the rating->percent
     // conversions and the candidate list all have to agree with it. Reporting a
@@ -561,7 +571,7 @@ function loadBuild(args, engine, level, saved = null) {
  * building for it rather than after.
  */
 function compareAcrossProfiles(s, args, profileIds) {
-  const target = s.engine.combat.foe(s.targetName, s.level);
+  const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
   const base = loadBuild(args, s.engine, s.level, s.saved);
   const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
   const restarts = s.numFlag('restarts', 1, { integer: true });
@@ -686,7 +696,7 @@ function compareAcrossProfiles(s, args, profileIds) {
  * class skills out of five, the runes on each, and the sixteen talent points.
  */
 function sweepWeaponPairs(s, args, top) {
-  const target = s.engine.combat.foe(s.targetName, s.level);
+  const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
   const base = loadBuild(args, s.engine, s.level, s.saved);
   const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
   const restarts = s.numFlag('restarts', 1, { integer: true });
@@ -914,7 +924,7 @@ const commands = {
     const loadout = loadBuild(args, s.engine, s.level, s.saved);
     const pins = applyProfile(s, loadout,
       applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
-    const target = s.engine.combat.foe(s.targetName, s.level);
+    const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
     const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s) });
     console.log(f.header(s.engine, VERSION) + '\n');
     if (ev.profile) console.log(f.profileBlock(ev.profile) + '\n');
@@ -940,7 +950,7 @@ const commands = {
     const slotIds = s.engine.cat.combatSlots().map((x) => x.id);
     if (typeof args.flags.slot !== 'string') die(`--slot is required. One of: ${slotIds.map(f.short).join(', ')}`);
     const slot = resolve(args.flags.slot, slotIds, 'slot');
-    const target = s.engine.combat.foe(s.targetName, s.level);
+    const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
     const { rows, baseScore } = rankSlot(s.engine, loadout, slot, { ...s, target });
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${loadout.class} ${s.level} - ranking ${f.short(slot)} by ${f.bold(s.goal)} vs ${target.name}`);
@@ -969,7 +979,7 @@ const commands = {
     const loadout = loadBuild(args, s.engine, s.level, s.saved);
     const pins = applyProfile(s, loadout,
       applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
-    const target = s.engine.combat.foe(s.targetName, s.level);
+    const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
     // Validated like every other number: `--restarts abc` used to make the
     // search loop run zero times and surface as a null dereference inside
     // optimize() rather than as a message.
@@ -1313,7 +1323,7 @@ const commands = {
    */
   layouts(args) {
     const s = commonSetup(args);
-    const target = s.engine.combat.foe(s.targetName, s.level);
+    const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
     const base = loadBuild(args, s.engine, s.level, s.saved);
     const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
     const restarts = s.numFlag('restarts', 3, { integer: true });
@@ -1548,7 +1558,7 @@ const commands = {
     const loadout = loadBuild(args, s.engine, s.level, s.saved);
     const pins = applyProfile(s, loadout,
       applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
-    const target = s.engine.combat.foe(s.targetName, s.level);
+    const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
     if (!loadout.gear.Slot_Weapon1?.item) {
       die('bench rotation needs a mainhand pinned - a rotation is FOR a weapon.\n'
         + '  bench rotation --class Warrior --profile armorpen \\\n'
@@ -1710,7 +1720,7 @@ const commands = {
         classSkillSlots: args.flags['class-skills'] != null && args.flags['class-skills'] !== true
           ? Number(args.flags['class-skills']) : undefined,
       });
-      const rolledTarget = rolled.combat.foe(s.targetName, s.level);
+      const rolledTarget = rolled.combat.foe(s.targetName, s.level, s.targetLevel);
       const run = (p) => rolled.evaluate(best.kit.loadout,
         { target: rolledTarget, rank: s.rank, mix: s.mix, policy: p, goal: simGoalOf(s) }).throughput;
       const a = run(null);
@@ -1972,7 +1982,7 @@ const commands = {
       if (!Number.isFinite(top) || top < 2) die('--top needs a number of weapons to pair, at least 2');
       return sweepWeaponPairs(s, args, top);
     }
-    const target = s.engine.combat.foe(s.targetName, s.level);
+    const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
     const base = loadBuild(args, s.engine, s.level, s.saved);
     const cls = s.engine.cat.classes.find((c) => c.unit === base.class);
     const restarts = s.numFlag('restarts', 1, { integer: true });

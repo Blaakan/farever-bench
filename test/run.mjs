@@ -4351,6 +4351,30 @@ group('questlog import');
     /wibble/.test(stray.stderr + stray.stdout));
 }
 
+// --- the two level dials ----------------------------------------------------
+group('mitigation uses two levels, not one');
+{
+  const engine = createEngine();
+  const K2 = engine.ctx.consts;
+  const [a, b] = K2.resistFormula;
+
+  // getResistanceLevelScaling@20663 builds the pool at the TARGET's level;
+  // getAffinityDamageReduction@4510 divides at the STRIKER's. Authored 0.40 is
+  // 40% only when the two agree.
+  const f25 = engine.combat.foe('boss', 25);
+  const fLow = engine.combat.foe('boss', 25, 10);
+  near('at parity the authored reduction is the mitigation',
+    f25.armor / (f25.armor + a + b * 25), f25.physReduction, 1e-9);
+  ok('a low-spawned boss mitigates less against a high striker',
+    fLow.armor < f25.armor);
+  near('...by exactly the pool ratio the formula predicts',
+    fLow.armor / f25.armor, (a + b * 10) / (a + b * 25), 1e-9);
+  ok('the spawn level is carried and named',
+    fLow.spawnLevel === 10 && /@L10/.test(fLow.name));
+  ok('omitting the spawn level is parity, exactly as before',
+    f25.spawnLevel === 25 && engine.combat.foe('boss', 25).armor === f25.armor);
+}
+
 // --- unit inheritance ------------------------------------------------------
 group('a unit inherits from every parent, not the first');
 {
