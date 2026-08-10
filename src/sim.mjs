@@ -339,6 +339,12 @@ function runFight(spec) {
       // critical strike fires that fraction as often.
       chance: (tr.rule.chance ?? 1) / Math.max(1, tr.rule.divisor ?? 1)
         * (tr.rule.critGated ? critChance : 1),
+      // A dot-tick rider knows which ticks it rides. `isStatusType(Bleed)` is
+      // the pool-dot event only; `isDoT()` and onInflictStatusEval are every
+      // tick of everything; `status.kind == Skill.X` is that one status's
+      // ticks and no other's - Virulent Magic rides Lethal Poison alone.
+      bleedOnly: !!tr.rule.bleedOnly,
+      statusFilter: tr.rule.status ?? null,
       // "The first <event> after each cooldown" - Dominion fires its bonus hit
       // on the first combo finisher every 20s. The gate is the authored
       // cooldown; between fires the events pass through untouched.
@@ -679,6 +685,11 @@ function runFight(spec) {
           d.damage += st.out.damage * k;
           d.heal += st.out.heal * k;
           d.ticks++;
+          // A regular dot's tick is an event too. Riders that asked for a
+          // bleed skip these - `fireDotTick` filters - but an any-dot or
+          // status-filtered rider fires here, which is where Virulent Magic
+          // lives: on Lethal Poison's own ticks.
+          fireDotTick(d.status, false);
           st.nextTick += d.tick;
         }
         if (st.expires <= until) live.delete(d);
@@ -694,7 +705,7 @@ function runFight(spec) {
           const pay = Math.min(p.owed, p.perTick);
           p.paid += pay;
           p.owed -= pay;
-          fireDotTick();
+          fireDotTick(p.status ?? null, true);
           p.nextTick += p.tick;
         }
       }
@@ -731,12 +742,20 @@ function runFight(spec) {
         && before / gaugePool.max > gauge.ratio + 1e-12) fireConduits(at);
     };
 
-    // What a bleed tick sets off. Deterministic runs credit the expected
-    // fraction of a fire, rolled ones roll - the same treatment every other
-    // proc gets, and priced against whatever is up at the time.
-    const fireDotTick = () => {
+    // What a tick sets off. Deterministic runs credit the expected fraction of
+    // a fire, rolled ones roll - the same treatment every other proc gets, and
+    // priced against whatever is up at the time.
+    //
+    // Which tick matters. A bleed-gated rider (isStatusType(Bleed)) rides pool
+    // dots only, which was all any dot-tick rider could do until the poison
+    // family arrived; an any-dot rider (isDoT, onInflictStatusEval) rides every
+    // tick of every status; a status-filtered one rides exactly the status its
+    // script named.
+    const fireDotTick = (statusId = null, isPool = true) => {
       for (const g of triggers) {
         if (g.on !== 'dot-tick') continue;
+        if (g.bleedOnly && !isPool) continue;
+        if (g.statusFilter && g.statusFilter !== statusId) continue;
         const share = rand ? (rand() < g.chance ? 1 : 0) : g.chance;
         if (!share) continue;
         const out = hit(g.prof, now);

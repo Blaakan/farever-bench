@@ -2055,13 +2055,50 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // damage event this is, the same way isBaseAttack does, and the fight
         // raises one every time a pool dot hurts the target. Cracking Blood is
         // the case: its whole payload is a Code step played on that event.
-        // `x.isDoT()` asks the same question as isStatusType(Bleed): is this
-        // damage event a tick? It is how the poison weapons phrase it.
-        const BLEED_EVENT = /\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(Bleed|Hemorage)\s*\)|\w+\.isDoT\s*\(\s*\)/;
+        //
+        // `x.isDoT()` is the same question asked wider - "is this damage event
+        // a tick", any tick, not specifically a bleed. The two are kept apart
+        // because the sim raises them apart: a bleed rider fires on pool-dot
+        // ticks, an any-dot rider on every tick of every status.
+        const BLEED_ONLY = /\w+\.isStatusType\s*\(\s*(?:StatusType\.)?(Bleed|Hemorage)\s*\)/;
+        const ANY_DOT = /\w+\.isDoT\s*\(\s*\)/;
+        const bleedOnly = BLEED_ONLY.test(scope);
         // onInflictStatusEval only ever fires because a status dealt damage, so
         // the hook itself is the tick event even when the body does not restate
         // it.
-        const onDotTick = BLEED_EVENT.test(scope) || hook === 'onInflictStatusEval';
+        const onDotTick = bleedOnly || ANY_DOT.test(scope) || hook === 'onInflictStatusEval';
+        let cleaned = scope.replace(BLEED_ONLY, ' ').replace(ANY_DOT, ' ');
+
+        // `s.status.kind == Skill.X` names WHICH dot's tick this rides. If the
+        // build applies X - its own steps, or a talent or rune it took - that
+        // is a filter the fight can honour, not a question about live state:
+        // Virulent Magic rides the ticks of Lethal Poison specifically.
+        let dotStatus = null;
+        const applied = new Set();
+        for (const st of s?.steps ?? []) {
+          for (const e of st.effects ?? []) if (e.status) applied.add(e.status);
+        }
+        const KIND_EQ = /\w+(?:\.\w+)*\.kind\s*==\s*(?:Skill\.)?([A-Za-z0-9_]+)/g;
+        KIND_EQ.lastIndex = 0;
+        for (let km; (km = KIND_EQ.exec(scope));) {
+          if (!(applied.has(km[1]) || canApply(km[1], opts) === true)) continue;
+          dotStatus = km[1];
+          cleaned = cleaned.replace(km[0], ' ');
+        }
+
+        // `hasStatusMaxStacked(_, Skill.X)` for a status the build applies is
+        // an ASSUMPTION rather than a refusal: in a sustained fight the stack
+        // cap is reached and stays reached. It is named in the rule's own
+        // `why`, because the ramp-up ticks before the cap are being credited
+        // as if they fired.
+        let maxStacked = null;
+        const MAXSTACK = /hasStatusMaxStacked\s*\(\s*[^,()]+,\s*(?:Skill\.)?([A-Za-z0-9_]+)\s*\)/g;
+        MAXSTACK.lastIndex = 0;
+        for (let mm; (mm = MAXSTACK.exec(scope));) {
+          if (!(applied.has(mm[1]) || canApply(mm[1], opts) === true)) continue;
+          maxStacked = mm[1];
+          cleaned = cleaned.replace(mm[0], ' ');
+        }
 
         // `target.hasStatus(Skill.X)` where X is a status THIS skill applies is
         // not a question about live state the reader cannot answer - the host
@@ -2069,13 +2106,8 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // it carries (that the status is up when the tick lands) is named in
         // `why` rather than hidden, because a host on a long cooldown will not
         // hold its own status through the whole fight.
-        const applied = new Set();
-        for (const st of s?.steps ?? []) {
-          for (const e of st.effects ?? []) if (e.status) applied.add(e.status);
-        }
         const SELF_STATUS = /(\w+)\.hasStatus\s*\(\s*(?:Skill\.)?([A-Za-z0-9_]+)\s*\)/g;
         let selfHeld = null;
-        let cleaned = onDotTick ? scope.replace(BLEED_EVENT, ' ') : scope;
         SELF_STATUS.lastIndex = 0;
         for (let sm; (sm = SELF_STATUS.exec(scope));) {
           if (!applied.has(sm[2])) continue;
@@ -2125,7 +2157,13 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const crit = critGated ? ' on a critical strike' : '';
         if (onDotTick) {
           const held = selfHeld ? `, while ${selfHeld} is on the target - which this skill applies itself, and which the model assumes is up whenever a tick lands` : '';
-          rule = { kind: 'per-dot-tick', chance, critGated, why: `${label} is played on every tick of a bleed${crit}${roll}${held}` };
+          const capped = maxStacked ? `, once ${maxStacked} is fully stacked - assumed held for the whole fight, so the ramp before the cap is credited as if it fired` : '';
+          const which = dotStatus ? `every tick of ${dotStatus}` : bleedOnly ? 'every tick of a bleed' : 'every tick of a damage-over-time';
+          rule = {
+            kind: 'per-dot-tick', chance, critGated, bleedOnly,
+            status: dotStatus,
+            why: `${label} is played on ${which}${crit}${roll}${held}${capped}`,
+          };
         } else if (ev.has('attack') && ev.has('combo')) {
           rule = { kind: 'per-attack-or-combo', chance, critGated, why: `${label} is played on a base attack or a combo finisher${crit}${roll}` };
         } else if (ev.has('combo')) {
@@ -2337,7 +2375,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       if (!g.fires) return { kind: 'never', why: g.why };
       if (!g.unread && onDotTick) {
         return {
-          kind: 'per-dot-tick', chance,
+          // This path only ever matched isStatusType(Bleed), so it stays on
+          // the pool-dot clock - regular dots now raise ticks too, and without
+          // this flag the two Warrior bleed talents would ride every poison.
+          kind: 'per-dot-tick', chance, bleedOnly: true,
           why: `vars.chance = ${chance} on every tick of a bleed`,
         };
       }
