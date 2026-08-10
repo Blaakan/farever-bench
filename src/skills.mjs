@@ -1100,7 +1100,12 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         //
         // Only TIMED buffs qualify. A permanent one is already in the sheet and
         // needs no cast to be true, which is the case `passive` exists for.
-        if (bucket === active && prof.cooldown > 0 && st.self.some((b) => b.duration > 0)) {
+        // ...and the same for a TARGET debuff with a duration: Death Mark is a
+        // ninety-second press whose whole payload is thirty seconds of +15% on
+        // one enemy, and a window like that is exactly what the lookahead
+        // exists to price.
+        if (bucket === active && prof.cooldown > 0
+          && (st.self.some((b) => b.duration > 0) || st.onTarget.some((d) => d.duration > 0))) {
           bucket.push({
             ...extra,
             prof: { ...prof, isFiller: false, isCombo: false },
@@ -1836,6 +1841,20 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         || (canFire(d) && canFire(held) && held.on === 'cast' && d.on !== 'cast')) {
         byStatus.set(d.status, d);
       }
+    }
+    // ONE status, EVERY applier. Collapsing to a single applier starved every
+    // multi-source dot: Lethal Poison is fed by the talent (20% per swing or
+    // finisher), Envenom (every finisher) and Venom Infusion (25% per weapon
+    // skill) SIMULTANEOUSLY - the game pins it at its stack cap, and the model,
+    // applying from exactly one channel, averaged a stack and a half of six.
+    // The losers' channels ride the winner as co-appliers: same status
+    // instance, same tally, more application events.
+    for (const d of dots) {
+      const held = byStatus.get(d.status);
+      if (!held || held === d || !canFire(d) || d.on === 'cast') continue;
+      const co = (held.coAppliers ??= []);
+      if (co.some((c) => c.on === d.on && c.from === d.from)) continue;
+      co.push({ on: d.on, chance: d.chance ?? 1, from: d.from, why: d.why ?? null });
     }
     const liveDots = [];
     for (const d of byStatus.values()) {
@@ -2983,6 +3002,25 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       if (dynamic) {
         unreadable.push({ ...entry, why: 'its affixes are scaled by a script-set dynVal, so their magnitude is not in the data' });
         continue;
+      }
+      // A status with NO affixes whose script says `dmg.dmgMult += vars.X`
+      // inside onReceiveDamageEval, gated on `sourceObject == status.instigator`,
+      // is a target debuff in disguise: +X% to everything the INSTIGATOR deals
+      // to the wearer, and nothing to anyone else. Death Mark is the shape -
+      // vars.var1 = 0.15 for thirty seconds on a ninety-second press - and it
+      // fell through every bucket because its whole payload is that one line
+      // of script. The magnitude is in the data (the status row's own vars);
+      // only the reading was missing.
+      {
+        const stRow = skills.get(statusId);
+        const sc = liveScript(stRow?.script ?? '');
+        const recv = /function\s+onReceiveDamageEval[\s\S]*?\bdmgMult\s*\+=\s*vars\.([A-Za-z0-9_]+)/.exec(sc);
+        const instigatorGated = /sourceObject\s*==\s*status\.instigator/.test(sc);
+        const v = recv ? stRow?.vars?.[recv[1]] : null;
+        if (recv && instigatorGated && typeof v === 'number' && v > 0 && wearer !== 'Self') {
+          onTarget.push({ ...entry, scriptTaken: v });
+          continue;
+        }
       }
       if (!affixes.length) continue;
       // A status whose APPLICATION is gated on live state the reader computed

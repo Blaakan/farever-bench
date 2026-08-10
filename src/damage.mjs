@@ -1014,6 +1014,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
         else if (atb === 'MagicArmor') magicArmor = apply(magicArmor);
         else if (atb === 'DamageTakenModifier') taken = apply(taken);
       }
+      // The script-side spelling of DamageTakenModifier: Death Mark's status
+      // has no affix at all, just `dmg.dmgMult += 0.15` for the instigator's
+      // hits while it is worn. Read by statusesOf into `scriptTaken`; folded
+      // here exactly where an affix saying the same thing would land.
+      if (d.scriptTaken) taken *= 1 + d.scriptTaken * (d.stacks ?? 1);
     }
     return { armor: Math.max(0, armor), magicArmor: Math.max(0, magicArmor), taken: Math.max(0, taken) };
   }

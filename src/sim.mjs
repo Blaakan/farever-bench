@@ -306,15 +306,28 @@ function runFight(spec) {
   const onWeaponSkill = [];
   const onAttack = [];
   const onCombo = [];
+  // A dot may be fed by several appliers at once - the same status instance,
+  // refreshed and stacked from every channel its build gives it. Each channel
+  // is a wrapper around the ONE descriptor, carrying its own chance and its
+  // own thinning credit; the dot's identity, tally and stacks stay single.
+  const dotChannels = [];
+  const channel = (d, on, chance) => {
+    const w = { d, chance: chance ?? 1, credit: 0 };
+    dotChannels.push(w);
+    if (on === 'attack') onAttack.push(w);
+    else if (on === 'combo') onCombo.push(w);
+    else if (on === 'weapon-skill') onWeaponSkill.push(w);
+    else if (on === 'attack-or-combo') { onAttack.push(w); onCombo.push(w); }
+    return w;
+  };
   for (const d of dots) {
-    if (d.on === 'weapon-skill') onWeaponSkill.push(d);
-    else if (d.on === 'attack') onAttack.push(d);
-    else if (d.on === 'combo') onCombo.push(d);
-    else if (d.on === 'attack-or-combo') { onAttack.push(d); onCombo.push(d); }
-    else {
+    if (d.on === 'weapon-skill' || d.on === 'attack' || d.on === 'combo' || d.on === 'attack-or-combo') {
+      channel(d, d.on, d.chance);
+    } else {
       if (!onCast.has(d.from)) onCast.set(d.from, []);
       onCast.get(d.from).push(d);
     }
+    for (const c of d.coAppliers ?? []) channel(d, c.on, c.chance);
   }
   const weaponSkillIds = new Set(rotation.active
     .filter((a) => a.prof.type === 'WeaponSkill' || a.prof.type === 'WeaponSubSkill')
@@ -569,6 +582,7 @@ function runFight(spec) {
     const hit = rand && rollCrit ? (prof, st) => rollCrit(cast(prof, st), rand) : cast;
     for (const a of actives) { a.casts = 0; a.hits = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
+    for (const w of dotChannels) w.credit = 0;
     for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; g.nextReady = 0; }
     for (const mu of cdMutations) mu.credit = 0;
     for (const p of poolDots) {
@@ -774,8 +788,12 @@ function runFight(spec) {
     };
 
     const put = (list, at) => {
-      for (const d of list) {
-        const p = d.chance ?? 1;
+      for (const entry of list) {
+        // A channel wrapper carries its own chance and its own thinning
+        // credit; the descriptor underneath is shared, so every channel feeds
+        // the SAME live status instance - which is the whole point.
+        const d = entry.d ?? entry;
+        const p = entry.chance ?? d.chance ?? 1;
         if (p < 1) {
           if (rand) {
             if (rand() >= p) continue;
@@ -783,9 +801,9 @@ function runFight(spec) {
             // Deterministic thinning: let one application through every 1/p
             // events, which reproduces the same mean gap between applications
             // as the roll does without sampling.
-            d.credit += p;
-            if (d.credit < 1) continue;
-            d.credit -= 1;
+            entry.credit += p;
+            if (entry.credit < 1) continue;
+            entry.credit -= 1;
           }
         }
         const st = live.get(d);
@@ -1340,7 +1358,12 @@ function runFight(spec) {
     // many stacks were on the target, so printing the one-stack figure beside a
     // total six times larger reads as an arithmetic error in the tool.
     const perTick = ticks > 0 ? (e.damage / rolls) / ticks : 0;
-    const meanStacks = d.out.damage > 0 ? perTick / d.out.damage : 1;
+    // Back-derived from damage, the mean can drift past the cap: with several
+    // appliers the per-application SNAPSHOT varies (whatever was up at each
+    // application), so damage/ticks is not per-stack x stacks exactly. The cap
+    // is enforced where stacks live; the report must not un-enforce it.
+    const meanStacks = Math.min(d.stacks ?? 1,
+      d.out.damage > 0 ? perTick / d.out.damage : 1);
     lines.push({
       id: d.status, name: d.name, kind: 'over time', source: d.from,
       perCast: { damage: e.damage / rolls, heal: e.heal / rolls, shield: 0 },
