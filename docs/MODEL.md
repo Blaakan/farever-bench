@@ -2338,3 +2338,28 @@ getArsenalSkills@8543 said it would. What one sitting of play settled:
 - Priest, on a window three times longer: every row within +-12%, most
   single digits (Smite -0.9%, Eruption -3.5%, orb -4.5%, RadiantVerdict
   -9.9% at n=39).
+
+## Probe v5 and the calibration sitting (2026-08-11, later still)
+
+- **snap_rune: what is slotted, not what is known.** Each skill instance's
+  replicated masteries list (the storage hasMastery@6089 consults). Emsey's
+  six rows exclude Combo Ruler - so her ComboPoint cap is 5, and with
+  comboPointCap() honouring known runes the finisher priced to the decimal
+  (517.2 vs 517.3) where the as-held 6 read +8.6%. Emsai emitted zero rows
+  and his Battle Shout landed without its M3 buff again: fourteen runes
+  known, none slotted - the jobs dump is a fallback for pre-v5 captures
+  only, and the probe writes an explicit `none` marker so known-empty never
+  reads as unknown.
+- **The behind perk, measured.** A split dummy session (one minute strictly
+  behind, one strictly in front): non-crit swing means 36.23 vs 29.42 over
+  92/146 swings = +23.2% live, against the model's priced sum of +25.0% -
+  the perk arithmetic verifies. This player's natural dummy positioning
+  measured behindFraction ~0; the sim keeps assuming 1 for build rankings
+  (best case, stated), and verify takes --behind-fraction for the honest
+  dummy ledger. The front half also isolates a ~+9% swing surplus that the
+  behind assumption used to hide - the Rogue tail's next question, along
+  with Demondash's Burn (-24%).
+- **The snapshot chooser weighs evidence on the verified target.** A dummy
+  calibration followed by a rift left the newest snapshot rich in
+  everything but dummy hits; the target-blind pick returned an all-PHANTOM
+  ledger once. Snapshots now carry per-archetype event counts.
