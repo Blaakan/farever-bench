@@ -2916,10 +2916,26 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     const poolFraction = new Map();
     if (s?.script) {
       const body = liveScript(s.script);
+      // The banked share is a VAR, and vars are rank-resolved: Demondash's
+      // passive authors var1 = 0.2 with a rankOverride restating 0.3 from
+      // rank 2, and the capture proves the live fraction to the integer
+      // (status_on amounts 61/77/101 against feeding hits 202/257/335 are
+      // round(0.3 x hit); 0.2 would read 40/51/67). Reading the raw row
+      // undercut every tick by a third and hid behind a feed-set error that
+      // overcounted by roughly the same amount - until a better arsenal
+      // moved the two in opposite directions.
+      const varAt = (key) => {
+        let v = s.vars?.[key];
+        for (const ov of (s.props?.rankOverride ?? []).slice()
+          .sort((a, b) => (a.minRank ?? 0) - (b.minRank ?? 0))) {
+          if ((ov.minRank ?? 0) <= rank && ov.vars?.[key] != null) v = ov.vars[key];
+        }
+        return v;
+      };
       const local = new Map();
       POOL_LOCAL.lastIndex = 0;
       for (let mm; (mm = POOL_LOCAL.exec(body));) {
-        const v = s.vars?.[mm[2]];
+        const v = varAt(mm[2]);
         if (typeof v === 'number' && v > 0) local.set(mm[1], v);
       }
       ADD_STATUS_3.lastIndex = 0;
@@ -2929,7 +2945,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         if (!id) continue;
         const t = arg.trim();
         const direct = /^\w+\.amount\s*\*\s*vars\.([A-Za-z0-9_]+)$/.exec(t);
-        const frac = direct ? s.vars?.[direct[1]] : local.get(t);
+        const frac = direct ? varAt(direct[1]) : local.get(t);
         if (typeof frac !== 'number' || !(frac > 0)) continue;
         // WHICH damage feeds the pool is the HOOK's business before it is the
         // guard's. `onInflictDamage` is the owner-global hook - Hemorrhage
@@ -2957,6 +2973,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           crit: /\bcritical\b|\bisCrit\b/.test(scope),
           physical: /\bisPhysical\b/.test(scope),
           magic: /\bisMagic\b/.test(scope),
+          // `dmg.isWeaponSkill` is skill type 7 exactly (isWeaponSkill@6054)
+          // - Demondash's pool banks weapon-skill hits ONLY, and feeding it
+          // from every swing and finisher overcounted its basket by ~63%.
+          weaponSkill: /\bisWeaponSkill\b/.test(scope),
           excludesDot: /isDoT/.test(body),
         });
       }

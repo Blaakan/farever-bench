@@ -684,6 +684,17 @@ function runFight(spec) {
     const feedPools = (out, at, fromId, scale = 1) => {
       for (const p of poolDots) {
         if (p.pool.own && p.from !== fromId) continue;
+        // A weapon-skill-scoped pool eats weapon-skill hits ONLY - the guard
+        // is `dmg.isWeaponSkill`, which is skill type 7 exactly - so swings,
+        // finishers and class casts must not feed it. Demondash's Burn was
+        // fed from the whole rotation, an overcount that happened to cancel
+        // its under-read fraction until a better arsenal moved the two apart.
+        // A script rider's `host#step` id feeds as its host: the duplicate
+        // hits are the weapon skill's own damage in the game's eyes.
+        if (p.pool.weaponSkill) {
+          const host = fromId?.includes('#') ? fromId.slice(0, fromId.indexOf('#')) : fromId;
+          if (!weaponSkillIds.has(host)) continue;
+        }
         const src = scale * (p.pool.crit
           ? (p.pool.magic ? (out.critMagic ?? 0)
             : p.pool.physical ? (out.critPhysical ?? 0)
@@ -695,7 +706,20 @@ function runFight(spec) {
         p.fed += src;
         p.owed += src;
         p.perTick = p.owed / p.lifeTicks;
-        if (p.expires <= at) p.nextTick = at + p.tick;
+        // The loop RESTARTS on every application, not only on expiry: the
+        // live lattice shows a 2s-tick status silent through sub-2s spam and
+        // each tick landing ~1.9s after the last feed - the refresh resets
+        // the clock (dur=6;refresh_dur=6 on every status_on). But only where
+        // the SIM's feeds are discrete events too: a crit-gated pool is fed
+        // the EXPECTED crit share of every swing - a continuous smear where
+        // the game feeds one event per actual crit - and resetting on the
+        // smear stalls the clock forever. Discrete live, discrete in the sim:
+        // reset. Smeared in the sim: expiry-anchored, as before.
+        if (p.pool.crit) {
+          if (p.expires <= at) p.nextTick = at + p.tick;
+        } else {
+          p.nextTick = at + p.tick;
+        }
         // max(new window, remaining) - a refresh never shortens the status
         // (Status.refresh@14446).
         p.expires = Math.max(p.expires, at + (Number.isFinite(p.duration) ? p.duration : fight));
@@ -749,11 +773,16 @@ function runFight(spec) {
       for (const p of poolDots) {
         if (!(p.tick > 0)) continue;
         while (p.nextTick <= Math.min(until, p.expires) && p.nextTick <= fight) {
-          p.ticks++;
           const pay = Math.min(p.owed, p.perTick);
-          p.paid += pay;
-          p.owed -= pay;
-          fireDotTick(p.status ?? null, true);
+          // A tick that pays nothing is not a tick: the live log records no
+          // row for an empty bank, and counting one diluted the per-hit mean
+          // the ledger prints.
+          if (pay > 0) {
+            p.ticks++;
+            p.paid += pay;
+            p.owed -= pay;
+            fireDotTick(p.status ?? null, true);
+          }
           p.nextTick += p.tick;
         }
       }

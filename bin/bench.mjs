@@ -2272,6 +2272,7 @@ const commands = {
       : null;
 
     let built;
+    let runeNote = null;
     if (snap) {
       // The snapshot has no runes, so the class still comes from the dump when
       // there is one - same character, and the class does not change.
@@ -2288,10 +2289,36 @@ const commands = {
       // pricing every rune-gated step as not taken: RadiantVerdict's whole
       // 8-second zone is behind its M1 rune, and the row read +158% per hit
       // against a live mean that is mostly zone ticks.
+      let runeSource = built.runesKnown ? 'snapshot' : null;
       if (!built.runesKnown && !Object.keys(built.loadout.runes ?? {}).length) {
         try {
           built.loadout.runes = toLoadout(engine.cat, readDump(game, character)).loadout.runes ?? {};
+          if (Object.keys(built.loadout.runes).length) runeSource = 'dump';
         } catch { /* no dump - the snapshot stands alone */ }
+      }
+      // Capture-proven overrides. Two reasons to need one: a pre-v5 capture
+      // has no slotted truth at all, and a v5 cache read can be stale-EMPTY
+      // (the per-instance masteries cache is skipped on client replicas -
+      // Emsai's Surging Force decomposed only WITH its M3 in the same window
+      // the snapshot claimed zero runes). `--rune A,B` slots them on top of
+      // whatever the sources above produced.
+      const runeOverrides = (args.repeated?.rune ?? [])
+        .flatMap((v) => String(v).split(',')).map((x) => x.trim()).filter(Boolean);
+      if (runeOverrides.length) {
+        const known = new Set();
+        for (const row of engine.cdb.lines('skill')) {
+          for (const m of row.mastery ?? []) if (m?.id) known.add(m.id);
+        }
+        built.loadout.runes ??= {};
+        for (const id of runeOverrides) {
+          if (!known.has(id)) die(`--rune ${id}: no skill in the data carries a mastery by that id`);
+          built.loadout.runes[id] = id;
+        }
+        runeSource = (runeSource ? runeSource + '+' : '') + 'override';
+      }
+      if (runeSource === 'dump') {
+        runeNote = 'runes: from the jobs dump, which lists what is KNOWN, not what is slotted - '
+          + 'rune-gated rows may be phantom (FaithfulWinds was). Re-capture with probe v5+ for the slotted truth.';
       }
     } else {
       built = toLoadout(engine.cat, readDump(game, character), { level: wantLevel, unit: wantClass });
@@ -2392,6 +2419,7 @@ const commands = {
     console.log(f.bold(`${character} - ${built.unit} ${built.level}`) + f.dim(
       `  ${built.placed.length} slots from ${snap ? 'the capture\'s own snapshot' : 'the modkit dump'}`));
     if (snapNote) console.log(f.warn(snapNote));
+    if (runeNote) console.log(f.warn(runeNote));
     if (window?.fromSnapshot) {
       console.log(f.dim(`window: the snapshot's own span - ${window.events.toLocaleString()} events`
         + (window.seconds ? ` over ${Math.round(window.seconds)}s` : ', open-ended')));
