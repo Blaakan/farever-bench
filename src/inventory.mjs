@@ -101,8 +101,13 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
     // The probe keys by the WEAPON'S ITEM KIND (HeroSpecialization.arsenals
     // is per weapon, not per hand); only selections for weapons actually WORN
     // reach the loadout - the rest are owned arsenals sitting in the bag.
+    // And NOT the mainhand: a weapon in the main slot grants everything it
+    // has, and its arsenals entry is dormant state from when it sat in the
+    // arsenal - Emsey's mainhand entry lists one skill while the capture
+    // shows Skill2 pressed live, so honouring it made a pressed skill
+    // MISSING. The selection constrains the slots the game constrains.
     for (const [host, ids] of Object.entries(snap.weaponSkills)) {
-      const slot = ['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']
+      const slot = ['Slot_Weapon2', 'Slot_OffhandWeapon']
         .find((sl) => built.loadout.gear[sl]?.item === host);
       if (!slot) continue;
       const good = ids.filter((id) => cat.cdb.has('skill', id));

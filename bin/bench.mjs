@@ -2241,7 +2241,12 @@ const commands = {
     //
     // Only then by how much damage was recorded under it, since the last
     // snapshot of a session is written as the player logs out.
-    const richness = (x) => ((x.sockets ?? []).length ? 1 : 0) + ((x.affixes ?? []).length ? 1 : 0);
+    // Each richness point is a probe generation: sockets and affixes arrived
+    // with v3, the weapon-skill selection with v4 - and a snapshot that
+    // carries the selection beats one that merely saw more damage, because
+    // the selection is the build fact the older snapshot CANNOT have.
+    const richness = (x) => ((x.sockets ?? []).length ? 1 : 0) + ((x.affixes ?? []).length ? 1 : 0)
+      + (x.weaponSkills && Object.keys(x.weaponSkills).length ? 1 : 0);
     const snap = usable.length
       ? usable.reduce((best, c) => {
         if (c.slots !== best.slots) return c.slots > best.slots ? c : best;
