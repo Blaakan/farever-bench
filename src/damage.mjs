@@ -1271,7 +1271,9 @@ export function buildCombat(cdb, ctx, assume = {}) {
         let n = Math.min(wantTargets, e.area.maxTargets ?? Infinity);
         const p = e.area.hitStrategy?.case === 'Proportion' ? e.area.hitStrategy.args.prop : null;
         if (p != null) n = Math.ceil(n * Math.min(1, Math.max(0, p)));
-        targets = Math.max(0, n - (e.area.ignoreMainTarget ? 1 : 0));
+        // A position-cast area is anchored to the ground - the aim target
+        // standing in it is hit like anyone else, whatever the row authors.
+        targets = Math.max(0, n - (e.area.ignoreMainTarget && !e.atPosition ? 1 : 0));
       }
       // A script rider whose site guards `target != ctx.aimTarget` lands only
       // on targets other than the one aimed at - none against a lone dummy.
@@ -1733,6 +1735,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       critChance: Math.min(1, Math.max(0, (sheet.get('CritChance') ?? 0) / 100)),
       timedBuffs: live?.timedBuffs ?? [],
       fight: opts.fight ?? 200,
+      chainFeeds: opts.chainFeeds ?? [],
       fights: opts.fights ?? 1,
       lookahead: opts.lookahead ?? 0,
       seed: opts.seed ?? 0x9e3779b9,

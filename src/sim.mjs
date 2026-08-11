@@ -100,7 +100,7 @@ function runFight(spec) {
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
     poolScale = null, poolFactor = null, goal = null, chainResets = true,
-    swingVariance = 0, comboWindow = 0.6, empowerments = [], stackProcs = [], markProcs = [],
+    swingVariance = 0, comboWindow = 0.6, empowerments = [], stackProcs = [], markProcs = [], chainFeeds = [],
   } = spec;
   // The objective the derived player maximises - see `goalWeights`.
   const [wDmg, wHeal, wShield] = goalWeights(goal);
@@ -646,6 +646,7 @@ function runFight(spec) {
     }
     const armAll = () => { for (const r of emp.values()) r.p += (1 - r.p) * r.chance; };
     let activeCasts = 0;
+    let chainFeedAt = 0;
     // --- summons, and the charge bank they feed -------------------------------
     // A summoner's cast opens a window; its pets swing on their own authored
     // period inside it, each swing crediting a pet line AND one charge; a
@@ -656,6 +657,11 @@ function runFight(spec) {
       sp, out: cast(sp.petProf, bare), until: 0, hits: 0, damage: 0,
     }));
     const chargeBank = rotation.chargeDump ? { ...rotation.chargeDump, value: 0 } : null;
+    // The next-weapon-skill register: armed per combo finisher, spent by the
+    // next weapon-skill cast at +amount in the additive bracket. Applied as a
+    // straight multiplier here - the cast's other riders are ~4%, so the
+    // additive-bracket exact form differs by under a point, stated not hidden.
+    let wsArmed = false;
     let summonCursor = 0;
     const advanceSummons = (until) => {
       if (!(until > summonCursor)) return;
@@ -1079,6 +1085,19 @@ function runFight(spec) {
       // Which casts are ready and still fit before the bell. "Ready" now means
       // the charge is back AND the pool can pay for it.
       advanceSummons(t);
+      // Off-model active presses (a replay feed) advance the chain counter:
+      // Blink and MysticEmpowerment fed the live Mage chain while the model
+      // never pressed them.
+      while (chainFeedAt < chainFeeds.length && chainFeeds[chainFeedAt] <= t) {
+        chainFeedAt++;
+        activeCasts++;
+        for (const r of comboRegs) {
+          if (r.every > 0 && activeCasts % r.every === 0) {
+            if (r.chainSpend) r.armed = true;
+            else { r.p += (1 - r.p) * r.chance; if (r.firesConduits && conduitTriggers.length) fireConduits(t); }
+          }
+        }
+      }
       const ready = [];
       for (let i = 0; i < actives.length; i++) {
         if (state[i].charges <= 0) continue;
@@ -1190,6 +1209,10 @@ function runFight(spec) {
           };
         }
         if (reg) reg.p = 0;   // one-shot, spent whether or not it was armed
+        if (rotation.wsRider && wsArmed && weaponSkillIds.has(a.prof.id)) {
+          wsArmed = false;
+          out = { ...out, damage: out.damage * (1 + rotation.wsRider.amount) };
+        }
         // The charge dump: one missile per banked charge, the whole bank in
         // one press - damage, hits and the physical counter all scale
         // linearly with the count consumed.
@@ -1299,6 +1322,7 @@ function runFight(spec) {
       }
       chainIndex++;
       if (link.prof.isCombo) combos++; else swings++;
+      if (rotation.wsRider && link.prof.isCombo) wsArmed = true;
       // The finisher arms every register the build carries. `isFinalAttack@6047`
       // is `inf.type == 4` (AttackCombo), which is exactly `isCombo` here.
       if (link.prof.isCombo && emp.size) armAll();

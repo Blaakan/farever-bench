@@ -1022,8 +1022,12 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
             });
             continue;
           }
-          const stepEffects = r.rule.notAimTarget
-            ? r.step.effects.map((e) => ({ ...e, notAimTarget: true }))
+          const stepEffects = (r.rule.notAimTarget || r.rule.atPosition)
+            ? r.step.effects.map((e) => ({
+              ...e,
+              ...(r.rule.notAimTarget ? { notAimTarget: true } : {}),
+              ...(r.rule.atPosition ? { atPosition: true } : {}),
+            }))
             : r.step.effects;
           folded = (folded ?? base.effects)
             .concat(foldRider(stepEffects, (r.rule.chance ?? 1) * (r.rule.perCast ?? 1)));
@@ -2095,6 +2099,28 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       break;
     }
 
+    // The NEXT-WEAPON-SKILL register: Demondash's finisher (onHit, rank >= 3)
+    // puts a status on the owner whose whole script is `isWeaponSkill() ->
+    // dmgMult += vars.damage; stop()` - +25% on the next weapon-skill hit,
+    // consumed. The conditional-buff refusal correctly keeps it off the
+    // sheet; the FIGHT arms it per finisher and spends it on the next
+    // weapon-skill cast, which is what live shows (8 of 23 Demondash_Skill1
+    // hits at the +25% plateau).
+    let wsRider = null;
+    for (const x of filler) {
+      if (!x.prof.isCombo) continue;
+      const body = liveScript(skills.get(x.prof.id)?.script ?? '');
+      const add = /addStatus\s*\(\s*owner\s*,\s*(?:Skill\.)?(\w+)/.exec(body);
+      if (!add) continue;
+      const gate = /rank\s*>=\s*(\d+)/.exec(body.slice(0, add.index));
+      if (gate && rank < Number(gate[1])) continue;
+      const row = skills.get(add[1]);
+      const m = /onInflictDamageEval[\s\S]{0,200}?isWeaponSkill\s*\(\s*\)[\s\S]{0,160}?dmgMult\s*\+=\s*vars\.(\w+)[\s\S]{0,100}?stop\s*\(\s*\)/
+        .exec(liveScript(row?.script ?? ''));
+      const v = m ? row.vars?.[m[1]] : null;
+      if (typeof v === 'number' && v > 0) { wsRider = { amount: v, status: add[1] }; break; }
+    }
+
     // Costs the data does not declare, read from the bytecode instead.
     // Mage: `Skill.getSparkCost@7986` - a weapon skill costs
     // round(max(Mage_Spark_SpellMinCost, cooldown x Mage_Spark_SpellCDCostRatio)),
@@ -2308,6 +2334,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       resources: { gains, tracked: [...tracked], capOverride: poolCapOverride },
       summons,
       chargeDump,
+      wsRider,
     };
   }
 
@@ -2545,6 +2572,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
             const chan = (prof.effects ?? []).find((e2) => e2.stepId === ownStep);
             if (chan?.spread && (chan.ticks ?? 1) > 1) perCast = chan.ticks;
           }
+          // ...and TIMES a script loop around the playStep site: Demondash's
+          // Skill2 plays its Projectiles step round(vars.var1) times per
+          // cast (3 at rank 2) - live, 13 presses threw 30.
+          {
+            const lead = body.slice(Math.max(0, m.index - 260), m.index);
+            const lm = /for\s*\(\s*\w+\s+in\s+0\.\.\.round\(\s*vars\.(\w+)\s*\)\s*\)/.exec(lead);
+            const lv = lm ? s?.vars?.[lm[1]] : null;
+            if (typeof lv === 'number' && lv > 1) perCast *= Math.round(lv);
+          }
           rule = prof.isCombo
             ? { kind: 'per-combo', chance, divisor: 1, critGated, why: `${label} is played by the finisher itself${crit}${roll}` }
             : prof.isFiller
@@ -2562,6 +2598,14 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // was crediting it a full hit per cast on a single target, which is
         // half of why that row read +89.6% per hit.
         if (rule && /\btarget\s*!=\s*(?:ctx\.)?aimTarget\b/.test(scope)) rule.notAimTarget = true;
+        // A step played AT A POSITION - playStep(Steps.X, null, pos) - is
+        // anchored to the ground, not to the aim target, so an authored
+        // ignoreMainTarget on its area does NOT exclude the target standing
+        // there: Demondash Skill2's AOE hit the lone dummy 10 times in 28
+        // projectile hits while the model zeroed it.
+        if (rule && new RegExp('playStep\\s*\\(\\s*Steps\\.' + step.stepId + '\\s*,\\s*null\\s*,').test(body)) {
+          rule.atPosition = true;
+        }
       }
       if (rule) riders.push({ step, rule });
       else {
@@ -2621,9 +2665,14 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       id: `${prof.id}#${step.stepId}`,
       name: prof.name,
       // A rider whose site guards `target != aimTarget` lands on nobody at
-      // one target; the pricing site reads the flag off each effect.
-      effects: rule?.notAimTarget
-        ? step.effects.map((e) => ({ ...e, notAimTarget: true }))
+      // one target; one played at a position keeps the aim target in its
+      // area. The pricing site reads both flags off each effect.
+      effects: (rule?.notAimTarget || rule?.atPosition)
+        ? step.effects.map((e) => ({
+          ...e,
+          ...(rule.notAimTarget ? { notAimTarget: true } : {}),
+          ...(rule.atPosition ? { atPosition: true } : {}),
+        }))
         : step.effects,
       // It is not a cast: it costs no time, no cooldown and no resource, and it
       // is not the base-attack chain even when its host is.

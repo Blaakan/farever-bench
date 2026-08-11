@@ -2417,6 +2417,7 @@ const commands = {
     const pressed = new Set(pressAgg.groups.map((g) => g.key));
     let policy = null;
     let fightLen = null;
+    let chainFeeds = null;
     let divergence = null;
     // --replay: hold the model to the capture's own PRESS SEQUENCE, not just
     // its press SET. The sim's chooser is replaced by the recorded timeline -
@@ -2445,6 +2446,22 @@ const commands = {
       }
       seq.length = cut;
       fightLen = seq.length ? seq[seq.length - 1].t + 15 : null;
+      // Presses the model holds no active for still advance the game's chain
+      // counter when their type is active-ish (isActiveSkill@6049: weapon,
+      // class and signature skills) - Blink and MysticEmpowerment fed the
+      // live Mage chain while the model's counter never saw them, which is
+      // why replay refused chain-reset presses the player demonstrably made.
+      try {
+        const rotR = engine.plan.resolve(built.loadout, rank);
+        const knownIds = new Set([
+          ...(rotR.active ?? []).map((a) => a.prof.id),
+          ...(rotR.active ?? []).map((a) => a.via).filter(Boolean),
+        ]);
+        const activeish = new Set(['WeaponSkill', 'ClassSkill', 'SignatureSkill', 'WeaponSubSkill']);
+        chainFeeds = seq
+          .filter((p) => !knownIds.has(p.id) && activeish.has(engine.plan.typeOf(p.id)))
+          .map((p) => p.t);
+      } catch { /* no feeds - replay still runs */ }
       divergence = { pressedLate: 0, notReady: 0, unknown: 0, replayed: 0, total: seq.length };
       let cursor = 0;
       policy = ({ ready, actives, t }) => {
@@ -2475,7 +2492,7 @@ const commands = {
         return -1;
       };
     }
-    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy, fight: fightLen });
+    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy, fight: fightLen, chainFeeds });
     const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed });
 
     if (args.flags.json) {
