@@ -494,8 +494,14 @@ function fillTemplate(desc, vars, skill, skills = null) {
  * The State's +1 lives on NO sheet the model builds - it exists only while the
  * status instance does - which is why the pool cap takes this value as an
  * override rather than reading MaxComboPoint off the evaluated sheet.
+ *
+ * WHEN THE RUNES ARE KNOWN, the mastery gate is honoured instead of assumed:
+ * a v5 capture's snap_rune rows say what hasMastery would answer, and Emsey's
+ * say Rogue_Finisher_M1 without M2 - so her cap is 5, not the 6 the as-held
+ * assumption priced (+8.6% on the finisher in the window that proved it).
+ * `runes = null` means unknown, and the assumption stands as before.
  */
-function comboPointCap(cdb) {
+function comboPointCap(cdb, runes = null) {
   const unit = cdb.lines('unit').find((u) => (u.stats ?? []).some((s) => s.attribute === 'MaxComboPoint'));
   if (!unit) return 4;
   let cap = 4;
@@ -513,9 +519,13 @@ function comboPointCap(cdb) {
     cap += flatOf(id);
     // The mastery-applied State: a unit skill whose script guards addStatus
     // behind hasMastery. Any status it names that carries its own
-    // MaxComboPoint affix counts once.
+    // MaxComboPoint affix counts once - if the gate passes.
     const src = String(cdb.byId('skill').get(id)?.script ?? '');
     if (!/hasMastery\s*\(/.test(src) || !/addStatus\s*\(\s*owner\s*,/.test(src)) continue;
+    if (runes) {
+      const gates = [...src.matchAll(/hasMastery\s*\(\s*Mastery\.(\w+)/g)].map((m) => m[1]);
+      if (gates.length && !gates.some((g) => runes.has(g))) continue;
+    }
     for (const m of src.matchAll(/Skill\.(\w+)/g)) {
       if (!counted.has(m[1])) { counted.add(m[1]); cap += flatOf(m[1]); }
     }
@@ -2038,7 +2048,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     }
     let poolCapOverride = null;
     if (loadout.class === 'Rogue' && tracked.has('ComboPoint')) {
-      const cap = comboPointCap(cdb);
+      // Runes count as KNOWN only when the loadout actually carries a rune
+      // map (a v5 snapshot or the jobs dump) - an empty map on a bare
+      // catalog build means unknown, and the as-held assumption stands.
+      const cap = comboPointCap(cdb, Object.keys(loadout.runes ?? {}).length ? runes : null);
       const per = cdb.byId('skill').get('Rogue_Sig_Finisher')?.vars?.var1 ?? 0.3;
       for (const a of active) {
         if (a.prof.id !== 'Rogue_Sig_Finisher') continue;

@@ -325,7 +325,15 @@ export async function snapshots(path, { source = null } = {}) {
     // proportion to the evidence it covers.
     if (r.event === 'inflict') {
       const cur = open.get(r.source);
-      if (cur) { cur.events++; cur.damage += r.amount ?? 0; }
+      if (cur) {
+        cur.events++; cur.damage += r.amount ?? 0;
+        // Per-archetype counts, so a caller verifying against one target can
+        // pick the snapshot that actually saw it: a dummy calibration
+        // followed by a rift leaves the NEWEST snapshot rich in everything
+        // except dummy hits, and target-blind selection chose it.
+        const a = archetype(r.target);
+        cur.targets[a] = (cur.targets[a] ?? 0) + 1;
+      }
       return;
     }
     if (!r.event || !r.event.startsWith('snap')) return;
@@ -349,6 +357,7 @@ export async function snapshots(path, { source = null } = {}) {
         errors: [],
         events: 0,
         damage: 0,
+        targets: {},
       };
       open.set(r.source, s);
       out.push(s);
@@ -446,7 +455,11 @@ export async function snapshots(path, { source = null } = {}) {
       // this says what is active, and the difference has been caught live
       // (a Battle Shout press with no M3 buff behind it). Probe v5.
       case 'snap_rune':
-        (s.runes ??= []).push({ id: r.skill, host: x.host ?? null });
+        // The explicit empty marker: `none` with count=0 makes "zero slotted"
+        // a recorded fact rather than an absence a reader would paper over
+        // with the jobs dump's known-runes list.
+        s.runes ??= [];
+        if (r.skill !== 'none') s.runes.push({ id: r.skill, host: x.host ?? null });
         break;
       case 'snap_attr':
         s.attrs[r.skill] = r.amount;

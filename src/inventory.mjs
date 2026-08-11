@@ -121,12 +121,18 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
   // a Battle Shout buff nobody had got credited. Only ids that appear in
   // some skill row's own mastery list are accepted - the same
   // garbage-vs-gap discipline the talent rows get.
-  if ((snap.runes ?? []).length) {
+  // Field PRESENCE is the signal, not length: a v5 snapshot with the `none`
+  // marker means zero slotted - a recorded fact that must not fall back to
+  // the jobs dump's known-runes list.
+  if (snap.runes) {
     const known = new Set();
     for (const row of cat.cdb.lines('skill')) {
       for (const m of row.mastery ?? []) if (m?.id) known.add(m.id);
     }
     built.loadout.runes = {};
+    // The flag a consumer needs to NOT fall back to the jobs dump when the
+    // slotted set is known to be empty.
+    built.runesKnown = true;
     for (const r of snap.runes) {
       if (known.has(r.id)) built.loadout.runes[r.id] = r.id;
       else rejected.push(r.id);

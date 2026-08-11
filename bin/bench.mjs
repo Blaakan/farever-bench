@@ -2246,14 +2246,21 @@ const commands = {
     // carries the selection beats one that merely saw more damage, because
     // the selection is the build fact the older snapshot CANNOT have.
     const richness = (x) => ((x.sockets ?? []).length ? 1 : 0) + ((x.affixes ?? []).length ? 1 : 0)
-      + (x.weaponSkills && Object.keys(x.weaponSkills).length ? 1 : 0);
+      + (x.weaponSkills && Object.keys(x.weaponSkills).length ? 1 : 0)
+      + (x.runes ? 1 : 0);
+    // When the run verifies against ONE target, the evidence that matters is
+    // events ON that target: a dummy calibration followed by a rift leaves
+    // the newest snapshot rich in everything except dummy hits, and a
+    // target-blind pick chose it - the whole ledger came back PHANTOM.
+    const wantArchetype = typeof args.flags.target === 'string' ? args.flags.target : null;
+    const evidence = (x) => (wantArchetype ? (x.targets?.[wantArchetype] ?? 0) : x.events);
     const snap = usable.length
       ? usable.reduce((best, c) => {
         if (c.slots !== best.slots) return c.slots > best.slots ? c : best;
         const cr = richness(c.s);
         const br = richness(best.s);
         if (cr !== br) return cr > br ? c : best;
-        return c.s.events > best.s.events ? c : best;
+        return evidence(c.s) > evidence(best.s) ? c : best;
       }).s
       : null;
     // Falling back is fine; falling back QUIETLY is not. A capture that holds
@@ -2281,7 +2288,7 @@ const commands = {
       // pricing every rune-gated step as not taken: RadiantVerdict's whole
       // 8-second zone is behind its M1 rune, and the row read +158% per hit
       // against a live mean that is mostly zone ticks.
-      if (!Object.keys(built.loadout.runes ?? {}).length) {
+      if (!built.runesKnown && !Object.keys(built.loadout.runes ?? {}).length) {
         try {
           built.loadout.runes = toLoadout(engine.cat, readDump(game, character)).loadout.runes ?? {};
         } catch { /* no dump - the snapshot stands alone */ }
