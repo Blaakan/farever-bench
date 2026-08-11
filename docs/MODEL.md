@@ -2200,3 +2200,85 @@ citation in src/. The drift report names additions, removals and changes, and
 the work list routes each to its validation - an in-game log, the SHEET
 check, or a model re-read. The suite fails when a citation stops resolving;
 `--accept` records a new build only deliberately.
+
+## The residual hunt (2026-08-11)
+
+Seven residuals the verification era left were investigated in parallel
+against the capture and closed in one pass. What each one taught:
+
+- **The ComboPoint cap is three rows, not one.** The unit sheet says 4;
+  `Rogue_ComboMax` (a baseline unit skill) and `Rogue_Finisher_Combo_Point`
+  (the permanent State the finisher's checkComboPoints() applies under the
+  Combo Ruler mastery) each add a TAttribute_Flat MaxComboPoint +1. Live
+  finisher hits quantize as A x (1 + 0.3c) with c = 6 on nine of ten hits.
+  `comboPointCap()` reads all three off the rows; the finisher's spend, the
+  checkProba(vars.x * cp) proc roll, and the fight's pool cap (an override -
+  the State's +1 is on no sheet the model builds) all consume it.
+  Sig finisher: -18.7% -> +3.4%.
+- **An op-2 dynVal is a floor, not a mystery.** getAffixModVal@20794: op 0
+  multiplies the authored value by the script-set dynVal (worth 0 until a
+  script writes), op 1 replaces, op 2 ADDS - and a fresh instance reads
+  dynVal 0, so the authored value is guaranteed. Crusader's +10 CritChance,
+  +10% damage, shield and heal, and 10 flat CDR are credited at ONE stack
+  (maxStacks 300 is the growth channel) at 20/120 uptime; the addDynVal
+  growth stays refused and flagged. Live in-buff crit +11.96 points agrees.
+- **The carrier's bracket belongs to self-worn Buffs.** initVars@5150 seeds
+  every tick's SkillContext from the status's OWNER: an enemy-worn debuff
+  ticks at the foe's ~1.0, a self-carried Buff at the player's
+  (1 + fervor + mastery). Same flag (`tickCarrierSelf`), same
+  over-generalisation, as the tick-crit rule.
+- **A swing-triggered tick inherits the swing's by-type crit.**
+  PurgingStrikes plays its damage step synchronously inside onInflictDamage
+  behind isBaseAttack || isFinalCombo; ZealousFighter's "+8 crit on attacks"
+  prices the tick too. `tickOnSwing` reads the guard-then-playStep shape and
+  the pricing keys the by-type bonuses on the swing's category.
+- **The item-scaling channel follows the granting item's TYPE CHAIN**
+  (getStepEffectScaling@20778): itemRatio 0.4 where the chain reaches
+  MainhandWeapon - every held weapon, so weapon-granted status ticks take
+  the ordinary 0.6/0.4 mix (Demondash's aura: -22.7% -> -3.2%) - 1.0 for
+  GearTrinket, and 0 otherwise. Shield inherits OffhandWeapon, never
+  MainhandWeapon, so the orb pulse is PURE attribute; a +0.4-budget reading
+  that fit the same number was degenerate on one build and the bytecode
+  breaks the tie. Raw-affinity ticks price pure everywhere (the capture
+  pins it twice), and dot-scoped talent multipliers never reach Raw dots
+  (getDamageScale@5146 returns 1 for Raw first).
+- **The trinket channel reads the character at rest and pays in full.**
+  Trinket_Demon_Status ticks its authored amount undivided - three equal
+  pulses per application - priced off floor(base primaries) + non-weapon
+  flat primary affixes (0.2 x 225 = 45.00 exactly, 2,407 rows), immune to
+  application-state repricing. -48.4% -> -1.6%; the rest is a consumable
+  the dump cannot see.
+- **Two talent guards became scopes.** Authority: `dmg.skillId == Skill.X`
+  -> a one-skill rider (Smite -20.3% -> -4.3%). Radiance: `ctx.status !=
+  null && ctx.status.owner == owner` -> a rider on every owner-carried tick
+  (five Priest rows moved at once; the orb's last-pulse ratio 2.25/1.25
+  proves the script's ctx.dmgMult += 1 shares this rider bracket). Both at
+  the rankOverride-RESTATED value, not times-rank.
+- **Gash counts company.** The daggers passive's hook adds +10% per OTHER
+  own status on the wearer at tick time (decoded exactly: 10.0/stack x
+  stacks x (1.04 + 0.1k), k = 3..7). The dot descriptor carries
+  `perOtherStatus` and the fight multiplies by its own live count. The hook
+  lives on a skill that never applies the status, so the plan searches every
+  processed skill - and it exposed the one build fact nothing records: WHICH
+  weapon skills are slotted. capture.mjs and fromSnapshot already consume a
+  probe-v4 `snap_wskill` row; until the probe emits it, the default
+  selection drops the arsenal passive and Gash verifies without its rider.
+- **The Censer's economy is fully authored.** The ultimate: a cloud every
+  vars.time seconds -> a counter stack per pickup -> conversion at maxStacks
+  -> props.skillOverride names the follow-up; one cast per 30s of combat,
+  priced +3.3%. The mark: consumed on the SECOND stack, one scripted lump
+  per pairing, 59.0 exact against 51 capture rows (-0.0%). The guaranteed
+  crit: `ownerHero` is the owner (SELF_TARGETS), and the costless register -
+  the status consumes itself on the finisher for critChance += 1 - is armed
+  per mage chain cast at Chaincast's authored one-per-four-actives, which
+  also force-fires every conduit. RayOfSpark: a spread channel divides by
+  the game's own floor(duration/tick) (initTicks@5882 - no start-tick +1)
+  and logs one row per tick, and the M2 splash's `target != ctx.aimTarget`
+  guard lands on nobody against a lone dummy. +89.6% -> -5.5%.
+
+Coverage stands at 100% on all four classes with zero MISSING rows. The
+open residuals, each named where it lives: PurgingStrikes -17.6% (a
+session-state item linkage that flips its flat with a relog - deliberately
+not baked), RadiantVerdict +158% (unexplained, one window, n=14), the Mage
+combo's crit mix and conduit share (the sim's own press cadence vs the live
+player's), and Gash's rider (gated on the probe-v4 weapon-skill snapshot).
