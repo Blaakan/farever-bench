@@ -2276,9 +2276,20 @@ against the capture and closed in one pass. What each one taught:
   and logs one row per tick, and the M2 splash's `target != ctx.aimTarget`
   guard lands on nobody against a lone dummy. +89.6% -> -5.5%.
 
+The hunt's last catch was not a formula at all: toLoadout wrote the dump's
+runes as `runes[r] = true` while every consumer reads the VALUES, so the
+whole build's rune set resolved to `{true}` and every rune-gated step
+priced as not taken, on every class, since the dump path existed. With the
+ids as values - and `bench verify` riding runes in from the jobs dump for
+snapshot builds, since runes belong to the character and not the moment -
+RadiantVerdict's "+158%" collapsed to -12.6% (its whole 8-second zone sits
+behind the M1 rune), Surging Force went -29.2% to -0.9%, and the Priest
+ledger tightened across the board.
+
 Coverage stands at 100% on all four classes with zero MISSING rows. The
-open residuals, each named where it lives: PurgingStrikes -17.6% (a
+open residuals, each named where it lives: PurgingStrikes -15.9% (a
 session-state item linkage that flips its flat with a relog - deliberately
-not baked), RadiantVerdict +158% (unexplained, one window, n=14), the Mage
-combo's crit mix and conduit share (the sim's own press cadence vs the live
-player's), and Gash's rider (gated on the probe-v4 weapon-skill snapshot).
+not baked), Hemorrhage +34.7% and Shield Craft +31.2% on the Warrior
+(model-high, uninvestigated), the Mage combo's crit mix and conduit share
+(the sim's own press cadence vs the live player's), and Gash's rider
+(gated on the probe-v4 weapon-skill snapshot).
