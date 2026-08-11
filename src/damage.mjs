@@ -376,7 +376,16 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // The epsilon is not cosmetic: `span / tick` is a float division and a
         // duration of 9 at a tick of 3 can land at 2.9999999999999996, which
         // floors to 2 and silently drops a third of the DoT.
-        ticks = Math.floor((span - first) / tick + 1e-9) + 1;
+        //
+        // A SPREAD loop divides by the game's own count - initTicks@5882 sets
+        // baseExpectedTicks = floor(duration / tick), with no start-tick +1
+        // whatever the flags say - and RayOfSpark is the row that shows the
+        // difference: dur 1 at tick 0.25 with DIRECT_START read 5 here while
+        // the game divides (and fires) 4. Every 2s-tick status row lands on
+        // the same number under both formulas, which is how the +1 hid.
+        ticks = spread
+          ? Math.max(1, Math.floor(span / tick + 1e-9))
+          : Math.floor((span - first) / tick + 1e-9) + 1;
         if (step.props?.area?.skipFirstTick) ticks -= 1;
         const tc = step.props?.area?.targetCooldown;
         if (tc > 0) ticks = Math.min(ticks, 1 + Math.floor((span - first) / tc + 1e-9));
@@ -1258,6 +1267,12 @@ export function buildCombat(cdb, ctx, assume = {}) {
         if (p != null) n = Math.ceil(n * Math.min(1, Math.max(0, p)));
         targets = Math.max(0, n - (e.area.ignoreMainTarget ? 1 : 0));
       }
+      // A script rider whose site guards `target != ctx.aimTarget` lands only
+      // on targets other than the one aimed at - none against a lone dummy.
+      // (At several targets this clamps to the non-area single-hit count and
+      // under-credits the splash; the flag rides area steps too when one
+      // appears, and until then the single-target case is the verified one.)
+      if (e.notAimTarget) targets = Math.max(0, Math.min(targets, wantTargets - 1));
       if (!targets && e.kind === 'Damage') continue;
       if (e.kind === 'Damage') {
         const aff = affinityOf(e.affinity);
@@ -1381,8 +1396,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // HOW MANY DAMAGE EVENTS this cast produces, which is what a damage
         // meter counts and what the capture logs a row for. `critRoll.hits` is
         // not it: that one only counts CRITTABLE hits, so a status tick - which
-        // can never crit - contributes nothing to it.
-        hitCount += (e.hits ?? 1) * targets;
+        // can never crit - contributes nothing to it. A SPREAD channel logs
+        // one row per tick - RayOfSpark's cast is four 84s, not one 368 - so
+        // its event count is the tick count, not the effect's single "hit".
+        hitCount += (e.spread ? Math.max(1, e.ticks ?? 1) : (e.hits ?? 1)) * targets;
         // Physical, non-tick events specifically: that is what a stack counter
         // keyed on `!dmg.isDoT && dmg.isPhysical` arms on.
         if (aff.root === 'Physical' && !statusTick) hitCountPhysical += (e.hits ?? 1) * targets;

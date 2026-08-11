@@ -1006,7 +1006,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
             });
             continue;
           }
-          folded = (folded ?? base.effects).concat(foldRider(r.step.effects, r.rule.chance ?? 1));
+          const stepEffects = r.rule.notAimTarget
+            ? r.step.effects.map((e) => ({ ...e, notAimTarget: true }))
+            : r.step.effects;
+          folded = (folded ?? base.effects).concat(foldRider(stepEffects, r.rule.chance ?? 1));
         }
         if (folded) prof = { ...base, effects: folded };
         for (const f of refused) pendingRiders.push({ host: id, prof: base, refusal: f });
@@ -1871,7 +1874,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         });
         continue;
       }
-      triggered.push({ prof: riderProf(r.prof, r.step), source: 'scripted', rule: r.rule });
+      triggered.push({ prof: riderProf(r.prof, r.step, r.rule), source: 'scripted', rule: r.rule });
       accountedLate.add(r.host);
     }
 
@@ -2417,6 +2420,12 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         } else {
           why ??= `${label} is played from ${hook} with no event this fight raises`;
         }
+        // `hit.target != ctx.aimTarget` on the playStep site: the step lands
+        // only on targets OTHER than the one aimed at - zero of them against
+        // a lone dummy. RayOfSpark's M2 splash is the shape, and the model
+        // was crediting it a full hit per cast on a single target, which is
+        // half of why that row read +89.6% per hit.
+        if (rule && /\btarget\s*!=\s*(?:ctx\.)?aimTarget\b/.test(scope)) rule.notAimTarget = true;
       }
       if (rule) riders.push({ step, rule });
       else {
@@ -2470,12 +2479,16 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   }
 
   /** A rider's own profile: the host's, carrying only the step the script plays. */
-  function riderProf(prof, step) {
+  function riderProf(prof, step, rule = null) {
     return {
       ...prof,
       id: `${prof.id}#${step.stepId}`,
       name: prof.name,
-      effects: step.effects,
+      // A rider whose site guards `target != aimTarget` lands on nobody at
+      // one target; the pricing site reads the flag off each effect.
+      effects: rule?.notAimTarget
+        ? step.effects.map((e) => ({ ...e, notAimTarget: true }))
+        : step.effects,
       // It is not a cast: it costs no time, no cooldown and no resource, and it
       // is not the base-attack chain even when its host is.
       occupancy: 0, cooldown: 0, charges: 1, costs: [], isFiller: false, isCombo: false,
