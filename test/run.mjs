@@ -4612,6 +4612,8 @@ group('capture: the probe log');
       '1000,snap_wskill,Emsey,,Daggers_DuplicatePoison_Skill1,,,,,host=Daggers_DuplicatePoison',
       '1000,snap_wskill,Emsey,,Daggers_DuplicatePoison_Passive,,,,,host=Daggers_DuplicatePoison',
       '1000,snap_wskill,Emsey,,Bow_BigGame_Skill1,,,,,host=Bow_BigGame',
+      '1000,snap_rune,Emsey,,Rogue_Finisher_M2,,,,,host=Rogue_Sig_Finisher',
+      '1000,snap_rune,Emsey,,map,,,,,host=Rogue_Sig_Finisher',
       '1000,snap_attr,Emsey,,critChance,18.6,,,,',
       '1000,snap_hattr,Emsey,,comboPoint,3,,,,',
       '1500,inflict,Emsey,Ratsar#1,Rogue_Sig_Finisher,240,1,,,affinity=Physical;hits=1',
@@ -4656,6 +4658,15 @@ group('capture: the probe log');
         JSON.stringify(built.loadout.skills ?? null));
       ok('an unworn arsenal\'s selection stays out of the loadout',
         !Object.values(built.loadout.skills ?? {}).some((ids) => ids.includes('Bow_BigGame_Skill1')));
+      // v5: slotted runes land keyed AND valued by id - every consumer reads
+      // the values - with proxy garbage rejected against the cdb's own
+      // mastery lists, the same discipline the talent rows get.
+      ok('a slotted rune reaches the loadout, id as value',
+        built.loadout.runes?.Rogue_Finisher_M2 === 'Rogue_Finisher_M2',
+        JSON.stringify(built.loadout.runes ?? null));
+      ok('...and a proxy-struct name is rejected, not carried',
+        !('map' in (built.loadout.runes ?? {})) && built.gaps.some((g) => /map/.test(g)),
+        JSON.stringify({ runes: built.loadout.runes, gaps: built.gaps }));
     }
 
     // A snapshot stands until the next one, which is what makes it a window.

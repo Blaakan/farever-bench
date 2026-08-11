@@ -440,6 +440,14 @@ export async function snapshots(path, { source = null } = {}) {
         s.weaponSkills[x.host ?? '?'].push(r.skill);
         break;
       }
+      // The runes actually SLOTTED, one row per rune with its host skill -
+      // read off each skill instance's replicated masteries list, i.e. what
+      // hasMastery@6089 would answer. The jobs dump lists what is KNOWN;
+      // this says what is active, and the difference has been caught live
+      // (a Battle Shout press with no M3 buff behind it). Probe v5.
+      case 'snap_rune':
+        (s.runes ??= []).push({ id: r.skill, host: x.host ?? null });
+        break;
       case 'snap_attr':
         s.attrs[r.skill] = r.amount;
         break;

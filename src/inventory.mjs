@@ -115,6 +115,23 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
       if (good.length) built.loadout.skills[slot] = good;
     }
   }
+  // The SLOTTED runes, when the capture carries them (probe v5's snap_rune).
+  // These outrank the jobs dump wholesale: the dump lists every rune the
+  // character KNOWS, and pricing a known-but-unslotted rune as active is how
+  // a Battle Shout buff nobody had got credited. Only ids that appear in
+  // some skill row's own mastery list are accepted - the same
+  // garbage-vs-gap discipline the talent rows get.
+  if ((snap.runes ?? []).length) {
+    const known = new Set();
+    for (const row of cat.cdb.lines('skill')) {
+      for (const m of row.mastery ?? []) if (m?.id) known.add(m.id);
+    }
+    built.loadout.runes = {};
+    for (const r of snap.runes) {
+      if (known.has(r.id)) built.loadout.runes[r.id] = r.id;
+      else rejected.push(r.id);
+    }
+  }
   built.attrs = snap.attrs ?? {};
   built.hattrs = snap.hattrs ?? {};
   // UnitAttributes.attributes is keyed by the attribute's POSITION in the cdb

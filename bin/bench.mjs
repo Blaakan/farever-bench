@@ -2274,16 +2274,18 @@ const commands = {
       }
       if (!unit) die(`${character} has a capture snapshot but no rune list to name the class - pass --class.`);
       built = fromSnapshot(engine.cat, snap, { level: wantLevel, unit });
-      // Runes ride in from the modkit's jobs dump even when the build comes
-      // from the snapshot: the snapshot has no field for them, and runes -
-      // like the class - belong to the character, not the moment. Without
-      // them every rune-gated step prices as not taken: RadiantVerdict's
-      // whole 8-second zone is behind its M1 rune, and the row read +158%
-      // per hit against a live mean that is mostly zone ticks.
-      try {
-        const dumpRunes = toLoadout(engine.cat, readDump(game, character)).loadout.runes ?? {};
-        built.loadout.runes = { ...dumpRunes, ...(built.loadout.runes ?? {}) };
-      } catch { /* no dump - the snapshot stands alone */ }
+      // Runes: a v5 snapshot carries the SLOTTED set (per-skill masteries,
+      // what hasMastery answers) and stands alone. Only when the capture
+      // predates v5 do runes ride in from the modkit's jobs dump - which
+      // lists every rune KNOWN, slotted or not, and is still better than
+      // pricing every rune-gated step as not taken: RadiantVerdict's whole
+      // 8-second zone is behind its M1 rune, and the row read +158% per hit
+      // against a live mean that is mostly zone ticks.
+      if (!Object.keys(built.loadout.runes ?? {}).length) {
+        try {
+          built.loadout.runes = toLoadout(engine.cat, readDump(game, character)).loadout.runes ?? {};
+        } catch { /* no dump - the snapshot stands alone */ }
+      }
     } else {
       built = toLoadout(engine.cat, readDump(game, character), { level: wantLevel, unit: wantClass });
     }
