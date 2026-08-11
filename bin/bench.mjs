@@ -2436,13 +2436,23 @@ const commands = {
         seq.push({ t: (r.ts - since) / 1000, id: r.skill });
       });
       seq.sort((a, b) => a.t - b.t);
+      // An open-ended window can span several sittings; a replay is ONE
+      // fight, so the sequence is cut at the first two-minute silence and
+      // the fight runs that block's span.
+      let cut = seq.length;
+      for (let i = 1; i < seq.length; i++) {
+        if (seq[i].t - seq[i - 1].t > 120) { cut = i; break; }
+      }
+      seq.length = cut;
       fightLen = seq.length ? seq[seq.length - 1].t + 15 : null;
       divergence = { pressedLate: 0, notReady: 0, unknown: 0, replayed: 0, total: seq.length };
       let cursor = 0;
       policy = ({ ready, actives, t }) => {
         while (cursor < seq.length && seq[cursor].t <= t + 0.05) {
           const want = seq[cursor].id;
-          const i = actives.findIndex((a) => a.prof.id === want);
+          // A via-granted active (the orb status rides its S1 cast) is
+          // pressed under its PRESSER's id in the live log.
+          const i = actives.findIndex((a) => a.prof.id === want || a.via === want);
           if (i < 0) { cursor++; divergence.unknown++; continue; }
           if (!ready.includes(i)) { cursor++; divergence.notReady++; continue; }
           cursor++;

@@ -210,7 +210,7 @@ function runFight(spec) {
   const isWeaponSkill = (prof) => prof.type === 'WeaponSkill' || prof.type === 'WeaponSubSkill';
   const cdrFor = (prof) => (cdrWeaponSkill != null && isWeaponSkill(prof) ? cdrWeaponSkill : cdr);
   const actives = [];
-  for (const { prof, source, applies } of rotation.active) {
+  for (const { prof, source, applies, via } of rotation.active) {
     const out = cast(prof, bare);
     const setsUp = (applies?.self?.length ?? 0) + (applies?.target?.length ?? 0);
     // A cast whose entire payload is a DOT is worth pressing even though the
@@ -229,7 +229,7 @@ function runFight(spec) {
     if (!worth(out.damage, out.heal, out.shield) && !setsUp && !appliesDot && !appliesSummon) continue;
     const cooldown = Math.max(prof.cooldown / cdrFor(prof), 0);
     actives.push({
-      prof, source, out, applies,
+      prof, source, out, applies, via: via ?? null,
       cooldown,
       occupancy: Math.max(prof.occupancy, 0.05),
       maxCharges: prof.charges ?? 1,

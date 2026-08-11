@@ -783,7 +783,21 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       const isProc = dur > 0 && !(cd > 0) && procHook && !FROZEN_ENCHANTS.has(b.status)
         && ((b.trigger?.chance ?? 1) < 1 || b.reapply === 'blocked');
       if (isProc) {
-        const r = Math.max(1e-9, (1 / swingPeriod) * (b.trigger?.chance ?? 1));
+        // The swing clock is a FLOOR on an onInflictDamage proc's rate: the
+        // hook rolls on EVERY damage instance - every dot tick, every cast
+        // hit - and Emsei's live stream runs 5.8 instances a second where
+        // her swing clock says 0.11, which priced the Stone's +10 Faith at
+        // uptime 0.53 against a measured 0.755. Estimate the instance rate
+        // from what the plan already knows: swings, every active's casts
+        // per cooldown, every dot's tick clock. Still a pre-fight estimate,
+        // still BELOW live (folded riders and procs are uncounted), so the
+        // flattering direction stays refused.
+        const instRate = b.trigger?.hook === 'onInflictDamage'
+          ? (1 / swingPeriod)
+            + (rot.active ?? []).reduce((s2, a) => s2 + (a.prof.cooldown > 0 ? 1 / a.prof.cooldown : 0), 0)
+            + (rot.dots ?? []).reduce((s2, d) => s2 + (d.tick > 0 ? 1 / d.tick : 0), 0)
+          : (1 / swingPeriod);
+        const r = Math.max(1e-9, instRate * (b.trigger?.chance ?? 1));
         // Blocked-while-up is an ALTERNATING RENEWAL process - on for its whole
         // duration, then off until the next success - so its uptime is
         // rD/(1+rD) and it NEVER saturates: 34% at one damage instance a

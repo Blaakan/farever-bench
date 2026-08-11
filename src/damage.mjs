@@ -582,7 +582,13 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // them in a bucket nothing reads - the one place damage still vanished
       // without a word.
       const rowLoops = (s.steps ?? []).some((x) => x.props?.loop?.tick != null);
-      const playedByScript = (stepOnNames[st.on ?? -1] ?? null) === 'Code'
+      // 'Trigger' (on: 8) steps are event-played like 'Code' ones, not part
+      // of the cast: DuplicatePoison_Skill1's 0.35xDex Trigger step was
+      // folded into every press while the capture shows ten presses, ten
+      // host hits and no such lattice anywhere - a phantom worth +10% on the
+      // row. The other rows carrying one are monster skills and a defensive.
+      const stepOnName = stepOnNames[st.on ?? -1] ?? null;
+      const playedByScript = (stepOnName === 'Code' || stepOnName === 'Trigger')
         && (!s.props?.status || !rowLoops);
 
       const stepType = stepTypeNames[st.type ?? -1] ?? null;
