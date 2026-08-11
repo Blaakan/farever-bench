@@ -805,21 +805,28 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         for (const a of b.affixes) applyAffix(a, b.stacks, b.uptime);
         continue;
       }
-      // A buff applied ONCE PER CONDUIT TRIGGER is not permanent, and crediting
-      // it at its cap was the single largest overstatement left in the Mage.
-      // Conduit: Power is +0.5 MagicMastery a stack to a cap of 20, so the cap
-      // reads +10 - and the fight's own conduit stream fires roughly once every
-      // 28 seconds against a 15-second buff, which is under one stack on
-      // average. Measured in game 2026-08-02, both halves: starved of Spark it
-      // stacked to exactly 5 and stopped (the gauge, not the cap), and fed
-      // Spark it reached 20 for +10% MagicMastery. The cap is real; standing at
-      // it is not. Pricing the mean needs the stack counter's affix side, so
-      // this is refused and named rather than kept at the flattering end.
+      // A buff applied ONCE PER CONDUIT TRIGGER follows the conduit economy.
+      // When this refusal was written the model's stream fired every ~28s
+      // against the 15-second buff - under one stack on average, and
+      // crediting the 20-stack cap (+10 MagicMastery) was the largest
+      // overstatement left in the Mage. The economy was the error: with the
+      // chain consuming free volleys and the gauge open at ~98% of spends,
+      // the live stream fires every ~2s, the status_on logs ONCE and stays
+      // refreshed - the cap is STOOD AT, not visited. Both regimes were
+      // measured in game (2026-08-02: starved it stacked to 5 and stopped;
+      // fed it reached 20), so the credit follows the regime: a build that
+      // sustains a chain stands at cap and is priced there (the ~40s ramp
+      // from a cold start is the audit's stated assumption); a chainless
+      // build keeps the refusal, named.
       if (dur > 0 && !(cd > 0) && b.trigger?.hook === 'onStartConduit') {
-        b.timed = false;
-        b.uptime = 0;
-        conduitBuffGaps.push({ id: b.status, from: b.from, stacks: b.stacks, duration: dur });
-        continue;
+        const chained = (evalOpts.empowerments ?? []).some((e2) => e2.chainSpend);
+        if (!chained) {
+          b.timed = false;
+          b.uptime = 0;
+          conduitBuffGaps.push({ id: b.status, from: b.from, stacks: b.stacks, duration: dur });
+          continue;
+        }
+        // falls through: permanent at cap, like the live stream says.
       }
       b.uptime = (cd > 0 && dur > 0) ? Math.min(1, dur / Math.max(cd, src.occupancy)) : 1;
       b.timed = cd > 0 && dur > 0;
