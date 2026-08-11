@@ -24,7 +24,7 @@ import {
   makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel,
 } from '../src/rotation.mjs';
 import { slugOf, endpoints, normalize, translate } from '../src/questlog.mjs';
-import { aggregate, sessions, snapshots } from '../src/capture.mjs';
+import { aggregate, sessions, snapshots, streamCapture } from '../src/capture.mjs';
 import { compare } from '../src/verify.mjs';
 import { readDump, toLoadout, listCharacters, fromSnapshot } from '../src/inventory.mjs';
 import { requireGame, requireBoot } from '../src/lib/game.mjs';
@@ -2416,7 +2416,43 @@ const commands = {
     });
     const pressed = new Set(pressAgg.groups.map((g) => g.key));
     let policy = null;
-    if (pressed.size) {
+    let fightLen = null;
+    let divergence = null;
+    // --replay: hold the model to the capture's own PRESS SEQUENCE, not just
+    // its press SET. The sim's chooser is replaced by the recorded timeline -
+    // each press fires at its recorded offset if the model agrees it is
+    // ready - and the fight runs the window's own length, so every cadence
+    // residual (register arming order, conduit spend sequence, charge banks)
+    // collapses into pure formula verification. Where the model DISAGREES
+    // that a recorded press was possible, that is counted and reported, not
+    // silently absorbed: a divergence is a finding about the model's
+    // cooldown/resource state, which is exactly what this mode exists to
+    // expose.
+    if (args.flags.replay && pressed.size) {
+      const seq = [];
+      await streamCapture(capturePath, (r) => {
+        if (r.source !== character || r.event !== 'press') return;
+        if (r.ts < since || (until && r.ts > until)) return;
+        seq.push({ t: (r.ts - since) / 1000, id: r.skill });
+      });
+      seq.sort((a, b) => a.t - b.t);
+      fightLen = seq.length ? seq[seq.length - 1].t + 15 : null;
+      divergence = { pressedLate: 0, notReady: 0, unknown: 0, replayed: 0, total: seq.length };
+      let cursor = 0;
+      policy = ({ ready, actives, t }) => {
+        while (cursor < seq.length && seq[cursor].t <= t + 0.05) {
+          const want = seq[cursor].id;
+          const i = actives.findIndex((a) => a.prof.id === want);
+          if (i < 0) { cursor++; divergence.unknown++; continue; }
+          if (!ready.includes(i)) { cursor++; divergence.notReady++; continue; }
+          cursor++;
+          divergence.replayed++;
+          if (t - seq[cursor - 1].t > 1) divergence.pressedLate++;
+          return i;
+        }
+        return -1;
+      };
+    } else if (pressed.size) {
       const allowed = new Set(pressed);
       try {
         const rotPre = engine.plan.resolve(built.loadout, rank);
@@ -2429,7 +2465,7 @@ const commands = {
         return -1;
       };
     }
-    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy });
+    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy, fight: fightLen });
     const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed });
 
     if (args.flags.json) {
@@ -2446,6 +2482,12 @@ const commands = {
       `  ${built.placed.length} slots from ${snap ? 'the capture\'s own snapshot' : 'the modkit dump'}`));
     if (snapNote) console.log(f.warn(snapNote));
     if (runeNote) console.log(f.warn(runeNote));
+    if (divergence) {
+      console.log(f.dim(`replay: ${divergence.replayed}/${divergence.total} presses replayed over ${Math.round(fightLen ?? 0)}s`
+        + (divergence.notReady ? `, ${divergence.notReady} the model refused as not ready` : '')
+        + (divergence.unknown ? `, ${divergence.unknown} outside the model's rotation` : '')
+        + (divergence.pressedLate ? `, ${divergence.pressedLate} landed >1s late` : '')));
+    }
     if (window?.fromSnapshot) {
       console.log(f.dim(`window: the snapshot's own span - ${window.events.toLocaleString()} events`
         + (window.seconds ? ` over ${Math.round(window.seconds)}s` : ', open-ended')));

@@ -135,7 +135,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
   }
 
   /** Full evaluation: stat sheet, throughput, survivability, rotation lines. */
-  function evaluate(loadout, { target, rank = 1, mix = 0.5, policy = null, goal = 'dps' } = {}) {
+  function evaluate(loadout, { target, rank = 1, mix = 0.5, policy = null, goal = 'dps', fight = null } = {}) {
     const cls = classOf(cat, loadout);
     const tgt = target ?? combat.foe('reference', loadout.level);
     const weaponPower = combat.weaponPowerFor(cat, loadout, cls);
@@ -168,6 +168,9 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       { rank, runes: new Set(rot.runes ?? []) });
     const evalOpts = {
       ...opts,
+      // A REPLAY prices the fight at the capture window's own length, so the
+      // per-minute columns are commensurable with the recorded ones.
+      ...(fight > 0 ? { fight } : {}),
       attackerLevel: loadout.level,
       swingAttrs: mainItem
         ? mainItem.aptitudes.map((a) => combat.primaryAtbFor({ aptitude: a })).filter(Boolean)
