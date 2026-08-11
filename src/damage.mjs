@@ -1248,7 +1248,18 @@ export function buildCombat(cdb, ctx, assume = {}) {
         : opts.weaponMix?.ids?.has(prof.id) ? opts.weaponMix.flats
           : (effRoot !== 'Raw' && opts.tickScaling?.mixIds?.has(prof.id)) ? opts.tickScaling.flats
             : null;
-      const raw = amountOf(e, sheet, opts.swingAttrs ?? null, mixFlats, tickFlats) * (e.hits ?? 1);
+      // The TRINKET channel, measured on Trinket_Demon_Status to the integer
+      // over 2,407 rows: a status granted by a non-weapon item ticks its
+      // authored amount IN FULL every tick (the capture's three equal pulses
+      // per application), priced off the standing weaponless floored
+      // primaries rather than the combat sheet. The spread division below is
+      // undone by counting the ticks back in, and the basis map is fixed at
+      // the resting build so buffed application states cannot reprice it.
+      const standing = opts.tickScaling?.standingIds?.has(prof.id) ? opts.tickScaling.standing : null;
+      const priceSheet = standing ? { get: (k) => standing.get(k) ?? sheet.get(k) } : sheet;
+      const spreadUndo = standing && e.spread ? Math.max(1, e.ticks ?? 1) : 1;
+      const raw = amountOf(e, priceSheet, opts.swingAttrs ?? null, mixFlats, tickFlats)
+        * (e.hits ?? 1) * spreadUndo;
       if (!raw) continue;
       // Only an Area or Aura step reaches the crowd, and `props.hitCount` is a
       // target cap when the row sets one. `ignoreMainTarget` takes the enemy
@@ -1548,8 +1559,17 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // matched against the pool dots, and then never offered to the dots the
       // fight actually schedules. The match walks the statusType parent chain,
       // so a Bleed guard covers a Hemorage dot and not the other way round.
+      // ...but not a RAW one. Raw bypasses the pipeline those hooks ride -
+      // getDamageScale@5146 returns 1 for Raw before any modifier enters -
+      // and the capture agrees twice over: Trinket_Demon_Status ticks a
+      // constant 45.00 through the whole rotation and DuplicatePoison's
+      // Skill1 status exactly the whole attribute, both Poison-typed, both
+      // with poison-scoped talents ranked on the build.
+      const dmgEffects = (d.prof.effects ?? []).filter((e) => e.kind === 'Damage');
+      const rawOnly = dmgEffects.length > 0
+        && dmgEffects.every((e) => affinityOf(e.affinity).root === 'Raw');
       let m = 1, critCh = 0;
-      for (const mod of dotScoped) {
+      if (!rawOnly) for (const mod of dotScoped) {
         if (!coveredBy(mod.statusType, d.types)) continue;
         if (mod.field === 'dmgMult') m += mod.amount;
         else if (mod.field === 'critChance') critCh += mod.amount;

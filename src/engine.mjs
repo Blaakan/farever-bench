@@ -18,7 +18,7 @@ import { buildCombat } from './damage.mjs';
 import { buildSkillPlan } from './skills.mjs';
 import { buildTalentPlan } from './talents.mjs';
 import { buildProfiles } from './profiles.mjs';
-import { evaluate as evaluateLoadout, classOf, socketsOf } from './loadout.mjs';
+import { evaluate as evaluateLoadout, classOf, socketsOf, standingPrimaries } from './loadout.mjs';
 
 export const GOALS = ['dps', 'hps', 'sps', 'ehp', 'mixed'];
 export const FERVOR_SCOPES = ['skills', 'all', 'none'];
@@ -179,19 +179,34 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       // (DuplicatePoison's, exact) - the Raw gate lives at the pricing site.
       // Statuses granted by class skills or talents are in neither set and
       // price pure, as before.
-      tickScaling: {
-        flats: combat.attributeBudgets(loadout.level),
-        flatIds: new Set(rot.active
-          .filter((x) => typeof x.source === 'string' && x.source.startsWith('Slot_')
-            && x.prof.isStatusTick
-            && cat.itemById.get(loadout.gear[x.source]?.item)?.type === 'Shield')
-          .map((x) => x.prof.id)),
-        mixIds: new Set((rot.dots ?? [])
-          .filter((d) => typeof d.source === 'string' && d.source.startsWith('Slot_')
-            && cat.itemById.get(loadout.gear[d.source]?.item)?.type
-            && cat.itemById.get(loadout.gear[d.source]?.item)?.type !== 'Shield')
-          .map((d) => d.status)),
-      },
+      tickScaling: (() => {
+        const WEAPON_SLOTS = new Set(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']);
+        const itemType = (slot) => cat.itemById.get(loadout.gear[slot]?.item)?.type ?? null;
+        return {
+          flats: combat.attributeBudgets(loadout.level),
+          flatIds: new Set(rot.active
+            .filter((x) => typeof x.source === 'string' && WEAPON_SLOTS.has(x.source)
+              && x.prof.isStatusTick && itemType(x.source) === 'Shield')
+            .map((x) => x.prof.id)),
+          mixIds: new Set((rot.dots ?? [])
+            .filter((d) => typeof d.source === 'string' && WEAPON_SLOTS.has(d.source)
+              && itemType(d.source) && itemType(d.source) !== 'Shield')
+            .map((d) => d.status)),
+          // The trinket channel: a status granted by a NON-weapon item ticks
+          // undivided at the standing, weaponless, floored primaries - see
+          // standingPrimaries() for the measurement. The map is fixed at the
+          // resting build, so buffed application states cannot reprice it,
+          // which is also measured: live ticks stay 45 through the rotation.
+          standingIds: new Set((rot.dots ?? [])
+            .filter((d) => typeof d.source === 'string' && d.source.startsWith('Slot_')
+              && !WEAPON_SLOTS.has(d.source) && itemType(d.source))
+            .map((d) => d.status)),
+          standing: standingPrimaries(cat, loadout, {
+            baseStatsFor,
+            primaries: [...combat.attributeBudgets(loadout.level).keys()],
+          }),
+        };
+      })(),
       // THE LIVE-STATE GATES a skill's own script riders ask about. Both were
       // refusals until the 2026-08-02 capture priced them; refusing them cost
       // -13.7% to -17.5% on the skills that carry one.

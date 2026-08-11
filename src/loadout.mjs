@@ -157,6 +157,60 @@ export function evaluate(cat, loadout, {
   return { sheet, mods, cls, armorReduction };
 }
 
+/**
+ * The standing, weaponless, floored primaries - the basis a TRINKET-granted
+ * status tick reads. Live, Trinket_Demon_Status pays a constant 45.00 per tick
+ * in Emsey's snapshot state, and 45.00 = 0.2 x 225 where 225 is exactly
+ * floor(each base primary) + the flat primary affixes of every NON-WEAPON
+ * piece (138 + 87) - not the combat sheet (whose four-primary sum is 294 and
+ * would tick 59), and not any weapon-mixed variant. 2,407 capture rows sit on
+ * the integer. The mechanism behind the weapon exclusion was not isolated in
+ * the client; the basis is stated here as measured, and a second wearer with
+ * primary affixes on more attributes would discriminate the near-miss
+ * decompositions (rounded-base + Dex-only lands on the same 225 for this one
+ * build).
+ */
+export function standingPrimaries(cat, loadout, { baseStatsFor, primaries }) {
+  const cls = classOf(cat, loadout);
+  const armorReduction = cat.armorReductionFor(cls.aptitude);
+  const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
+  const opts = { aptitude: cls.aptitude, charLevel: loadout.level, armorReduction };
+  const WEAPON = new Set(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']);
+  for (const slot of cat.combatSlots()) {
+    if (WEAPON.has(slot.id)) continue;
+    const g = loadout.gear[slot.id];
+    if (!g?.item) continue;
+    const item = cat.itemById.get(g.item);
+    if (!item) continue;
+    const rarity = g.rarity ?? item.rarity;
+    const stars = Math.min(g.stars ?? 0, cat.maxStars(item, rarity));
+    const socketed = [];
+    for (const type of cat.socketsFor(item)) {
+      const augId = loadout.augments?.[`${slot.id}/${type}`];
+      if (augId) socketed.push(augId);
+    }
+    cat.contribute(item, slot.id, {
+      ...opts, stars, rarity, flawless: !!g.flawless, level: g.level ?? null, socketed,
+      generic: g.generic ?? null,
+    }, mods);
+  }
+  for (const sock of socketsOf(cat, loadout)) {
+    if (WEAPON.has(sock.slot)) continue;
+    const augId = loadout.augments[sock.key];
+    if (!augId) continue;
+    const aug = cat.itemById.get(augId);
+    if (!aug) continue;
+    const af = cat.slotById.get(sock.slot)?.affixFactor ?? 1;
+    cat.applyAffixes(aug.affixes, mods, af, af !== 1);
+  }
+  const base = baseStatsFor(cls.unit, loadout.level);
+  const out = new Map();
+  for (const atb of primaries) {
+    out.set(atb, Math.floor(base.get(atb) ?? 0) + (mods.flat.get(atb) ?? 0));
+  }
+  return out;
+}
+
 // Every skill id this build touches, with where it came from. Used for
 // reporting and for the coverage manifest; the rotation itself is built by
 // skills.mjs, which knows which of these you actually get to press.
