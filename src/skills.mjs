@@ -1907,10 +1907,44 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // instance, same tally, more application events.
     for (const d of dots) {
       const held = byStatus.get(d.status);
-      if (!held || held === d || !canFire(d) || d.on === 'cast') continue;
+      if (!held) continue;
+      // The count-scaled companion rider belongs to the STATUS, not to
+      // whichever applier won the selection - the hook keys on dmg.skillId ==
+      // the status and fires whoever applied the instance. Gash is applied by
+      // Skill2 in this build while the hook lives on the weapon PASSIVE's
+      // script, so the winner inherits it from any losing copy.
+      if (d.perOtherStatus && !held.perOtherStatus) held.perOtherStatus = d.perOtherStatus;
+      if (held === d || !canFire(d) || d.on === 'cast') continue;
       const co = (held.coAppliers ??= []);
       if (co.some((c) => c.on === d.on && c.from === d.from)) continue;
       co.push({ on: d.on, chance: d.chance ?? 1, from: d.from, why: d.why ?? null });
+    }
+    // The count-scaled companion hook can live on a skill that never APPLIES
+    // the status at all: Gash is applied by Skill2 in this build while the
+    // hook - dmgMult += count-of-other-own-statuses x vars.x, keyed on
+    // dmg.skillId == the status - sits on the weapon Passive's script. So the
+    // hook is searched for across every skill the plan processed, not just
+    // the appliers.
+    {
+      const hosts = [...active, ...filler, ...passive].map((x) => x.prof.id);
+      for (const d of byStatus.values()) {
+        if (d.perOtherStatus) continue;
+        for (const hid of hosts) {
+          const hs = skills.get(hid);
+          if (!hs?.script) continue;
+          const ap = liveScript(hs.script);
+          const mm = new RegExp('skillId\\s*==\\s*Skill\\.' + d.status
+            + '\\b([\\s\\S]{0,600}?)dmgMult\\s*\\+=\\s*(\\w+)\\s*\\*\\s*vars\\.(\\w+)').exec(ap);
+          if (!mm || !/for\s*\(\s*\w+\s+in\s+\w+\.target\.statuses\s*\)/.test(mm[1])) continue;
+          const gate = /rank\s*>=\s*(\d+)/.exec(mm[1]);
+          if (gate && rank < Number(gate[1])) continue;
+          let v = hs.vars?.[mm[3]];
+          for (const ov of (hs.props?.rankOverride ?? [])) {
+            if ((ov.minRank ?? 0) <= rank && ov.vars?.[mm[3]] != null) v = ov.vars[mm[3]];
+          }
+          if (typeof v === 'number' && v > 0) { d.perOtherStatus = v; break; }
+        }
+      }
     }
     const liveDots = [];
     for (const d of byStatus.values()) {
@@ -3030,6 +3064,30 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           // answer to 44,000 dps. Four rows is a rule; everything else refreshes.
           stacking: st.props?.status?.stackingPolicy != null
             ? stackNames[st.props.status.stackingPolicy] ?? null : null,
+          // A COUNT-SCALED companion rider: the APPLIER's own script boosts
+          // this status's every damage event by +vars.x per OTHER status the
+          // owner has on the wearer at that instant. Gash is the shape -
+          // Daggers_DuplicatePoison_Passive's onInflictDamageEval counts
+          // dmg.target.statuses owned by the owner, excluding Gash itself,
+          // and does dmgMult += count * vars.var1 behind a rank gate. The
+          // count is live state, so the FIGHT multiplies each tick by
+          // (1 + x * others-up-right-now) rather than this reader guessing a
+          // number; the live decode ran k = 3..7, mean 5.09, and the ledger
+          // mean was a third low without it.
+          perOtherStatus: (() => {
+            const ap = liveScript(s?.script ?? '');
+            const mm = new RegExp('skillId\\s*==\\s*Skill\\.' + statusId
+              + '\\b([\\s\\S]{0,600}?)dmgMult\\s*\\+=\\s*(\\w+)\\s*\\*\\s*vars\\.(\\w+)').exec(ap);
+            if (!mm) return null;
+            if (!/for\s*\(\s*\w+\s+in\s+\w+\.target\.statuses\s*\)/.test(mm[1])) return null;
+            const gate = /rank\s*>=\s*(\d+)/.exec(mm[1]);
+            if (gate && rank < Number(gate[1])) return null;
+            let v = s.vars?.[mm[3]];
+            for (const ov of (s.props?.rankOverride ?? [])) {
+              if ((ov.minRank ?? 0) <= rank && ov.vars?.[mm[3]] != null) v = ov.vars[mm[3]];
+            }
+            return typeof v === 'number' && v > 0 ? v : null;
+          })(),
           pool,
           trigger,
           prof: sp,

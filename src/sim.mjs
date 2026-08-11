@@ -703,7 +703,21 @@ function runFight(spec) {
           // however many stacks are on the target RIGHT NOW. The value snapshots;
           // the multiplier does not.
           const k = d.scaleByStacks ? st.stacks : 1;
-          d.damage += st.out.damage * k;
+          // The count-scaled companion rider (Gash): +x per OTHER status the
+          // owner has on the wearer AT TICK TIME. The count is this fight's
+          // own live state - every other running dot plus every debuff window
+          // still open - which undercounts multi-instance statuses (the live
+          // decode reached k=7 with stacked Burn instances; this map holds
+          // one entry per descriptor) and marks, and says so here rather
+          // than inflating the ratio to compensate.
+          let om = 1;
+          if (d.perOtherStatus) {
+            let others = 0;
+            for (const [od, os] of live) if (od !== d && os.expires > st.nextTick) others++;
+            for (const exp of upFoe.values()) if (exp > st.nextTick) others++;
+            om = 1 + d.perOtherStatus * others;
+          }
+          d.damage += st.out.damage * k * om;
           d.heal += st.out.heal * k;
           d.ticks++;
           // A regular dot's tick is an event too. Riders that asked for a

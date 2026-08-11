@@ -89,6 +89,21 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
     talents.filter((t) => t.rank > 0).map((t) => [t.id, t.rank])
   );
   built.arsenals = snap.arsenals ?? [];
+  // The slotted WEAPON skills, when the capture is new enough to carry them
+  // (probe v4's snap_wskill). This is the one build fact nothing else records
+  // - the dump has only the item, and the arsenal pool makes even the weapon
+  // passive a choice - so without it the plan's default selection stands and
+  // a companion hook on an unslotted-by-default passive (Gash's) never
+  // prices. Only ids the catalog recognises are handed over; the rest are
+  // named in gaps like every other unresolvable row.
+  if (snap.weaponSkills && Object.keys(snap.weaponSkills).length) {
+    built.loadout.skills ??= {};
+    for (const [slot, ids] of Object.entries(snap.weaponSkills)) {
+      const good = ids.filter((id) => cat.cdb.has('skill', id));
+      for (const bad of ids.filter((id) => !cat.cdb.has('skill', id))) rejected.push(bad);
+      if (good.length) built.loadout.skills[slot] = good;
+    }
+  }
   built.attrs = snap.attrs ?? {};
   built.hattrs = snap.hattrs ?? {};
   // UnitAttributes.attributes is keyed by the attribute's POSITION in the cdb

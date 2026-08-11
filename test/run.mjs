@@ -4211,6 +4211,36 @@ group('a timed self-buff on a cooldown is a cast');
       && (a.applies?.self ?? []).length && (a.applies.self).every((b) => !(b.duration > 0))));
 }
 
+// --- the count-scaled companion rider --------------------------------------
+// Gash's hook lives on the weapon PASSIVE - dmgMult += other-own-statuses x
+// vars.var1 behind rank >= 2, keyed on dmg.skillId == the status - while the
+// status can be APPLIED by a different skill entirely. The rider must land on
+// whichever applier wins the dot selection, and only when the hook's host is
+// actually slotted: the arsenal pool makes the passive a CHOICE, and crediting
+// an unslotted passive's hook would price a build the player is not running.
+group('the count-scaled companion rider');
+{
+  const engine = createEngine();
+  const withSel = (sel) => {
+    const lo = emptyLoadout(cat, 'Rogue', 25);
+    lo.gear.Slot_Weapon2 = { item: 'Daggers_DuplicatePoison' };
+    if (sel) lo.skills.Slot_Weapon2 = sel;
+    const rot = engine.plan.resolve(lo, 3);
+    return (rot.dots ?? []).find((d) => d.status === 'Daggers_DuplicatePoison_PassiveStatus');
+  };
+  const slotted = withSel(['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Passive']);
+  ok('with the passive slotted, the winning dot carries the rider',
+    slotted?.perOtherStatus === 0.1 && slotted?.from === 'Daggers_DuplicatePoison_Passive',
+    JSON.stringify({ from: slotted?.from, per: slotted?.perOtherStatus }));
+  ok('...applied on the swing stream at its authored chance',
+    slotted?.on === 'attack' && slotted?.chance === 0.2,
+    JSON.stringify({ on: slotted?.on, chance: slotted?.chance }));
+  const unslotted = withSel(['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill2']);
+  ok('without the passive, no rider is credited',
+    !!unslotted && unslotted.perOtherStatus == null,
+    JSON.stringify({ from: unslotted?.from, per: unslotted?.perOtherStatus }));
+}
+
 // --- a rune's vars, and the durations it extends ---------------------------
 // `updateSkillInf@20788` runs applyVars per slotted mastery ON TOP of the row's
 // own, so where both name a key the RUNE wins. The reader had it the other way
