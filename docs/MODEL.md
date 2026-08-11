@@ -2460,3 +2460,36 @@ Surging Force press: ~110-130 non-crit means the container is right and
 history moved; ~150-175 means it is not the whole truth. Until then the
 row prices bare, with --rune Warrior_SurgingForce_M3 on record as the
 capture-proven override (199.2 vs the live n=11 mean 199.55).
+
+## The priced frontier (2026-08-11, end of session)
+
+What the last investigation pass measured but deliberately did NOT implement
+- each is real, priced, and waiting for its own careful session:
+
+- **Boss armour is a SUM over the inheritance closure, not the nearest row.**
+  A Priest dungeon window inverts the authored mitigation ladder under
+  nearest-wins and reconciles to <=1.3% cross-ratio error under
+  sum-of-all-rows; rift boss+adds share one fitted zone level only under
+  the sum. Parity spawn level (target=attacker) is refuted in every boss
+  window tested (fitted: rift-R1 ~6.5, dungeon-Z1D ~15.5 under chain-sum).
+  And the ArmorPenetration rating conversion reads ~2x the boss-implied
+  effective pen (sheet 34.1% vs implied 16-18%) - untestable on dummies by
+  construction. Changing armour resolution moves every boss price in the
+  bench; medium confidence; needs its own session with the fit re-derived
+  (golems included) before it lands.
+- **Demondash tail**: the rank-3 Combo_Status (+0.25 next weapon-skill hit,
+  consumed) is unpriced (fixes Demondash_Skill1 -13% and part of
+  DuplicatePoison_Skill1's remainder); Skill2's scripted 3-projectile
+  multiplicity and its blocked ignoreMainTarget AOE at one target are read
+  wrong in opposite directions and happen to leave +17% net.
+- **Rider mix on DuplicatePoison_Skill1**: the model fires its per-dot-tick
+  rider without Lethal Poison stack multiplicity but at an assumed 100%
+  Skill1_Status uptime - reweighting its own component prices at the live
+  mix lands -1.6%.
+- **Devote ramps**: event-weighted mean 2.77/5 stacks in mixed fights (4.31
+  on dummies) against the frozen cap - ~0.7% generous outside calibration
+  windows.
+- **Replay refinements**: utility casts (Blink, MysticEmpowerment) advance
+  the live chain counter but are not model actives, so replay refuses some
+  chain-reset presses; SummonDemon's missile channel may under-fold sheet
+  crit (~10% on that row, evidence split).
