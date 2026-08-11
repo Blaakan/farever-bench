@@ -2254,8 +2254,14 @@ const commands = {
     // target-blind pick chose it - the whole ledger came back PHANTOM.
     const wantArchetype = typeof args.flags.target === 'string' ? args.flags.target : null;
     const evidence = (x) => (wantArchetype ? (x.targets?.[wantArchetype] ?? 0) : x.events);
-    const snap = usable.length
-      ? usable.reduce((best, c) => {
+    // A snapshot with NOTHING recorded on the verified target cannot win on
+    // richness: a login-and-out snapshot carries the newest probe fields and
+    // zero combat, and it once out-ranked a two-thousand-event window on the
+    // strength of its empty rune list.
+    const withEvidence = usable.filter((c) => evidence(c.s) > 0);
+    const pickFrom = withEvidence.length ? withEvidence : usable;
+    const snap = pickFrom.length
+      ? pickFrom.reduce((best, c) => {
         if (c.slots !== best.slots) return c.slots > best.slots ? c : best;
         const cr = richness(c.s);
         const br = richness(best.s);
@@ -2290,6 +2296,26 @@ const commands = {
       // 8-second zone is behind its M1 rune, and the row read +158% per hit
       // against a live mean that is mostly zone ticks.
       let runeSource = built.runesKnown ? 'snapshot' : null;
+      // Runes belong to the character more than to the moment: when the
+      // WINDOW's snapshot predates the rune probe, the nearest snapshot that
+      // does carry the authoritative set (a later login is enough to write
+      // one) beats the jobs dump's known-runes list outright - it is the
+      // same character and the slotted truth, just read on a different day.
+      if (!built.runesKnown) {
+        const runed = snaps.snapshots
+          .filter((x) => x.runes)
+          .sort((a, b) => Math.abs(a.ts - snap.ts) - Math.abs(b.ts - snap.ts))[0];
+        if (runed) {
+          const known = new Set();
+          for (const row of engine.cdb.lines('skill')) {
+            for (const m of row.mastery ?? []) if (m?.id) known.add(m.id);
+          }
+          built.loadout.runes = {};
+          for (const r of runed.runes) if (known.has(r.id)) built.loadout.runes[r.id] = r.id;
+          built.runesKnown = true;
+          runeSource = 'nearest-snapshot';
+        }
+      }
       if (!built.runesKnown && !Object.keys(built.loadout.runes ?? {}).length) {
         try {
           built.loadout.runes = toLoadout(engine.cat, readDump(game, character)).loadout.runes ?? {};
