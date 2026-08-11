@@ -2493,3 +2493,21 @@ What the last investigation pass measured but deliberately did NOT implement
   the live chain counter but are not model actives, so replay refuses some
   chain-reset presses; SummonDemon's missile channel may under-fold sheet
   crit (~10% on that row, evidence split).
+
+## The armour law (2026-08-11, the boss session)
+
+Two independent fitters and an adversarial judge landed on one law, now
+implemented: a unit's pool coefficient is the SUM of red/(1-red) over every
+reduction-carrying row in its full inheritance closure - a child's row does
+not shadow its parent's - and the pool is S x (385 + 100 x spawnLevel).
+Nearest-row is refuted by the dungeon ladder inversion and by pooled
+log-SSE 14.4 vs 1.0 over 27 rows. Golem stubs compose onto the first
+reduction row of their attribute (Golem_Z2W_E is the untested
+discriminator, flagged). Spawn-level parity is refuted in every boss
+window: fitted zone levels ship per family (rift-R1 6.9, arena 7.9,
+dungeon-Z1D 12, re-rolling 9.7-12.5 between runs - --target-level wins
+when known). Penetration conversion reads ~2x the boss-implied effective
+values (Emsey AP_eff ~8.6 vs sheet 34; Emsei SP_eff ~41 vs sheet 53) - the
+next open question, with the judge's back-solve check specified. First
+boss ledger under the law: Reblochonk, 100% coverage, 3 match / 9 close /
+2 miss - a boss page that reads like a dummy's.
