@@ -2363,3 +2363,45 @@ getArsenalSkills@8543 said it would. What one sitting of play settled:
   calibration followed by a rift left the newest snapshot rich in
   everything but dummy hits; the target-blind pick returned an all-PHANTOM
   ledger once. Snapshots now carry per-archetype event counts.
+
+## The second residual hunt (2026-08-11, night)
+
+Four investigators on the last disk-serviceable rows. What each closed:
+
+- **The swings were right all along.** The "+9% surplus" was the
+  calibration's own arithmetic: it unfolded crits with the sheet's 16.95%
+  where the line folds 26.95% (FinishTheJob's +10% on Attacks, live-confirmed
+  at 24.4% observed), and it blended DeathMark's +15% taken at the sim's
+  uptime in a window that never pressed DeathMark. State-matched, the model
+  swing reads -1.7% at front and -0.2% behind - and the behind minute
+  independently proves both weapons' behind perks sum at FULL value on the
+  arsenal copy (0.12 + 0.14; an arsenal-scaled 0.4 x 0.14 is excluded by the
+  data). "Arsenal stats efficiency 40%" is Slot_Weapon2's affixFactor,
+  already inside the affix integers both sides agree on. No code changed.
+- **Demondash's Burn was two errors cancelling.** The banked fraction is a
+  rank-resolved VAR (0.2 authored, 0.3 from rank 2 - the capture's
+  status_on amounts prove 0.3 to the integer: 61/77/101 against hits
+  202/257/335), and the feed guard is `dmg.isWeaponSkill` = skill type 7
+  exactly - the model banked 0.2 of the whole rotation instead of 0.3 of
+  three skills, and the two cancelled until the Legendary arsenal raised
+  the true feed while shrinking the false one. Fixed both, plus the tick
+  clock: it resets on every discrete feed (the live lattice is silent
+  through sub-2s spam), expiry-anchored only where the sim's feed is an
+  expectation smear (crit-gated pools), and zero-pay ticks are not ticks.
+  Share verdict: -2.7pp CLOSE, feed rising with the arsenal like live.
+- **The v5 rune cache lies by omission.** BaseSkill.masteries is DERIVED
+  from HeroSpecialization.skillMasteries and a pure client replica never
+  rebuilds it (initData@6029 skips applyMasteries) - Emsai's Surging Force
+  decomposed only WITH its M3 (+40% single-target; all 11 hits across five
+  days, min non-crit 149 vs a no-M3 ceiling of ~129) twenty-three seconds
+  after a snapshot claiming zero runes. Probe v6 reads the authoritative
+  container itself; until a v6 capture lands, verify's --rune slots
+  capture-proven overrides (M3 prices 199.2 vs the live n=11 mean 199.55).
+- **FaithfulWinds' phantom was the dump fallback working as designed and
+  labelled wrong.** Its only damage step is M3-gated; Emsei pressed it once
+  live and produced exactly one self status and zero damage - M3 unslotted
+  - while the pre-v5 fallback slotted all 12 KNOWN runes (including three
+  mutually exclusive Judgment runes). The model's mastery gate is correct;
+  verify now names the fallback in its output, and Emsei's first v5+ login
+  resolves the row to zero on its own. A whole-cdb sweep found no Damage
+  effect on any enemy-excluding step - no alignment gate is missing.
