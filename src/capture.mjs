@@ -454,6 +454,11 @@ export async function snapshots(path, { source = null } = {}) {
       // hasMastery@6089 would answer. The jobs dump lists what is KNOWN;
       // this says what is active, and the difference has been caught live
       // (a Battle Shout press with no M3 buff behind it). Probe v5.
+      // The equipped conduits in slot order, duplicates real (probe v7) -
+      // stacks carries the slot index.
+      case 'snap_conduit':
+        (s.conduits ??= []).push(r.skill);
+        break;
       case 'snap_rune':
         // The explicit empty marker: `none` with count=0 makes "zero slotted"
         // a recorded fact rather than an absence a reader would paper over

@@ -138,6 +138,20 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
       else rejected.push(r.id);
     }
   }
+  // The equipped conduits (probe v7): slot order, duplicates real. The pool
+  // key is `class/<type>` - resolved from the first conduit's own cdb type so
+  // no class name is hardcoded here.
+  if ((snap.conduits ?? []).length) {
+    const T = cat.cdb.enumValues('skill', 'type');
+    const first = cat.cdb.byId('skill').get(snap.conduits[0]);
+    const tname = T[first?.type ?? -1];
+    const good = snap.conduits.filter((id) => cat.cdb.has('skill', id));
+    for (const bad of snap.conduits.filter((id) => !cat.cdb.has('skill', id))) rejected.push(bad);
+    if (tname && good.length) {
+      built.loadout.skills ??= {};
+      built.loadout.skills[`class/${tname}`] = good;
+    }
+  }
   built.attrs = snap.attrs ?? {};
   built.hattrs = snap.hattrs ?? {};
   // UnitAttributes.attributes is keyed by the attribute's POSITION in the cdb
