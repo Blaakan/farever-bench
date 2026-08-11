@@ -885,13 +885,23 @@ group('statuses that tick');
     fervor?.affixes.some((a) => a.target.attribute === 'Fervor'),
     JSON.stringify(fervor?.affixes?.map((a) => a.target.attribute)));
 
-  // A status whose magnitude is injected by a script has no magnitude in the
-  // data, and must be refused rather than counted at its stack cap.
+  // An op-2 dynVal ADDS the script's growth to the authored value, and a
+  // fresh instance reads dynVal 0 - so the authored +10 CritChance is a floor
+  // the model credits, at ONE stack (maxStacks 300 is the growth channel, not
+  // a stack count), with the growth itself still refused and flagged.
   const crusader = engine.plan.statusesOf('Priest_Crusader', { rank: 3 });
-  ok('a dynVal-scaled status is refused, not counted at maxStacks 300',
-    crusader.unreadable.some((x) => x.status === 'Priest_Crusader_Status')
-      && !crusader.self.some((x) => x.status === 'Priest_Crusader_Status'),
-    JSON.stringify({ self: crusader.self.map((x) => x.status), no: crusader.unreadable.map((x) => x.status) }));
+  const crusaderSelf = crusader.self.find((x) => x.status === 'Priest_Crusader_Status');
+  ok('an op-2 dynVal status is credited at its authored floor, one stack',
+    !!crusaderSelf && crusaderSelf.stacks === 1 && crusaderSelf.growthRefused === true
+      && crusaderSelf.affixes.some((a) => a.target?.attribute === 'CritChance' && a.val === 10)
+      && !crusader.unreadable.some((x) => x.status === 'Priest_Crusader_Status'),
+    JSON.stringify({ self: crusader.self.map((x) => ({ id: x.status, stacks: x.stacks })), no: crusader.unreadable.map((x) => x.status) }));
+  // The other dynVal ops still mean "the authored number is not the value":
+  // op 0 multiplies by a script-set factor that starts at 0. Those stay out.
+  const waterCombo = engine.plan.statusesOf('DA_Water_Combo', { rank: 3 });
+  ok('an op-0 dynVal status stays refused',
+    !waterCombo.self.length || waterCombo.self.every((x) => !x.affixes.some((a) => a.mod?.dynVal)),
+    JSON.stringify(waterCombo.self.map((x) => x.status)));
 }
 
 // --- the optimiser ---------------------------------------------------------

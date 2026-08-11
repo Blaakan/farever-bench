@@ -2631,11 +2631,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * names its status in a `Status` STEP, not in a script, and it is +10 Fervor.
    *
    * Stat buffs are modelled AT FULL STACKS, which is stated in the audit - with
-   * one refusal. A status whose affix carries `mod.dynVal` has its magnitude
-   * decided by a script at runtime (`Priest_Crusader_Status` is +10% damage per
-   * dynVal with `maxStacks: 300`), so counting it at its cap would credit the
-   * build with +3000% and is exactly the kind of large, wrong, flattering
-   * number worth refusing. Those are reported as unmodelled instead.
+   * one refusal, now narrowed by op. A status whose affix carries `mod.dynVal`
+   * has part of its magnitude decided by a script at runtime, but
+   * getAffixModVal@20794 says HOW: op 0 multiplies the authored val by the
+   * dynVal, op 1 replaces it - those are refused, the authored number means
+   * nothing on its own. Op 2 ADDS, and a fresh instance reads dynVal 0, so the
+   * authored val is a floor: `Priest_Crusader_Status`'s +10 CritChance is live
+   * for the whole 20s press even with zero growth. The floor is credited at
+   * one stack (its maxStacks 300 is the growth channel, and crediting it at
+   * cap would hand the build +3000 crit); the addDynVal growth stays refused.
    */
   const statusCache = new Map();
   function statusesOf(skillId, { runes = null, rank = 1, talents = null, talentRanks = null } = {}) {
@@ -3075,7 +3079,23 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         .concat(scripted);
       // A scripted multiplier is a real number, so it does not make the status
       // "dynamic" the way a mod.dynVal does.
-      const dynamic = affixes.some((a) => a.mod?.dynVal);
+      //
+      // And a dynVal does not always erase the authored value: the game's
+      // getAffixModVal@20794 switches on the mod's op - op 0 MULTIPLIES the
+      // authored val by the script-set dynVal (worth 0 until a script writes
+      // it), op 1 REPLACES it, but op 2 ADDS - and a fresh status instance
+      // reads dynVal 0, so for op 2 the authored val is a floor the wearer
+      // always gets. Priest_Crusader_Status is the whole op-2 population in
+      // the data (the other two dynVal rows are op 0): authored +10
+      // CritChance, +10% damage, +10% shield and heal per press, grown by
+      // addDynVal per prayer trigger under the M2 mastery. The base is
+      // credited; the growth stays refused; and the stacks are pinned to 1 -
+      // its maxStacks 300 is the growth channel's headroom, not a stack count
+      // any fight reaches (the applier's own script is removeStatus +
+      // addStatus, a fresh single-stack instance per press, and the live
+      // capture's status_on rows say stacks=1).
+      const dynamic = affixes.some((a) => a.mod?.dynVal && a.mod.dynVal.op !== 2);
+      const dynGrowth = !dynamic && affixes.some((a) => a.mod?.dynVal);
       const entry = {
         from: skillId,
         status: statusId,
@@ -3086,9 +3106,13 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         // An uncapped buff is held at one stack instead: nothing in the data
         // says how many a fight reaches, and Infinity is not a number to
         // multiply an affix by.
-        stacks: Number.isFinite(maxStacksOf(statusId, rank, talentRanks))
-          ? maxStacksOf(statusId, rank, talentRanks) : 1,
+        stacks: dynGrowth ? 1
+          : Number.isFinite(maxStacksOf(statusId, rank, talentRanks))
+            ? maxStacksOf(statusId, rank, talentRanks) : 1,
         uncapped: !Number.isFinite(maxStacksOf(statusId, rank, talentRanks)),
+        // Op-2 dynVal: the authored base is credited above, the script's
+        // addDynVal growth is not - the flag keeps the partial credit visible.
+        growthRefused: dynGrowth || undefined,
         stackingPolicy: st.props?.status?.stackingPolicy ?? null,
         duration: st.duration ?? null,
         // Time this build's own script adds back while the status runs, per
