@@ -1192,20 +1192,23 @@ export function buildCombat(cdb, ctx, assume = {}) {
   const NO_MODS = { critDamageByType: null, critChanceByType: null, damageByAffinity: null, armorIgnore: null, bleed: null };
   function targetState(active) {
     if (!active || !active.length) return NO_DEBUFF;
-    let armor = 1, magicArmor = 1, taken = 1;
+    // ARatio armour debuffs SUM into one bracket - the extracted pool law is
+    // Armor x (1 + SUM ARatio) x (1 - ignore) x (1 - pen/100) - so Tear
+    // Reality's -25% and a -25% shred together are x0.50, not x0.5625. One
+    // debuff composes identically either way, which is how the multiply hid
+    // through every single-debuff window. mulRatio rows keep their own
+    // sheet-declared composition, applied after the summed bracket.
+    const add = { Armor: 0, MagicArmor: 0, DamageTakenModifier: 0 };
+    const mul = { Armor: 1, MagicArmor: 1, DamageTakenModifier: 1 };
+    let taken = 1;
     for (const d of active) {
       for (const a of d.affixes ?? []) {
         const atb = a.target?.attribute;
+        if (!(atb in add)) continue;
         const v = (a.val ?? 0) * (d.stacks ?? 1);
-        // A debuff states its change the same three ways an item does, and
-        // composes the way the `affix` sheet says it does.
         const kind = ctx.affix.kindOf(a.ref);
-        const apply = (cur) => (kind === 'addRatio' ? cur * (1 + v)
-          : kind === 'mulRatio' ? ctx.affix.composeMul(a.ref, cur, v)
-            : cur);
-        if (atb === 'Armor') armor = apply(armor);
-        else if (atb === 'MagicArmor') magicArmor = apply(magicArmor);
-        else if (atb === 'DamageTakenModifier') taken = apply(taken);
+        if (kind === 'addRatio') add[atb] += v;
+        else if (kind === 'mulRatio') mul[atb] = ctx.affix.composeMul(a.ref, mul[atb], v);
       }
       // The script-side spelling of DamageTakenModifier: Death Mark's status
       // has no affix at all, just `dmg.dmgMult += 0.15` for the instigator's
@@ -1213,7 +1216,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // here exactly where an affix saying the same thing would land.
       if (d.scriptTaken) taken *= 1 + d.scriptTaken * (d.stacks ?? 1);
     }
-    return { armor: Math.max(0, armor), magicArmor: Math.max(0, magicArmor), taken: Math.max(0, taken) };
+    return {
+      armor: Math.max(0, (1 + add.Armor) * mul.Armor),
+      magicArmor: Math.max(0, (1 + add.MagicArmor) * mul.MagicArmor),
+      taken: Math.max(0, (1 + add.DamageTakenModifier) * mul.DamageTakenModifier * taken),
+    };
   }
 
   function mitigate(effect, sheet, target, foe = NO_DEBUFF, mods = NO_MODS, attackerLevel = null) {
