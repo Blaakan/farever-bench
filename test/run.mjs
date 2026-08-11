@@ -1718,8 +1718,11 @@ group('scoped talent modifiers');
     sever && sever.field === 'critDmgMult' && sever.scope === 'weaponSkill' && Math.abs(sever.amount - 0.2) < 1e-9,
     JSON.stringify(sever));
   const maa = one('Warrior_Talent_MasterAtArms', 2);
-  ok('Master-at-arms is scoped to the attack chain, and scales with rank',
-    maa && maa.scope === 'attack' && Math.abs(maa.amount - 0.3) < 1e-9, JSON.stringify(maa));
+  // Its guard names BOTH halves - isBaseAttack || isFinalCombo - and the scope
+  // keeps them now instead of collapsing to 'attack' and silently dropping the
+  // finisher's share.
+  ok('Master-at-arms is scoped to swings and the finisher, and scales with rank',
+    maa && maa.scope === 'attack-or-combo' && Math.abs(maa.amount - 0.3) < 1e-9, JSON.stringify(maa));
   const bl = one('Warrior_Talent_Bloodletting', 2);
   ok('Bloodletting is scoped to bleed damage', bl && bl.scope === 'bleed', JSON.stringify(bl));
   const mc = one('Warrior_Talent_MagicConduction', 2);
@@ -3816,12 +3819,21 @@ group("the arsenal's upgrade effect is not discounted away");
     eng.plan.pruneSelection(l);
     return eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank: 3 }).sheet.get('CritChance');
   };
-  // GreatAxe_Upgrade is +1/+2/+3/+4/+5 CritChance by rank, mutually exclusive,
-  // and the rank is STARS - 1: the four-star weapon's own tooltip reads
-  // "Critical Chance increased by 3%" while its iLevel 320 proves four stars.
-  near('a 4-star arsenal axe is worth 3 crit over an unupgraded one',
+  // GreatAxe_Upgrade is +1/+2/+3/+4/+5 CritChance by rank, mutually exclusive.
+  // The rank is the ROLLED RARITY's index and the skill only attaches at three
+  // stars - Weapon.getWeaponUpgradeSkill@8182 gates on upgradeLevel >=
+  // GearUpgrades.SkillUnlockLevel (3) and reads rank off inf.rarity, which
+  // updateInf@8174 overwrites with the instance's roll. Every earlier
+  // measurement was degenerate between this and the old stars-1 reading (an
+  // Epic 4-star reads 3 either way); the discriminators that broke stars-1
+  // are a 3-star Epic dagger showing its rank-3 "12%" perk and a Legendary
+  // shield showing rank-4 "-11%" where stars-1 predicts -9%.
+  near('a 4-star Epic arsenal axe is worth its rarity rank, 3 crit',
     crit(4) - crit(0), 3, 1e-9);
-  near('...and a 2-star one exactly 1', crit(2) - crit(0), 1, 1e-9);
+  near('...and a 3-star Epic the same 3 - rank is rarity, not stars',
+    crit(3) - crit(0), 3, 1e-9);
+  near('...and a 2-star one nothing at all: the upgrade skill attaches at three stars',
+    crit(2) - crit(0), 0, 1e-9);
   ok('...and a 1-star one carries no rider at all', Math.abs(crit(1) - crit(0)) < 1e-9,
     String(crit(1) - crit(0)));
 }

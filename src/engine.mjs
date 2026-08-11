@@ -31,6 +31,13 @@ export const DEFAULT_ASSUME = {
   // the default. --fervor-scope skills|none remain as sensitivity toggles.
   fervorScope: 'all',
   mastery: true,
+  // How much of the time basic attacks land from the target's rear half-plane,
+  // for the weapon upgrade perks that pay there. The predicate (read from
+  // Daggers_Upgrade's script) is a full 180 degrees of "behind", so 1.0 is the
+  // right claim for a build that repositions - Shadowstep teleports there -
+  // and the one measured dummy session put a drifting melee at 0.68-0.85.
+  // An assumption, not data; --behind-fraction overrides it.
+  behindFraction: 1,
   // Reported from play: casting a skill interrupts the base-attack chain, so
   // the next swing starts the chain over. Everything gated on the combo
   // finisher - Rage income, prayer charging, per-combo procs - rides on this.
@@ -270,6 +277,23 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // +3 the second.
     const upgradeGaps = [];
     const upgradeProcs = [];
+    const upgradeBehind = [];
+    // The open question above is CLOSED, by bytecode and by two tooltips that
+    // break the stars rule. Weapon.getWeaponUpgradeSkill@8182 attaches the
+    // upgrade skill only at upgradeLevel >= GearUpgrades.SkillUnlockLevel (3),
+    // and sets rank = the instance's ROLLED rarity index - updateInf@8174
+    // overwrites inf.rarity with the roll before the read. Every previously
+    // measured weapon was degenerate between the two rules (Rare 3-star reads
+    // 2 either way, Epic 4-star reads 3); the discriminators are Emsey's
+    // 3-star Epic daggers showing the rank-3 "12%" where stars-1 says rank 2,
+    // and Emsei's Legendary shield showing the rank-4 "-11%" where stars-1
+    // says -9%.
+    const rarityIndex = new Map(cdb.lines('rarity').map((r, i) => [r.id, i]));
+    const skillUnlock = (() => {
+      const v = cdb.constant('GearUpgrades');
+      const row = v?.group?.find?.((x) => x.id === 'SkillUnlockLevel');
+      return row?.v?.float ?? 3;
+    })();
     for (const slotId of ['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']) {
       const g = loadout.gear[slotId];
       if (!g?.item) continue;
@@ -277,12 +301,27 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       const upgradeId = cat.upgradeSkillFor(item);
       if (!upgradeId) continue;
       const stars = Math.min(g.stars ?? 0, cat.maxStars(item, g.rarity));
-      if (stars < 1) continue;
-      // The affix ladder is read at STARS - 1; see above. A one-star weapon
-      // still reaches the script-proc branch below, which is keyed on the star
-      // count and not on this ladder.
-      const riderRank = stars - 1;
+      if (stars < skillUnlock) continue;
+      const riderRank = rarityIndex.get(g.rarity ?? item.rarity) ?? 0;
       const up = cdb.byId('skill').get(upgradeId);
+      // The behind perk: `dmgMult += vars.damage` on basic attacks landed from
+      // the target's rear half-plane, rank-resolved through rankOverride, and
+      // BOTH weapons' copies sum - evalDamage runs every skill instance's hook
+      // into the one additive bracket, and nothing dedupes by kind.
+      {
+        const body = String(up?.script ?? '');
+        if (/isBasicAttack\s*\(\s*\)/.test(body) && /dmgMult\s*\+=\s*vars\.damage/.test(body)
+          && /getForward\s*\(\s*\)\s*\.dot\s*\(/.test(body)) {
+          let dmg = up?.vars?.damage;
+          for (const ov of up?.props?.rankOverride ?? []) {
+            if ((ov.minRank ?? 0) <= riderRank && ov.vars?.damage != null) dmg = ov.vars.damage;
+          }
+          if (typeof dmg === 'number' && dmg > 0) {
+            upgradeBehind.push({ id: upgradeId, slot: slotId, damage: dmg });
+            continue;
+          }
+        }
+      }
       const rows = riderRank < 1 ? [] : (up?.affixes ?? []).filter((a) => a.target?.attribute
         && !(a.conds?.minRank != null && riderRank < a.conds.minRank)
         && !(a.conds?.maxRank != null && riderRank > a.conds.maxRank)
@@ -306,7 +345,12 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         // and none uses the game's own internal-cooldown idiom, so the rate is
         // plain Bernoulli with nothing to saturate.
         const body = String(up?.script ?? '');
-        const chance = up?.vars?.chance;
+        // Rank-resolved, like every other vars read: Sword_Swarm at Legendary
+        // is rank 4 and its double-attack rolls at 7%, not the base row's 4%.
+        let chance = up?.vars?.chance;
+        for (const ov of up?.props?.rankOverride ?? []) {
+          if ((ov.minRank ?? 0) <= riderRank && ov.vars?.chance != null) chance = ov.vars.chance;
+        }
         if (/isBasicAttack\s*\(\s*\)/.test(body) && /playStep\s*\(/.test(body)
           && /checkProba\s*\(\s*vars\.chance/.test(body)
           && typeof chance === 'number' && chance > 0 && chance <= 1) {
@@ -442,6 +486,12 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       // chain, never the combo finisher that ends it. The weapon-upgrade
       // double-attack proc is the only thing that writes it today.
       basicAttack: upgradeProcs.reduce((s, p) => s + p.chance, 0),
+      // The behind perks, summed across both weapons - the game runs every
+      // instance's hook into one additive bracket - and billed at the
+      // assumed behind-fraction. 1.0 is the Shadowstep claim; the measured
+      // dummy fraction was 0.68-0.85 for a player who repositions.
+      basicAttackBehind: upgradeBehind.reduce((s, p) => s + p.damage, 0)
+        * (assumeAll.behindFraction ?? 1),
     };
     // Modifiers whose scope this fight does not separate. Named, not dropped.
     const unreadMods = [];
@@ -496,8 +546,13 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         // is dropped, not folded into "everything": `Rogue_Talent_LethalDose`
         // scopes its +20% to Poison damage, and the model has no poison pool to
         // put it on, so it must contribute nothing rather than +20% globally.
-        const type = mod.scope === 'attack' ? 'Attack'
-          : mod.scope === 'weaponSkill' ? 'WeaponSkill' : null;
+        // A scope may cover more than one profile category: the finisher's
+        // profile type is AttackCombo, and 'attack-or-combo' pays both halves.
+        const types = mod.scope === 'attack' ? ['Attack']
+          : mod.scope === 'combo' ? ['AttackCombo']
+            : mod.scope === 'attack-or-combo' ? ['Attack', 'AttackCombo']
+              : mod.scope === 'weaponSkill' ? ['WeaponSkill'] : null;
+        const type = types?.[0] ?? null;
         if (mod.field === 'healShare' && mod.scope === 'bleed') { add(mods.bleed, 'healShare'); scoped('healShare'); }
         else if (mod.scope === 'bleed' && mod.field !== 'cooldownPerTick') { add(mods.bleed, mod.field); scoped(mod.field); }
         // A modifier scoped to a status type that is NOT a bleed. The reader
@@ -513,11 +568,11 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
             statusType: mod.scope.slice(4), field: mod.field, amount: mod.amount,
           });
         }
-        else if (mod.field === 'critDmgMult' && type) add(mods.critDamageByType, type);
-        else if (mod.field === 'critChance' && type) add(mods.critChanceByType, type);
+        else if (mod.field === 'critDmgMult' && types) for (const t of types) add(mods.critDamageByType, t);
+        else if (mod.field === 'critChance' && types) for (const t of types) add(mods.critChanceByType, t);
         else if (mod.field === 'dmgMult' && mod.scope === 'physical') add(mods.damageByAffinity, 'Physical');
         else if (mod.field === 'dmgMult' && mod.scope === 'magic') add(mods.damageByAffinity, 'Magic');
-        else if (mod.field === 'dmgMult' && type) add(mods.damageByAffinity, type);
+        else if (mod.field === 'dmgMult' && types) for (const t of types) add(mods.damageByAffinity, t);
         else if (mod.field === 'dmgMult' && mod.scope === 'all') add(mods.damageByAffinity, 'all');
         // Cooldown reduction earned per bleed tick. The bleed's own tick
         // interval turns "a 12% chance for one second" into a rate: at one tick

@@ -393,6 +393,13 @@ function commonSetup(args) {
   }
   // The measured floor on a chain link's swing period (0 to trust the
   // authored durations alone).
+  // How often basic attacks land from behind, for the upgrade perks that pay
+  // there. Default 1 (the Shadowstep claim); the measured drifting-melee dummy
+  // fraction was 0.68-0.85.
+  if (args.flags['behind-fraction'] != null && args.flags['behind-fraction'] !== true) {
+    assume.behindFraction = Number(args.flags['behind-fraction']);
+    if (!(assume.behindFraction >= 0 && assume.behindFraction <= 1)) die('--behind-fraction needs 0..1');
+  }
   if (args.flags['swing-floor'] != null && args.flags['swing-floor'] !== true) {
     assume.swingFloor = Number(args.flags['swing-floor']);
     if (!Number.isFinite(assume.swingFloor) || assume.swingFloor < 0) die('--swing-floor needs a number of seconds');

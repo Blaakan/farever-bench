@@ -73,6 +73,20 @@ export function buildCombat(cdb, ctx, assume = {}) {
   const skillNatureNames = cdb.enumValues('skill', 'nature');
   const stepTypeNames = cdb.enumValues('skill@steps', 'type');
   const stepOnNames = cdb.enumValues('skill@steps', 'on');
+
+  // Does a statusType carry the DoT (bit 0) or HoT (bit 3) flag, its parent
+  // chain included - Hemorage carries DoT itself AND parents to Bleed, and
+  // hasStatusFlag@20821 walks the chain, so this does too.
+  const statusTypeById = new Map(cdb.lines('statusType').map((r) => [r.id, r]));
+  function statusTypeDotOrHot(typeId) {
+    let cur = statusTypeById.get(typeId);
+    for (let hop = 0; cur && hop < 8; hop++) {
+      const f = cur.flags ?? 0;
+      if ((f & 1) || (f & 8)) return true;
+      cur = cur.parent ? statusTypeById.get(cur.parent) : null;
+    }
+    return false;
+  }
   const PROJECTILE_HIT = stepOnNames.indexOf('ProjectileHit');
   // Which step types hit everything in a shape rather than one target.
   //
@@ -711,10 +725,25 @@ export function buildCombat(cdb, ctx, assume = {}) {
       nature: natureName,
       cooldown: num(props.cooldown, num(s.cooldown)),
       occupancy: occupancyOf(s, typeName),
-      // A row that IS a status prices as a status tick: no crit (initVars
-      // zeroes ctx.critChance) and no attacker fervor/mastery bracket (the
-      // tick's SkillContext belongs to the carrier). See castOutput.
+      // A row that IS a status prices as a status tick: no attacker
+      // fervor/mastery bracket (the tick's SkillContext belongs to the
+      // carrier). See castOutput.
       isStatusTick: !!s.props?.status,
+      // WHETHER ITS TICKS CAN CRIT is a narrower rule than "it is a status",
+      // and the model over-generalised it for its whole life. initVars@5150
+      // zeroes ctx.critChance only for statuses whose statusType carries the
+      // DoT or HoT flag - Bleed, Burn, Poison, Hemorage-via-parent,
+      // HealOverTime - walked through the type's parent chain. Everything
+      // else rolls the CARRIER's crit chance: PurgingStrikes crits at 11.6%
+      // live, Demondash's aura at 12.7%, and the model priced both flat.
+      // A Buff carried by its own caster ticks with the player's crit; a
+      // status worn by the enemy ticks with the enemy's (~0), which is why
+      // enemy-worn debuff steps still read as good as flat.
+      tickCanCrit: !!s.props?.status
+        && !(s.props.status.types ?? []).some((t) => statusTypeDotOrHot(t.type)),
+      tickCarrierSelf: !!s.props?.status
+        && (s.props.status.types ?? []).some((t) => t.type === 'Buff')
+        && !(s.props.status.types ?? []).some((t) => t.type === 'Debuff'),
       // The row's vars WITH every rankOverride the build's rank clears already
       // folded in, so a reader never has to remember to do it. `s.vars` is the
       // unresolved row and is the wrong thing to read at a rank.
@@ -1186,13 +1215,17 @@ export function buildCombat(cdb, ctx, assume = {}) {
         }
         const critBonus = (mods.critDamageByType?.[cat] ?? 0) + scriptCritDmg;
         const chanceBonus = mods.critChanceByType?.[cat] ?? 0;
-        // A status tick cannot crit: SkillContext.initVars@5150 zeroes
-        // ctx.critChance for damage-carrying statuses, and the crit roll reads
-        // it (criticalRoll@6211). A talent that gives a bleed its own crit
-        // chance is a script hook and rides poolScale, not this path.
+        // WHICH status ticks crit is the statusType's DoT/HoT flag, not the
+        // fact of being a status: initVars@5150 zeroes ctx.critChance only for
+        // flagged types, and everything else rolls the CARRIER's chance
+        // (criticalRoll@6211). A self-carried Buff aura ticks with the
+        // player's crit; an enemy-worn status ticks with the enemy's, which
+        // against a dummy is as good as none. A talent that gives a bleed its
+        // own crit chance is a script hook and rides poolScale, not this path.
         const rawAff = aff.root === 'Raw';
         const statusTick = prof.isStatusTick === true;
-        const localCrit = statusTick ? 1
+        const tickCrits = statusTick && prof.tickCanCrit === true && prof.tickCarrierSelf === true;
+        const localCrit = statusTick && !tickCrits ? 1
           : (critBonus || chanceBonus)
             ? 1 + Math.min(1, critChance + chanceBonus)
               * ((sheet.get('CritDamage') ?? 100) / 100 + critBonus - 1)
@@ -1231,6 +1264,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // must not reach the swing that ends the chain. `prof.isFiller` is the
         // wrong test here: it covers the finisher too.
         if (mods.basicAttack && /^Attack[234]?$/.test(prof.type ?? '')) riders += mods.basicAttack;
+        // The behind perks land in the same additive bracket the game uses -
+        // `hit.dmgMult +=` into computeDamage's one modMult scalar - already
+        // scaled by the assumed behind-fraction at the engine.
+        if (mods.basicAttackBehind && /^Attack[234]?$/.test(prof.type ?? '')) riders += mods.basicAttackBehind;
         m *= 1 + riders;
         // Fervor and the matching mastery share ONE additive bracket -
         // getDamageRatio@4505: (1 + fervor + mastery) x DamageModifier - and

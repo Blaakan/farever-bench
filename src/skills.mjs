@@ -253,7 +253,17 @@ function scopeOf(block, rank = null) {
   const targetBleeding = /(?:target\s*,\s*StatusType\.|target\.)hasStatusType|hasStatusType\s*\([^)]*target/.test(guard);
   if (/isMagic/.test(guard)) return { scope: 'magic', targetBleeding };
   if (/isWeaponSkill/.test(guard)) return { scope: 'weaponSkill', targetBleeding };
-  if (/isBaseAttack|isBasicAttack|isFinalCombo|isFinalAttack/.test(guard)) return { scope: 'attack', targetBleeding };
+  // Which half of the swing-and-finisher pair a guard names is a third of the
+  // rate, and collapsing both onto 'attack' silently dropped the finisher:
+  // Zealous Fighter's +8pp crit reads `isBaseAttack || isFinalCombo`, and the
+  // finisher never saw it.
+  {
+    const base = /isBaseAttack|isBasicAttack/.test(guard);
+    const fin = /isFinalCombo|isFinalAttack/.test(guard);
+    if (base && fin) return { scope: 'attack-or-combo', targetBleeding };
+    if (fin) return { scope: 'combo', targetBleeding };
+    if (base) return { scope: 'attack', targetBleeding };
+  }
   if (fromStatus) {
     // WHICH bleed is kept, not collapsed. The statusType sheet subtypes them
     // one way - `Hemorage` declares `parent: Bleed`, nothing else declares a
