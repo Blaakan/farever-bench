@@ -1025,15 +1025,22 @@ export function buildCombat(cdb, ctx, assume = {}) {
       for (const r of fam) if (r.stub && r.mult != null) stubMult *= r.mult;
       let S = 0;
       let first = true;
+      let declared = false;
       for (const r of fam) {
+        // A row authoring reduction ZERO (the Dummy's) still DECLARES the
+        // family - the unit is a target that mitigates nothing, which is not
+        // the same as a unit with no armour intent at all.
+        if (!r.stub && r.red != null) declared = true;
         if (r.stub || !(r.red > 0)) continue;
         const m = (first ? stubMult : 1) * (r.mult ?? 1);
         S += (m * r.red) / (1 - r.red);
         first = false;
       }
-      return S;
+      return { S, declared };
     };
-    const out = { physS: sum(rows.Armor), magS: sum(rows.MagicArmor) };
+    const p = sum(rows.Armor);
+    const m2 = sum(rows.MagicArmor);
+    const out = { physS: p.S, magS: m2.S, physDeclared: p.declared, magDeclared: m2.declared };
     chainArmourCache.set(unitId, out);
     return out;
   }
@@ -1045,8 +1052,8 @@ export function buildCombat(cdb, ctx, assume = {}) {
     const c = chainArmour(unitId);
     return {
       physS: c.physS, magS: c.magS,
-      phys: c.physS > 0 ? c.physS / (1 + c.physS) : null,
-      mag: c.magS > 0 ? c.magS / (1 + c.magS) : null,
+      phys: c.physDeclared ? c.physS / (1 + c.physS) : null,
+      mag: c.magDeclared ? c.magS / (1 + c.magS) : null,
     };
   }
 
