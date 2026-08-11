@@ -979,33 +979,74 @@ export function buildCombat(cdb, ctx, assume = {}) {
     return out;
   }
 
-  // A stat's `multiplier` scales the resist POOL, not the reduction fraction it
-  // was authored as. Converting back is level-independent, which is worth
-  // knowing because it means one number describes the target at every level:
+  // ARMOUR IS A SUM OVER THE WHOLE INHERITANCE CLOSURE, not one nearest row.
   //
-  //   R    = r/(1-r) * K      (resistForReduction, K = a + b*level)
-  //   R'   = m * R
-  //   red' = R'/(R'+K) = m*r / (m*r + 1 - r)
+  // Re-derived 2026-08-11 from two independent fits plus an adversarial
+  // judge, all three landing on the same law: a child's armour row does NOT
+  // shadow its parent's - every reduction-carrying row in the closure
+  // contributes red/(1-red) to the pool coefficient, and the pool is
+  // S x (385 + 100 x spawnLevel). Nearest-row is refuted by the dungeon
+  // ladder inversion (adds authored 0.25 taking LESS per hit than the boss
+  // authored 0.30 - impossible under nearest-wins, exact under the sum:
+  // Kobold_Z1D = 0.25/0.75 + inherited 0.30/0.70 = 0.762 vs Reblochonk's
+  // bare 0.30/0.70 = 0.429) and by pooled log-SSE 14.4 vs 1.0 on 27 rows.
   //
-  // Golem_Base declares Armor with `multiplier: 1.6` and nothing else, and
-  // W_Base declares `armorReduction: 0.3`. A golem inheriting [W_Base,
-  // Golem_Base] therefore mitigates 0.4068, not 0.30 - and following only the
-  // first parent, or ignoring the multiplier, gets 0.30.
-  function scaledReduction(base, multiplier) {
-    if (base == null) return null;
-    const m = multiplier ?? 1;
-    if (!(m > 0) || m === 1) return base;
-    return (m * base) / (m * base + 1 - base);
+  // A modifier-only stub (Golem_Base's Armor x1.6: no value, no scaling)
+  // composes its multiplier onto the FIRST reduction-carrying row of its
+  // attribute in merge order - the same attachment mergedStats performs -
+  // which reproduces the previously verified golem number exactly for every
+  // single-row family (m·r/(1-r) equals scaledReduction re-expressed) and
+  // splits from x1.6-on-everything only on Golem_Z2W_E, flagged untested.
+  function chainArmour(unitId) {
+    const hit = chainArmourCache.get(unitId);
+    if (hit) return hit;
+    const rows = { Armor: [], MagicArmor: [] };
+    const walk = (id, seen) => {
+      const u = units.get(id);
+      if (!u || seen.has(id)) return;
+      seen.add(id);
+      for (const s of u.stats ?? []) {
+        if (s.attribute !== 'Armor' && s.attribute !== 'MagicArmor') continue;
+        const red = s.attribute === 'Armor'
+          ? s.specScaling?.armorReduction ?? null
+          : s.specScaling?.magicReduction ?? null;
+        const modifierOnly = s.value == null
+          && (s.levelScaling ?? []).length === 0 && s.specScaling == null;
+        rows[s.attribute].push({ red, mult: s.multiplier ?? null, stub: modifierOnly });
+      }
+      for (const inh of u.inherit ?? []) {
+        if (inh?.textOnly || !inh?.ref) continue;
+        walk(inh.ref, seen);
+      }
+    };
+    walk(unitId, new Set());
+    const sum = (fam) => {
+      let stubMult = 1;
+      for (const r of fam) if (r.stub && r.mult != null) stubMult *= r.mult;
+      let S = 0;
+      let first = true;
+      for (const r of fam) {
+        if (r.stub || !(r.red > 0)) continue;
+        const m = (first ? stubMult : 1) * (r.mult ?? 1);
+        S += (m * r.red) / (1 - r.red);
+        first = false;
+      }
+      return S;
+    };
+    const out = { physS: sum(rows.Armor), magS: sum(rows.MagicArmor) };
+    chainArmourCache.set(unitId, out);
+    return out;
   }
+  const chainArmourCache = new Map();
 
-  // What a unit actually mitigates, after the whole inheritance merge.
+  // What a unit actually mitigates: the summed coefficients, plus the
+  // level-parity DISPLAY reduction S/(1+S) for humans and headers.
   function armourIntent(unitId) {
-    const stats = mergedStats(unitId);
-    const arm = stats.find((s) => s.attribute === 'Armor');
-    const mag = stats.find((s) => s.attribute === 'MagicArmor');
+    const c = chainArmour(unitId);
     return {
-      phys: scaledReduction(arm?.specScaling?.armorReduction ?? null, arm?.multiplier),
-      mag: scaledReduction(mag?.specScaling?.magicReduction ?? null, mag?.multiplier),
+      physS: c.physS, magS: c.magS,
+      phys: c.physS > 0 ? c.physS / (1 + c.physS) : null,
+      mag: c.magS > 0 ? c.magS / (1 + c.magS) : null,
     };
   }
 
@@ -1044,32 +1085,54 @@ export function buildCombat(cdb, ctx, assume = {}) {
   // 10, and inverting the clean magic channel of a real fight puts him at
   // ~18-25 - world bosses spawn at zone level, set by world data the model
   // does not read. A caller who knows the spawn level passes it.
+  // Fitted spawn levels, per world family: parity (target = attacker) is
+  // refuted in every boss window tested, and these are the joint fits with
+  // their windows in MODEL.md. The zone level RE-ROLLS between dungeon runs
+  // (9.7-12.5 observed), so --target-level always wins when given.
+  const FITTED_LEVELS = [
+    { re: /_Rift|^Ratsar$|Kobold_Ratsar/, level: 6.9, label: 'rift-R1 fit' },
+    { re: /^Phrixes/, level: 7.9, label: 'arena fit' },
+    { re: /_Z1D|^Reblochonk$/, level: 12, label: 'dungeon-Z1D fit (re-rolls 9.7-12.5 per run)' },
+  ];
   function foe(name, level, targetLevel = null) {
-    let phys, mag, label;
+    let S, label, unitId = null;
     const named = NAMED[name];
     if (named?.unit) {
+      unitId = named.unit;
       const i = armourIntent(named.unit);
-      phys = i.phys ?? 0; mag = i.mag ?? 0;
-      label = `${named.label} (${named.unit}: ${phys}/${mag})`;
+      S = { phys: i.physS, mag: i.magS };
+      label = `${named.label} (${named.unit}: S ${i.physS.toFixed(2)}/${i.magS.toFixed(2)})`;
     } else if (named) {
-      phys = named.phys; mag = named.mag;
+      // The designers' own reference constant, still a single-row intent.
+      S = { phys: named.phys / (1 - named.phys), mag: named.mag / (1 - named.mag) };
       label = `${name} (${named.label})`;
     } else if (targetsByUnit.has(name)) {
+      unitId = name;
       const i = targetsByUnit.get(name);
-      phys = i.phys ?? 0; mag = i.mag ?? 0;
-      label = `${name} (${phys}/${mag})`;
+      S = { phys: i.physS, mag: i.magS };
+      label = `${name} (S ${i.physS.toFixed(2)}/${i.magS.toFixed(2)})`;
     } else {
       throw new Error(
         `unknown target "${name}". Named: ${Object.keys(NAMED).join(', ')}. ` +
         'Any unit id with a declared armour intent also works - see `bench targets`.'
       );
     }
-    const at = targetLevel ?? level;
+    // Spawn level: explicit wins; a fitted world family beats the parity
+    // guess; parity remains only for reference foes and the unfitted rest.
+    let at = targetLevel;
+    let lvlNote = targetLevel != null ? ` @L${targetLevel}` : '';
+    if (at == null && unitId) {
+      const fit = FITTED_LEVELS.find((f) => f.re.test(unitId));
+      if (fit) { at = fit.level; lvlNote = ` @L${fit.level} (${fit.label})`; }
+    }
+    if (at == null) at = level;
+    const [a, b] = ctx.consts.resistFormula;
     return {
-      name: label + (targetLevel != null && targetLevel !== level ? ` @L${targetLevel}` : ''),
-      physReduction: phys, magicReduction: mag, level, spawnLevel: at,
-      armor: resistForReduction(at, phys, ctx.consts.resistFormula),
-      magicArmor: resistForReduction(at, mag, ctx.consts.resistFormula),
+      name: label + lvlNote,
+      physReduction: S.phys / (1 + S.phys), magicReduction: S.mag / (1 + S.mag),
+      level, spawnLevel: at,
+      armor: S.phys * (a + b * at),
+      magicArmor: S.mag * (a + b * at),
     };
   }
 

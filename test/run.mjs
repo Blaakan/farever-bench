@@ -1251,9 +1251,12 @@ group('reference targets');
   // (unit.stats[].specScaling.armorReduction), not from a table in this repo.
   // The ladder must keep its shape, or the penetration numbers move silently.
   const red = (n) => engine.combat.foe(n, 25).physReduction;
-  ok('the archetype ladder is ordered small < trash < big <= elite',
-    red('small') < red('trash') && red('trash') < red('big') && red('big') <= red('elite'),
-    [red('small'), red('trash'), red('big'), red('elite')].join(' < '));
+  // Under the chain-SUM law a small mob's own 0.25 row ADDS to the inherited
+  // 0.30 (S = 0.762, display 0.432) - live-verified by the dungeon ladder
+  // inversion - so trash, with its single row, sits at the bottom.
+  ok('the archetype ladder is ordered trash < small < big <= elite',
+    red('trash') < red('small') && red('small') < red('big') && red('big') <= red('elite'),
+    [red('trash'), red('small'), red('big'), red('elite')].join(' < '));
   ok('a named boss matches the elite tier', red('boss') === red('elite'),
     `${red('boss')} vs ${red('elite')}`);
   ok('Armor_ExpectedReduction is softer than what you actually fight',
@@ -1313,7 +1316,7 @@ group('reference targets');
   // Penetration is worth more against a harder target - the whole reason the
   // default moved off the constant.
   const gain = (n) => {
-    const t = engine.combat.foe(n, 25);
+    const t = engine.combat.foe(n, 25, 25);   // explicit parity - bosses carry fitted spawn levels now
     const [a, b] = K.resistFormula;
     const at = (pen) => { const r = t.armor * (1 - pen / 100); return 1 - r / (r + a + b * 25); };
     return at(50) / at(0) - 1;
@@ -4462,18 +4465,22 @@ group('mitigation uses two levels, not one');
   // getResistanceLevelScaling@20663 builds the pool at the TARGET's level;
   // getAffinityDamageReduction@4510 divides at the STRIKER's. Authored 0.40 is
   // 40% only when the two agree.
-  const f25 = engine.combat.foe('boss', 25);
-  const fLow = engine.combat.foe('boss', 25, 10);
-  near('at parity the authored reduction is the mitigation',
+  // 'trash' (W_Base) carries no fitted spawn level, so it still defaults to
+  // parity; the bosses now spawn at their measured zone levels.
+  const f25 = engine.combat.foe('trash', 25, 25);
+  const fLow = engine.combat.foe('trash', 25, 10);
+  near('at parity the display reduction is the mitigation',
     f25.armor / (f25.armor + a + b * 25), f25.physReduction, 1e-9);
-  ok('a low-spawned boss mitigates less against a high striker',
+  ok('a low-spawned foe mitigates less against a high striker',
     fLow.armor < f25.armor);
   near('...by exactly the pool ratio the formula predicts',
     fLow.armor / f25.armor, (a + b * 10) / (a + b * 25), 1e-9);
   ok('the spawn level is carried and named',
     fLow.spawnLevel === 10 && /@L10/.test(fLow.name));
-  ok('omitting the spawn level is parity, exactly as before',
-    f25.spawnLevel === 25 && engine.combat.foe('boss', 25).armor === f25.armor);
+  ok('omitting the spawn level is parity for an unfitted family',
+    f25.spawnLevel === 25 && engine.combat.foe('trash', 25).armor === f25.armor);
+  ok('a fitted world family refuses the parity default',
+    engine.combat.foe('boss', 25).spawnLevel < 10 && /fit/.test(engine.combat.foe('boss', 25).name));
 }
 
 // --- unit inheritance ------------------------------------------------------
@@ -4492,7 +4499,10 @@ group('a unit inherits from every parent, not the first');
 
   // The declared bases, unchanged by any of this.
   near('W_Base mitigates its authored 0.30', intent('W_Base').phys, 0.30, 1e-9);
-  near('W_Base_Unique mitigates its authored 0.35', intent('W_Base_Unique').phys, 0.35, 1e-9);
+  // ...and a unique's own 0.35 row SUMS with the inherited 0.30 - the
+  // chain-sum law, live-verified: S = 0.35/0.65 + 0.30/0.70 = 0.967.
+  near('W_Base_Unique sums its own row with the base', intent('W_Base_Unique').phys,
+    (0.35 / 0.65 + 0.30 / 0.70) / (1 + 0.35 / 0.65 + 0.30 / 0.70), 1e-9);
 
   // Golem_Base declares Armor with `multiplier: 1.6` and nothing else - no
   // value, no levelScaling, no specScaling. A golem inheriting
@@ -4507,9 +4517,11 @@ group('a unit inherits from every parent, not the first');
   near('...while its magic armour, which no golem multiplies, stays 0.30',
     golem.mag, 0.30, 1e-9);
 
-  // A unique golem compounds the same multiplier onto the 0.35 base.
-  near('the multiplier composes with whichever base was inherited',
-    intent('Golem_Z2W_U').phys, (1.6 * 0.35) / (1.6 * 0.35 + 1 - 0.35), 1e-9);
+  // A unique golem: the x1.6 stub lands on the FIRST reduction row (its own
+  // 0.35) and the inherited 0.30 sums plain - the judge's golem ruling.
+  near('the multiplier lands on the first reduction row and the rest sum plain',
+    intent('Golem_Z2W_U').phys,
+    (1.6 * (0.35 / 0.65) + 0.30 / 0.70) / (1 + 1.6 * (0.35 / 0.65) + 0.30 / 0.70), 1e-9);
 
   // The pool multiplier folds back into a reduction with the level cancelling,
   // which is why one number describes a target at every level.
@@ -4525,9 +4537,10 @@ group('a unit inherits from every parent, not the first');
     }
   }
 
-  // Named targets the rest of the suite and the README depend on.
-  near('Ratsar still reads the 0.40 the meter was calibrated against',
-    intent('Ratsar').phys, 0.40, 1e-9);
+  // Ratsar sums his own 0.40 with the inherited 0.30: S = 1.09524, display
+  // 0.523 - the coefficient the rift windows verified to -0.0% residual.
+  near('Ratsar sums to the S the rift windows measured',
+    intent('Ratsar').physS, 0.40 / 0.60 + 0.30 / 0.70, 1e-9);
 
   ok('every unit that resolves an intent resolves a finite one',
     units.every((u) => {
