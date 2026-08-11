@@ -192,13 +192,20 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
           .filter((x) => typeof x.source === 'string' && x.prof.isStatusTick
             && cat.itemById.get(loadout.gear[x.source]?.item)?.type === 'Shield')
           .map((x) => x.prof.id));
+        // A SHIELD in the offhand takes no mix at all - the type chain
+        // (Shield > OffhandWeapon > Weapon) never reaches MainhandWeapon, so
+        // getStepEffectScaling@20778's itemRatio is 0 for everything it
+        // grants, casts included, not only status ticks. Inert on every
+        // current build (no equipped shield grants a damage-dealing cast
+        // with mixable attributes), fixed while it is.
+        const shieldCast = (slot) => cat.itemById.get(loadout.gear[slot]?.item)?.type === 'Shield';
         return {
           flats: combat.attributeBudgets(loadout.level),
           ids: new Set([
             ...rot.filler.map((x) => x.prof.id),
             ...rot.active
-              .filter((x) => x.source === 'Slot_Weapon1' || x.source === 'Slot_Weapon2'
-                || x.source === 'Slot_OffhandWeapon')
+              .filter((x) => (x.source === 'Slot_Weapon1' || x.source === 'Slot_Weapon2'
+                || x.source === 'Slot_OffhandWeapon') && !shieldCast(x.source))
               .map((x) => x.prof.id),
             ...stackProcs.filter((sp) => weaponItemSkills.has(sp.from)).map((sp) => sp.skill),
             ...markProcs.filter((mp) => mp.appliers.some((a) => weaponItemSkills.has(a)))

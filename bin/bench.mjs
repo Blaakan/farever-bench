@@ -2334,14 +2334,35 @@ const commands = {
     const verifyTarget = typeof args.flags.target === 'string'
       ? engine.combat.foe(args.flags.target, built.level, targetLevel)
       : undefined;
-    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget });
-    // What the player actually pressed in this window, so a model line with no
-    // recorded damage can be told apart from an invented one: a skill never
-    // pressed is a rotation the human did not play, not a phantom source.
+    // What the player actually pressed in this window - BEFORE the model runs,
+    // because the model is held to it. Left to its own rotation the sim
+    // presses every active it owns, and a utility the player never touched
+    // can distort a row it feeds: Fortifying Cry doubles Armor for 10 of
+    // every 35 seconds and the sim's auto-press read Heartsteel - the one
+    // skill that scales off Armor - 31% high against a player who pressed
+    // the buff once in the whole capture, out of combat. A skill applied BY
+    // a pressed cast (the orb status rides its S1) stays allowed through the
+    // via chain; with no press rows at all (an old capture), the model keeps
+    // its own rotation.
     const pressAgg = await aggregate(capturePath, {
       source: character, event: 'press', groupBy: 'skill', since, until,
     });
     const pressed = new Set(pressAgg.groups.map((g) => g.key));
+    let policy = null;
+    if (pressed.size) {
+      const allowed = new Set(pressed);
+      try {
+        const rotPre = engine.plan.resolve(built.loadout, rank);
+        for (const a of rotPre.active ?? []) {
+          if (a.via && (pressed.has(a.via) || allowed.has(a.via))) allowed.add(a.prof.id);
+        }
+      } catch { /* the rotation still resolves inside evaluate */ }
+      policy = ({ ready, actives }) => {
+        for (const i of ready) if (allowed.has(actives[i].prof.id)) return i;
+        return -1;
+      };
+    }
+    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy });
     const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed });
 
     if (args.flags.json) {

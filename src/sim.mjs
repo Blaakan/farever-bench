@@ -1487,7 +1487,15 @@ function runFight(spec) {
       // A pool feed is not a SUBSET of the lines above it - it is a share of
       // their crits, paid out again on its own schedule - so it belongs in the
       // repartition and the column closes on the reported total with it in.
-      interval: elapsed, share: 0,
+      //
+      // WHOSE damage feeds it travels with the line: a GLOBAL pool's per-tick
+      // magnitude is share x rotation-dps x tick-interval - a rate, not a
+      // per-event constant - and verify's per-hit test is meaningless against
+      // it (it inherits the whole rotation's rate difference, the exact thing
+      // per-hit exists to be immune to). An own-fed pool's tick is set by the
+      // one cast that banked it and keeps its per-hit meaning.
+      pool: { own: !!p.pool.own },
+      interval: (e.ticks ?? 0) > 0 ? elapsed / ((e.ticks ?? 0) / rolls) : elapsed, share: 0,
       // Say what the guard actually says: Hemorrhage pools physical CRITICAL
       // damage from everyone, Bonethrow pools its OWN damage, crit or not.
       //

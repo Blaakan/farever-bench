@@ -98,6 +98,10 @@ export function compare({ modelLines = [], captureGroups = [], only = null, pres
         hits,
         damage,
         interval: l.interval ?? null,
+        // A GLOBAL pool dot's per-tick is share x rotation-dps x interval - a
+        // rate, not a per-event constant - so its per-hit verdict would just
+        // re-measure the rotation-rate difference per-hit exists to ignore.
+        globalPool: l.pool ? l.pool.own === false : false,
         parts: l.id !== id ? [l.id.slice(l.id.indexOf('#') + 1)] : [],
       });
     }
@@ -168,7 +172,16 @@ export function compare({ modelLines = [], captureGroups = [], only = null, pres
       perHitDelta,
       shareDelta,
       cadenceDelta: m.interval && c.meanGapMs ? rel(m.interval, c.meanGapMs / 1000) : null,
-      verdict: verdict(perHitDelta, BANDS.perHit),
+      // A globally-fed pool is judged on SHARE: its tick magnitude is a rate
+      // (Hemorrhage read "+34.7% per hit" while its own pricing reproduced
+      // the live lattice to the integer - the delta was the model rotation's
+      // dps and a second concurrent target, both invisible to a per-tick
+      // comparison). The per-hit delta stays printed, informationally.
+      globalPool: m.globalPool || undefined,
+      verdict: m.globalPool
+        ? (Math.abs(shareDelta) <= BANDS.share.match ? 'MATCH'
+          : Math.abs(shareDelta) <= BANDS.share.close ? 'CLOSE' : 'MISS')
+        : verdict(perHitDelta, BANDS.perHit),
       shareVerdict: Math.abs(shareDelta) <= BANDS.share.match ? 'MATCH'
         : Math.abs(shareDelta) <= BANDS.share.close ? 'CLOSE' : 'MISS',
     });
