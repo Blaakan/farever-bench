@@ -2416,6 +2416,40 @@ two-thousand-event window on the strength of its empty rune list), and a
 window predating the rune probe backfills from the NEAREST rune-bearing
 snapshot before the dump is ever consulted.
 
+## The Mage's three economies (2026-08-11, later)
+
+"The mage simulated damage seems very low" - seventeen percent low, and
+none of it a formula: every per-hit price was already within ten percent.
+Three authored economies the fight never ran, each decoded against the
+415-second window (live 341.4 dps, model 284.4):
+
+- **The chain is a consume-site economy, not a crit rider.** Chaincast
+  arms per four active casts; Mage_SparkMaster's onPreSkillProc - the sole
+  propagateMageChainCast@29172 caller - consumes it on the next
+  weapon-skill press, which pays ZERO Spark, raises EVERY onMageChainCast
+  consumer (Chaincast's conduit volley plus Reverberate's echo 0.4s
+  later), resets its own cooldown a frame later (respent live within
+  ~0.5s - Censer skills beat their authored cooldowns), and plants the
+  forced-crit register. Ledger: 207 predicted vs 204 observed trigger
+  events.
+- **The summoner's worth is its pets'.** SummonDemon_Skill2's two imps
+  swing every ~3.2s for 0.2 x the OWNER's Intellect; Skill1 dumps one
+  missile per banked charge (cap 20, fed per pet hit + per 3s + per
+  expiry proc) - 14.9 per press live against the model's one. The fight
+  now schedules windows, pets and the bank; pet damage rides a flagged
+  line verify's source-filtered fold skips.
+- **Conduit slots repeat, income was 4x, refunds exist.** Projectile x2 +
+  Power (the script fans by instance; every live trigger is a pair);
+  RayOfSpark's SparkRegen plays per CHANNEL TICK so own-channel riders
+  fold at the tick count; ConduitResidues refunds per trigger event. The
+  gauge law stays spends-only, exactly as the bytecode has it.
+
+Result: model 342.2 vs live 341.4 dps (+0.2%), conduits matching 59
+rows/min at -2.8% per hit, every share within 6pp; the other three
+classes' ledgers byte-identical. Remaining Mage residuals are per-hit
+state (staff swings -10..-20% under in-fight fervor, combo -23.6% at the
+live 73.7% crit mix) - the cadence story is closed.
+
 One contradiction stays open, on record: Emsai's authoritative container
 ALSO reads zero runes - two containers, same answer - while his eleven
 Surging Force hits across five days decompose only WITH M3's +40%,
