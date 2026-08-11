@@ -744,6 +744,24 @@ export function buildCombat(cdb, ctx, assume = {}) {
       tickCarrierSelf: !!s.props?.status
         && (s.props.status.types ?? []).some((t) => t.type === 'Buff')
         && !(s.props.status.types ?? []).some((t) => t.type === 'Debuff'),
+      // HOW the tick is fired decides which BY-TYPE crit bonus its roll
+      // inherits. PurgingStrikes' status plays its damage step synchronously
+      // inside onInflictDamage, gated on the swing being a base attack or the
+      // combo finisher - the tick lands 0-1ms after the swing, in the swing's
+      // hit context, so a talent that says "+8 crit on your attacks"
+      // (ZealousFighter) prices the tick too. The status row's own cdb type
+      // is undefined, so keying the bonus on it dropped the credit on the
+      // floor: swings priced 15.5% crit, their ticks 7.5%, live both ~16%.
+      // Read narrowly - the exact guard-then-playStep shape, nothing looser.
+      tickOnSwing: (() => {
+        if (!s.props?.status || !s.script) return null;
+        const m = /function\s+onInflictDamage\s*\(\s*(\w+)\s*\)\s*\{\s*if\s*\(\s*\1\.(isBaseAttack|isFinalCombo)(?:\s*\|\|\s*\1\.(isBaseAttack|isFinalCombo))?\s*\)\s*\{\s*playStep\s*\(/
+          .exec(String(s.script));
+        if (!m) return null;
+        const flags = new Set([m[2], m[3]].filter(Boolean));
+        if (flags.has('isBaseAttack') && flags.has('isFinalCombo')) return 'attack-or-combo';
+        return flags.has('isFinalCombo') ? 'combo' : 'attack';
+      })(),
       // The row's vars WITH every rankOverride the build's rank clears already
       // folded in, so a reader never has to remember to do it. `s.vars` is the
       // unresolved row and is the wrong thing to read at a rank.
@@ -1213,8 +1231,15 @@ export function buildCombat(cdb, ctx, assume = {}) {
           if (!gateOn(rd.gate)) continue;
           scriptCritDmg += rd.amount * gateVal(rd.gate);
         }
-        const critBonus = (mods.critDamageByType?.[cat] ?? 0) + scriptCritDmg;
-        const chanceBonus = mods.critChanceByType?.[cat] ?? 0;
+        // A swing-triggered status tick rolls inside the swing's hit context,
+        // so its by-type key is the SWING's category, not the status row's
+        // (which has none - `cat` is null for every status row). ZealousFighter
+        // writes its +8 under both Attack and AttackCombo, so either key pays.
+        const tickCat = prof.isStatusTick === true && prof.tickOnSwing
+          ? (prof.tickOnSwing === 'combo' ? 'AttackCombo' : 'Attack')
+          : cat;
+        const critBonus = (mods.critDamageByType?.[tickCat] ?? 0) + scriptCritDmg;
+        const chanceBonus = mods.critChanceByType?.[tickCat] ?? 0;
         // WHICH status ticks crit is the statusType's DoT/HoT flag, not the
         // fact of being a status: initVars@5150 zeroes ctx.critChance only for
         // flagged types, and everything else rolls the CARRIER's chance
@@ -1271,9 +1296,16 @@ export function buildCombat(cdb, ctx, assume = {}) {
         m *= 1 + riders;
         // Fervor and the matching mastery share ONE additive bracket -
         // getDamageRatio@4505: (1 + fervor + mastery) x DamageModifier - and
-        // neither touches a status tick, whose SkillContext belongs to the
-        // CARRIER, not the attacker (initVars@5150 sources the owner).
-        if (!rawAff && !statusTick) {
+        // it belongs to the CARRIER: initVars@5150 seeds every SkillContext's
+        // physical/magicDmgMult from the status's owner. For a status the FOE
+        // wears, the carrier is the foe and the bracket is as good as 1 - the
+        // exclusion this branch always priced. But a self-carried Buff's
+        // carrier is the player, and the player's own fervor and mastery ride
+        // every tick: Demondash's aura reads x1.27 live against the bare
+        // model, and the flat-1.27 was state-independent across sessions -
+        // the same over-generalisation the tick-crit rule had, fixed the same
+        // way, keyed on the same flag.
+        if (!rawAff && (!statusTick || prof.tickCarrierSelf === true)) {
           const fervorAdd = fervorHere ? fervor : 0;
           const masteryAdd = opts.assume.mastery
             ? (aff.root === 'Physical' ? physMastery : aff.root === 'Magic' ? magicMastery : 0)
