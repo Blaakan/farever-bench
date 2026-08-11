@@ -3328,14 +3328,24 @@ group('a stack counter arms its follow-up at a readable rate');
   const eng = createEngine({ quiet: true });
   const all = eng.cdb.lines('skill').map((s) => s.id);
   const found = eng.plan.stackProcsOf(all, { rank: 3 });
-  ok('exactly one row in the game carries this shape', found.length === 1, JSON.stringify(found));
-  const p = found[0];
-  ok('...and it is Hysteria arming Anger Release at 100',
-    p.from === 'GS_Nova_Passive' && p.skill === 'GS_Nova_Ultimate' && p.cap === 100,
+  // Two authored shapes now, one row each: the event counter (Hysteria, one
+  // stack per physical hit) and the timed pickup chain (the Censer's clouds,
+  // one every vars.time seconds of combat, maxStacks to arm, the follow-up
+  // named by the proc status's own skillOverride).
+  ok('exactly two rows in the game carry a stack-proc shape', found.length === 2,
+    JSON.stringify(found));
+  const p = found.find((x) => x.from === 'GS_Nova_Passive');
+  ok('...one is Hysteria arming Anger Release at 100',
+    p && p.skill === 'GS_Nova_Ultimate' && p.cap === 100 && p.on === 'physicalHit',
     JSON.stringify(p));
+  const c = found.find((x) => x.from === 'Staff_Censer_Passive');
+  ok('...the other is the Censer arming its Ultimate at 10 pickups x 3s',
+    c && c.skill === 'Staff_Censer_Ultimate' && c.cap === 10
+      && c.on === 'timer' && c.period === 30,
+    JSON.stringify(c));
   // The cap is rank-gated: 150 authored, 100 from rank 2 via rankOverride.
   near('the cap is the authored 150 at rank 1',
-    eng.plan.stackProcsOf(all, { rank: 1 })[0].cap, 150, 1e-9);
+    eng.plan.stackProcsOf(all, { rank: 1 }).find((x) => x.from === 'GS_Nova_Passive').cap, 150, 1e-9);
 
   const l = emptyLoadout(eng.cat, 'Warrior', 25);
   l.gear.Slot_Weapon1 = { item: 'GS_Nova', rarity: 'Legendary', stars: 5, level: 25 };

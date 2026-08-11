@@ -151,6 +151,21 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     const mainItem = loadout.gear.Slot_Weapon1?.item
       ? cat.itemById.get(loadout.gear.Slot_Weapon1.item) : null;
     const hasArsenal = !!loadout.gear.Slot_Weapon2?.item;
+    // Hoisted so the weapon-mix can see them: a stack-proc's follow-up hosted
+    // by a WEAPON's own passive (the Censer ultimate) is weapon-based and
+    // takes the 0.6/0.4 mix like every other weapon cast.
+    const stackProcs = plan.stackProcsOf(talents.runableSkillIds(loadout),
+      { rank, runes: new Set(rot.runes ?? []) });
+    const weaponItemSkills = new Set(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']
+      .map((slot) => loadout.gear[slot]?.item && cat.itemById.get(loadout.gear[slot].item))
+      .filter(Boolean)
+      .flatMap((it) => it.skills ?? []));
+    // Marks the rotation's own casts apply: consumed on the second stack, one
+    // scripted lump per pairing. Weapon-hosted appliers put the mark's step
+    // on the weapon mix like every other weapon cast.
+    const markProcs = plan.markProcsOf(
+      [...rot.active, ...rot.filler].map((x) => x.prof.id),
+      { rank, runes: new Set(rot.runes ?? []) });
     const evalOpts = {
       ...opts,
       attackerLevel: loadout.level,
@@ -185,6 +200,9 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
               .filter((x) => x.source === 'Slot_Weapon1' || x.source === 'Slot_Weapon2'
                 || x.source === 'Slot_OffhandWeapon')
               .map((x) => x.prof.id),
+            ...stackProcs.filter((sp) => weaponItemSkills.has(sp.from)).map((sp) => sp.skill),
+            ...markProcs.filter((mp) => mp.appliers.some((a) => weaponItemSkills.has(a)))
+              .map((mp) => mp.status),
           ].filter((id) => !shieldStatus.has(id))),
         };
       })(),
@@ -236,8 +254,8 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       // A stack counter that arms a follow-up. Its rate is `events / maxStacks`
       // and the fight counts its own events, so the old refusal - "nothing in
       // the data says how many hits arm it" - was false: the data says 100.
-      stackProcs: plan.stackProcsOf(talents.runableSkillIds(loadout),
-        { rank, runes: new Set(rot.runes ?? []) }),
+      stackProcs,
+      markProcs,
       rank,
       gates: (() => {
         const bleeding = rot.dots?.some((d) => (d.types ?? []).some((t) => /Bleed|Hemorage/i.test(t)))

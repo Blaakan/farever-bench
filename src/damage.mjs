@@ -1706,6 +1706,21 @@ export function buildCombat(cdb, ctx, assume = {}) {
           ? { ...sp, prof, out: castOutput(prof, sheet, target, opts, NO_DEBUFF, live?.mods ?? NO_MODS) }
           : sp;
       }).filter((sp) => sp.prof),
+      // A mark's lump is the STATUS row's scripted step, priced with the
+      // status-tick conventions its wearer dictates: an enemy-worn Debuff, so
+      // no crit and no carrier bracket - the capture's 51 rows are one
+      // constant integer with zero crits.
+      markProcs: (opts.markProcs ?? []).map((mp) => {
+        const sp = profile(mp.status, opts.rank ?? 1);
+        const step = (sp?.scripted ?? []).find((x) => x.stepId === mp.step);
+        if (!sp || !step?.effects?.length) return mp;
+        const prof = {
+          ...sp, effects: step.effects,
+          occupancy: 0, cooldown: 0, charges: 1, costs: [], isFiller: false, isCombo: false,
+          scripted: [],
+        };
+        return { ...mp, prof, out: castOutput(prof, sheet, target, opts, NO_DEBUFF, live?.mods ?? NO_MODS) };
+      }).filter((mp) => mp.prof),
       comboWindow: cdb.byId('constant').get('ComboWindow')?.v?.float ?? 0.6,
       swingVariance: cdb.byId('constant').get('WeaponAttack_RandomRange')?.v?.float ?? 0.1,
       poolHealShare: bleedMods.healShare ?? 0,

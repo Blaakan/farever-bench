@@ -100,7 +100,7 @@ function runFight(spec) {
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
     poolScale = null, poolFactor = null, goal = null, chainResets = true,
-    swingVariance = 0, comboWindow = 0.6, empowerments = [], stackProcs = [],
+    swingVariance = 0, comboWindow = 0.6, empowerments = [], stackProcs = [], markProcs = [],
   } = spec;
   // The objective the derived player maximises - see `goalWeights`.
   const [wDmg, wHeal, wShield] = goalWeights(goal);
@@ -624,8 +624,12 @@ function runFight(spec) {
     // the Chaincast talent raises every `armEveryActiveCasts` active casts.
     const comboRegs = [];
     for (const e of empowerments ?? []) {
-      if (e.consume === 'combo') comboRegs.push({ chance: e.chance, every: e.armEveryActiveCasts ?? 0, p: 0 });
-      else emp.set(e.skill, { chance: e.chance, p: 0 });
+      if (e.consume === 'combo') {
+        comboRegs.push({
+          chance: e.chance, every: e.armEveryActiveCasts ?? 0,
+          firesConduits: !!e.firesConduits, p: 0,
+        });
+      } else emp.set(e.skill, { chance: e.chance, p: 0 });
     }
     const armAll = () => { for (const r of emp.values()) r.p += (1 - r.p) * r.chance; };
     let activeCasts = 0;
@@ -1078,7 +1082,12 @@ function runFight(spec) {
         if (comboRegs.length) {
           activeCasts++;
           for (const r of comboRegs) {
-            if (r.every > 0 && activeCasts % r.every === 0) r.p += (1 - r.p) * r.chance;
+            if (r.every > 0 && activeCasts % r.every === 0) {
+              r.p += (1 - r.p) * r.chance;
+              // The chain cast raising this arm also force-fires every
+              // equipped conduit (Chaincast's own onMageChainCast).
+              if (r.firesConduits && conduitTriggers.length) fireConduits(t);
+            }
           }
         }
         a.casts++;
@@ -1354,7 +1363,11 @@ function runFight(spec) {
   // the same convention the pool dots' un-ticked tail already follows.
   const physicalHits = mean((x) => x.physicalHits ?? 0);
   for (const sp of stackProcs ?? []) {
-    const fires = Math.floor(physicalHits / sp.cap);
+    // The timed shape's clock is combat time, not an event count: a pickup
+    // every period/cap seconds, cap pickups to arm.
+    const fires = sp.on === 'timer'
+      ? Math.floor(elapsed / (sp.period > 0 ? sp.period : Infinity))
+      : Math.floor(physicalHits / sp.cap);
     if (!(fires > 0)) continue;
     const prof = sp.prof;
     const out = sp.out;
@@ -1366,8 +1379,33 @@ function runFight(spec) {
       hits: (out.hits ?? 1) * fires,
       interval: fires > 0 ? elapsed / fires : Infinity, share: 0,
       postHoc: true,
-      why: `one per ${sp.cap} physical hits (${Math.round(physicalHits)} in this fight), `
-        + 'from a cold start - no stacks carried in',
+      why: sp.on === 'timer'
+        ? `one per ${sp.period}s of combat - a pickup every ${sp.period / sp.cap}s, ${sp.cap} to arm - from a cold start`
+        : `one per ${sp.cap} physical hits (${Math.round(physicalHits)} in this fight), `
+          + 'from a cold start - no stacks carried in',
+    });
+  }
+
+  // A MARK fires its lump once per `per` applications - the second stack
+  // consumes it - so its rate is the fight's own cast counts over the skills
+  // that apply it. The finisher-consume path in the mark's script only
+  // accelerates the same alternation and is deliberately not double-counted.
+  for (const mp of markProcs ?? []) {
+    if (!mp.prof || !mp.out) continue;
+    let apps = 0;
+    for (const [a, e] of acc.active) if (mp.appliers.includes(a.prof.id)) apps += e.casts;
+    for (const link of chain) if (mp.appliers.includes(link.prof.id)) apps += link.total.fires;
+    apps /= rolls;
+    const fires = Math.floor(apps / (mp.per > 0 ? mp.per : 2));
+    if (!(fires > 0)) continue;
+    lines.push({
+      id: mp.prof.id, name: mp.prof.name, kind: 'triggered', source: mp.appliers.join('+'),
+      perCast: { damage: mp.out.damage, heal: mp.out.heal, shield: mp.out.shield },
+      total: { damage: mp.out.damage * fires, heal: mp.out.heal * fires, shield: mp.out.shield * fires },
+      hits: (mp.out.hits ?? 1) * fires,
+      interval: fires > 0 ? elapsed / fires : Infinity, share: 0,
+      postHoc: true,
+      why: `one per ${mp.per} applications (${Math.round(apps)} in this fight) - the second stack consumes the mark`,
     });
   }
 

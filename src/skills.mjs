@@ -3854,7 +3854,37 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     for (const id of ownedIds) {
       const s = skills.get(id);
       const body = s?.script ? liveScript(s.script) : '';
-      if (!body || !/hasStatusMaxStacked/.test(body) || !/addStatus/.test(body)) continue;
+      if (!body) continue;
+      // The TIMED shape - the Censer's ultimate. The passive drops a pickup
+      // every vars.time seconds of combat (onRegUpdate), walking into it
+      // grants one stack of a counter status, the counter's own script
+      // converts at full stacks into a proc status, and THAT status's
+      // props.skillOverride names the follow-up it puts on the signature
+      // slot. Every number is authored: the timer, the counter's maxStacks,
+      // the override target - so the rate is cap x time seconds of combat
+      // per cast, from a cold start, plus the press the model does not bill.
+      {
+        const timed = /function\s+onRegUpdate\s*\([\s\S]{0,200}?isInCombat[\s\S]{0,200}?>\s*vars\.(\w+)[\s\S]{0,120}?playStep\s*\(\s*Steps\.(\w+)/.exec(body);
+        const period = timed ? s.vars?.[timed[1]] : null;
+        const pick = timed
+          ? new RegExp('stepId\\s*==\\s*Steps\\.' + timed[2] + '\\b[\\s\\S]{0,300}?playStep\\s*\\(\\s*Steps\\.(\\w+)').exec(body)
+          : null;
+        const pickStep = pick ? (s.steps ?? []).find((x) => x.id === pick[1]) : null;
+        const counterId = pickStep?.props?.status?.ref
+          ?? (pickStep?.effects ?? []).map((e) => e.status).find(Boolean) ?? null;
+        const counterRow = counterId ? skills.get(counterId) : null;
+        const cap2 = counterId ? maxStacksOf(counterId, rank) : null;
+        const conv = counterRow?.script
+          ? /hasStatusMaxStacked\s*\([\s\S]{0,80}?\{\s*addStatus\s*\(\s*owner\s*,\s*(?:Skill\.)?(\w+)/.exec(liveScript(counterRow.script))
+          : null;
+        const followUp = conv
+          ? skills.get(conv[1])?.props?.status?.skillOverride?.[0]?.skill ?? null : null;
+        if (typeof period === 'number' && period > 0 && Number.isFinite(cap2) && cap2 > 1 && followUp) {
+          out.push({ from: id, counter: counterId, cap: cap2, skill: followUp, on: 'timer', period: cap2 * period });
+          continue;
+        }
+      }
+      if (!/hasStatusMaxStacked/.test(body) || !/addStatus/.test(body)) continue;
       const alias = (n) => new RegExp(`\\b${n}\\s*=\\s*Skill\\.([A-Za-z0-9_]+)`).exec(body)?.[1] ?? n;
       const capped = /hasStatusMaxStacked\s*\(\s*owner\s*,\s*(\w+)/.exec(body)?.[1];
       if (!capped) continue;
@@ -3870,6 +3900,48 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       out.push({ from: id, counter, cap, skill: follow[0], on: 'physicalHit' });
     }
     return out;
+  }
+
+  /**
+   * A MARK: a payload-less target debuff whose damage is a scripted step its
+   * own consume() plays - fired when the SECOND stack arrives, so it pays one
+   * lump per maxStacks applications. The Censer's mark is the shape: applied
+   * by three step refs and one rank-gated script addStatus, consumed on
+   * pairing (the instigator's-finisher consume path only accelerates the same
+   * alternation - either way one fire spends the whole mark), Trigger step
+   * 0.25 x (Int + Faith) at the weapon mix = the capture's constant 59, 51
+   * rows without a single deviation or crit.
+   */
+  function markProcsOf(applierIds, { rank = 1, runes = null } = {}) {
+    const byStatus = new Map();
+    const note = (statusId, applier) => {
+      const row = skills.get(statusId);
+      if (!row?.script || !row.props?.status) return;
+      const body = liveScript(row.script);
+      const step = /function\s+consume\s*\(\s*\)\s*\{\s*playStep\s*\(\s*Steps\.(\w+)\s*\)\s*;?\s*consumeStatus\s*\(\s*owner\s*,\s*kind\s*\)/.exec(body)?.[1];
+      if (!step) return;
+      if (!/onReceiveStatus[\s\S]{0,200}?stacks\s*>\s*1[\s\S]{0,120}?consume\s*\(\s*\)/.test(body)) return;
+      const cap = maxStacksOf(statusId, rank);
+      if (!Number.isFinite(cap) || cap < 2) return;
+      const e = byStatus.get(statusId) ?? { status: statusId, step, per: cap, appliers: [] };
+      if (!e.appliers.includes(applier)) e.appliers.push(applier);
+      byStatus.set(statusId, e);
+    };
+    for (const id of applierIds) {
+      const p = combat.profile(id, rank, runes);
+      for (const r of p?.statusRefs ?? []) {
+        if (r.target === 1 && typeof r.ref === 'string') note(r.ref, id);
+      }
+      const body = liveScript(skills.get(id)?.script ?? '');
+      const AS = /addStatus\s*\(\s*\w+\.target\s*,\s*Skill\.(\w+)\s*\)/g;
+      AS.lastIndex = 0;
+      for (let m; (m = AS.exec(body));) {
+        const gate = /rank\s*>=\s*(\d+)/.exec(enclosingBlock(body.slice(0, m.index)));
+        if (gate && rank < Number(gate[1])) continue;
+        note(m[1], id);
+      }
+    }
+    return [...byStatus.values()];
   }
 
   /** Both halves of every stack-counter pair in the sheet, for the coverage report. */
@@ -3951,17 +4023,25 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const consume = /function\s+onUseSkill\s*\(\s*(\w+)\s*\)\s*\{\s*if\s*\(\s*\1\.(?:baseSkill\.)?(?:isFinalAttack|isFinalCombo)\s*\(\s*\)\s*\)\s*\{\s*\1\.critChance\s*\+?=\s*1\b[\s\S]{0,200}?consumeStatus\s*\(\s*(?:owner|ownerHero)\s*,/.exec(sBody);
       if (!consume) continue;
       let every = null;
+      let firesConduits = false;
       for (const rid of ownedIds) {
         const rb = liveScript(skills.get(rid)?.script ?? '');
         if (!rb || !/isActiveSkill\s*\(\s*\)/.test(rb) || !/onMageChainCast/.test(rb)) continue;
         const cnt = /<\s*vars\.(\w+)/.exec(rb);
         const n = cnt ? skills.get(rid)?.vars?.[cnt[1]] : null;
-        if (typeof n === 'number' && n > 0) { every = n; break; }
+        if (typeof n === 'number' && n > 0) {
+          every = n;
+          // The chain cast's own script also force-fires every equipped
+          // conduit (Chaincast: onMageChainCast -> forceTriggerAllConduits),
+          // a second conduit clock on top of the Spark-threshold one.
+          firesConduits = /forceTriggerAllConduits/.test(rb);
+          break;
+        }
       }
       if (!(every > 0)) continue;
       out.push({
         status: arm[1], skill: null, from: id, chance: 1,
-        on: 'combo', consume: 'combo', armEveryActiveCasts: every,
+        on: 'combo', consume: 'combo', armEveryActiveCasts: every, firesConduits,
       });
     }
     return out;
@@ -3970,7 +4050,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   return {
     pools, defaultSelection, pruneSelection, resolve, selfBuffs, selfBuffsOf, statusesOf,
     weaponSlotsAt, arsenalSlotsAt, typeOf, baseChain, resourceGainsOf, talentModifiers, maxStacksOf,
-    empowermentsOf, empowermentIds, scriptGapsOf, stackProcsOf,
+    empowermentsOf, empowermentIds, scriptGapsOf, stackProcsOf, markProcsOf,
     mechanicTypes: MECHANIC_TYPES,
   };
 }
