@@ -82,6 +82,10 @@ export function compare({ modelLines = [], captureGroups = [], only = null, pres
     // skill's name. Folding is therefore not a convenience - reporting the
     // rider on its own line would show it as damage the game never recorded
     // AND leave the host looking short by the same amount, which is two wrong
+    // A pet line is real damage the capture files under source=Summon_*, not
+    // under the player this comparison is filtered to - skipping it here is
+    // what keeps the model's fold commensurate with the capture's.
+    if (l.petSource) continue;
     // answers from one naming difference.
     const id = l.id.includes('#') ? l.id.slice(0, l.id.indexOf('#')) : l.id;
     const prev = model.get(id);

@@ -2995,8 +2995,14 @@ group('the conduit gauge');
   const lines = ev2.throughput.lines.filter((x) => /Conduit/.test(x.id));
   ok('the fight fires the conduits', lines.length >= 1,
     ev2.throughput.lines.map((x) => x.id).join(','));
-  ok('...far slower than once per weapon skill, which is the whole point',
-    lines.every((x) => x.interval > 10), lines.map((x) => `${x.id} every ${x.interval.toFixed(1)}s`).join(', '));
+  // The cadence understanding moved with the income: RayOfSpark's SparkRegen
+  // is played per CHANNEL TICK (script onHit, four a cast - 118 tick-plays
+  // for 32 live presses), not once per cast, so a build that channels keeps
+  // the pool above the bound and most spends fire - the live gauge read open
+  // at 98.3% of presses. The invariant that survives is that conduits ride
+  // SPEND EVENTS, not the GCD: never faster than a couple of seconds.
+  ok('...on the spend cadence, not the GCD',
+    lines.every((x) => x.interval > 1.5), lines.map((x) => `${x.id} every ${x.interval.toFixed(1)}s`).join(', '));
 
   // Conduit: Power stacks to 20 - confirmed in game, +10% MagicMastery when the
   // pool can feed it - but the gauge fires far too slowly to stand there, so

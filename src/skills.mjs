@@ -927,7 +927,13 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     for (const [type, def] of Object.entries(MECHANIC_TYPES)) {
       const options = classSkills.filter((id) => typeOf(id) === type);
       if (!options.length) continue;
-      const slots = Math.min(slotsAt(def.slotConstant, level), options.length);
+      // Mechanic slots may REPEAT an option: Mage_Conduit_Projectile's own
+      // script fans by getSkillInstanceCount()/getSkillInstanceIndex() with a
+      // 0.1s stagger, and the live stream shows every trigger as an
+      // instance PAIR - Emsay runs Projectile x2 + Power in her three slots.
+      // Clamping to options.length priced one row per event where the game
+      // fires two.
+      const slots = slotsAt(def.slotConstant, level);
       if (slots < 1) continue;
       out.push({
         key: `class/${type}`, kind: 'mechanic', slot: null, host: loadout.class,
@@ -1019,7 +1025,8 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           const stepEffects = r.rule.notAimTarget
             ? r.step.effects.map((e) => ({ ...e, notAimTarget: true }))
             : r.step.effects;
-          folded = (folded ?? base.effects).concat(foldRider(stepEffects, r.rule.chance ?? 1));
+          folded = (folded ?? base.effects)
+            .concat(foldRider(stepEffects, (r.rule.chance ?? 1) * (r.rule.perCast ?? 1)));
         }
         if (folded) prof = { ...base, effects: folded };
         for (const f of refused) pendingRiders.push({ host: id, prof: base, refusal: f });
@@ -1293,15 +1300,31 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
 
     // 2. Slotted weapon skills, from both hands, plus their follow-ups.
     for (const p of pools(loadout)) {
-      const chosen = (sel[p.key] ?? p.options.slice(0, p.slots)).slice(0, p.slots);
+      // A mechanic pool with more slots than options CYCLES: the third
+      // conduit slot repeats the first option, which is exactly Emsay's live
+      // fill (Projectile x2 + Power, proven by the paired trigger rows).
+      const dflt = p.kind === 'mechanic' && p.slots > p.options.length
+        ? Array.from({ length: p.slots }, (_, i) => p.options[i % p.options.length])
+        : p.options.slice(0, p.slots);
+      const chosen = (sel[p.key] ?? dflt).slice(0, p.slots);
       const item = p.kind === 'weapon' ? cat.itemById.get(loadout.gear[p.slot]?.item) : null;
       const all = item?.skills ?? [];
 
-      for (const id of chosen) {
-        const t = typeOf(id);
-        if (t === 'WeaponSkill') push(active, id, { source: p.key, chosen: true });
-        else if (t === 'WeaponPassive') pushTriggered(id, p.key);
-        else if (p.mechanic) pushTriggered(id, p.key, { mechanic: p.mechanic, sharedWith: chosen.length });
+      if (p.mechanic) {
+        // Duplicates collapse to one entry with an INSTANCE COUNT - the
+        // seen-guard would eat a second push, and the game itself fans one
+        // trigger event across instances (getSkillInstanceCount).
+        const counts = new Map();
+        for (const id of chosen) counts.set(id, (counts.get(id) ?? 0) + 1);
+        for (const [id, n] of counts) {
+          pushTriggered(id, p.key, { mechanic: p.mechanic, sharedWith: counts.size, instances: n });
+        }
+      } else {
+        for (const id of chosen) {
+          const t = typeOf(id);
+          if (t === 'WeaponSkill') push(active, id, { source: p.key, chosen: true });
+          else if (t === 'WeaponPassive') pushTriggered(id, p.key);
+        }
       }
       // A follow-up fires off its parent, so it is TRIGGERED, not active. It
       // has no cooldown of its own and asking it for one sent every one of them
@@ -1997,6 +2020,81 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       });
     }
 
+    // --- summons, and the charge economy they feed ---------------------------
+    //
+    // Staff_SummonDemon_Skill2 is a SUMMONER: step type 23 with props.summon
+    // {unit: Summon_Imp, count: 2}, duration 12 - and it sat in unmodelled as
+    // "everything it does lives in its hscript body" while its imps swung
+    // every ~3.2s for 0.2 x the OWNER's Intellect (live: 35.3 hits/min at
+    // 41.7, the same law as the owner's own missiles to within 0.3%). Its
+    // partner Skill1 is a CHARGE DUMP: one missile per banked charge (cap =
+    // the Charge status's maxStacks, 20), fed +1 per pet hit
+    // (onInflictDamage: sourceUnit != owner), +1 per vars.time seconds of
+    // combat at rank >= 2 (onRegUpdate), and 20% per summon expiry - live
+    // 14.9 hits per press against the model's one. Both are authored; the
+    // reader hands the fight the spec and the fight schedules it.
+    const summons = [];
+    const summonSpecOf = (id) => {
+      const row = skills.get(id);
+      const st = (row?.steps ?? []).find((x) => x.props?.summon?.unit);
+      if (!st) return null;
+      const unitId = st.props.summon.unit;
+      const unitRow = cdb.byId('unit').get(unitId);
+      const autoId = (unitRow?.skills ?? []).map((x) => x.skill ?? x.ref ?? x).find(Boolean);
+      const auto = autoId ? profileOf(autoId) : null;
+      if (!auto || !(auto.effects ?? []).some((e) => e.kind === 'Damage')) return null;
+      // The pet's swing period from its own authored steps: every step's
+      // delay + duration, summed - cast 0.3 + 2.2 and recovery 1.3 for the
+      // imp, 3.8s authored against a measured 3.23s (the recovery overlaps
+      // partially live; the authored number is kept, conservative and cited).
+      const period = (cdb.byId('skill').get(autoId)?.steps ?? [])
+        .reduce((s2, x) => s2 + (Number(x.delay) || 0) + (Number(x.duration) > 0 ? Number(x.duration) : 0), 0) || 3.8;
+      const dur = Number(row.duration) || row.vars?.dur1 || 12;
+      // onSummonElapsed -> checkProba(vars.chance) -> a charge, per expiry.
+      const body = liveScript(row.script ?? '');
+      const el = /onSummonElapsed[\s\S]{0,160}?checkProba\s*\(\s*vars\.(\w+)\s*\)/.exec(body);
+      return {
+        from: id, unit: unitId, count: st.props.summon.count ?? 1,
+        duration: dur, period, petProf: auto,
+        elapsedChargeChance: el ? (row.vars?.[el[1]] ?? 0) : 0,
+      };
+    };
+    // A summoner that fell into unmodelled earns its slot back: its worth is
+    // its pets', which the fight now schedules.
+    for (let i = unmodelled.length - 1; i >= 0; i--) {
+      const spec = summonSpecOf(unmodelled[i].id);
+      if (!spec) continue;
+      const prof = profileOf(unmodelled[i].id);
+      if (!prof) continue;
+      unmodelled.splice(i, 1);
+      active.push({ prof, source: 'class', applies: { self: [], target: [] } });
+      summons.push(spec);
+    }
+    for (const a of active) {
+      if (summons.some((sp) => sp.from === a.prof.id)) continue;
+      const spec = summonSpecOf(a.prof.id);
+      if (spec) summons.push(spec);
+    }
+    // The charge dump's whole shape, off its script: an enable gate on the
+    // charge count, a shoot per charge, pet hits and a combat timer feeding
+    // it, and the cap on the Charge status row.
+    let chargeDump = null;
+    for (const a of active) {
+      const row = skills.get(a.prof.id);
+      const body = liveScript(row?.script ?? '');
+      if (!body || !/checkEnabled[\s\S]{0,120}?getStatusCount\s*\(\s*owner\s*,/.test(body)) continue;
+      const alias = /\b(\w+)\s*=\s*Skill\.(\w+)/.exec(body);
+      const statusId = alias?.[2] ?? null;
+      if (!statusId || !skills.get(statusId)) continue;
+      const cap = maxStacksOf(statusId, rank);
+      if (!Number.isFinite(cap) || cap < 2) continue;
+      const petFed = /onInflictDamage[\s\S]{0,160}?sourceUnit\s*!=\s*owner[\s\S]{0,120}?addStatus\s*\(\s*owner\s*,/.test(body);
+      const tm = /onRegUpdate[\s\S]{0,300}?rank\s*>=\s*(\d+)[\s\S]{0,300}?vars\.(\w+)/.exec(body);
+      const timerPeriod = tm && rank >= Number(tm[1]) ? row.vars?.[tm[2]] ?? null : null;
+      chargeDump = { skill: a.prof.id, status: statusId, cap, petFed, timerPeriod };
+      break;
+    }
+
     // Costs the data does not declare, read from the bytecode instead.
     // Mage: `Skill.getSparkCost@7986` - a weapon skill costs
     // round(max(Mage_Spark_SpellMinCost, cooldown x Mage_Spark_SpellCDCostRatio)),
@@ -2040,10 +2138,24 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const bounds = (() => {
         try { return cdb.constantFloats('Mage_Conduit_SparkBounds'); } catch { return [0.5]; }
       })();
+      // A trigger-event refund: Mage_Talent_ConduitResidues hooks
+      // onConduitTriggers - raised once per trigger EVENT, not per conduit
+      // (triggerAllConduits@29170) - and returns vars.var1 Spark at
+      // vars.chance. Carried as its expectation on the gauge.
+      let residues = 0;
+      for (const tid of Object.keys(loadout.talents ?? {})) {
+        const tb = liveScript(skills.get(tid)?.script ?? '');
+        const m = /function\s+onConduitTriggers[\s\S]{0,200}?checkProba\s*\(\s*vars\.(\w+)\s*\)[\s\S]{0,120}?addResource\s*\(\s*Attribute\.Spark\s*,\s*vars\.(\w+)/.exec(tb);
+        if (!m) continue;
+        const ch = skills.get(tid)?.vars?.[m[1]];
+        const amt = skills.get(tid)?.vars?.[m[2]];
+        if (typeof ch === 'number' && typeof amt === 'number') residues += ch * amt;
+      }
       sparkGauge = {
         atb: 'Spark',
         ratio: bounds[0] ?? 0.5,
         finisherCost: constNum('Mage_Spark_SpellCDCost_FinalCombo', 10),
+        residues,
       };
     }
     let poolCapOverride = null;
@@ -2194,6 +2306,8 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       unmodelled: unmodelled.filter((u) => !accounted.has(u.id) && !accountedLate.has(u.id)),
       selection: sel, runes: [...runes], rank, chain, cdMutations, sparkGauge,
       resources: { gains, tracked: [...tracked], capOverride: poolCapOverride },
+      summons,
+      chargeDump,
     };
   }
 
@@ -2421,14 +2535,23 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           rule = { kind: 'per-weapon-skill', chance, critGated, why: `${label} is played on every weapon skill you press${crit}${roll}` };
         } else if (onOwnCast) {
           // The host's own landing. For a chain link that IS the combo or a
-          // swing; for anything else it is one fire per cast of the host.
+          // swing; for anything else it is one fire per cast of the host -
+          // TIMES the tick count when the gating step is a spread CHANNEL:
+          // RayOfSpark's SparkRegen is played per ChannelTick hit (script
+          // onHit), so its +18% MaxSpark arrives four times a cast, and
+          // folding it once starved the sim's pool by ~75% of that income.
+          let perCast = 1;
+          if (ownStep) {
+            const chan = (prof.effects ?? []).find((e2) => e2.stepId === ownStep);
+            if (chan?.spread && (chan.ticks ?? 1) > 1) perCast = chan.ticks;
+          }
           rule = prof.isCombo
             ? { kind: 'per-combo', chance, divisor: 1, critGated, why: `${label} is played by the finisher itself${crit}${roll}` }
             : prof.isFiller
               ? { kind: 'per-attack', chance, critGated, why: `${label} is played by the swing itself${crit}${roll}` }
               : {
-                kind: 'per-parent-cast', parent: skillId, chance, divisor: 1, critGated,
-                why: `${label} is played by the cast itself${crit}${roll}`,
+                kind: 'per-parent-cast', parent: skillId, chance, divisor: 1, perCast, critGated,
+                why: `${label} is played by the cast itself${perCast > 1 ? `, once per channel tick (${perCast} a cast)` : ''}${crit}${roll}`,
               };
         } else {
           why ??= `${label} is played from ${hook} with no event this fight raises`;
@@ -4056,7 +4179,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const consume = /function\s+onUseSkill\s*\(\s*(\w+)\s*\)\s*\{\s*if\s*\(\s*\1\.(?:baseSkill\.)?(?:isFinalAttack|isFinalCombo)\s*\(\s*\)\s*\)\s*\{\s*\1\.critChance\s*\+?=\s*1\b[\s\S]{0,200}?consumeStatus\s*\(\s*(?:owner|ownerHero)\s*,/.exec(sBody);
       if (!consume) continue;
       let every = null;
-      let firesConduits = false;
+      let resetsCooldown = false;
       for (const rid of ownedIds) {
         const rb = liveScript(skills.get(rid)?.script ?? '');
         if (!rb || !/isActiveSkill\s*\(\s*\)/.test(rb) || !/onMageChainCast/.test(rb)) continue;
@@ -4064,17 +4187,38 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         const n = cnt ? skills.get(rid)?.vars?.[cnt[1]] : null;
         if (typeof n === 'number' && n > 0) {
           every = n;
-          // The chain cast's own script also force-fires every equipped
-          // conduit (Chaincast: onMageChainCast -> forceTriggerAllConduits),
-          // a second conduit clock on top of the Spark-threshold one.
-          firesConduits = /forceTriggerAllConduits/.test(rb);
+          // Chaincast's payoff also resets the consuming cast's cooldown a
+          // frame later - wait(0, ctx.skill.resetCooldown()) - which live
+          // play respends within ~0.5s, the whole reason Censer skills beat
+          // their authored cooldowns.
+          resetsCooldown = /resetCooldown/.test(rb);
           break;
         }
       }
       if (!(every > 0)) continue;
+      // EVERY onMageChainCast consumer that force-fires conduits counts, not
+      // only the counting talent: Reverberate's whole payoff is a SECOND
+      // full volley 0.4s after Chaincast's - the capture's burst-start gaps
+      // cluster at [400,600)ms once per chain, and without the echo the
+      // trigger ledger runs 37 events short of the observed 204.
+      let conduitVolleys = 0;
+      for (const rid of ownedIds) {
+        const rb = liveScript(skills.get(rid)?.script ?? '');
+        if (!rb || !/onMageChainCast/.test(rb)) continue;
+        if (/forceTriggerAllConduits/.test(rb)) conduitVolleys++;
+      }
+      // The CONSUME is the event, and it is not free of semantics: the chain
+      // is spent by the next WEAPON-SKILL press (Mage_SparkMaster's
+      // onPreSkillProc, the sole propagateMageChainCast@29172 caller), and
+      // that press pays ZERO Spark - ops 81-87 of fn 44855 charge only when
+      // !isFree. The sim consumes at the press, waives the Spark, fires the
+      // volleys, resets the cooldown, and arms this crit register - all at
+      // the same instant the game does.
       out.push({
         status: arm[1], skill: null, from: id, chance: 1,
-        on: 'combo', consume: 'combo', armEveryActiveCasts: every, firesConduits,
+        on: 'combo', consume: 'combo', armEveryActiveCasts: every,
+        firesConduits: conduitVolleys > 0, conduitVolleys,
+        chainSpend: { on: 'weapon-skill', freeSpark: true, resetsCooldown },
       });
     }
     return out;

@@ -220,10 +220,13 @@ function runFight(spec) {
     // with it - a quarter of the Priest's recorded damage, refused as "nothing
     // gives it a rate" while the rate was its own cooldown.
     const appliesDot = (rotation.dots ?? []).some((d) => d.from === prof.id && d.on === 'cast');
+    // A SUMMONER's worth is its pets': the cast itself emits nothing and the
+    // imps swing for twelve seconds after it.
+    const appliesSummon = (rotation.summons ?? []).some((sp) => sp.from === prof.id);
     // Worth nothing TOWARD THE GOAL and sets nothing up: not in this rotation.
     // A dps fight does not spend GCDs on a pure heal; an hps fight does not
     // spend them on a nuke. A buff-applier stays - the lookahead prices it.
-    if (!worth(out.damage, out.heal, out.shield) && !setsUp && !appliesDot) continue;
+    if (!worth(out.damage, out.heal, out.shield) && !setsUp && !appliesDot && !appliesSummon) continue;
     const cooldown = Math.max(prof.cooldown / cdrFor(prof), 0);
     actives.push({
       prof, source, out, applies,
@@ -344,6 +347,8 @@ function runFight(spec) {
     if (!out.damage && !out.heal && !out.shield) continue;
     triggers.push({
       prof: tr.prof, source: tr.source, out, rule: tr.rule,
+      // Duplicate mechanic slots (two Projectile conduits) fire per instance.
+      instances: tr.instances ?? 1,
       // Which event this rides. A follow-up rides its parent's cast, which is
       // neither a swing nor a combo - collapsing every rule to those two put it
       // on the base-attack rate and read it several times too fast.
@@ -627,12 +632,56 @@ function runFight(spec) {
       if (e.consume === 'combo') {
         comboRegs.push({
           chance: e.chance, every: e.armEveryActiveCasts ?? 0,
-          firesConduits: !!e.firesConduits, p: 0,
+          firesConduits: !!e.firesConduits,
+          conduitVolleys: e.conduitVolleys ?? (e.firesConduits ? 1 : 0),
+          // The chain SPEND semantics: the arm is consumed by the next
+          // weapon-skill press, which pays no Spark, fires every
+          // onMageChainCast conduit volley, resets its own cooldown, and
+          // arms the forced-crit register - all one instant, per
+          // Mage_SparkMaster.onPreSkillProc@44855.
+          chainSpend: e.chainSpend ?? null,
+          p: 0, armed: false,
         });
       } else emp.set(e.skill, { chance: e.chance, p: 0 });
     }
     const armAll = () => { for (const r of emp.values()) r.p += (1 - r.p) * r.chance; };
     let activeCasts = 0;
+    // --- summons, and the charge bank they feed -------------------------------
+    // A summoner's cast opens a window; its pets swing on their own authored
+    // period inside it, each swing crediting a pet line AND one charge; a
+    // combat timer and the summon-expiry proc feed the same bank; the charge
+    // dump spends the whole bank as one multiplied cast. All expectations,
+    // like everything else in the deterministic fight.
+    const summonState = (rotation.summons ?? []).map((sp) => ({
+      sp, out: cast(sp.petProf, bare), until: 0, hits: 0, damage: 0,
+    }));
+    const chargeBank = rotation.chargeDump ? { ...rotation.chargeDump, value: 0 } : null;
+    let summonCursor = 0;
+    const advanceSummons = (until) => {
+      if (!(until > summonCursor)) return;
+      const dt = until - summonCursor;
+      if (chargeBank && chargeBank.timerPeriod > 0) {
+        chargeBank.value = Math.min(chargeBank.cap, chargeBank.value + dt / chargeBank.timerPeriod);
+      }
+      for (const s2 of summonState) {
+        const overlap = Math.max(0, Math.min(until, s2.until) - summonCursor);
+        if (overlap > 0) {
+          const petSwings = overlap * s2.sp.count / s2.sp.period;
+          s2.hits += petSwings;
+          s2.damage += petSwings * s2.out.damage;
+          if (chargeBank && chargeBank.petFed) {
+            chargeBank.value = Math.min(chargeBank.cap, chargeBank.value + petSwings);
+          }
+        }
+        // The expiry proc: a chance at a charge per pet, once per window end.
+        if (chargeBank && s2.sp.elapsedChargeChance > 0
+          && s2.until > summonCursor && s2.until <= until) {
+          chargeBank.value = Math.min(chargeBank.cap,
+            chargeBank.value + s2.sp.elapsedChargeChance * s2.sp.count);
+        }
+      }
+      summonCursor = until;
+    };
     let swings = 0, combos = 0, busy = 0, fillerTime = 0;
     // Non-DoT physical damage EVENTS, which is what a stack counter arms on.
     let physicalHits = 0;
@@ -732,6 +781,7 @@ function runFight(spec) {
     // follows, and it is why `out` is stored per instance rather than read off
     // the dot.
     const tickTo = (until) => {
+      advanceSummons(until);
       for (const [d, st] of live) {
         while (st.nextTick <= Math.min(until, st.expires) && st.nextTick <= fight) {
           // THE STACK COUNT IS LIVE, not snapshot. `getStackFactor@20772` reads
@@ -803,12 +853,17 @@ function runFight(spec) {
     const conduitTriggers = triggers.filter((g) => g.on === 'conduit');
     const fireConduits = (at) => {
       for (const g of conduitTriggers) {
-        const out = hit(g.prof, now);
-        g.fires += 1;
-        g.damage += out.damage;
-        g.heal += out.heal;
-        g.shield += out.shield;
+        for (let i = 0; i < (g.instances ?? 1); i++) {
+          const out = hit(g.prof, now);
+          g.fires += 1;
+          g.damage += out.damage;
+          g.heal += out.heal;
+          g.shield += out.shield;
+        }
       }
+      // ConduitResidues: +Spark at a chance, once per trigger EVENT (its
+      // hook is onConduitTriggers, raised once by triggerAllConduits@29170).
+      if (gauge?.residues > 0 && conduitTriggers.length) earn(gauge.atb, gauge.residues);
     };
     /** Spend, then fire if the pool was above the gauge BEFORE the spend. */
     const spendAndGauge = (amount, at) => {
@@ -1023,11 +1078,15 @@ function runFight(spec) {
 
       // Which casts are ready and still fit before the bell. "Ready" now means
       // the charge is back AND the pool can pay for it.
+      advanceSummons(t);
       const ready = [];
       for (let i = 0; i < actives.length; i++) {
         if (state[i].charges <= 0) continue;
         if (t + actives[i].occupancy > fight) continue;
         if (!canPay(actives[i].prof)) continue;
+        // The charge dump needs at least one banked charge - its own script's
+        // checkEnabled refuses an empty press, and the capture shows one.
+        if (chargeBank && actives[i].prof.id === chargeBank.skill && chargeBank.value < 1) continue;
         ready.push(i);
       }
 
@@ -1081,9 +1140,34 @@ function runFight(spec) {
         // An armed register makes this cast free with probability p, so the
         // expected spend is `cost x (1 - p)`.
         const reg = emp.get(a.prof.id);
-        pay(a.prof, reg ? 1 - reg.p : 1);
-        if (sparkCost > 0 && conduitTriggers.length && gaugePool.max > 0
+        // An armed MAGE CHAIN is spent by the next weapon-skill press - this
+        // one, if it qualifies - and the spend rewrites the cast's whole
+        // economy: zero Spark, every onMageChainCast conduit volley, the
+        // cooldown handed back, and the forced-crit register planted.
+        let chain = null;
+        if (comboRegs.length && weaponSkillIds.has(a.prof.id)) {
+          chain = comboRegs.find((r) => r.chainSpend && r.armed) ?? null;
+          if (chain) chain.armed = false;
+        }
+        if (chain?.chainSpend?.freeSpark) {
+          for (const c of a.prof.costs ?? []) {
+            if (c.atb === gauge?.atb) continue;   // the free half, per fn 44855
+            const p2 = pools.get(c.atb);
+            if (p2) p2.value = Math.max(0, p2.value - c.amount * (reg ? 1 - reg.p : 1));
+          }
+        } else {
+          pay(a.prof, reg ? 1 - reg.p : 1);
+        }
+        // No spend, no spend-crossing: the gauge fire belongs to paid casts.
+        if (!chain && sparkCost > 0 && conduitTriggers.length && gaugePool.max > 0
           && sparkBefore / gaugePool.max > gauge.ratio + 1e-12) fireConduits(t);
+        if (chain) {
+          for (let v = 0; v < Math.max(1, chain.conduitVolleys); v++) {
+            if (conduitTriggers.length) fireConduits(t);
+          }
+          chain.p += (1 - chain.p) * chain.chance;
+          if (chain.chainSpend.resetsCooldown && st.nextCharge > t) st.nextCharge = t;
+        }
         // ...and a GUARANTEED critical strike with the same probability. The
         // cast decomposes as `fixed + base x (1 + p(cd-1))`, so lifting the
         // effective crit chance to `p + (1-p) x base` is exactly what a forced
@@ -1106,16 +1190,40 @@ function runFight(spec) {
           };
         }
         if (reg) reg.p = 0;   // one-shot, spent whether or not it was armed
+        // The charge dump: one missile per banked charge, the whole bank in
+        // one press - damage, hits and the physical counter all scale
+        // linearly with the count consumed.
+        if (chargeBank && a.prof.id === chargeBank.skill) {
+          const k = Math.min(chargeBank.cap, chargeBank.value);
+          chargeBank.value = 0;
+          out = {
+            ...out,
+            damage: out.damage * k, heal: out.heal * k, shield: out.shield * k,
+            hits: (out.hits ?? 0) * k,
+            hitsPhysical: (out.hitsPhysical ?? 0) * k,
+            totalPhysical: (out.totalPhysical ?? 0) * k,
+            totalMagic: (out.totalMagic ?? 0) * k,
+            critPhysical: (out.critPhysical ?? 0) * k,
+            critMagic: (out.critMagic ?? 0) * k,
+          };
+        }
+        // A summoner's cast opens (or extends) its window.
+        const sum2 = summonState.find((x) => x.sp.from === a.prof.id);
+        if (sum2) sum2.until = Math.max(sum2.until, t + sum2.sp.duration);
         // Every ACTIVE cast advances the chain counter; each `every`-th one
-        // raises a chain cast, which re-plants the combo registers.
+        // ARMS the chain. The payoff waits for the next weapon-skill press -
+        // the consume site above - which is also when the game raises
+        // onMageChainCast; a register without chain-spend semantics keeps the
+        // old arm-time behaviour.
         if (comboRegs.length) {
           activeCasts++;
           for (const r of comboRegs) {
             if (r.every > 0 && activeCasts % r.every === 0) {
-              r.p += (1 - r.p) * r.chance;
-              // The chain cast raising this arm also force-fires every
-              // equipped conduit (Chaincast's own onMageChainCast).
-              if (r.firesConduits && conduitTriggers.length) fireConduits(t);
+              if (r.chainSpend) r.armed = true;
+              else {
+                r.p += (1 - r.p) * r.chance;
+                if (r.firesConduits && conduitTriggers.length) fireConduits(t);
+              }
             }
           }
         }
@@ -1259,7 +1367,17 @@ function runFight(spec) {
 
     // The denominator is the FIGHT, not the moment the last cast happened - a
     // damage meter divides by the clock, and so must this.
-    return { swings, combos, busy, fillerTime, physicalHits, elapsed: fight };
+    advanceSummons(fight);
+    return {
+      swings, combos, busy, fillerTime, physicalHits, elapsed: fight,
+      // The pets' own ledger: real damage, but the capture attributes it to
+      // source=Summon_* rather than to the player, so it rides a flagged line
+      // that source-filtered verification excludes.
+      pets: summonState.map((s2) => ({
+        from: s2.sp.from, unit: s2.sp.unit, prof: s2.sp.petProf,
+        hits: s2.hits, damage: s2.damage,
+      })),
+    };
   }
 
   // --- run it ---------------------------------------------------------------
@@ -1278,7 +1396,7 @@ function runFight(spec) {
   const rand = rolls > 1 ? rng(seed) : null;
   const totals = [];
   let last = null;
-  const acc = { active: new Map(), filler: new Map(), dot: new Map(), trig: new Map(), pool: new Map() };
+  const acc = { active: new Map(), filler: new Map(), dot: new Map(), trig: new Map(), pool: new Map(), pet: new Map() };
   for (const link of chain) link.total = { damage: 0, heal: 0, shield: 0, hits: 0, fires: 0 };
   for (let i = 0; i < rolls; i++) {
     for (const link of chain) { link.damage = 0; link.heal = 0; link.shield = 0; link.hits = 0; link.fires = 0; }
@@ -1318,6 +1436,12 @@ function runFight(spec) {
       const e = acc.trig.get(g) ?? { fires: 0, damage: 0, heal: 0, shield: 0 };
       e.fires += g.fires; e.damage += g.damage; e.heal += g.heal; e.shield += g.shield;
       acc.trig.set(g, e);
+    }
+    for (const p2 of last.pets ?? []) {
+      damage += p2.damage;
+      const e = acc.pet.get(p2.from) ?? { hits: 0, damage: 0, prof: p2.prof, unit: p2.unit };
+      e.hits += p2.hits; e.damage += p2.damage;
+      acc.pet.set(p2.from, e);
     }
     totals.push({ damage, heal, shield, ...last });
   }
@@ -1435,6 +1559,24 @@ function runFight(spec) {
       interval: fires > 0 ? elapsed / fires : Infinity, share: 0,
       postHoc: true,
       why: `one per ${mp.per} applications (${Math.round(apps)} in this fight) - the second stack consumes the mark`,
+    });
+  }
+
+  // The pets' own damage, on a FLAGGED line: real output, but the capture
+  // attributes it to source=Summon_*, not the player, so source-filtered
+  // verification must skip it - the flag is the skip.
+  for (const [from, e] of acc.pet) {
+    if (!(e.damage > 0)) continue;
+    const hits = e.hits / rolls;
+    lines.push({
+      id: `${from}#pets`, name: `${e.prof?.name ?? e.unit} (summon)`, kind: 'summon', source: from,
+      perCast: { damage: hits > 0 ? (e.damage / rolls) / hits : 0, heal: 0, shield: 0 },
+      total: { damage: e.damage / rolls, heal: 0, shield: 0 },
+      hits,
+      interval: hits > 0 ? elapsed / hits : Infinity, share: 0,
+      postHoc: true, petSource: true,
+      why: `the ${e.unit}'s own swings while summoned - logged live under source=${e.unit}, not the player, `
+        + 'so the verify fold skips this line and the dps headline keeps it',
     });
   }
 
