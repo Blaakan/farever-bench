@@ -584,7 +584,7 @@ function runFight(spec) {
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
     for (const w of dotChannels) w.credit = 0;
     for (const g of triggers) { g.fires = 0; g.damage = 0; g.heal = 0; g.shield = 0; g.nextReady = 0; }
-    for (const mu of cdMutations) mu.credit = 0;
+    for (const mu of cdMutations) { mu.credit = 0; mu.bank = 0; }
     for (const p of poolDots) {
       p.fed = 0; p.damage = 0; p.heal = 0; p.ticks = 0; p.expires = -1; p.nextTick = 0;
       p.owed = 0; p.paid = 0; p.perTick = 0;
@@ -710,7 +710,7 @@ function runFight(spec) {
           // bleed skip these - `fireDotTick` filters - but an any-dot or
           // status-filtered rider fires here, which is where Virulent Magic
           // lives: on Lethal Poison's own ticks.
-          fireDotTick(d.status, false);
+          fireDotTick(d.status, false, k);
           st.nextTick += d.tick;
         }
         if (st.expires <= until) live.delete(d);
@@ -772,12 +772,19 @@ function runFight(spec) {
     // family arrived; an any-dot rider (isDoT, onInflictStatusEval) rides every
     // tick of every status; a status-filtered one rides exactly the status its
     // script named.
-    const fireDotTick = (statusId = null, isPool = true) => {
+    const fireDotTick = (statusId = null, isPool = true, stacks = 1) => {
       for (const g of triggers) {
         if (g.on !== 'dot-tick') continue;
         if (g.bleedOnly && !isPool) continue;
         if (g.statusFilter && g.statusFilter !== statusId) continue;
-        const share = rand ? (rand() < g.chance ? 1 : 0) : g.chance;
+        // A stacked dot's tick raises onInflictStatusEval once PER STACK, not
+        // once per logged row: Virulent Magic recorded exactly five procs per
+        // Lethal Poison tick at five stacks, against the model's one. Applied
+        // only to riders that NAME their status - the per-stack evidence is
+        // exactly there, and widening it to every any-dot rider without its
+        // own measurement would be the flattering guess this file refuses.
+        const mult = g.statusFilter && !isPool ? Math.max(1, stacks) : 1;
+        let share = (rand ? (rand() < g.chance ? 1 : 0) : g.chance) * mult;
         if (!share) continue;
         const out = hit(g.prof, now);
         g.fires += share;
@@ -890,6 +897,10 @@ function runFight(spec) {
       // Cooldown riders fire off the same events - the value of "reset
       // Bonethrow when Tear crits" IS the extra casts the reset buys.
       for (const mu of cdMutations) {
+        // Bank a mark whenever a supplier lands a cast; a supply-gated reset
+        // spends one, and without one it simply does not fire. Ungated, the
+        // dash pressed at three times the rate its marks could arrive.
+        if (mu.supply && wasCast && mu.supply.includes(skillId)) mu.bank++;
         const hit = mu.on === 'host' ? (skillId === mu.host)
           : mu.on === 'attack' ? attack
             : mu.on === 'combo' ? combo
@@ -902,6 +913,7 @@ function runFight(spec) {
         if (rand) fire = rand() < p;
         else { mu.credit += p; if (mu.credit >= 1) { mu.credit -= 1; fire = true; } }
         if (!fire) continue;
+        if (mu.supply) { if (mu.bank <= 0) continue; mu.bank--; }
         const stT = state[mu.targetIdx];
         const aT = actives[mu.targetIdx];
         if (stT.charges >= aT.maxCharges) continue;   // nothing to give back

@@ -1965,7 +1965,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // whose hook the fight cannot produce (onKill, onAreaExited) or whose
     // guard asks live state is refused with the reason, not skipped.
     const cdMutations = [];
-    const CD_MUT = /\b(resetCooldown|reduceCooldown)\s*\(\s*Skill\.([A-Za-z0-9_]+)\s*(?:,\s*vars\.([A-Za-z0-9_]+))?\s*\)/g;
+    // Both spellings of the target: `Skill.X`, and `skill.kind` - the host
+    // resetting ITSELF. Demondash's dash is the second kind: a 12-second
+    // cooldown whose script consumes a Mark off the target and calls
+    // resetCooldown(skill.kind), so the real cadence is however fast Marks
+    // arrive - and its Skill2 puts a Mark on every damage instance it deals.
+    // The player pressed it at 0.353/s against the model's 0.085/s, a 4.2x
+    // under-rate on the second-biggest hit in the build, all of it this one
+    // unread spelling.
+    const CD_MUT = /\b(resetCooldown|reduceCooldown)\s*\(\s*(?:Skill\.([A-Za-z0-9_]+)|skill\.kind)\s*(?:,\s*vars\.([A-Za-z0-9_]+))?\s*\)/g;
     const activeIds = new Set(active.map((a) => a.prof.id));
     const KNOWN_HOOKS = /^on(Damage|DamageEval|InflictDamage|InflictHit|InflictDamageEval|FirstHit|Hit)$/;
     for (const hostId of seen) {
@@ -1974,7 +1982,8 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const body = liveScript(hs.script);
       CD_MUT.lastIndex = 0;
       for (let m; (m = CD_MUT.exec(body));) {
-        const [, call, targetId, secVar] = m;
+        const [, call, named, secVar] = m;
+        const targetId = named ?? hostId;            // skill.kind = the host itself
         if (!activeIds.has(targetId)) continue;      // mutating a skill not in this build
         const seconds = call === 'reduceCooldown' ? hs.vars?.[secVar] : null;
         if (call === 'reduceCooldown' && !(typeof seconds === 'number' && seconds > 0)) continue;
@@ -2001,7 +2010,33 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           });
           continue;
         }
-        const g = guardOf(scope, { rank, runes, talents });
+        // `hasStatus(hit.target, <Mark>)` where the Mark is applied by ANOTHER
+        // skill this build runs is a rotation fact, not unreadable live state:
+        // Skill2 marks on every damage instance it deals, so a build weaving
+        // both has a Mark waiting essentially every dash. Resolved through the
+        // script's own alias table, stripped from the guard, and the
+        // mark-always-up reading is an assumption this comment owns.
+        let scope2 = scope;
+        const markSuppliers = new Set();
+        {
+          const aliases = new Map();
+          SKILL_ALIAS.lastIndex = 0;
+          for (let am; (am = SKILL_ALIAS.exec(body));) aliases.set(am[1], am[2]);
+          const HAS_T = /hasStatus\s*\(\s*[\w.]+\s*,\s*(?:Skill\.)?([A-Za-z_][\w]*)\s*\)/g;
+          for (let hm; (hm = HAS_T.exec(scope));) {
+            const stId = aliases.get(hm[1]) ?? hm[1];
+            for (const sid of seen) {
+              if (sid === hostId) continue;
+              const other = skills.get(sid);
+              const applies = new RegExp(`addStatus\\s*\\([^)]*${stId}\\b`).test(String(other?.script ?? ''))
+                || (other?.steps ?? []).some((x) => x.props?.status?.ref === stId
+                  || (x.effects ?? []).some((ef) => ef.status === stId));
+              if (applies) markSuppliers.add(sid);
+            }
+            if (markSuppliers.size) scope2 = scope2.replace(hm[0], ' ');
+          }
+        }
+        const g = guardOf(scope2, { rank, runes, talents });
         if (!g.fires) continue;                       // rank/talent-gated off: dead for this build
         if (g.unread && !/^(critical|isCrit)$/.test(g.unread)) {
           unmodelled.push({
@@ -2026,6 +2061,11 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           host: hostId, target: targetId,
           on: ownHit ? 'host' : ev.has('combo') && ev.has('attack') ? 'attack-or-combo'
             : ev.has('combo') ? 'combo' : ev.has('attack') ? 'attack' : 'weapon-skill',
+          // The reset SPENDS a mark another skill supplies, so the fight banks
+          // one per supplier cast and each reset consumes one - "the mark is
+          // always up" briefly stood here unbanked, and the sim promptly
+          // pressed the dash at three times the rate its marks could arrive.
+          supply: markSuppliers.size ? [...markSuppliers] : null,
           chance, critGated,
           kind: call === 'resetCooldown' ? 'reset' : 'reduce',
           seconds: seconds ?? 0,
