@@ -1754,13 +1754,24 @@ group('scoped talent modifiers');
   ok('a Poison-scoped bonus is not read as global damage',
     ld && ld.scope !== 'all' && /Poison/.test(ld.scope), JSON.stringify(ld));
 
-  // The refusals. These carry guards the reader cannot classify, so they must
-  // produce NOTHING rather than an unconditional bonus.
-  for (const id of ['Priest_Talent_PiercingLight', 'Priest_Talent_Radiance', 'Priest_Talent_Authority']) {
-    if (!eng.cdb.byId('skill').has(id)) continue;
-    ok(`${id} is refused rather than read as unconditional`, mod(id, 2).length === 0,
-      JSON.stringify(mod(id, 2)));
-  }
+  // A guard the reader cannot classify must still produce NOTHING rather than
+  // an unconditional bonus.
+  ok('Priest_Talent_PiercingLight is refused rather than read as unconditional',
+    !eng.cdb.byId('skill').has('Priest_Talent_PiercingLight')
+      || mod('Priest_Talent_PiercingLight', 2).length === 0,
+    JSON.stringify(mod('Priest_Talent_PiercingLight', 2)));
+  // Two guards the reader NOW classifies, at the value the rankOverride
+  // restates (0.12 x 2 is not 0.25). Authority names one castable skill;
+  // Radiance rides every status tick the owner carries - both measured on
+  // Emsei's ledger, one x1.2 and one x1.25.
+  const auth = one('Priest_Talent_Authority', 2);
+  ok('Authority is a +20% rider scoped to Smite alone',
+    auth && auth.scope === 'one-skill' && auth.skill === 'Priest_Prayer_Smite'
+      && Math.abs(auth.amount - 0.2) < 1e-9, JSON.stringify(auth));
+  const rad = one('Priest_Talent_Radiance', 2);
+  ok('Radiance is a +25% rider on owner-carried status ticks',
+    rad && rad.scope === 'own-status-tick' && Math.abs(rad.amount - 0.25) < 1e-9,
+    JSON.stringify(rad));
 
   // ...and no talent anywhere may come out as a global bonus large enough to be
   // a mis-read conditional. Nothing in this data legitimately grants one.
@@ -3642,13 +3653,22 @@ group('a next-cast register is spent for a free crit');
   const eng = createEngine({ quiet: true });
   const all = eng.cdb.lines('skill').map((s) => s.id);
   const found = eng.plan.empowermentsOf(all, { rank: 3 });
-  ok('exactly one skill in the game carries this shape', found.length === 1,
+  // Two authored shapes now: the costed register (Surge of Violence) and the
+  // costless one the finisher itself consumes (HighVoltage, armed per mage
+  // chain cast at Chaincast's counted rate). A sweep of all scripts matches
+  // exactly one of each.
+  ok('exactly two skills in the game carry a register shape', found.length === 2,
     JSON.stringify(found));
-  const e = found[0];
-  ok('...and it is Surge of Violence arming Rage Strike off a finisher',
-    e.skill === 'Warrior_Rage_Strike' && e.from === 'Warrior_Talent_SurgeOfViolence'
+  const e = found.find((x) => x.from === 'Warrior_Talent_SurgeOfViolence');
+  ok('...one is Surge of Violence arming Rage Strike off a finisher',
+    e && e.skill === 'Warrior_Rage_Strike'
       && Math.abs(e.chance - 0.25) < 1e-9 && e.on === 'combo',
     JSON.stringify(e));
+  const hv = found.find((x) => x.from === 'Mage_Talent_HighVoltage');
+  ok('...the other is HighVoltage, consumed by the combo, re-armed every 4 actives',
+    hv && hv.consume === 'combo' && hv.armEveryActiveCasts === 4 && hv.chance === 1
+      && hv.status === 'Mage_Talent_HighVoltage_Status',
+    JSON.stringify(hv));
   // Nothing is armed without the source, so a build that has neither the talent
   // nor the sigil must read nothing.
   ok('a build without the node arms nothing',

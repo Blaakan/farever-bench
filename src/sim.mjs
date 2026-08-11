@@ -618,8 +618,17 @@ function runFight(spec) {
     // either: a queued press resolves when the current cast ENDS, which is the
     // same removal. So one arm buys exactly one free critical cast.
     const emp = new Map();   // skill id -> { chance, p }
-    for (const e of empowerments ?? []) emp.set(e.skill, { chance: e.chance, p: 0 });
+    // A register the COMBO FINISHER itself consumes, re-armed by a cast
+    // counter rather than by the finisher: HighVoltage's status forces the
+    // next finisher critical and is planted on every mage chain cast, which
+    // the Chaincast talent raises every `armEveryActiveCasts` active casts.
+    const comboRegs = [];
+    for (const e of empowerments ?? []) {
+      if (e.consume === 'combo') comboRegs.push({ chance: e.chance, every: e.armEveryActiveCasts ?? 0, p: 0 });
+      else emp.set(e.skill, { chance: e.chance, p: 0 });
+    }
     const armAll = () => { for (const r of emp.values()) r.p += (1 - r.p) * r.chance; };
+    let activeCasts = 0;
     let swings = 0, combos = 0, busy = 0, fillerTime = 0;
     // Non-DoT physical damage EVENTS, which is what a stack counter arms on.
     let physicalHits = 0;
@@ -1064,6 +1073,14 @@ function runFight(spec) {
           };
         }
         if (reg) reg.p = 0;   // one-shot, spent whether or not it was armed
+        // Every ACTIVE cast advances the chain counter; each `every`-th one
+        // raises a chain cast, which re-plants the combo registers.
+        if (comboRegs.length) {
+          activeCasts++;
+          for (const r of comboRegs) {
+            if (r.every > 0 && activeCasts % r.every === 0) r.p += (1 - r.p) * r.chance;
+          }
+        }
         a.casts++;
         a.hits = (a.hits ?? 0) + (out.hits ?? 0);
         physicalHits += out.hitsPhysical ?? 0;
@@ -1145,7 +1162,24 @@ function runFight(spec) {
       // gauge: five finishers take a full 100 to 50, and 50 is not strictly
       // above the threshold.
       if (link.prof.isCombo && gauge?.finisherCost > 0) spendAndGauge(gauge.finisherCost, t);
-      const swingOut = hit(link.prof, now);
+      let swingOut = hit(link.prof, now);
+      // The combo registers spend HERE: the finisher's own cast is the
+      // consumer (onUseSkill isFinalAttack -> critChance += 1, consume). Same
+      // expectation blend the active-cast registers use, cleared either way.
+      if (link.prof.isCombo && comboRegs.length) {
+        for (const r of comboRegs) {
+          if (r.p > 0 && swingOut.critRoll) {
+            const cr = swingOut.critRoll;
+            const forced = cr.fixed + cr.base * cr.cd;
+            swingOut = {
+              ...swingOut,
+              damage: swingOut.damage * (1 - r.p) + forced * r.p,
+              critRoll: { ...cr, p: r.p + (1 - r.p) * cr.p },
+            };
+          }
+          r.p = 0;
+        }
+      }
       // WeaponAttack_RandomRange: observed in play as a symmetric ~±10% on
       // WeaponPower-scaled swings (19-24, 78-95 around their means) - and as
       // NOTHING on the Strength-scaled combo finisher, which read a constant

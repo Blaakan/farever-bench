@@ -85,7 +85,11 @@ const INERT_TYPES = new Set([
 // and disappears from the build entirely.
 const ADD_STATUS = /(?:addStatus|enforceStatus|setStatus)\s*\(\s*([A-Za-z_.]+)\s*,\s*(?:Skill\.)?([A-Za-z0-9_]+)\s*([,)])/g;
 const SKILL_ALIAS = /\b(?:var|final)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*Skill\.([A-Za-z0-9_]+)\s*;/g;
-const SELF_TARGETS = new Set(['owner', 'hit.source', 'this.owner', 'dmg.source', 'ctx.source', 'self']);
+// `ownerHero` is the game's own alias for the owning hero - its scripts use it
+// interchangeably with `owner` (`consumeStatus(ownerHero, ...)`,
+// `ownerHero?.mage`), and reading it as a third party filed HighVoltage's
+// guaranteed-crit register under "handed to an ally", which no ally ever saw.
+const SELF_TARGETS = new Set(['owner', 'ownerHero', 'hit.source', 'this.owner', 'dmg.source', 'ctx.source', 'self']);
 // The thing you just hit. Everything NOT in this set and not in SELF_TARGETS
 // is a third party - an ally, a party member, a summoned pet, usually bound to
 // a lambda parameter - and a Buff handed to one of those is not YOUR buff.
@@ -3658,6 +3662,49 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           name: s.texts?.name ?? skillId,
         });
       }
+      // Two more authored guard shapes, each carried at the value the
+      // rankOverride RESTATES rather than the times-rank heuristic - both
+      // rows restate (Authority 0.1 -> 0.2 at rank 2, Radiance 0.12 -> 0.25),
+      // and 0.12 x 2 is not 0.25.
+      const varAtRank = (key) => {
+        let v = s.vars?.[key];
+        for (const ov of (s.props?.rankOverride ?? []).slice()
+          .sort((a, b) => (a.minRank ?? 0) - (b.minRank ?? 0))) {
+          if ((ov.minRank ?? 0) <= rank && ov.vars?.[key] != null) v = ov.vars[key];
+        }
+        return v;
+      };
+      // A rider scoped to ONE SKILL by id - Authority is `dmg.skillId ==
+      // Skill.Priest_Prayer_Smite -> dmgMult += vars.damage`. Only when the
+      // named row is a castable skill: the same guard naming a STATUS is the
+      // companion-hook family the dot pipeline reads.
+      const ONE_SKILL = /if\s*\(\s*\w+\.skillId\s*==\s*Skill\.(\w+)\s*\)\s*\{\s*\w+\.dmgMult\s*\+=\s*vars\.(\w+)/g;
+      ONE_SKILL.lastIndex = 0;
+      for (let m; (m = ONE_SKILL.exec(body));) {
+        const v = varAtRank(m[2]);
+        const row = skills.get(m[1]);
+        if (typeof v !== 'number' || v <= 0 || !row || row.props?.status) continue;
+        out.push({
+          field: 'dmgMult', scope: 'one-skill', skill: m[1], statusType: null,
+          targetBleeding: undefined, amount: v, from: skillId, name: s.texts?.name ?? skillId,
+        });
+      }
+      // A rider on every status tick the OWNER CARRIES - Radiance is
+      // `ctx.status != null && ctx.status.owner == owner -> dmgMult +=
+      // vars.damage`, measured x1.25 on all five of Emsei's self-carried
+      // ticks at once (the orb's last-pulse ratio 2.25/1.25 pins that the +1
+      // and this rider share the one additive bracket). The owner test is the
+      // WEARER: a dot on the enemy is worn by the enemy and takes nothing.
+      const OWN_TICK = /if\s*\(\s*(\w+)\.status\s*!=\s*null\s*&&\s*\1\.status\.owner\s*==\s*owner\s*\)\s*\{\s*\1\.dmgMult\s*\+=\s*vars\.(\w+)/.exec(body);
+      if (OWN_TICK) {
+        const v = varAtRank(OWN_TICK[2]);
+        if (typeof v === 'number' && v > 0) {
+          out.push({
+            field: 'dmgMult', scope: 'own-status-tick', statusType: null,
+            targetBleeding: undefined, amount: v, from: skillId, name: s.texts?.name ?? skillId,
+          });
+        }
+      }
     }
     // ...and the modifiers that live on a DEBUFF this talent puts on the enemy.
     // `Warrior_Talent_Bruise` applies a 15-second status whose own script reads
@@ -3856,20 +3903,53 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const alias = new RegExp(`\\b${forced[1]}\\s*=\\s*(?:Skill\\.)?([A-Za-z0-9_]+)`).exec(body);
       consumers.set(alias?.[1] ?? forced[1], id);
     }
-    if (!consumers.size) return out;
+    if (consumers.size) {
+      for (const id of ownedIds) {
+        const body = liveScript(skills.get(id)?.script ?? '');
+        if (!body) continue;
+        for (const [status, skill] of consumers) {
+          const m = new RegExp(`addStatus\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?${status}`).exec(body);
+          if (!m) continue;
+          const line = body.slice(0, m.index);
+          const onFinisher = /isFinalAttack|isFinalCombo/.test(line);
+          const cv = /checkProba\s*\(\s*vars\.(\w+)/.exec(line)?.[1];
+          const chance = cv ? skills.get(id)?.vars?.[cv] : 1;
+          if (!onFinisher || typeof chance !== 'number' || !(chance > 0)) continue;
+          out.push({ status, skill, from: id, chance, on: 'combo' });
+        }
+      }
+    }
+    // The COSTLESS register, the second authored shape: the STATUS's own
+    // script is the consumer - onUseSkill guards the finisher predicate, adds
+    // critChance += 1 to the cast, and consumes itself - and the armer plants
+    // it on every MAGE CHAIN CAST (HighVoltage: onMageChainCast ->
+    // addStatus(ownerHero, ...Status)). The chain cast has an authored rate
+    // of its own: the Chaincast talent counts ACTIVE-skill casts up to
+    // vars.var1 and arms the chain, so the register re-arms every var1
+    // actives - live, 2-4x faster than finishers are pressed, which is why
+    // every recorded finisher volley crits (12 of 12 at 100%). Without the
+    // counting talent there is no rate, and the register is not credited.
     for (const id of ownedIds) {
       const body = liveScript(skills.get(id)?.script ?? '');
       if (!body) continue;
-      for (const [status, skill] of consumers) {
-        const m = new RegExp(`addStatus\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?${status}`).exec(body);
-        if (!m) continue;
-        const line = body.slice(0, m.index);
-        const onFinisher = /isFinalAttack|isFinalCombo/.test(line);
-        const cv = /checkProba\s*\(\s*vars\.(\w+)/.exec(line)?.[1];
-        const chance = cv ? skills.get(id)?.vars?.[cv] : 1;
-        if (!onFinisher || typeof chance !== 'number' || !(chance > 0)) continue;
-        out.push({ status, skill, from: id, chance, on: 'combo' });
+      const arm = /function\s+onMageChainCast\s*\([^)]*\)\s*\{[\s\S]*?addStatus\s*\(\s*(?:owner|ownerHero)\s*,\s*(?:Skill\.)?([A-Za-z0-9_]+)/.exec(body);
+      if (!arm) continue;
+      const sBody = liveScript(skills.get(arm[1])?.script ?? '');
+      const consume = /function\s+onUseSkill\s*\(\s*(\w+)\s*\)\s*\{\s*if\s*\(\s*\1\.(?:baseSkill\.)?(?:isFinalAttack|isFinalCombo)\s*\(\s*\)\s*\)\s*\{\s*\1\.critChance\s*\+?=\s*1\b[\s\S]{0,200}?consumeStatus\s*\(\s*(?:owner|ownerHero)\s*,/.exec(sBody);
+      if (!consume) continue;
+      let every = null;
+      for (const rid of ownedIds) {
+        const rb = liveScript(skills.get(rid)?.script ?? '');
+        if (!rb || !/isActiveSkill\s*\(\s*\)/.test(rb) || !/onMageChainCast/.test(rb)) continue;
+        const cnt = /<\s*vars\.(\w+)/.exec(rb);
+        const n = cnt ? skills.get(rid)?.vars?.[cnt[1]] : null;
+        if (typeof n === 'number' && n > 0) { every = n; break; }
       }
+      if (!(every > 0)) continue;
+      out.push({
+        status: arm[1], skill: null, from: id, chance: 1,
+        on: 'combo', consume: 'combo', armEveryActiveCasts: every,
+      });
     }
     return out;
   }

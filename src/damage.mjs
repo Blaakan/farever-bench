@@ -1059,7 +1059,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
   }
 
   // --- one cast ------------------------------------------------------------
-  function amountOf(effect, sheet, swingAttrs = null, weaponMixFlats = null, itemFlats = null) {
+  function amountOf(effect, sheet, swingAttrs = null, weaponMixFlats = null) {
     let a = effect.baseVal;
     for (const s of effect.scaling) {
       let v = sheet.get(s.atb) ?? 0;
@@ -1089,18 +1089,6 @@ export function buildCombat(cdb, ctx, assume = {}) {
       else if (weaponMixFlats) {
         const f = weaponMixFlats.get(s.atb);
         if (f) v = 0.6 * v + 0.4 * f;
-      }
-      // A SHIELD-granted status pulse takes the item flat WITHOUT the
-      // attribute reduction: 0.4 x the attribute's own budget curve adds on
-      // top of the whole attribute. Measured on the orb pulse to 0.4% -
-      // 0.55 x (Faith 137 + 0.4 x 123.58) x carrier bracket = 116.03 against
-      // live non-crit [116.08, 116.74] - where the 0.6/0.4 mix (81.9) and a
-      // full budget replacement (68.0) are both excluded outright. One row
-      // pins this; the mechanism (the (1-r) scaleSource gate not firing for
-      // status contexts, getStepEffectScaling@20778) is the audit's to state.
-      else if (itemFlats) {
-        const f = itemFlats.get(s.atb);
-        if (f) v += 0.4 * f;
       }
       a += s.ratio * v;
     }
@@ -1239,15 +1227,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // WHICH scaling channel this effect's attributes read is per-effect,
       // because Raw is priced pure: the Raw-affinity weapon-granted tick
       // (Daggers_DuplicatePoison_Skill1_Status) lands at exactly the whole
-      // attribute live - 4 x Dex 166 - where the mix would say 159. The
-      // shield flat wins over the mix for the ids the engine routed there.
+      // attribute live - 4 x Dex 166 - where the mix would say 159.
       const effRoot = affinityOf(e.affinity).root;
-      const tickFlats = effRoot !== 'Raw' && opts.tickScaling?.flatIds?.has(prof.id)
-        ? opts.tickScaling.flats : null;
-      const mixFlats = tickFlats ? null
-        : opts.weaponMix?.ids?.has(prof.id) ? opts.weaponMix.flats
-          : (effRoot !== 'Raw' && opts.tickScaling?.mixIds?.has(prof.id)) ? opts.tickScaling.flats
-            : null;
+      const mixFlats = opts.weaponMix?.ids?.has(prof.id) ? opts.weaponMix.flats
+        : (effRoot !== 'Raw' && opts.tickScaling?.mixIds?.has(prof.id)) ? opts.tickScaling.flats
+          : null;
       // The TRINKET channel, measured on Trinket_Demon_Status to the integer
       // over 2,407 rows: a status granted by a non-weapon item ticks its
       // authored amount IN FULL every tick (the capture's three equal pulses
@@ -1258,7 +1242,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       const standing = opts.tickScaling?.standingIds?.has(prof.id) ? opts.tickScaling.standing : null;
       const priceSheet = standing ? { get: (k) => standing.get(k) ?? sheet.get(k) } : sheet;
       const spreadUndo = standing && e.spread ? Math.max(1, e.ticks ?? 1) : 1;
-      const raw = amountOf(e, priceSheet, opts.swingAttrs ?? null, mixFlats, tickFlats)
+      const raw = amountOf(e, priceSheet, opts.swingAttrs ?? null, mixFlats)
         * (e.hits ?? 1) * spreadUndo;
       if (!raw) continue;
       // Only an Area or Aura step reaches the crowd, and `props.hitCount` is a
@@ -1362,6 +1346,17 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // `hit.dmgMult +=` into computeDamage's one modMult scalar - already
         // scaled by the assumed behind-fraction at the engine.
         if (mods.basicAttackBehind && /^Attack[234]?$/.test(prof.type ?? '')) riders += mods.basicAttackBehind;
+        // A talent rider naming this one skill (Authority's +20% on Smite),
+        // and the owner-carried-tick rider (Radiance's +25%) on self-worn
+        // status ticks. Same additive bracket as every other hook.
+        riders += mods.bySkill?.[prof.id] ?? 0;
+        if (statusTick && prof.tickCarrierSelf === true) riders += mods.ownStatusTick ?? 0;
+        // The detector's last-pulse `ctx.dmgMult += 1` sums HERE, with the
+        // hook riders: the live final/plain ratio is 2.25/1.25 on a build
+        // whose only other rider is Radiance's 0.25 - the +1 and the talent
+        // share one bracket, and the carrier's fervor bracket cancels out of
+        // the ratio entirely.
+        riders += e.ctxDmgAdd ?? 0;
         m *= 1 + riders;
         // Fervor and the matching mastery share ONE additive bracket -
         // getDamageRatio@4505: (1 + fervor + mastery) x DamageModifier - and
@@ -1379,13 +1374,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
           const masteryAdd = opts.assume.mastery
             ? (aff.root === 'Physical' ? physMastery : aff.root === 'Magic' ? magicMastery : 0)
             : 0;
-          // A script's `ctx.dmgMult +=` on a PLAYED STEP lands on the
-          // SkillContext scalar this bracket models - initVars@5150 seeds it
-          // with the carrier's ratio and the += adds into it - so the orb's
-          // last-pulse +1 dilutes against fervor and mastery instead of
-          // doubling clean. Live: final/plain 1.795-1.801 with the carrier
-          // bracket at ~1.25, exactly (B+1)/B.
-          m *= 1 + fervorAdd + masteryAdd + (e.ctxDmgAdd ?? 0);
+          m *= 1 + fervorAdd + masteryAdd;
         }
         damage += raw * m * targets;
         singleTargetDamage += raw * m;

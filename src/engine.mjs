@@ -161,33 +161,38 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       // isWeaponBased on the skill type - so the arsenal's weapon skills mix
       // exactly like the mainhand's. Class skills (type 9) stay pure
       // attribute, read straight off BaseSkill.isWeaponBased@6057's set.
-      weaponMix: mainItem || hasArsenal ? {
-        flats: combat.attributeBudgets(loadout.level),
-        ids: new Set([
-          ...rot.filler.map((x) => x.prof.id),
-          ...rot.active
-            .filter((x) => x.source === 'Slot_Weapon1' || x.source === 'Slot_Weapon2'
-              || x.source === 'Slot_OffhandWeapon')
-            .map((x) => x.prof.id),
-        ]),
-      } : null,
-      // STATUS TICKS read the granting item's channel too, and the channel
-      // depends on the item. Measured, one row each: a SHIELD-granted pulse
-      // keeps the whole attribute and adds 0.4 x its budget curve (the orb,
-      // exact to 0.4%); a WEAPON-granted tick takes the ordinary 0.6/0.4 mix
-      // (Demondash's aura, -1.4%); a Raw-affinity tick stays pure attribute
-      // (DuplicatePoison's, exact) - the Raw gate lives at the pricing site.
-      // Statuses granted by class skills or talents are in neither set and
-      // price pure, as before.
+      // The item-scaling channel follows the granting item's TYPE CHAIN, per
+      // getStepEffectScaling@20778: itemRatio 0.4 when the chain reaches
+      // MainhandWeapon (every held weapon does), 1.0 for GearTrinket, and 0
+      // otherwise - Shield inherits OffhandWeapon > Weapon and never
+      // MainhandWeapon, so a SHIELD-granted status prices PURE attribute (the
+      // orb's live pulse is 0.55 x live-ceiled Faith x its riders exactly; an
+      // earlier +0.4-budget reading of the same number was degenerate on this
+      // one build and is gone). Weapon-granted ticks take the ordinary
+      // 0.6/0.4 mix, Raw gated at the pricing site; class and talent statuses
+      // are in no set and price pure.
+      weaponMix: (() => {
+        if (!mainItem && !hasArsenal) return null;
+        const shieldStatus = new Set(rot.active
+          .filter((x) => typeof x.source === 'string' && x.prof.isStatusTick
+            && cat.itemById.get(loadout.gear[x.source]?.item)?.type === 'Shield')
+          .map((x) => x.prof.id));
+        return {
+          flats: combat.attributeBudgets(loadout.level),
+          ids: new Set([
+            ...rot.filler.map((x) => x.prof.id),
+            ...rot.active
+              .filter((x) => x.source === 'Slot_Weapon1' || x.source === 'Slot_Weapon2'
+                || x.source === 'Slot_OffhandWeapon')
+              .map((x) => x.prof.id),
+          ].filter((id) => !shieldStatus.has(id))),
+        };
+      })(),
       tickScaling: (() => {
         const WEAPON_SLOTS = new Set(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']);
         const itemType = (slot) => cat.itemById.get(loadout.gear[slot]?.item)?.type ?? null;
         return {
           flats: combat.attributeBudgets(loadout.level),
-          flatIds: new Set(rot.active
-            .filter((x) => typeof x.source === 'string' && WEAPON_SLOTS.has(x.source)
-              && x.prof.isStatusTick && itemType(x.source) === 'Shield')
-            .map((x) => x.prof.id)),
           mixIds: new Set((rot.dots ?? [])
             .filter((d) => typeof d.source === 'string' && WEAPON_SLOTS.has(d.source)
               && itemType(d.source) && itemType(d.source) !== 'Shield')
@@ -641,6 +646,19 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
           else unreadMods.push(mod);
         } else if (mod.field === 'armorIgnore') add(mods.armorIgnore, 'Physical');
         else if (mod.field === 'magicArmorIgnore') add(mods.armorIgnore, 'Magic');
+        // A rider naming ONE castable skill - Authority's +20% on Smite -
+        // lands on exactly that row's casts, and a rider on every status tick
+        // the OWNER CARRIES - Radiance's +25% - lands on the tickCarrierSelf
+        // rows at the pricing site. Both were read correctly and then dropped
+        // here for want of a channel; Smite read 20% low and all five of the
+        // Priest's self-carried ticks 25% low, in one measurement each.
+        else if (mod.field === 'dmgMult' && mod.scope === 'one-skill' && mod.skill) {
+          mods.bySkill ??= {};
+          mods.bySkill[mod.skill] = (mods.bySkill[mod.skill] ?? 0) + mod.amount;
+        }
+        else if (mod.field === 'dmgMult' && mod.scope === 'own-status-tick') {
+          mods.ownStatusTick = (mods.ownStatusTick ?? 0) + mod.amount;
+        }
         else unreadMods.push(mod);
       }
     }
