@@ -2286,10 +2286,26 @@ RadiantVerdict's "+158%" collapsed to -12.6% (its whole 8-second zone sits
 behind the M1 rune), Surging Force went -29.2% to -0.9%, and the Priest
 ledger tightened across the board.
 
-Coverage stands at 100% on all four classes with zero MISSING rows. The
-open residuals, each named where it lives: PurgingStrikes -15.9% (a
+The two Warrior model-highs turned out to be the mirror's, not the model's.
+Hemorrhage's pool pricing reproduces the live lattice to the integer
+(status_on stacks = round(0.35 x the feeding crit), four 2s ticks of
+ceil(pool/4)); its "+34.7% per hit" decomposed as share x rotation-dps x a
+second target's tick dilution, an identity to five digits - so verify now
+judges GLOBALLY-fed pools on share (per-hit printed informationally) while
+own-fed pools keep their per-hit verdict. Heartsteel's per-fire formula is
+byte-exact (269 = ceil(0.1 x Armor x fervor bracket); 323 is that under
+Berserk; 412 the one crit); its excess was the sim auto-pressing Fortifying
+Cry - so verify now holds the model to the PRESSED set, with via-granted
+casts riding their presser. And a Shield-granted CAST leaves the weapon mix
+entirely (the type chain never reaches MainhandWeapon), fixed while inert.
+
+Under the pressed frame, the ledgers close at: Warrior 5 match / 4 close /
+2 miss, Priest 5/6/3, Rogue 7/7/4, Mage 2/5/4 - and coverage is 100%
+everywhere except one honest hole: Gash reads MISSING because its live
+applier is the arsenal passive the default selection drops (the probe-v4
+snap_wskill row closes it). The open residuals: PurgingStrikes -15.9% (a
 session-state item linkage that flips its flat with a relog - deliberately
-not baked), Hemorrhage +34.7% and Shield Craft +31.2% on the Warrior
-(model-high, uninvestigated), the Mage combo's crit mix and conduit share
-(the sim's own press cadence vs the live player's), and Gash's rider
-(gated on the probe-v4 weapon-skill snapshot).
+not baked), the Mage combo's crit mix and conduit share (the sim's press
+cadence vs the live player's), and the rune-slotting question (the modkit
+dump lists runes with no slotted field; one Battle Shout press without its
+M3 buff proves at least one listed rune inactive in-window).
