@@ -473,6 +473,52 @@ function fillTemplate(desc, vars, skill, skills = null) {
     });
 }
 
+/**
+ * The ComboPoint cap the finisher actually spends at - from the rows, not a
+ * literal.
+ *
+ * The unit sheet authors 4, and exactly two skill rows in the whole data raise
+ * it, each with a TAttribute_Flat MaxComboPoint affix: `Rogue_ComboMax`, a
+ * baseline skill on the unit row itself, and `Rogue_Finisher_Combo_Point`, the
+ * permanent State the signature finisher's checkComboPoints() applies while
+ * Mastery.Rogue_Finisher_M2 is held ("Combo Ruler" - whose own text names the
+ * total, vars.var2 = 6). Masteries are priced as held everywhere else in this
+ * file, so both count: 4 + 1 + 1 = 6. The live capture agrees to the integer -
+ * finisher hits quantize as A x (1 + 0.3c) with c = 6 on nine of ten hits in
+ * the proper-rotation window, c = 5 on the tenth.
+ *
+ * The State's +1 lives on NO sheet the model builds - it exists only while the
+ * status instance does - which is why the pool cap takes this value as an
+ * override rather than reading MaxComboPoint off the evaluated sheet.
+ */
+function comboPointCap(cdb) {
+  const unit = cdb.lines('unit').find((u) => (u.stats ?? []).some((s) => s.attribute === 'MaxComboPoint'));
+  if (!unit) return 4;
+  let cap = 4;
+  for (const st of unit.stats) {
+    if (st.attribute === 'MaxComboPoint' && typeof st.value === 'number') cap = st.value;
+  }
+  const flatOf = (id) => (cdb.byId('skill').get(id)?.affixes ?? [])
+    .filter((x) => x.ref === 'TAttribute_Flat' && x.target?.attribute === 'MaxComboPoint')
+    .reduce((n, x) => n + (typeof x.val === 'number' ? x.val : 0), 0);
+  const counted = new Set();
+  for (const s of unit.skills ?? []) {
+    const id = s.skill ?? s.ref ?? s;
+    if (typeof id !== 'string' || counted.has(id)) continue;
+    counted.add(id);
+    cap += flatOf(id);
+    // The mastery-applied State: a unit skill whose script guards addStatus
+    // behind hasMastery. Any status it names that carries its own
+    // MaxComboPoint affix counts once.
+    const src = String(cdb.byId('skill').get(id)?.script ?? '');
+    if (!/hasMastery\s*\(/.test(src) || !/addStatus\s*\(\s*owner\s*,/.test(src)) continue;
+    for (const m of src.matchAll(/Skill\.(\w+)/g)) {
+      if (!counted.has(m[1])) { counted.add(m[1]); cap += flatOf(m[1]); }
+    }
+  }
+  return cap;
+}
+
 export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_SKILL_SLOTS } = {}) {
   const skills = cdb.byId('skill');
   const T = cdb.enumValues('skill', 'type');
@@ -1908,7 +1954,11 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // is not pool-gated in the fight - which flatters a Spark-starved build
     // slightly and is on record rather than hidden.
     // Rogue: the signature finisher consumes all Combo Points for +0.3 dmgMult
-    // each (script.skills.Rogue_Sig_Finisher.onStep@44709); modelled at a 4-point spend, the cap.
+    // each (script.skills.Rogue_Sig_Finisher.onStep@44709); modelled at a
+    // full-cap spend - comboPointCap() reads the cap off the rows (6 with the
+    // Combo Ruler mastery's State, see its docstring), and the live capture
+    // quantizes at exactly that spend. The 4 this used to hardcode was the
+    // unit row's base, two affixes short, and read the finisher 19% low.
     // Profs are CLONED before costs are attached - the profile cache is shared
     // across builds and a mutated cached prof would leak between classes.
     const constNum = (id, dflt) => cdb.byId('constant').get(id)?.v?.float
@@ -1945,15 +1995,21 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         finisherCost: constNum('Mage_Spark_SpellCDCost_FinalCombo', 10),
       };
     }
+    let poolCapOverride = null;
     if (loadout.class === 'Rogue' && tracked.has('ComboPoint')) {
+      const cap = comboPointCap(cdb);
+      const per = cdb.byId('skill').get('Rogue_Sig_Finisher')?.vars?.var1 ?? 0.3;
       for (const a of active) {
         if (a.prof.id !== 'Rogue_Sig_Finisher') continue;
         a.prof = {
           ...a.prof,
-          costs: [...(a.prof.costs ?? []), { atb: 'ComboPoint', amount: 4 }],
-          runeDamage: [...(a.prof.runeDamage ?? []), { amount: 4 * 0.3 }],
+          costs: [...(a.prof.costs ?? []), { atb: 'ComboPoint', amount: cap }],
+          runeDamage: [...(a.prof.runeDamage ?? []), { amount: cap * per }],
         };
       }
+      // The Combo Ruler State's +1 is on no sheet, so the pool's cap cannot
+      // come from the sheet alone - the fight takes the larger of the two.
+      poolCapOverride = { ComboPoint: cap };
     }
 
     // --- cooldown mutations -------------------------------------------------
@@ -2083,7 +2139,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // built, so it is applied here rather than folded in above.
       unmodelled: unmodelled.filter((u) => !accounted.has(u.id) && !accountedLate.has(u.id)),
       selection: sel, runes: [...runes], rank, chain, cdMutations, sparkGauge,
-      resources: { gains, tracked: [...tracked] },
+      resources: { gains, tracked: [...tracked], capOverride: poolCapOverride },
     };
   }
 
@@ -3159,13 +3215,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const v = /checkProba\s*\(\s*vars\.([A-Za-z0-9_]+)/.exec(scope)?.[1];
       const n = v ? skill?.vars?.[v] : null;
       if (typeof n === 'number' && n > 0) {
-        let cap = 4;
-        for (const u of cdb.lines('unit')) {
-          for (const st of u.stats ?? []) {
-            if (st.attribute === 'MaxComboPoint' && typeof st.value === 'number') { cap = st.value; break; }
-          }
-        }
-        chance = Math.min(1, n * cap);
+        chance = Math.min(1, n * comboPointCap(cdb));
       }
     }
     let on = 'cast';

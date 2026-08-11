@@ -1473,7 +1473,13 @@ export function buildCombat(cdb, ctx, assume = {}) {
     for (const atb of rotation.resources?.tracked ?? []) {
       const a = ctx.attrTable.byId.get(atb);
       if (!a) continue;
-      const max = a.maxAtb ? (sheet.get(a.maxAtb) ?? 0) : Infinity;
+      // The plan can know a cap the sheet cannot: the Combo Ruler mastery's
+      // permanent State carries a MaxComboPoint affix that exists only while
+      // the status instance does, so no sheet the model builds ever holds it.
+      // The larger of the two wins - a sheet that already reads the full cap
+      // is not bumped twice.
+      const override = rotation.resources?.capOverride?.[atb] ?? 0;
+      const max = a.maxAtb ? Math.max(sheet.get(a.maxAtb) ?? 0, override) : Infinity;
       if (!(max > 0)) continue;
       // `attribute.gainAtb` names a multiplier on everything you EARN into this
       // pool - Rage declares `RageGainFactor`, which the Warrior unit sets to 1
