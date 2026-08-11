@@ -27,7 +27,11 @@ import { slugOf, endpoints, normalize, translate } from '../src/questlog.mjs';
 import { aggregate, sessions, snapshots } from '../src/capture.mjs';
 import { compare } from '../src/verify.mjs';
 import { readDump, toLoadout, listCharacters, fromSnapshot } from '../src/inventory.mjs';
-import { requireGame } from '../src/lib/game.mjs';
+import { requireGame, requireBoot } from '../src/lib/game.mjs';
+import { readHlb } from '../src/lib/hl.mjs';
+import { loadCdb } from '../src/cdb.mjs';
+import { buildFingerprint, diffFingerprints, resolveCitations, workList, loadFingerprint, fingerprintPath } from '../src/drift.mjs';
+import { fileURLToPath } from 'node:url';
 import * as f from '../src/format.mjs';
 
 export const VERSION = '0.1.0';
@@ -2100,6 +2104,78 @@ const commands = {
       + 'cannot read scores low for a reason the GAPS column names, not because it is weak.'));
   },
 
+  // The patch-day pipeline. `bench update` diffs the install against the
+  // committed fingerprint and prints the work list; --accept records the new
+  // state once the work is done (or consciously deferred).
+  async update(args) {
+    const game = requireGame(args._);
+    const cdb = loadCdb({ game, quiet: true });
+    const code = readHlb(requireBoot(args._));
+    const srcDir = fileURLToPath(new URL('../src', import.meta.url));
+    const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+
+    const stored = loadFingerprint(repoRoot);
+    const current = buildFingerprint(cdb, { code, srcDir });
+    const cites = resolveCitations(code, srcDir);
+
+    if (!stored) {
+      mkdirSync(join(repoRoot, 'model'), { recursive: true });
+      writeFileSync(fingerprintPath(repoRoot), JSON.stringify(current, null, 1));
+      console.log(`No fingerprint existed. Recorded the current build as the baseline:`);
+      console.log(`  cdb ${current.cdbSha.slice(0, 12)}  boot ${current.bootSha?.slice(0, 12)}`);
+      console.log(`  ${Object.keys(current.sheets).length} sheets, ${Object.keys(current.scripts).length} scripts, ${Object.keys(current.citations ?? {}).length} citations`);
+      console.log(f.dim('Commit model/fingerprint.json. Future runs diff against it.'));
+      return;
+    }
+
+    // Citations first - they are free to check and they gate everything else.
+    const moved = cites.report.filter((c) => c.state === 'MOVED');
+    const missing = cites.report.filter((c) => c.state === 'MISSING');
+    console.log(f.bold(`CITATIONS  ${cites.report.filter((c) => c.state === 'OK').length} ok, ${moved.length} moved, ${missing.length} missing`));
+    for (const c of moved.slice(0, 20)) console.log(`  MOVED    ${c.name}  @${c.cached} -> @${c.now}  (name is the identity; update the cache)`);
+    for (const c of missing) console.log(f.warn(`  MISSING  ${c.name}@${c.cached} - the cited function no longer exists; the formula it anchored is UNVERIFIED`));
+
+    const diff = diffFingerprints(stored, current);
+    if (diff.same) {
+      console.log(`\nNo drift: the install matches the fingerprint from ${stored.at}.`);
+      return;
+    }
+    console.log('');
+    console.log(f.bold(`DRIFT since ${stored.at}`)
+      + f.dim(`  cdb ${diff.cdbChanged ? 'CHANGED' : 'same'}, boot ${diff.bootChanged ? 'CHANGED' : 'same'}`));
+    for (const [sheet, d] of Object.entries(diff.sheets)) {
+      console.log(`  ${sheet.padEnd(12)} +${d.added.length} added  -${d.removed.length} removed  ~${d.changed.length} changed`);
+    }
+    if (diff.scripts.changed.length || diff.scripts.added.length || diff.scripts.removed.length) {
+      console.log(`  ${'scripts'.padEnd(12)} +${diff.scripts.added.length}  -${diff.scripts.removed.length}  ~${diff.scripts.changed.length}`);
+    }
+
+    const work = workList(diff, cdb);
+    const needsGame = work.filter((w) => w.needs === 'in-game');
+    const needsSheet = work.filter((w) => w.needs === 'sheet');
+    const needsModel = work.filter((w) => w.needs === 'model');
+    console.log('');
+    console.log(f.bold(`WORK LIST  ${work.length} items: ${needsGame.length} need an in-game log, ${needsSheet.length} a SHEET check, ${needsModel.length} a model re-read`));
+    const show = (list, cap = 25) => {
+      for (const w of list.slice(0, cap)) console.log(`  [${w.needs}] ${w.kind.padEnd(18)} ${w.id}\n${f.dim('           ' + w.why)}`);
+      if (list.length > cap) console.log(f.dim(`  ...and ${list.length - cap} more`));
+    };
+    show(needsGame); show(needsSheet, 10); show(needsModel, 10);
+
+    if (args.flags.json) {
+      const out = typeof args.flags.json === 'string' ? args.flags.json : 'bench-drift.json';
+      writeFileSync(out, JSON.stringify({ stored: stored.at, diff, citations: cites.report, work }, null, 1));
+      console.log(f.dim(`\nfull report -> ${out}`));
+    }
+    if (args.flags.accept) {
+      writeFileSync(fingerprintPath(repoRoot), JSON.stringify(current, null, 1));
+      console.log(f.bold('\nAccepted: the fingerprint now records this build.')
+        + f.dim(' Commit model/fingerprint.json with the work that justified accepting.'));
+    } else {
+      console.log(f.dim('\nThe fingerprint is unchanged; re-run with --accept once the work list is addressed.'));
+    }
+  },
+
   audit(args) {
     const { engine } = commonSetup(args);
     console.log(f.header(engine, VERSION) + '\n');
@@ -2425,6 +2501,12 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
                    (default 3), --show <n> prints the top layouts in full,
                    --json <file> additionally collates everything into one
   bench rotation   search for the rotation a weapon wants, and the kit with it
+  bench update     the patch-day pipeline: diff the install against the
+                   committed fingerprint - every sheet row, every script,
+                   every bytecode citation - and print the work list, split
+                   into what needs an in-game log, what the SHEET check can
+                   confirm, and what is a model re-read. --accept records the
+                   new build once addressed; --json <file> dumps the report
   bench audit      every assumption and gap in the model
   bench verify     hold the model against a recorded capture and print the
                    per-skill difference, signed. Needs --character <Name>,

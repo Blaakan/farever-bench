@@ -2135,3 +2135,68 @@ magic sub-school is empty (§4), an affinity resistance would have nothing to
 attach to anyway. Foe level comes from `--level`; the 125 `zone` rows carry
 levels 1..25 if a specific one matters. And `specScaling.playerCount` scales boss
 health and add counts with party size, which the model does not carry.
+
+---
+
+## The verification era (2026-08-06 .. 2026-08-11)
+
+Everything above describes the model as derived; this section records what
+holding it against the game's own record changed. The instrument is
+`bench verify`: the HLX probe's capture supplies the damage the game actually
+dealt and a build snapshot taken while it was being dealt (gear with rolled
+rarity, sockets, talents at rank, live affixes with provenance), and the join
+prints per-skill signed deltas plus a SHEET check against the game's own affix
+arithmetic. The capture is the oracle; the game's damage code cannot be run
+outside the client (server-side, verified at the opcode level - applyDamage
+throws without Config.server and logged zero rows in 4.5M).
+
+Corrections that came out of it, each verified against a capture and most
+against the bytecode:
+
+- **Mitigation composes as two multiplies**, not one sum: armorIgnore takes
+  its own `(1 - clamp(a,0,1))` on the pool before penetration's
+  `(1 - clamp(p,0,100)/100)` (getAffinityDamageReduction@4510). And armour is
+  a RATING at a LEVEL: the pool is built at the target's spawn level, the
+  divisor at the striker's (`foe(name, level, targetLevel)`, parity default -
+  boss rows' lvl column is contradicted by measurement; they spawn at zone
+  level). Dynamic level scaling (getDynamicScalingFactor@4638) is read and
+  confirmed inactive in ordinary fights.
+- **Units inherit from every parent** (loadUnit@18967 iterates all `inherit`
+  entries, modifier-only stubs take the parent's row with multipliers
+  multiplied). Golems mitigate 0.4068 physical off a 0.30 base and are the
+  one family where ArmorPenetration beats SpellPenetration.
+- **The character sheet and the combat sheet are different objects.** The
+  fight prices against permanent statuses at cap (a Devote enchant's five
+  stacks are the value of the slot); the sheet the game shows you standing
+  still contains none of that - except auras with no duration, which are worn,
+  not entered (the Boomerang crit aura). `bench verify`'s SHEET check now
+  lands 9/9 to 12/13 attributes within 1% on all four classes.
+- **A star is not the rider rank.** Weapon upgrade skills attach at three
+  stars (GearUpgrades.SkillUnlockLevel) and take their rank from the ROLLED
+  rarity index (updateInf@8174 overwrites the authored rarity), settling the
+  stars-minus-one question. Upgrade proc chances rank-resolve through the
+  same overrides. The behind perk (dmgMult += vars.damage on basic attacks
+  from the rear half-plane) sums across both weapons into the one additive
+  bracket, billed at `assume.behindFraction` (default 1, an assumption).
+- **Which ticks crit is the statusType's DoT/HoT flag** (initVars@5150 zeroes
+  ctx.critChance only for flagged types, parent chain walked); everything
+  else ticks with the CARRIER's crit chance. Buff auras crit; poisons do not.
+- **Scripted riders are events, not decoration.** onInflictStatusEval rides
+  dot ticks - once PER STACK (measured: exactly 5.0 procs per tick at five
+  stacks); `status.kind == Skill.X` filters which dot; hasStatusMaxStacked on
+  a build-applied status is a named assumption; a self-`resetCooldown` behind
+  a Mark another skill supplies is a banked economy (one mark per supplier
+  cast, one spent per reset). Multi-applier dots keep one identity fed from
+  every channel - Lethal Poison went from -81% to -1.4% per tick on that
+  change alone.
+- **Coverage is 100% on all four classes**: every damage source the game
+  recorded has a model line. Held against a player pressing the proper
+  rotation on one dummy, the formulas price within -2.9% at the player's own
+  press rate; the model's own fight cadence remains the dominant residual.
+
+Patch days run through `bench update`: model/fingerprint.json holds one hash
+per sheet row, per script, and the resolved name->findex table for every
+citation in src/. The drift report names additions, removals and changes, and
+the work list routes each to its validation - an in-game log, the SHEET
+check, or a model re-read. The suite fails when a citation stops resolving;
+`--accept` records a new build only deliberately.

@@ -26,6 +26,9 @@ import { slugOf, normalize, translate, commandLine } from '../src/questlog.mjs';
 import { compare } from '../src/verify.mjs';
 import { parseExtra, archetype, snapshots, aggregate } from '../src/capture.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readHlb } from '../src/lib/hl.mjs';
+import { requireBoot } from '../src/lib/game.mjs';
+import { buildFingerprint, diffFingerprints, resolveCitations, workList } from '../src/drift.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -4455,6 +4458,53 @@ group('a unit inherits from every parent, not the first');
       return (i.phys === null || (i.phys >= 0 && i.phys < 1))
         && (i.mag === null || (i.mag >= 0 && i.mag < 1));
     }));
+}
+
+// --- the patch-day pipeline -------------------------------------------------
+group('drift: the patch-day pipeline');
+{
+  // CITATIONS ARE A GATE, not documentation. Every name@findex in src/ must
+  // resolve by name in the live bytecode with the cached findex still true.
+  // On patch day this test failing IS the alarm: MOVED means re-anchor the
+  // cache, MISSING means a formula's source no longer exists and the formula
+  // is unverified until re-read. Both stop the build, on purpose.
+  const code = readHlb(requireBoot([]));
+  const srcDir = fileURLToPath(new URL('../src', import.meta.url));
+  const cites = resolveCitations(code, srcDir);
+  const bad = cites.report.filter((c) => c.state !== 'OK');
+  ok(`every bytecode citation resolves, name and cache both (${cites.report.length} checked)`,
+    bad.length === 0,
+    bad.map((c) => `${c.state} ${c.name}@${c.cached}${c.now ? ' now @' + c.now : ''}`).join('; '));
+
+  // The diff and the work list, on a synthetic patch: one stat nudge, one new
+  // row, one deletion, one script rewrite - each must land in the right bucket
+  // with the right validation need.
+  const cdb2 = loadCdb({ quiet: true });
+  const fp = buildFingerprint(cdb2);
+  const mutated = JSON.parse(JSON.stringify(fp));
+  const someSkill = Object.keys(mutated.sheets.skill)[0];
+  mutated.sheets.skill[someSkill] = 'deadbeef0000';
+  mutated.sheets.constant['Synthetic_New_Row'] = 'cafebabe0000';
+  const someItem = Object.keys(mutated.sheets.item)[0];
+  delete mutated.sheets.item[someItem];
+  const someScript = Object.keys(mutated.scripts)[0];
+  mutated.scripts[someScript] = 'feedface0000';
+
+  const diff = diffFingerprints(fp, mutated);
+  ok('a changed row is seen as changed', diff.sheets.skill?.changed?.includes(someSkill));
+  ok('an added row is seen as added', diff.sheets.constant?.added?.includes('Synthetic_New_Row'));
+  ok('a removed row is seen as removed', diff.sheets.item?.removed?.includes(someItem));
+  ok('a rewritten script is its own kind of event', diff.scripts.changed.includes(someScript));
+
+  const work = workList(diff, cdb2);
+  const scriptItem = work.find((w) => w.id === someScript && w.kind === 'script-changed');
+  ok('a changed script demands an in-game log, and names where to stand',
+    scriptItem?.needs === 'in-game' && /dummy session/.test(scriptItem.why));
+  ok('a changed constant routes to the SHEET check',
+    work.find((w) => w.id === 'Synthetic_New_Row')?.needs === 'sheet');
+  ok('an identical fingerprint reports no drift',
+    diffFingerprints(fp, fp).same === true
+    && Object.keys(diffFingerprints(fp, fp).sheets).length === 0);
 }
 
 // --- reading the capture ---------------------------------------------------

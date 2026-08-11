@@ -472,7 +472,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
     // It restates VARS as well, and that half was missing. `updateSkillInf@20788`
     // (HSkill.hx:368-373) loops the overrides and, for every one whose minRank
     // the rank clears, calls BOTH `applyProps(r.props)` at ops 54-56 AND
-    // `applyVars(r.vars)` at ops 57-59; `applyVars@20790` Reflect-sets each
+    // `applyVars(r.vars)` at ops 57-59; the anonymous fn@20790 (HSkill.hx:357) Reflect-sets each
     // field onto the accumulated vars, so a later override wins. 98 rows carry
     // override vars, and Domination is the one that shows the cost: GA_Craft_
     // _Passive is `var1: 0.15` with `rankOverride [{minRank: 2, vars: {var1:

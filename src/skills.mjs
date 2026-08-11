@@ -1908,7 +1908,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // is not pool-gated in the fight - which flatters a Spark-starved build
     // slightly and is on record rather than hidden.
     // Rogue: the signature finisher consumes all Combo Points for +0.3 dmgMult
-    // each (Rogue_Sig_Finisher@44709); modelled at a 4-point spend, the cap.
+    // each (script.skills.Rogue_Sig_Finisher.onStep@44709); modelled at a 4-point spend, the cap.
     // Profs are CLONED before costs are attached - the profile cache is shared
     // across builds and a mutated cached prof would leak between classes.
     const constNum = (id, dflt) => cdb.byId('constant').get(id)?.v?.float
