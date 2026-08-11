@@ -2309,3 +2309,32 @@ not baked), the Mage combo's crit mix and conduit share (the sim's press
 cadence vs the live player's), and the rune-slotting question (the modkit
 dump lists runes with no slotted field; one Battle Shout press without its
 M3 buff proves at least one listed rune inactive in-window).
+
+## Probe v4 lands (2026-08-11, same day)
+
+The v4 capture came back clean on the first deploy: 94 snap_wskill rows,
+zero wskill errors - HeroSpecialization.arsenals unwrapped exactly as
+getArsenalSkills@8543 said it would. What one sitting of play settled:
+
+- **Gash: MISSING -> -8.9%.** The selection rows show the passive slotted
+  ("Sharpen Fangs" - whose own tooltip states the +10%-per-other-status
+  rider the capture decoded), the loadout carries it, the companion rider
+  prices, Rogue coverage returns to 100%. Two corrections the capture
+  taught in passing: the arsenals map keeps a DORMANT entry for the
+  mainhand (one skill listed while the capture shows another pressed), so
+  selections constrain only the arsenal and offhand; and a snapshot
+  carrying the selection outranks one that merely saw more damage.
+- **The PurgingStrikes flat is the NORMAL state.** The relog differential
+  ran entirely on the +30 lattice (modal 38/36/35 = 0.15 x (Faith + 30) x
+  the bracket in its buff states; the pure 29/30 never appears) - three of
+  four observed sessions now. Still unbaked, because one session proves it
+  absent; the row sits at -11.1%.
+- **The Censer ultimate crits** - 23.1% over 13 casts - so the crit-folded
+  price was right (-7.9%), and its 30s arming cadence holds at share +1.0.
+  The mark holds at scale: 116 hits, -2.2%. The combo's live crit is 73.7%
+  at the player's real cadence - the register genuinely does not saturate,
+  which files the remaining combo gap under the sim's own press cadence,
+  not the formula.
+- Priest, on a window three times longer: every row within +-12%, most
+  single digits (Smite -0.9%, Eruption -3.5%, orb -4.5%, RadiantVerdict
+  -9.9% at n=39).
