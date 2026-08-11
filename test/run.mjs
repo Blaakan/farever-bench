@@ -25,6 +25,7 @@ import {
 import { slugOf, normalize, translate, commandLine } from '../src/questlog.mjs';
 import { compare } from '../src/verify.mjs';
 import { parseExtra, archetype, snapshots, aggregate } from '../src/capture.mjs';
+import { fromSnapshot } from '../src/inventory.mjs';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { readHlb } from '../src/lib/hl.mjs';
 import { requireBoot } from '../src/lib/game.mjs';
@@ -4608,6 +4609,9 @@ group('capture: the probe log');
       '1000,snap_gear,Emsey,,Daggers_Demondash,,,,,upgrade=3;rarity=Epic;ilevel=300;flawless=1',
       '1000,snap_gear,Emsey,,Daggers_DuplicatePoison,,,,,upgrade=4;rarity=Epic;ilevel=300',
       '1000,snap_talent,Emsey,,Rogue_Talent_VirulentMagic,,,2,,',
+      '1000,snap_wskill,Emsey,,Daggers_DuplicatePoison_Skill1,,,,,host=Daggers_DuplicatePoison',
+      '1000,snap_wskill,Emsey,,Daggers_DuplicatePoison_Passive,,,,,host=Daggers_DuplicatePoison',
+      '1000,snap_wskill,Emsey,,Bow_BigGame_Skill1,,,,,host=Bow_BigGame',
       '1000,snap_attr,Emsey,,critChance,18.6,,,,',
       '1000,snap_hattr,Emsey,,comboPoint,3,,,,',
       '1500,inflict,Emsey,Ratsar#1,Rogue_Sig_Finisher,240,1,,,affinity=Physical;hits=1',
@@ -4634,6 +4638,25 @@ group('capture: the probe log');
     near('...with their rank', first.talents[0].rank, 2, 1e-9);
     near('the live sheet rides along', first.attrs.critChance, 18.6, 1e-9);
     near('...including the hero-side resource block', first.hattrs.comboPoint, 3, 1e-9);
+
+    // v4: the weapon-skill selection, keyed by the granting weapon's kind.
+    ok('slotted weapon skills are captured per host weapon',
+      (first.weaponSkills?.Daggers_DuplicatePoison ?? []).length === 2
+        && first.weaponSkills.Daggers_DuplicatePoison.includes('Daggers_DuplicatePoison_Passive'),
+      JSON.stringify(first.weaponSkills ?? null));
+    {
+      // ...and only selections for WORN weapons reach the loadout: the bow is
+      // an owned arsenal in the bag, not equipment, so its row stays behind.
+      const built = fromSnapshot(cat, first, { unit: 'Rogue' });
+      const w2 = built.loadout.gear.Slot_Weapon2?.item === 'Daggers_DuplicatePoison'
+        ? 'Slot_Weapon2'
+        : built.loadout.gear.Slot_Weapon1?.item === 'Daggers_DuplicatePoison' ? 'Slot_Weapon1' : null;
+      ok('the worn weapon\'s selection lands on its slot, passive included',
+        w2 !== null && (built.loadout.skills?.[w2] ?? []).includes('Daggers_DuplicatePoison_Passive'),
+        JSON.stringify(built.loadout.skills ?? null));
+      ok('an unworn arsenal\'s selection stays out of the loadout',
+        !Object.values(built.loadout.skills ?? {}).some((ids) => ids.includes('Bow_BigGame_Skill1')));
+    }
 
     // A snapshot stands until the next one, which is what makes it a window.
     near('a snapshot is bounded by the next one', first.until, 2000, 1e-9);

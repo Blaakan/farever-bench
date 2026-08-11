@@ -98,7 +98,13 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
   // named in gaps like every other unresolvable row.
   if (snap.weaponSkills && Object.keys(snap.weaponSkills).length) {
     built.loadout.skills ??= {};
-    for (const [slot, ids] of Object.entries(snap.weaponSkills)) {
+    // The probe keys by the WEAPON'S ITEM KIND (HeroSpecialization.arsenals
+    // is per weapon, not per hand); only selections for weapons actually WORN
+    // reach the loadout - the rest are owned arsenals sitting in the bag.
+    for (const [host, ids] of Object.entries(snap.weaponSkills)) {
+      const slot = ['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']
+        .find((sl) => built.loadout.gear[sl]?.item === host);
+      if (!slot) continue;
       const good = ids.filter((id) => cat.cdb.has('skill', id));
       for (const bad of ids.filter((id) => !cat.cdb.has('skill', id))) rejected.push(bad);
       if (good.length) built.loadout.skills[slot] = good;

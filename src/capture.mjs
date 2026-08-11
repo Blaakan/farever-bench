@@ -424,17 +424,20 @@ export async function snapshots(path, { source = null } = {}) {
       case 'snap_arsenal':
         s.arsenals.push({ id: r.skill, value: x.value ?? null });
         break;
-      // WHICH weapon skills are slotted, per hand - the one build fact no
+      // WHICH weapon skills are slotted, per weapon - the one build fact no
       // other source carries. The dump has only the item; the snapshot's
       // arsenals list is the weapons OWNED, not the choices made; and the
       // arsenal pool makes even the weapon PASSIVE a choice, so a build
       // rebuilt without this row prices Gash's companion hook on a passive
       // it cannot know is slotted. `skill_id` is the slotted skill,
-      // `extra.slot` the hand. Probe v4 emits it; older captures simply
-      // leave the map empty and the default selection stands.
+      // `extra.host` the granting weapon's item kind - the probe reads
+      // HeroSpecialization.arsenals, which is keyed by weapon, not by hand;
+      // the loadout builder matches hosts against the WORN weapons. Probe v4
+      // emits it; older captures simply leave the map empty and the default
+      // selection stands.
       case 'snap_wskill': {
-        (s.weaponSkills ??= {})[x.slot ?? 'Slot_Weapon1'] ??= [];
-        s.weaponSkills[x.slot ?? 'Slot_Weapon1'].push(r.skill);
+        (s.weaponSkills ??= {})[x.host ?? '?'] ??= [];
+        s.weaponSkills[x.host ?? '?'].push(r.skill);
         break;
       }
       case 'snap_attr':
