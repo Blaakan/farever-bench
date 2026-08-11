@@ -171,6 +171,27 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
             .map((x) => x.prof.id),
         ]),
       } : null,
+      // STATUS TICKS read the granting item's channel too, and the channel
+      // depends on the item. Measured, one row each: a SHIELD-granted pulse
+      // keeps the whole attribute and adds 0.4 x its budget curve (the orb,
+      // exact to 0.4%); a WEAPON-granted tick takes the ordinary 0.6/0.4 mix
+      // (Demondash's aura, -1.4%); a Raw-affinity tick stays pure attribute
+      // (DuplicatePoison's, exact) - the Raw gate lives at the pricing site.
+      // Statuses granted by class skills or talents are in neither set and
+      // price pure, as before.
+      tickScaling: {
+        flats: combat.attributeBudgets(loadout.level),
+        flatIds: new Set(rot.active
+          .filter((x) => typeof x.source === 'string' && x.source.startsWith('Slot_')
+            && x.prof.isStatusTick
+            && cat.itemById.get(loadout.gear[x.source]?.item)?.type === 'Shield')
+          .map((x) => x.prof.id)),
+        mixIds: new Set((rot.dots ?? [])
+          .filter((d) => typeof d.source === 'string' && d.source.startsWith('Slot_')
+            && cat.itemById.get(loadout.gear[d.source]?.item)?.type
+            && cat.itemById.get(loadout.gear[d.source]?.item)?.type !== 'Shield')
+          .map((d) => d.status)),
+      },
       // THE LIVE-STATE GATES a skill's own script riders ask about. Both were
       // refusals until the 2026-08-02 capture priced them; refusing them cost
       // -13.7% to -17.5% on the skills that carry one.

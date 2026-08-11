@@ -611,6 +611,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
         if (fill?.scaling) for (const sc of fill.scaling) scaling.push(sc);
         into.push({
           kind,
+          // The step the effect rides on, by the id scripts name it with -
+          // the detector split below needs to tell an Area pulse from the
+          // LastOrbArea one, and nothing else carried the distinction.
+          stepId: st.id ?? null,
           // WHICH attribute a GainAtb feeds. This was dropped, so the eight
           // GainAtb rows in the database read as effects with no subject and
           // the resource layer had nothing to build on: `Warrior_InfiniteRage`
@@ -674,25 +678,56 @@ export function buildCombat(cdb, ctx, assume = {}) {
     // foe - and the script consumes one of the status's own stacks per hit,
     // playing an Area step that carries the real damage. Pricing that as a
     // 0.1s-tick DoT spread 0.55x Faith over a lifetime of detector polls and
-    // printed 0.7 a tick against the game's 152 a strike. The shape is: no
-    // periodic at all, and the Area pulses fire once per stack per
-    // application, so the pulse effects are multiplied by the stacks they
-    // spend. (The rank-3 last-orb double is not carried - one pulse of the
-    // stack's worth is credited plain, which understates rank 3 by that
-    // pulse and is stated here rather than hidden.)
+    // printed 0.7 a tick against the game's 152 a strike.
     const detector = !!looping
       && !(looping.effects ?? []).length
       && new RegExp(`consumeStatus\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?${s.id}\\b`)
         .test(String(s.script ?? ''));
     if (detector) {
-      const pulses = Math.max(1, s.props?.status?.maxStacks ?? 1);
-      // The effects list already carries every pulse-shaped Code step once -
-      // Depth Shield has two, Area and LastOrbArea - so each is scaled to its
-      // share of the stack count rather than multiplied by all of it.
-      const pulseSteps = Math.max(1, (s.steps ?? [])
-        .filter((x) => (stepOnNames[x.on ?? -1] ?? null) === 'Code' && (x.effects ?? []).length).length);
-      for (const e of effects) {
-        if (e.kind === 'Damage' || e.kind === 'Heal') e.hits = (e.hits || 1) * pulses / pulseSteps;
+      // The pulse count is the stack count - THROUGH rankOverride, which
+      // restates maxStacks at the top level of the override's props (shallow,
+      // exactly how the fold above merged it). The orb row authors 3 and
+      // overrides to 4 at rank >= 2; the capture shows 4 pulses in 23 of 23
+      // bursts at the evaluated rank.
+      const pulses = Math.max(1, props.maxStacks ?? s.props?.status?.maxStacks ?? 1);
+      // WHICH step each pulse plays is in the script, not the step list: the
+      // onHit shape consumes a stack, then plays the loop step while stacks
+      // remain and the last step once - so the loop step fires pulses-1 times
+      // and the last exactly once. The last pulse can also carry a rider:
+      //   var ctx = playStep(Steps.Last); if (rank >= R) ctx.dmgMult += N
+      // and that += lands on the SkillContext's dmgMult, the SAME scalar
+      // initVars@5150 seeds with the carrier's (1 + fervor + mastery) - the
+      // live final/plain ratio across 297 players sits at 1.77-2.0, the
+      // signature of +1 diluting inside that bracket, not a clean x2. The
+      // rider rides `ctxDmgAdd` into castOutput's bracket for that reason.
+      const sc = String(s.script ?? '');
+      const split = new RegExp(
+        'if\\s*\\(\\s*hasStatus\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?' + s.id
+        + '\\s*\\)\\s*\\)\\s*\\{\\s*playStep\\s*\\(\\s*Steps\\.(\\w+)\\s*\\)[\\s\\S]*?'
+        + 'else\\s*\\{\\s*(?:var\\s+(\\w+)\\s*=\\s*)?playStep\\s*\\(\\s*Steps\\.(\\w+)\\s*\\)').exec(sc);
+      const rider = split?.[2]
+        ? new RegExp('if\\s*\\(\\s*rank\\s*>=\\s*(\\d+)\\s*\\)\\s*\\{\\s*'
+          + split[2] + '\\.dmgMult\\s*\\+=\\s*([\\d.]+|vars\\.\\w+)').exec(sc)
+        : null;
+      const riderAdd = rider && rank >= Number(rider[1])
+        ? (rider[2].startsWith('vars.') ? num(vars[rider[2].slice(5)]) : Number(rider[2]))
+        : 0;
+      if (split) {
+        for (const e of effects) {
+          if (e.kind !== 'Damage' && e.kind !== 'Heal') continue;
+          if (e.stepId === split[1]) e.hits = (e.hits || 1) * Math.max(0, pulses - 1);
+          else if (e.stepId === split[3]) {
+            e.hits = e.hits || 1;
+            if (riderAdd > 0) e.ctxDmgAdd = riderAdd;
+          }
+        }
+      } else {
+        // No readable guard shape: the even split, as before, stated not hidden.
+        const pulseSteps = Math.max(1, (s.steps ?? [])
+          .filter((x) => (stepOnNames[x.on ?? -1] ?? null) === 'Code' && (x.effects ?? []).length).length);
+        for (const e of effects) {
+          if (e.kind === 'Damage' || e.kind === 'Heal') e.hits = (e.hits || 1) * pulses / pulseSteps;
+        }
       }
     }
     const periodic = (looping && !detector)
@@ -1024,7 +1059,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
   }
 
   // --- one cast ------------------------------------------------------------
-  function amountOf(effect, sheet, swingAttrs = null, weaponMixFlats = null) {
+  function amountOf(effect, sheet, swingAttrs = null, weaponMixFlats = null, itemFlats = null) {
     let a = effect.baseVal;
     for (const s of effect.scaling) {
       let v = sheet.get(s.atb) ?? 0;
@@ -1054,6 +1089,18 @@ export function buildCombat(cdb, ctx, assume = {}) {
       else if (weaponMixFlats) {
         const f = weaponMixFlats.get(s.atb);
         if (f) v = 0.6 * v + 0.4 * f;
+      }
+      // A SHIELD-granted status pulse takes the item flat WITHOUT the
+      // attribute reduction: 0.4 x the attribute's own budget curve adds on
+      // top of the whole attribute. Measured on the orb pulse to 0.4% -
+      // 0.55 x (Faith 137 + 0.4 x 123.58) x carrier bracket = 116.03 against
+      // live non-crit [116.08, 116.74] - where the 0.6/0.4 mix (81.9) and a
+      // full budget replacement (68.0) are both excluded outright. One row
+      // pins this; the mechanism (the (1-r) scaleSource gate not firing for
+      // status contexts, getStepEffectScaling@20778) is the audit's to state.
+      else if (itemFlats) {
+        const f = itemFlats.get(s.atb);
+        if (f) v += 0.4 * f;
       }
       a += s.ratio * v;
     }
@@ -1189,8 +1236,19 @@ export function buildCombat(cdb, ctx, assume = {}) {
         (gains ??= []).push({ atb: e.atb, amount: got });
         continue;
       }
-      const raw = amountOf(e, sheet, opts.swingAttrs ?? null,
-        opts.weaponMix?.ids?.has(prof.id) ? opts.weaponMix.flats : null) * (e.hits ?? 1);
+      // WHICH scaling channel this effect's attributes read is per-effect,
+      // because Raw is priced pure: the Raw-affinity weapon-granted tick
+      // (Daggers_DuplicatePoison_Skill1_Status) lands at exactly the whole
+      // attribute live - 4 x Dex 166 - where the mix would say 159. The
+      // shield flat wins over the mix for the ids the engine routed there.
+      const effRoot = affinityOf(e.affinity).root;
+      const tickFlats = effRoot !== 'Raw' && opts.tickScaling?.flatIds?.has(prof.id)
+        ? opts.tickScaling.flats : null;
+      const mixFlats = tickFlats ? null
+        : opts.weaponMix?.ids?.has(prof.id) ? opts.weaponMix.flats
+          : (effRoot !== 'Raw' && opts.tickScaling?.mixIds?.has(prof.id)) ? opts.tickScaling.flats
+            : null;
+      const raw = amountOf(e, sheet, opts.swingAttrs ?? null, mixFlats, tickFlats) * (e.hits ?? 1);
       if (!raw) continue;
       // Only an Area or Aura step reaches the crowd, and `props.hitCount` is a
       // target cap when the row sets one. `ignoreMainTarget` takes the enemy
@@ -1310,7 +1368,13 @@ export function buildCombat(cdb, ctx, assume = {}) {
           const masteryAdd = opts.assume.mastery
             ? (aff.root === 'Physical' ? physMastery : aff.root === 'Magic' ? magicMastery : 0)
             : 0;
-          m *= 1 + fervorAdd + masteryAdd;
+          // A script's `ctx.dmgMult +=` on a PLAYED STEP lands on the
+          // SkillContext scalar this bracket models - initVars@5150 seeds it
+          // with the carrier's ratio and the += adds into it - so the orb's
+          // last-pulse +1 dilutes against fervor and mastery instead of
+          // doubling clean. Live: final/plain 1.795-1.801 with the carrier
+          // bracket at ~1.25, exactly (B+1)/B.
+          m *= 1 + fervorAdd + masteryAdd + (e.ctxDmgAdd ?? 0);
         }
         damage += raw * m * targets;
         singleTargetDamage += raw * m;
