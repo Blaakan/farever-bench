@@ -292,7 +292,12 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
     placed.push({ slot: free, item: item.id, stars: e.upgrade ?? 0 });
   }
 
-  for (const r of runes) loadout.runes[r] = true;
+  // The VALUE is the rune id, not a boolean: every consumer reads
+  // Object.values(loadout.runes).flat() - the plan, the engine's cache key -
+  // so `runes[r] = true` handed the whole build a rune set of `{true}` and
+  // every rune-gated step priced as not taken. RadiantVerdict's entire
+  // 8-second zone sits behind its M1 rune and read +158% per hit that way.
+  for (const r of runes) loadout.runes[r] = r;
 
   return {
     loadout,
