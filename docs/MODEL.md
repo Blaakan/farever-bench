@@ -2405,3 +2405,24 @@ Four investigators on the last disk-serviceable rows. What each closed:
   verify now names the fallback in its output, and Emsei's first v5+ login
   resolves the row to zero on its own. A whole-cdb sweep found no Damage
   effect on any enemy-excluding step - no alignment gate is missing.
+
+The v6 logins landed the same night. Emsei's authoritative set reads five
+runes - the FaithfulWinds M2 heal, not the M3 damage - and her ledger
+closed at 100% coverage, zero phantoms, 5 match / 6 close / 3 miss, with
+RadiantVerdict holding at -10% under its authoritative M1. Two chooser
+rules came out of it: a snapshot with nothing recorded on the verified
+target cannot win on richness (a login-and-out snapshot once out-ranked a
+two-thousand-event window on the strength of its empty rune list), and a
+window predating the rune probe backfills from the NEAREST rune-bearing
+snapshot before the dump is ever consulted.
+
+One contradiction stays open, on record: Emsai's authoritative container
+ALSO reads zero runes - two containers, same answer - while his eleven
+Surging Force hits across five days decompose only WITH M3's +40%,
+including one twenty-three seconds after a zero-read. Either the runes
+were genuinely unslotted at some point (old hits legitimate, the last one
+unexplained) or a third container exists. The discriminator is his next
+Surging Force press: ~110-130 non-crit means the container is right and
+history moved; ~150-175 means it is not the whole truth. Until then the
+row prices bare, with --rune Warrior_SurgingForce_M3 on record as the
+capture-proven override (199.2 vs the live n=11 mean 199.55).
