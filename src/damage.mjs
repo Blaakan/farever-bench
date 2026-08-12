@@ -2112,9 +2112,18 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'the combo finisher, so the rider must not reach the swing that ends the chain - `isFiller` ' +
            'would have, since it covers the finisher too. None of these rows carries a cooldown and none ' +
            'uses the game\'s internal-cooldown idiom, so the rate is plain Bernoulli with nothing to ' +
-           'saturate. The upgrade RANK is the star count, not the rarity index: Staff_Upgrade at ' +
-           'minRank 3 is CooldownReduction +4, and a real 3-star Censer tooltip reads "Cooldown ' +
-           'Reduction increased by 4%".' },
+           'saturate. The upgrade RANK is the ROLLED RARITY INDEX, not the star count - stars only ' +
+           'decide whether the skill attaches at all, at GearUpgrades.SkillUnlockLevel (3). This line ' +
+           'used to say the opposite and was stale: the code has read rarity since the bytecode ' +
+           'settled it (Weapon.getWeaponUpgradeSkill@8182 sets rank from the instance rarity that ' +
+           'updateInf@8174 has already overwritten with the roll). Every earlier measurement was ' +
+           'degenerate between the two rules - a 3-star Rare and a 4-star Epic read the same rank ' +
+           'either way, which is how the wrong reading survived a tooltip that agreed with it. The ' +
+           'discriminators are Emsey\'s 3-star EPIC daggers reading rank 3 where stars-1 says 2, and ' +
+           'a Censer whose CooldownReduction is FLAT across 3/4/5 stars and steps once per rarity: ' +
+           'Rare 3, Epic 4, Legendary 5. One consequence worth knowing: the rank-1 and rank-5 rows of ' +
+           'every `<Type>_Upgrade` are unreachable, because the 3-star unlock floors the rank at the ' +
+           'Rare index and no rarity indexes past Legendary.' },
     { severity: 'verified', what: 'what you socket raises the host item\'s gear level',
       why: 'Read from Gear.getILevel@8123 (src/st/item/Gear.hx:48-51), which is three lines: the base ' +
            'iLevel plus the rarity bonus (and the flawless bonus, in Item.getILevel@7787), then ' +

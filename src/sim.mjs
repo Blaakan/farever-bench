@@ -335,6 +335,12 @@ function runFight(spec) {
   const weaponSkillIds = new Set(rotation.active
     .filter((a) => a.prof.type === 'WeaponSkill' || a.prof.type === 'WeaponSubSkill')
     .map((a) => a.prof.id));
+  // What each active is worth as the CONSUMER of an armed chain register, and
+  // whether any two of them disagree about it. -1 is "cannot spend one".
+  // Both are constants of the build, so the press site pays only a lookup.
+  const armWorth = actives.map((a) => (weaponSkillIds.has(a.prof.id)
+    ? worth(a.out.damage, a.out.heal, a.out.shield) : -1));
+  const anyArmRival = armWorth.some((w, i) => w >= 0 && armWorth.some((v, j) => j !== i && v > w));
 
   // --- things that fire at you ---------------------------------------------
   // A proc is an event inside the fight, not a rate applied to it afterwards.
@@ -1147,6 +1153,31 @@ function runFight(spec) {
         // than swinging and saving them, swing - that is what "do not spend both
         // weapon skills inside one window" looks like from the inside.
         if (chain.length && rollout(-1, t, state, upSelf, upFoe, live, chainIndex, timeIncome) > best + 1e-9) pressed = -1;
+      }
+
+      // HOLD THE ARM. An armed chain register is spent by the NEXT weapon-skill
+      // press and hands that press a free cast (`chainSpend.resetsCooldown`
+      // above), so it is a scarce resource worth a whole extra cast of whatever
+      // consumes it - and nothing in the pick prices it. Spending it on the
+      // cheaper weapon skill while a dearer one comes back inside this press's
+      // OWN occupancy throws that free cast away; swinging instead keeps it and
+      // costs only the swing. The horizon is the candidate's occupancy and
+      // nothing else: it is exactly the time the press would cost you, so there
+      // is no fitted window here.
+      //
+      // This is what let a Legendary arsenal sim BELOW an Epic one. The rider's
+      // extra CooldownReduction rerouted three of a Mage's sixty-one arms off a
+      // 621-damage consumer onto a 249-damage one, which cost more than the
+      // whole rest of the upgrade was worth - a strictly better item scoring
+      // strictly lower. The rollout could not catch it: it never models the
+      // register at all, so it prices every arm at zero.
+      if (pressed >= 0 && anyArmRival && chain.length && armWorth[pressed] >= 0
+        && comboRegs.some((r) => r.chainSpend && r.armed)) {
+        const occ = actives[pressed].occupancy, w0 = armWorth[pressed];
+        for (let j = 0; j < actives.length; j++) {
+          if (armWorth[j] <= w0 || state[j].charges > 0) continue;
+          if (state[j].nextCharge - t <= occ) { pressed = -1; break; }
+        }
       }
 
       if (pressed >= 0) {

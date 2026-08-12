@@ -680,11 +680,17 @@ upgrade row is a skill affix, not a stat line.
 unambiguous about the stars — 320 = 250 + Epic 30 + 4 × 10 — and the ladder is
 +1/+2/+3/+4/+5 by rank, so the data reads +4. The screenshot reads *"Critical
 Chance increased by 3%"* on that same four-star weapon, and the sheet closes at
-17.3 with 3. **The rank the row sees is `stars - 1`**, and a one-star weapon
-carries no rider at all. Which of two rules that is stays open: plain
-`stars - 1`, or `stars` capped at the rarity's own maximum minus one. Every Epic
-case agrees, so one hover of the Rare 3-star Axe_Boomerang decides it — +2 is the
-first, +3 the second.
+17.3 with 3, so the row that fired here is rank 3 on a four-star Epic.
+
+~~**The rank the row sees is `stars - 1`.**~~ **Settled, and not this way.** The
+rank is the **rolled rarity index**; the stars only decide whether the skill
+attaches at all, at `GearUpgrades.SkillUnlockLevel` (3). Every case on this page
+is degenerate between the two rules — a four-star Epic reads rank 3 either way,
+which is exactly why the wrong reading survived a tooltip that agreed with it.
+What decided it is `Weapon.getWeaponUpgradeSkill@8182` plus two weapons that
+break the stars rule, and a Censer whose CooldownReduction is *flat* across
+3/4/5 stars and steps once per rarity (Rare 3, Epic 4, Legendary 5). See
+"A star is not the rider rank" further down.
 
 *Reading a printed sheet against the game's:* the model folds a proc-applied
 buff with no cooldown behind it into the resting sheet at its cap, because in

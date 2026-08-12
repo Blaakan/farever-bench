@@ -5030,6 +5030,89 @@ group('verify: the model against the record');
     }).totals.missing === 0);
 }
 
+// --- a better item never sims lower ----------------------------------------
+// Both blocks below failed before the arm-hold rule in sim.mjs. A Mage carrying
+// a Halos mainhand and a Censer arsenal read 426.93 dps on a LEGENDARY Censer
+// against 427.39 on an EPIC one - a strictly better item scoring strictly
+// lower, which is the one result a gear bench must never print.
+group('the weapon-upgrade rider is ranked by rarity, not by stars');
+{
+  const eng = createEngine();
+  const at = (rarity, stars) => {
+    const l = emptyLoadout(eng.cat, 'Mage', 25);
+    l.gear.Slot_Weapon1 = { item: 'Halos_Totem', rarity: 'Legendary', stars: 5 };
+    l.gear.Slot_Weapon2 = { item: 'Staff_Censer', rarity, stars };
+    eng.plan.pruneSelection(l);
+    return l;
+  };
+  const cdr = (r, s) => eng.evaluate(at(r, s), { target: eng.combat.foe('boss', 25), rank: 3 })
+    .sheet.get('CooldownReduction');
+  // `stars - 1` would read 3 at three stars and 5 at five. It reads 5 at both.
+  ok('the rider is FLAT in stars above the unlock',
+    cdr('Legendary', 3) === cdr('Legendary', 5) && cdr('Legendary', 5) > 0,
+    `${cdr('Legendary', 3)} vs ${cdr('Legendary', 5)}`);
+  ok('...and steps exactly one rung per rarity',
+    cdr('Legendary', 5) - cdr('Epic', 4) === 1 && cdr('Epic', 4) - cdr('Rare', 3) === 1,
+    `Rare ${cdr('Rare', 3)} / Epic ${cdr('Epic', 4)} / Legendary ${cdr('Legendary', 5)}`);
+  // GearUpgrades.SkillUnlockLevel is 3, so two stars carries no rider at all -
+  // which is what lets the test below compare two rarities at MATCHED cooldown.
+  ok('below the star unlock it does not attach at all', cdr('Legendary', 2) === 0,
+    String(cdr('Legendary', 2)));
+}
+
+// The reported case, as small as it still reproduces: the Mage kit that carries
+// a chain register, a Halos mainhand, and a Censer arsenal whose rider is the
+// only thing that moves. No gear and no augments are needed - the inversion is
+// in the SCHEDULE, so the sheet is not what makes it.
+//
+// This is a guard on ONE case, deliberately, and not a monotonicity law. The
+// reported dps is a single deterministic timeline whose phase quantisation is
+// worth a couple of percent, so which pairs inch across the line moves whenever
+// anything in the fight moves. Asserting "no upgrade ever sims lower" would be
+// asserting something this estimator cannot currently deliver - see the note on
+// the arm hold in sim.mjs.
+group('the arsenal inversion stays fixed');
+{
+  const eng = createEngine();
+  const target = eng.combat.foe('boss', 25);
+  const kit = () => {
+    const l = emptyLoadout(eng.cat, 'Mage', 25);
+    l.gear.Slot_Weapon1 = { item: 'Halos_Totem', rarity: 'Legendary', stars: 5 };
+    l.skills = {
+      'class/ClassSkill': ['Mage_Blink', 'Mage_ShieldOfSpark', 'Mage_MysticEmpowerment', 'Mage_StaticNova'],
+      'class/MageConduit': ['Mage_Conduit_Projectile', 'Mage_Conduit_Power', 'Mage_Conduit_Projectile'],
+      Slot_Weapon1: ['Halos_Totem_Skill', 'Halos_Totem_Skill2'],
+      Slot_Weapon2: ['Staff_Censer_Skill1', 'Staff_Censer_Skill2'],
+    };
+    l.runes = { Mage_ShieldOfSpark: 'Mage_ShieldOfSpark_M3' };
+    l.talents = {
+      Mage_Talent_HighVoltage: 1, Mage_Talent_Chaincast: 1, Mage_Talent_ConduitResidues: 1,
+      Mage_Talent_Discipline: 1, Mage_Talent_FerventWizard: 2, Mage_Talent_SparkFlask: 1,
+      Mage_Talent_Reverberate: 1, Mage_Talent_ConcentratedPower: 2, Mage_Talent_InfiniteResources: 1,
+      Mage_Talent_ExpandedSpirit: 2, Mage_Talent_ChainStrike: 2, Mage_Talent_Amplification: 2,
+    };
+    return l;
+  };
+  const dps = (rarity, stars) => {
+    const l = kit();
+    l.gear.Slot_Weapon2 = { item: 'Staff_Censer', rarity, stars };
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target, rank: 3 }).throughput.dps;
+  };
+  // Legendary carries +1 CooldownReduction over Epic. Before the arm hold that
+  // extra 1% rerouted chain arms off the 621-damage weapon skill onto the
+  // 249-damage one, and this read 161.61 against 163.28 - the better item, lower.
+  const leg = dps('Legendary', 5), epi = dps('Epic', 4);
+  ok('a Legendary arsenal beats the Epic one it dominates', leg >= epi - 1e-9,
+    `${leg.toFixed(4)} vs ${epi.toFixed(4)}`);
+  // The control: at two stars neither rider attaches (below SkillUnlockLevel),
+  // so both run the SAME schedule and the comparison is the sheet alone. This
+  // passed before the fix too, which is what localises the bug to the schedule.
+  const legFlat = dps('Legendary', 2), epiFlat = dps('Epic', 2);
+  ok('...and already did at matched cooldown, on the sheet alone',
+    legFlat >= epiFlat - 1e-9, `${legFlat.toFixed(4)} vs ${epiFlat.toFixed(4)}`);
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

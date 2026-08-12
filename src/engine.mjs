@@ -352,11 +352,17 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
 
     // The effect a weapon's upgrade stars unlock. The game's own window says
     // upgrading a weapon gives "access to a unique effect", and each weapon
-    // type has a `<Type>_Upgrade` skill whose affix rows are gated by the
-    // upgrade level - `Scepter_Upgrade` is +4 SpellPenetration at one star
-    // rising to +8 at five, `Staff_Upgrade` +2..+6 CooldownReduction. Eight of
-    // the twenty carry readable affixes; the other twelve are procs whose
-    // payload lives in a script, and those are named in the audit.
+    // type has a `<Type>_Upgrade` skill carrying five mutually exclusive
+    // rank-gated affix rows - `Scepter_Upgrade` +4..+8 SpellPenetration,
+    // `Staff_Upgrade` +2..+6 CooldownReduction. Eight of the twenty carry
+    // readable affixes; the other twelve are procs whose payload lives in a
+    // script, and those are named in the audit.
+    //
+    // STARS DECIDE WHETHER IT ATTACHES; RARITY DECIDES WHICH ROW. See the
+    // closed question below - the rank is the rolled rarity index, and the
+    // stars only have to clear GearUpgrades.SkillUnlockLevel. So the ladder's
+    // ends never fire: rank 1 is below the Rare index the unlock floors it at,
+    // and rank 5 is past Legendary. A Staff reads +3/+4/+5 and nothing else.
     //
     // The rows are MUTUALLY EXCLUSIVE per star, the same shape as every other
     // rank-gated affix in this database, so they are filtered and never summed.
