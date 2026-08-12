@@ -33,9 +33,9 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: Which part of the version to raise
+        description: Which part of the version to raise, or none to cut what the manifests already say
         type: choice
-        options: [patch, minor, major]
+        options: [patch, minor, major, none]
         default: patch
         required: true
       notes:
@@ -209,7 +209,15 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add package.json ui/package.json CHANGELOG.md
           if [ -f ui/package-lock.json ]; then git add ui/package-lock.json; fi
-          git commit -m "Release v$VERSION"
+          # `bump: none` cuts the version the manifests already carry, so there
+          # is nothing to commit and `git commit` would exit 1 on an empty
+          # index and fail the release. The tag is the point either way; the
+          # commit only exists when a version actually moved.
+          if git diff --cached --quiet; then
+            echo "nothing to commit - tagging the current HEAD"
+          else
+            git commit -m "Release v$VERSION"
+          fi
           git tag -a "v$VERSION" -m "v$VERSION"
           # HEAD:<the branch this run was dispatched from>. A protected branch
           # that refuses this push fails the job here, before the release
