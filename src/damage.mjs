@@ -1131,7 +1131,25 @@ export function buildCombat(cdb, ctx, assume = {}) {
     small: { unit: 'W_Base_Small', label: 'small world mob' },
     big: { unit: 'W_Base_Big', label: 'big world mob' },
     elite: { unit: 'W_Base_Elite', label: 'world elite' },
-    boss: { unit: 'Ratsar', label: 'named boss' },
+    // The authored boss intent, 0.40/0.40, at YOUR level.
+    //
+    // `boss` used to point at Ratsar, who carries a fitted rift-R1 spawn level
+    // of 6.9 (see FITTED_LEVELS below) - and because the resist POOL is built
+    // at the target's level while the divisor uses the striker's, that froze
+    // the default's armour at 1,177 while a level-25 character's divisor grew
+    // to 2,885. The tool's own headline target mitigated 29%, SOFTER than
+    // world trash at 30% and barely above the reference constant it was chosen
+    // to replace, which quietly priced penetration at roughly half its worth
+    // against the content anyone is actually gearing for.
+    //
+    // Ulserous is the named boss that resolves to the authored 0.40 exactly:
+    // it declares its own single reduction row, so the chain sum has nothing
+    // to add to it, where the other seven inherit a second row and land at
+    // 0.523. It is matched by no fitted family, so parity needs no special
+    // case here. `--target Ratsar` still names Ratsar and still gets the
+    // measured rift level; `--target elite` is still the 0.523 tier; and
+    // `--target-level` still overrides any of them.
+    boss: { unit: 'Ulserous', label: 'named boss' },
     dungeon: { unit: 'D_Base_Big', label: 'dungeon mob' },
   };
 

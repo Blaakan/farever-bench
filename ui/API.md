@@ -39,7 +39,7 @@ Static-per-session data, fetched once at startup.
   "slots": [ { "id": "Slot_Head", "short": "Head", "column": "left"|"right",
                "label": "Head", "emptyIcon": {…}, "sockets": ["AugmentDemonSigil"] } ],
                // 12 doll slots in visual order + Weapon1/Weapon2/OffhandWeapon
-  "targets": [ { "id": "boss", "label": "named boss (Ratsar…)" }, … ],
+  "targets": [ { "id": "boss", "label": "named boss (Ulserous…)" }, … ],
   "goals": ["dps","hps","sps","ehp","mixed"],
   "talents": { "Mage": {
       "root": "Mage_Talent_Chaincast",

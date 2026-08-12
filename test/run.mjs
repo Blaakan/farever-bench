@@ -1257,8 +1257,15 @@ group('reference targets');
   ok('the archetype ladder is ordered trash < small < big <= elite',
     red('trash') < red('small') && red('small') < red('big') && red('big') <= red('elite'),
     [red('trash'), red('small'), red('big'), red('elite')].join(' < '));
-  ok('a named boss matches the elite tier', red('boss') === red('elite'),
-    `${red('boss')} vs ${red('elite')}`);
+  // `boss` carries the AUTHORED 0.40 intent, on its own single row, so the
+  // chain sum has nothing to add to it. Seven of the eight named bosses
+  // inherit a second row and land on the elite tier's 0.523 instead - that
+  // tier is still reachable, it is just called `elite` now rather than being
+  // what the default quietly meant.
+  near('a named boss mitigates the authored 0.40', red('boss'), 0.4, 1e-9);
+  ok('...which sits above world trash and below the elite chain sum',
+    red('trash') < red('boss') && red('boss') < red('elite'),
+    `${red('trash')} < ${red('boss')} < ${red('elite')}`);
   ok('Armor_ExpectedReduction is softer than what you actually fight',
     engine.combat.foe('reference', 25).physReduction < red('boss'),
     `${engine.combat.foe('reference', 25).physReduction} vs ${red('boss')}`);
@@ -4408,8 +4415,27 @@ group('rune vars and duration extension');
   ok('the engine extends the status it was told about', !!b?.extended, JSON.stringify(b?.extended));
   ok('...to strictly longer than the row declares, and finitely so',
     b.extended.to > b.extended.from && Number.isFinite(b.extended.to), JSON.stringify(b.extended));
+  // Against `extended.to`, not `duration`. The engine does not write the
+  // extension back onto the buff - that object is cached across evaluations,
+  // so feeding it its own output compounded the duration on every call - and
+  // this line used to read the mutated field, which made it a tautology.
   ok('...and the uptime follows the extended duration',
-    Math.abs(b.uptime - Math.min(1, b.duration / 120)) < 1e-6, `${b.uptime} vs ${b.duration}/120`);
+    Math.abs(b.uptime - Math.min(1, b.extended.to / 120)) < 1e-6,
+    `${b.uptime} vs ${b.extended.to}/120`);
+  ok('...and the row it extends is left alone, so the buff still declares 15s',
+    b.duration === 15, String(b.duration));
+
+  // The bug that fix is for: `b.duration = dur` fed its own output back in, so
+  // the extension compounded by 1/(1-e) on every later evaluation of the SAME
+  // engine. Battle Shout's only affix is CritChance 20, so a warm engine grew
+  // a Warrior's crit without anything in the build changing - and `optimize`
+  // and `rank` score every candidate on one engine, which made them rank by
+  // enumeration order. Nineteen calls took a real build from 503 to 578 dps.
+  const dpsOf = () => engine.evaluate(lo, { target: engine.combat.foe('dummy', 25), rank: 3 }).throughput.dps;
+  const first = dpsOf();
+  for (let i = 0; i < 18; i++) dpsOf();
+  near('evaluate() is idempotent - a warm engine scores what a cold one did',
+    dpsOf(), first, 1e-9);
 }
 
 // --- the target's health is stated, not guessed ------------------------------
@@ -4676,8 +4702,21 @@ group('mitigation uses two levels, not one');
     fLow.spawnLevel === 10 && /@L10/.test(fLow.name));
   ok('omitting the spawn level is parity for an unfitted family',
     f25.spawnLevel === 25 && engine.combat.foe('trash', 25).armor === f25.armor);
+  // Named directly. `boss` no longer points at Ratsar: a fitted spawn level
+  // froze the default target's armour pool while the striker's divisor grew
+  // with the character, so the tool's headline foe mitigated less than world
+  // trash. The fit is still right about Ratsar and still applies to him.
   ok('a fitted world family refuses the parity default',
-    engine.combat.foe('boss', 25).spawnLevel < 10 && /fit/.test(engine.combat.foe('boss', 25).name));
+    engine.combat.foe('Ratsar', 25).spawnLevel < 10 && /fit/.test(engine.combat.foe('Ratsar', 25).name));
+  // ...and the default does NOT, which is the whole point of moving it: the
+  // authored 0.40 boss intent, at the striker's own level, on both schools.
+  const dflt = engine.combat.foe('boss', 25);
+  ok('the default boss spawns at your level',
+    dflt.spawnLevel === 25, String(dflt.spawnLevel));
+  near('...and mitigates the authored 0.40, physical', dflt.physReduction, 0.4, 1e-9);
+  near('...and magical', dflt.magicReduction, 0.4, 1e-9);
+  near('...which is what the pool actually does at parity, not just what it declares',
+    dflt.armor / (dflt.armor + a + b * 25), 0.4, 1e-9);
 }
 
 // --- unit inheritance ------------------------------------------------------

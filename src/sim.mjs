@@ -401,7 +401,11 @@ function runFight(spec) {
   // other case, and preferring the resolved list wholesale would quietly change
   // which of two copies wins wherever they ever disagreed for some other
   // reason - a much wider blast radius than this fix is entitled to.
-  const timedDur = new Map(timedBuffs.filter((b) => b.extended).map((b) => [b.status, b.duration]));
+  // `b.extended.to`, not `b.duration`: the engine no longer writes the
+  // extension back onto the buff, because that object is cached across
+  // evaluations and feeding it its own output compounded the duration on
+  // every call.
+  const timedDur = new Map(timedBuffs.filter((b) => b.extended).map((b) => [b.status, b.extended.to]));
   const lifeOf = (b) => {
     const d = timedDur.get(b.status) ?? b.duration;
     return d > 0 ? d : fight;

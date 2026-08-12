@@ -954,9 +954,20 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       const e = rate * b.extend.amount;
       // e >= 1 means the build adds time faster than the status spends it, so
       // it never drops once it is up. That is a real answer, not an overflow.
+      // `b.duration` is READ here and never written. These buff objects come
+      // out of statusCache by reference and outlive the call - the same
+      // aliasing the `b.stacks` fold above refuses - so `b.duration = dur`
+      // fed its own output back in and compounded the extension by 1/(1-e)
+      // on every later evaluation. Battle Shout's only affix is CritChance
+      // 20, so a warm engine handed a Warrior build a growing crit bonus:
+      // 15s of buff became 245s over 25 identical calls, uptime 0.14 -> 1.00,
+      // averaged crit 37 -> 54, dps +14.8%. Within one `optimize` or `rank`
+      // that is worse than a wrong number, because every candidate is scored
+      // on the same engine and the later ones are enumerated into a bigger
+      // bonus - the search was ranking by evaluation order. The extended
+      // value lives in `b.extended.to`, which is what the fight reads.
       const dur = e >= 1 ? Math.max(cd, src.occupancy) : b.duration / (1 - e);
       b.extended = { from: b.duration, to: dur, rate, perEvent: b.extend.amount, permanent: e >= 1 };
-      b.duration = dur;
       b.uptime = Math.min(1, dur / Math.max(cd, src.occupancy));
     }
 

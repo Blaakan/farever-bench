@@ -489,10 +489,12 @@ function commonSetup(args) {
     : null;
   const goal = String(from('goal', 'goal', 'dps'));
   if (!GOALS.includes(goal)) die(`--goal must be one of ${GOALS.join(', ')}`);
-  // Default to a boss rather than to `Armor_ExpectedReduction`. Every named boss
-  // and every world elite sits at 0.40 reduction while that constant is 0.25,
-  // which understates penetration by nearly half against the content anyone
-  // actually gears for. See `bench targets`.
+  // Default to a boss rather than to `Armor_ExpectedReduction`: the authored
+  // boss intent is 0.40 against that constant's 0.25, which understates
+  // penetration against the content anyone actually gears for. The boss also
+  // spawns at YOUR level - it used to be Ratsar, whose fitted rift level of
+  // 6.9 froze the pool at 1,177 and left the default mitigating less than
+  // world trash. See `bench targets`.
   //
   // An envelope written by this version records the target NAME. One written
   // by an older version recorded only the label ("named boss (Ratsar: 0.4/0.4)"),
@@ -1309,8 +1311,15 @@ const commands = {
       '    by your class and your gear\'s faction, never by the fight.',
       '',
       `  * Armor_ExpectedReduction (${s.engine.cdb.constant('Armor_ExpectedReduction')}) is well below what you actually fight, so`,
-      '    it understates penetration by nearly half against a boss. That is why',
-      '    the default target is a boss and not that constant.',
+      '    it understates penetration against a boss - +14.3% against +25.0% at',
+      '    50% penetration. That is why the default target is a boss and not that',
+      '    constant.',
+      '',
+      '  * A foe\'s pool is built at ITS level and divided at YOURS, so a boss that',
+      '    spawns below you mitigates far less than its intent says. `boss` is a',
+      '    world boss at your own level; Ratsar and Phrixes carry measured rift and',
+      '    arena levels and are softer than 0.40 when you name them directly.',
+      '    `--target-level <n>` sets the spawn level on any of them.',
       '',
       f.dim('  Not modelled: unitType.props.resistance is an affinity-level resistance'),
       f.dim('  hook and only Bee uses it (Honey), so it is inert. Foe level is taken'),
@@ -2859,7 +2868,14 @@ Common flags
   --goal <g>              dps | hps | sps | ehp | mixed (default dps)
   --weight <g>=<n>        blend goals, e.g. --weight dps=1 --weight ehp=0.25
   --target <t>            dummy | small | trash | big | elite | boss | dungeon
-                          | reference | any unit id     (default boss)
+                          | reference | any unit id     (default boss, 0.40/0.40
+                          at your own level)
+  --target-level <n>      the level the foe SPAWNED at, when it differs from
+                          yours. The resist pool is built at its level and
+                          divided at yours, so a foe below you mitigates less
+                          than its intent says. Defaults to parity, except for
+                          the rift and arena families whose levels were fitted
+                          from real fights (see bench targets)
   --fight <s>             how long the simulated fight is    (default 200s)
   --fights <n>            roll the procs for real n times and report the mean
                           and the spread; 1 folds them in at their expected
