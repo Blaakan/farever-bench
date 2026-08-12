@@ -1,0 +1,33 @@
+{
+  "name": "farever-bench-ui",
+  "version": "0.1.0",
+  "description": "Desktop UI for farever-bench: character sheet, talent tree, rune page, optimizer",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "serve": "node server.mjs",
+    "dist": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^43.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "bench.farever.ui",
+    "productName": "Farever Bench",
+    "directories": { "output": "dist" },
+    "files": [
+      "electron/**",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "..", "to": "bench", "filter": ["src/**", "bin/**", "package.json", "LICENSE"] },
+      { "from": ".", "to": "bench/ui",
+        "filter": ["server.mjs", "api.mjs", "view.mjs", "icons.mjs",
+                   "optimize-worker.mjs", "lib/**", "web/**"] }
+    ],
+    "win": { "target": ["portable"], "icon": "web/appicon.ico" },
+    "portable": { "artifactName": "FareverBench.exe" }
+  }
+}

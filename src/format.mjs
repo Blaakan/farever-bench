@@ -280,9 +280,13 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
   for (const p of pools) {
     const chosen = loadout.skills?.[p.key] ?? p.options.slice(0, p.slots);
     const dropped = p.options.filter((id) => !chosen.includes(id));
+    // A pool that may slot the same option twice is counted against its SLOTS,
+    // not its option list: a Mage filling three conduit slots from two conduits
+    // is full, and "3/2" reads like an overflow rather than a finished bar.
+    const denom = p.repeats ? p.slots : p.options.length;
     rows.push([
       p.label,
-      `${chosen.length}/${p.options.length}`,
+      `${chosen.length}/${denom}`,
       chosen.map((id) => bold(name(id))).join(', '),
       // A main-hand passive is granted rather than chosen, so it is not in the
       // pool - but leaving it off the line makes a three-skill weapon read
@@ -314,6 +318,10 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
       ['conditional', 'it procs, but only while something this reader cannot evaluate holds'],
       ['buff refused', 'the skill is scored, but a status it grants is gated on live state this reader cannot evaluate'],
       ['gated off', 'its script gates it on a rank or a talent this build does not have'],
+      // NOT a gap, and it is here precisely because it is not: read, answered,
+      // and correctly zero for the fight you described. Same species as the
+      // crowd-control line below - the input decides it, so the input is named.
+      ['off at this target health', 'read and correctly worth zero at the health you stated - --target-health moves it'],
       ['chain', 'the weapon\'s base-attack chain is shorter than its moveSet declares'],
       ['crowd control', 'a stun, root or slow - worth nothing while the simulated foe does not act'],
       ['foe is passive', 'it fires on a block or on being hit, and the simulated foe never attacks'],
@@ -350,6 +358,11 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
         for (const r of u.runePromises ?? []) {
           out.push('      ' + (r.slotted ? warn('slotted ') : dim('offers  ')) + dim(`${r.name}: ${r.desc}`));
         }
+        // Same exception, for the same reason. The blurb explains a KIND, and
+        // for this one the kind is not the useful half: the user needs the
+        // threshold and the flag that reaches it, per rider, or "correctly
+        // worth zero" reads as "this rune is worthless".
+        if (kind === 'off at this target health' && u.why) out.push('      ' + dim(u.why));
       }
       if (list.length > 8) out.push(dim(`    ... and ${list.length - 8} more`));
       byKind.delete(kind);

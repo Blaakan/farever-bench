@@ -580,7 +580,17 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     if (cost(off) !== cost(on)) what.push('changes its cost');
     if ((on?.runeDamage ?? []).length > (off?.runeDamage ?? []).length) {
       const d = on.runeDamage[on.runeDamage.length - 1];
-      what.push(`+${Math.round(d.amount * 100)}% damage${d.singleTarget ? ' at one target' : ''}`);
+      // WITH ITS WINDOW. This column says what slotting the rune buys, and a
+      // bare "+25% damage" beside a rider the fight priced at zero is an
+      // assertion the run does not support - the same fault as a refusal whose
+      // reason is false, pointing the other way. Execution is +25% UNDER 35%
+      // health and the column has to say so, at every --target-health, because
+      // the sentence is about the rune and not about one fight.
+      const th = d.targetHealth
+        ? ` ${/^</.test(d.targetHealth.op) ? 'under' : 'above'} `
+          + `${+(d.targetHealth.threshold * 100).toFixed(2)}% health`
+        : '';
+      what.push(`+${Math.round(d.amount * 100)}% damage${th}${d.singleTarget ? ' at one target' : ''}`);
     }
     // An effect the rune fills in. A `dynVal` effect declares no amount at all -
     // the number arrives from a script - so the same step reads as a blank

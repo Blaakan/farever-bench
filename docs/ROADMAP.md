@@ -188,6 +188,40 @@ weapon tooltips against the Legendary 5★ pin. Neither can rescue Ratsar.
 - The **three-rider sum** is still untested together: the v2 session was a GS
   build, so the axe's combo-bleed rider never fired. It wants an axe session with
   a finisher on a bleeding target inside Berserk during the stun.
+- **TODO — `armorIgnore` is folded into penetration additively, and the game
+  multiplies.** `mitigate()` at `src/damage.mjs:922-923` computes
+  `pen = sheet(ArmorPenetration) + armorIgnore × 100` and applies one
+  `(1 - pen/100)`. `getAffinityDamageReduction@4510` applies **two** separate
+  multiplies on the pool: `resist ×= (1 - clamp(armorIgnore, 0, 1))` at ops
+  133–147 (physical) / 80–95 (magic), and only then `resist ×= (1 - pen/100)`
+  at ops 259–263. So the model computes `(1 - a - b)` where the game computes
+  `(1 - a)(1 - b)`, and OVERSTATES damage whenever both are non-zero. Exact when
+  either is zero, which is why it never showed on the calibrated Warrior — the
+  captured build had no `armorIgnore` source live.
+
+  Measured, lv25 vs a 0.40 elite (Armor 1923.33): 10% ignore + 40% pen gives
+  pool 1038.6 in game vs 961.7 in the model, **73.53 vs 75.00 per 100 base
+  (+2.0%)**; at 60% pen it is 80.65 vs 83.33 (+3.3%). The live carrier is
+  `Warrior_ExposedEssence` — a script talent, `maxPoints 2`, `vars.var1 = 0.05`
+  with `rankOverride minRank 2 → 0.10`, setting BOTH `dmg.armorIgnore` and
+  `dmg.magicArmorIgnore` when the target `hasStatusType(Bleed)`. Rank 2 alone is
+  worth exactly 10 points of ArPen (+4.17% on a 0.40 boss); the error is the
+  interaction, not the term.
+
+  The fix cannot be done inside `penetrationPct` — folding into pen cannot
+  express the two-multiply form. `damageReduction()` in `src/model.mjs:79` needs
+  its own `ignore` parameter applied before the pen multiply, and
+  `survivability()` at `src/damage.mjs:1417` wants the same treatment for
+  symmetry. The comment at `src/damage.mjs:919` states the additive reading
+  explicitly, so this was a deliberate simplification, not an oversight — it
+  should be replaced, not just patched around.
+
+  Note also the operator split across the five scripts that write these fields:
+  `Warrior_ExposedEssence`, `Daggers_Demondash_Skill1` and `Staff_Censer_Passive`
+  use `=` (last writer wins, no stacking), while `DS_Bladeleaf_Skill1` and
+  `Priest_Talent_PiercingLight` use `+=`. Whatever carries `armorIgnore` into
+  `mitigate()` has to preserve that distinction or two sources will compose
+  wrongly once Priest and Rogue are in scope.
 
 ## The method (proven, in order of preference)
 

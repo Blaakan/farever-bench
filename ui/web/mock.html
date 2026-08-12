@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>farever-bench mock sheet</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* mock-only placeholder art */
+  .ph-ico { width: 86%; height: 86%; border-radius: 8px;
+            background: radial-gradient(circle at 35% 30%, #e6b96a, #8a5a2a); }
+  .ph-sk  { width: 100%; height: 100%;
+            background: radial-gradient(circle at 40% 35%, #ff9a3d, #7a1f08); }
+  .ph-t   { width: 100%; height: 100%;
+            background: radial-gradient(circle at 40% 35%, #b48ae8, #241040); }
+</style>
+</head>
+<body>
+
+<div class="profile-title">Character Profile</div>
+
+<div class="band">
+  <div class="level-wedge">
+    <span class="lvl-word">Level</span>
+    <input class="lvl-num" value="25">
+  </div>
+  <div class="crest"><div class="crest-flag"></div></div>
+  <div class="class-name">
+    <select class="class-select">
+      <option>Mage</option><option>Warrior</option><option>Rogue</option><option>Priest</option>
+    </select>
+  </div>
+  <div class="spacer"></div>
+  <input class="charname" value="Emsay">
+  <button class="btn btn-red">Optimize</button>
+</div>
+
+<div class="tabs">
+  <button class="tab active">Profile</button>
+  <button class="tab">Talents</button>
+  <button class="tab">Runes</button>
+</div>
+
+<div class="sheet">
+  <div class="columns">
+
+    <div class="panel">
+      <div class="nameplate">Emsay</div>
+      <div class="ornhead">Attributes</div>
+      <div class="statrow"><div class="lab">Vitality</div><div class="val">171</div></div>
+      <div class="statrow"><div class="lab">Strength</div><div class="val">34</div></div>
+      <div class="statrow"><div class="lab">Dexterity</div><div class="val">38</div></div>
+      <div class="statrow"><div class="lab">Faith</div><div class="val">62</div></div>
+      <div class="statrow"><div class="lab">Intellect</div><div class="val">141</div></div>
+      <div class="statrow gap"></div>
+      <div class="statrow"><div class="lab">Armor</div>
+        <div class="val">1 011<span class="sub">(-25.95%)</span></div></div>
+      <div style="margin-top:26px">
+        <button class="btn btn-red">More stats</button>
+      </div>
+    </div>
+
+    <div class="doll">
+      <div class="watermark"><div style="width:46%;aspect-ratio:1;border-radius:50%;background:#7a6650"></div></div>
+      <div class="slotcol">
+        <div class="slot r2"><div class="ph-ico"></div><div class="lvl-badge">21</div></div>
+        <div class="slot r4"><div class="ph-ico"></div></div>
+        <div class="slot r1"><div class="ph-ico"></div></div>
+        <div class="slot r2"><div class="ph-ico"></div></div>
+        <div class="slot r0"><div class="ph-ico"></div></div>
+        <div class="slot empty"><div class="ph"></div></div>
+      </div>
+      <div class="slotcol">
+        <div class="slot r1"><div class="ph-ico"></div></div>
+        <div class="slot r2"><div class="ph-ico"></div></div>
+        <div class="slot r3"><div class="ph-ico"></div></div>
+        <div class="slot r2"><div class="ph-ico"></div></div>
+        <div class="slot r4"><div class="ph-ico"></div></div>
+        <div class="slot empty"><div class="ph"></div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="ornhead">Weapons</div>
+      <div class="wcard">
+        <div class="wrow">
+          <div class="slot r4" style="width:64px;height:64px"><div class="ph-ico"></div><div class="stars">★★★★★</div></div>
+          <div class="wlabel">Main Hand</div>
+        </div>
+        <div class="skillrow">
+          <div class="skilltile"><div class="ph-sk"></div></div>
+          <div class="skilltile picked"><div class="ph-sk"></div></div>
+          <div class="skilltile off"><div class="ph-sk"></div><div class="badge">2</div></div>
+        </div>
+      </div>
+      <div class="wcard ghost">
+        <div class="wrow">
+          <div class="slot empty" style="width:64px;height:64px"><div class="ph"></div></div>
+          <div class="wlabel">Off Hand</div>
+        </div>
+      </div>
+      <div class="ornhead">Arsenal</div>
+      <div class="wcard">
+        <div class="wrow">
+          <div class="slot r3" style="width:64px;height:64px"><div class="ph-ico"></div><div class="stars">★★★☆☆</div></div>
+          <div class="skillorb picked"><div class="ph-sk"></div></div>
+          <div class="skillorb"><div class="ph-sk"></div></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ------------------------------------------------ talent tree mock -->
+<div class="sheet" style="margin-top:18px">
+  <div class="talents-wrap">
+    <div class="tp-chip">Talent Points available: <b>0 ✦</b></div>
+    <div class="ttree" id="mocktree">
+
+      <div class="trow">
+        <div class="tnode"><div class="plate"></div><div class="art"><div class="ph-t"></div></div><div class="rank">1/1</div></div>
+      </div>
+
+      <div class="trow" style="margin-top:26px">
+        <div class="tnode"><div class="plate"></div><div class="art"><div class="ph-t"></div></div><div class="rank">1/1</div></div>
+        <div class="tnode"><div class="plate"></div><div class="art"><div class="ph-t"></div></div><div class="rank">1/1</div></div>
+        <div class="tnode"><div class="plate"></div><div class="art"><div class="ph-t"></div></div><div class="rank">1/1</div></div>
+      </div>
+
+      <div class="trow" style="margin-top:20px">
+        <div class="tier-label">1 <span class="star">✦</span></div>
+        <div class="tcluster pair"><div class="plate"></div>
+          <div class="orbs">
+            <div class="torb max"><div class="art"><div class="ph-t"></div></div><div class="rank">2/2</div></div>
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/2</div></div>
+          </div>
+        </div>
+        <div class="tcluster pair"><div class="plate"></div>
+          <div class="orbs">
+            <div class="torb max"><div class="art"><div class="ph-t"></div></div><div class="rank">2/2</div></div>
+            <div class="torb max"><div class="art"><div class="ph-t"></div></div><div class="rank">2/2</div></div>
+          </div>
+        </div>
+        <div class="tcluster pair"><div class="plate"></div>
+          <div class="orbs">
+            <div class="torb max"><div class="art"><div class="ph-t"></div></div><div class="rank">2/2</div></div>
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/2</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="trow" style="margin-top:24px">
+        <div class="tier-label">3 <span class="star">✦</span></div>
+        <div class="tcluster tri"><div class="plate"></div>
+          <div class="orbs">
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/1</div></div>
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/2</div></div>
+          </div>
+          <div class="second"><div class="torb max"><div class="art"><div class="ph-t"></div></div><div class="rank">2/2</div></div></div>
+        </div>
+        <div class="tcluster tri"><div class="plate"></div>
+          <div class="orbs">
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/1</div></div>
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/2</div></div>
+          </div>
+          <div class="second"><div class="torb max"><div class="art"><div class="ph-t"></div></div><div class="rank">2/2</div></div></div>
+        </div>
+        <div class="tcluster tri locked"><div class="plate"></div>
+          <div class="orbs">
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/1</div></div>
+            <div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/2</div></div>
+          </div>
+          <div class="second"><div class="torb zero"><div class="art"><div class="ph-t"></div></div><div class="rank">0/2</div></div></div>
+        </div>
+      </div>
+
+      <div class="trow" style="margin-top:26px">
+        <div class="tier-label">7 <span class="star">✦</span></div>
+        <div class="tnode lockedplate"><div class="plate"></div><div class="art"><div class="ph-t"></div></div><div class="rank">0/1</div></div>
+        <div class="tnode"><div class="plate"></div><div class="art"><div class="ph-t"></div></div><div class="rank">1/1</div></div>
+        <div class="tnode lockedplate"><div class="plate"></div><div class="art"><div class="ph-t"></div></div><div class="rank">0/1</div></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ------------------------------------------------ tooltip mock -->
+<div class="tooltip" style="left:820px; top:120px">
+  <div class="tname r4">Beefury, Blessed Blade of the Farseeker</div>
+  <div class="ttype">Sword — Main Hand · iLvl 350 · Legendary ★★★★★</div>
+  <div class="taffix">+39 Intellect</div>
+  <div class="taffix">+39 Critical</div>
+  <div class="taffix">+21 Armor Penetration</div>
+  <hr>
+  <div class="tdesc">The Farseeker's chosen carry its sting.</div>
+  <div class="tacquire">Drops from Bee enemies — Meridion Ruins, Krisomal Prairie</div>
+  <div class="tmeta">Faction: Bee — gives ArmorPenetration + SpellPenetration</div>
+</div>
+
+</body>
+</html>

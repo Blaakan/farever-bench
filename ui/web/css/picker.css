@@ -1,0 +1,166 @@
+/* ---------------------------------------------------------------------------
+   picker.css — item-picker extensions (components/picker.js).
+   The modal shell, list rows and config column live in style.css + sheet.css;
+   only the instance-level control is here, because it is the one control the
+   game's parchment kit has no shape for.
+--------------------------------------------------------------------------- */
+
+/* ------------------------------------------------- instance-level slider */
+
+.pconf .levelctl {
+  --thumb: 16px;
+  --track: 8px;
+  --lvl-fill: var(--teal);
+  margin: 12px 0 2px;
+}
+/* unset means "whatever it drops at" — the bar reads as a hint, not a choice */
+.pconf .levelctl.unset { --lvl-fill: #cdb99e; }
+
+.levelctl .lvlhead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  margin-bottom: 3px;
+}
+.levelctl .lvlval {
+  flex: 1;
+  min-width: 0;
+}
+.levelctl .lvlval b {
+  font-family: Georgia, serif;
+  font-size: 17px;
+  color: var(--ink);
+}
+.levelctl.unset .lvlval { font-style: italic; }
+
+.levelctl .lvlauto {
+  flex: none;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  padding: 2px 8px;
+  cursor: pointer;
+  color: var(--ink-soft);
+  background: #fff9f0;
+  border: 1px solid #cdb897;
+  border-radius: 999px;
+}
+.levelctl .lvlauto:hover {
+  color: var(--ink);
+  background: #f1e4d0;
+}
+
+.levelctl .lvlslide {
+  position: relative;
+  padding-bottom: 9px;   /* room for the tick marks under the track */
+}
+
+/* content-box + vertical padding puts the track box exactly in the middle of
+   the control instead of trusting the UA to centre a short track in a tall
+   input; the thumb then overhangs symmetrically into the padding. */
+.levelctl input[type=range] {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: content-box;
+  display: block;
+  width: 100%;
+  height: var(--track);
+  padding: calc((var(--thumb) - var(--track)) / 2) 0;
+  margin: 0;
+  background: none;
+  cursor: pointer;
+}
+.levelctl input[type=range]:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
+/* The fill has to stop under the thumb CENTRE, and that centre travels inset
+   by half a thumb at each end — hence the calc instead of a gradient stop.
+   --frac (0..1) is written by picker.js on every input event. */
+.levelctl input[type=range]::-webkit-slider-runnable-track {
+  height: var(--track);
+  border-radius: 999px;
+  background-color: #e3d4bf;
+  background-image: linear-gradient(var(--lvl-fill), var(--lvl-fill));
+  background-repeat: no-repeat;
+  background-size: calc(var(--thumb) / 2 + var(--frac, 1) * (100% - var(--thumb))) 100%;
+  box-shadow: inset 0 1px 2px rgba(90, 70, 45, .28);
+}
+.levelctl input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: var(--thumb);
+  height: var(--thumb);
+  margin-top: calc((var(--track) - var(--thumb)) / 2);
+  border: 2px solid #fff9f0;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 1px 3px rgba(60, 40, 20, .45);
+}
+.levelctl input[type=range]:active::-webkit-slider-thumb { background: var(--gold-bright); }
+
+/* Gecko names the same two parts differently and centres the thumb itself */
+.levelctl input[type=range]::-moz-range-track {
+  height: var(--track);
+  border-radius: 999px;
+  background-color: #e3d4bf;
+  background-image: linear-gradient(var(--lvl-fill), var(--lvl-fill));
+  background-repeat: no-repeat;
+  background-size: calc(var(--thumb) / 2 + var(--frac, 1) * (100% - var(--thumb))) 100%;
+}
+.levelctl input[type=range]::-moz-range-thumb {
+  box-sizing: border-box;
+  width: var(--thumb);
+  height: var(--thumb);
+  border: 2px solid #fff9f0;
+  border-radius: 50%;
+  background: var(--gold);
+}
+
+/* notches: inset by half a thumb so every mark sits where the thumb can stop */
+.levelctl .lvlticks {
+  position: absolute;
+  left: calc(var(--thumb) / 2);
+  right: calc(var(--thumb) / 2);
+  bottom: 0;
+  height: 7px;
+  pointer-events: none;
+}
+.levelctl .lvlticks span {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  height: 4px;
+  transform: translateX(-50%);
+  background: #c6b193;
+}
+.levelctl .lvlticks span.maj {
+  height: 7px;
+  background: #a5885f;
+}
+
+.levelctl .lvlends {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 1px;
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------ items whose level never moves */
+
+.pconf .levelfix {
+  margin: 12px 0 2px;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-style: italic;
+  color: #8d7a62;
+  background: #f7f0e5;
+  border: 1px dashed #d8c6ac;
+  border-radius: 8px;
+}

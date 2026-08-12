@@ -216,7 +216,22 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // `vars` is the RANK-RESOLVED set - `props.rankOverride` restates them and
       // Domination's 0.15 becomes 0.25 from rank 2. Reading `s.vars` here would
       // understate it by 1.67x at every rank bench actually uses.
-      const amount = vars?.[m[2]] ?? runeVars?.[m[2]];
+      //
+      // THE SLOTTED RUNE GOES ON TOP OF IT, which is the other way round from
+      // how this read until the health clause made the difference observable.
+      // `updateSkillInf@20788` runs applyVars per slotted mastery ON TOP of the
+      // row's own, so the rune wins wherever both name a key - the same
+      // resolution `scriptGapsOf` in skills.mjs already applies, and the same
+      // reason: a var read only inside a clause gated on the rune that
+      // overrides it has no observable base value at all. Exactly one rider in
+      // the sheet can tell the two orders apart, and it is Execution: its own
+      // row says damage 0.5 under threshold 0.2, its rune says 0.25 under 0.35,
+      // and the tooltip says 25% under 35%. Reading the row would have priced
+      // this rune at DOUBLE its printed value in a window it does not have.
+      // (Concentrated Impact is the other rune-gated rider and its `damage`
+      // lives only on the rune, so the old fallback already reached it.)
+      const varOf = (name) => (runeVars && name in runeVars ? runeVars[name] : vars?.[name]);
+      const amount = varOf(m[2]);
       if (typeof amount !== 'number' || amount <= 0) continue;
 
       // A RANK guard is a question about the build, not about live state, so it
@@ -246,6 +261,36 @@ export function buildCombat(cdb, ctx, assume = {}) {
         : /hasStatusType\s*\(\s*(?:StatusType\.)?(?:Stun|Root|Slow)\s*\)/.test(line) ? 'cc'
           : null;
 
+      // THE TARGET'S HEALTH, which is not a question about live state at all -
+      // it is a fact about the fight the CALLER STATES, exactly the class of
+      // input `--targets` already is. `Execution` is the shape:
+      //
+      //   if (hasMastery(Mastery.Warrior_RageStrike_M3)
+      //       && hit.targetUnit.healthRatio <= vars.threshold)   // 0.35
+      //     hit.dmgMult += vars.damage;                          // 0.25
+      //
+      // The COMPARISON is recorded here and never its answer. `profile()` is
+      // memoised on skill+rank+runes and its cache outlives every evaluation
+      // the process runs, so a rider that banked a verdict would freeze the
+      // first health the engine was asked about into every later answer. The
+      // number arrives at the pricing site instead, where `opts.targetHealth`
+      // is per-evaluation - which is also why nothing about these caches had
+      // to change.
+      //
+      // THE SUBJECT HAS TO BE THE THING BEING HIT. Six scripts in the sheet
+      // read `owner.healthRatio` - Hive Bite, Tide Warlord, Flamie, Fanatical
+      // Fury, RobinHoof_Summon, Infused Tusk - and your own health over a
+      // fight is not something this model tracks. Reading one of those as the
+      // target's would hand a full-health Warrior a boss's execute bonus.
+      const th = (() => {
+        const h = /(\w+(?:\.\w+)*)\.healthRatio\s*(<=|>=|<|>)\s*vars\.([A-Za-z0-9_]+)/.exec(line);
+        if (!h || !/target/i.test(h[1])) return null;
+        const t = varOf(h[3]);
+        // No number, no reading: the clause stays in `rest` below and the whole
+        // rider is refused, rather than being silently stripped to nothing.
+        return typeof t === 'number' ? { op: h[2], threshold: t, text: h[0] } : null;
+      })();
+
       // Everything the guard says beyond what is stripped here is a condition
       // this cannot answer, and it must refuse rather than approximate.
       const singleTarget = /totalHits\s*==\s*1/.test(line);
@@ -256,11 +301,20 @@ export function buildCombat(cdb, ctx, assume = {}) {
         .replace(/\w+\.isCCImmune\s*\(\s*\)/g, ' ')
         .replace(/\brank\s*(?:>=|<=|==|!=|>|<)\s*\d+/g, ' ')
         .replace(/\w+\.ctx\.totalHits\s*==\s*1/g, ' ')
+        .replace(th ? new RegExp(th.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') : /(?!)/g, ' ')
+        // `hit.targetUnit != null` is not a condition on anything: either there
+        // is a unit being hit or there is no hit to price. Demonic Bite writes
+        // it beside its health clause and nothing else, so refusing on it would
+        // leave that rider unread for a reason that is not a reason.
+        .replace(/\w+(?:\.\w+)*\.(?:targetUnit|target)\s*!=\s*null/g, ' ')
         .replace(/\w+\.(?:dmgMult|critDmgMult)\s*\+=\s*vars\.\w+\s*;?/g, ' ')
         .replace(/\b(?:if|hit|dmg|ctx|var|target)\b/g, ' ')
         .replace(/[\s{}()&|!,;.=+]/g, '');
       if (rest.length) continue;
-      hit.push({ amount, singleTarget, rune: rune ?? null, field, gate });
+      hit.push({
+        amount, singleTarget, rune: rune ?? null, field, gate,
+        targetHealth: th ? { op: th.op, threshold: th.threshold } : null,
+      });
     }
     runeDmgCache.set(key, hit);
     return hit;
@@ -1377,11 +1431,29 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // Domination's +25% inside a stun window.
         const gateOn = (g) => g == null || (opts.gates?.[g] ?? 0) > 0;
         const gateVal = (g) => (g == null ? 1 : (opts.gates?.[g] ?? 0));
+        // ...and the one live-state guard that is not a guess, because it is
+        // STATED. `opts.targetHealth` is the fraction of its health the target
+        // is standing at, and the comparison is answered EXACTLY against it:
+        // no assumption that the fight is a kill, none that damage is even,
+        // none that a share of the fight is spent below the line.
+        //
+        // `<` and `<=` therefore differ only exactly AT the boundary - at 0.35
+        // stated, `<= 0.35` fires and `< 0.35` does not - which is all the
+        // precision a single stated number can carry, and it is not rounded to
+        // hide that. At the default of full health an execute clause is simply
+        // OFF and an above-threshold clause is ON. Both are the right answer
+        // for the fight that was described, not a missing feature.
+        const health = opts.targetHealth ?? 1;
+        const healthOk = (th) => th == null
+          || (th.op === '<=' ? health <= th.threshold
+            : th.op === '<' ? health < th.threshold
+              : th.op === '>=' ? health >= th.threshold : health > th.threshold);
         let scriptCritDmg = 0;
         for (const rd of prof.runeDamage ?? []) {
           if (rd.field !== 'critDmgMult') continue;
           if (rd.singleTarget && wantTargets !== 1) continue;
           if (!gateOn(rd.gate)) continue;
+          if (!healthOk(rd.targetHealth)) continue;
           scriptCritDmg += rd.amount * gateVal(rd.gate);
         }
         // A swing-triggered status tick rolls inside the swing's hit context,
@@ -1431,6 +1503,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
           if (rd.field === 'critDmgMult') continue;   // handled at `critBonus`
           if (rd.singleTarget && wantTargets !== 1) continue;
           if (!gateOn(rd.gate)) continue;
+          if (!healthOk(rd.targetHealth)) continue;
           riders += rd.amount * gateVal(rd.gate);
         }
         riders += (mods.damageByAffinity?.[aff.root] ?? 0)

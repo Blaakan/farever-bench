@@ -61,10 +61,19 @@ const CLASS_SKILL_SLOTS = 4;
 
 // The per-class mechanic skills. Each is chosen from a pool and each fires on
 // an event rather than on a cooldown.
+// `repeats` says whether the SAME option may fill more than one slot. Nothing
+// in the data declares it, so it is player testimony, the same standing as
+// CLASS_SKILL_SLOTS: a Mage may slot one conduit twice, a Priest gets one of
+// each prayer. The conduit side has corroboration in the game's own code -
+// Mage_Conduit_Projectile's script fans by getSkillInstanceCount() /
+// getSkillInstanceIndex() with a stagger, which only means anything if a
+// second copy can exist - and in the live capture, where Emsay's three slots
+// read Projectile x2 + Power. RoguePoison stays false: nothing says otherwise
+// and its slot count is unbounded, so cycling would fabricate poisons.
 const MECHANIC_TYPES = {
-  PriestPrayer: { slotConstant: 'Priest_Prayer_Slot_Unlocks', label: 'prayers' },
-  MageConduit: { slotConstant: 'Mage_Conduit_Levels', label: 'conduits' },
-  RoguePoison: { slotConstant: null, label: 'poisons' },
+  PriestPrayer: { slotConstant: 'Priest_Prayer_Slot_Unlocks', label: 'prayers', repeats: false },
+  MageConduit: { slotConstant: 'Mage_Conduit_Levels', label: 'conduits', repeats: true },
+  RoguePoison: { slotConstant: null, label: 'poisons', repeats: false },
 };
 
 // Types that are never throughput: movement, mounts, menus.
@@ -1001,6 +1010,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       out.push({
         key: `class/${type}`, kind: 'mechanic', slot: null, host: loadout.class,
         label: def.label, slots, options, mechanic: type,
+        repeats: def.repeats === true,
       });
     }
     return out;
@@ -1016,9 +1026,21 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
   // nobody. Left alone deliberately: it is a separate bug from the one this
   // change fixes, it moves every Mage's baseline, and the one assertion that
   // covers it reads per-hit interval where it means trigger cadence.
+  // How a pool fills when nobody has chosen. A pool that allows repeats fills
+  // every slot, cycling its options - the third conduit slot going back to the
+  // first option is exactly the live fill (Projectile x2 + Power). Everything
+  // else takes each option at most once, so a Priest holding two prayers at
+  // three slots carries two, not one of them twice.
+  function fillPool(p) {
+    if (p.repeats && p.options.length) {
+      return Array.from({ length: p.slots }, (_, i) => p.options[i % p.options.length]);
+    }
+    return p.options.slice(0, p.slots);
+  }
+
   function defaultSelection(loadout) {
     const sel = {};
-    for (const p of pools(loadout)) sel[p.key] = p.options.slice(0, p.slots);
+    for (const p of pools(loadout)) sel[p.key] = fillPool(p);
     return sel;
   }
 
@@ -1035,7 +1057,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     }
     // Fill anything unset so a partial build still evaluates.
     for (const [key, p] of live) {
-      if (!loadout.skills[key]?.length) loadout.skills[key] = p.options.slice(0, p.slots);
+      if (!loadout.skills[key]?.length) loadout.skills[key] = fillPool(p);
     }
     return loadout;
   }
@@ -1385,13 +1407,10 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // is still the talent's - so the membership test, not the type test.
     const mechanicOptions = new Set(livePools.filter((p) => p.mechanic).flatMap((p) => p.options));
     for (const p of livePools) {
-      // A mechanic pool with more slots than options CYCLES: the third
-      // conduit slot repeats the first option, which is exactly Emsay's live
-      // fill (Projectile x2 + Power, proven by the paired trigger rows).
-      const dflt = p.kind === 'mechanic' && p.slots > p.options.length
-        ? Array.from({ length: p.slots }, (_, i) => p.options[i % p.options.length])
-        : p.options.slice(0, p.slots);
-      const chosen = (sel[p.key] ?? dflt).slice(0, p.slots);
+      // One fill rule, shared with defaultSelection/pruneSelection - when they
+      // disagreed, a stored selection of two conduits silently beat the cycle
+      // here and the third slot went to nobody.
+      const chosen = (sel[p.key] ?? fillPool(p)).slice(0, p.slots);
       const item = p.kind === 'weapon' ? cat.itemById.get(loadout.gear[p.slot]?.item) : null;
       const all = item?.skills ?? [];
 

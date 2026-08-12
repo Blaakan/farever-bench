@@ -1489,6 +1489,11 @@ function runFight(spec) {
     triggeredLines.push({
       id: g.prof.id, name: g.prof.name, kind: 'triggered', source: g.source,
       perCast: g.out, interval: elapsed / fires, share: 0, why: g.rule.why,
+      // How many slots hold this option. `interval` counts every instance's
+      // hit, so the cadence of the EVENT behind them is interval * instances -
+      // two conduits in one slot pair fire together, they do not fire twice as
+      // often.
+      instances: g.instances ?? 1,
       total: {
         damage: (e.damage ?? 0) / rolls,
         heal: (e.heal ?? 0) / rolls,

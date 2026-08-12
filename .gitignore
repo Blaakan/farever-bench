@@ -8,6 +8,10 @@
 node_modules/
 *.log
 
+# Electron build output for the UI. ~90MB of packaged runtime, always
+# reproducible from `cd ui && npm run dist`.
+ui/dist/
+
 # Build exports. These are derived from the player's own copy of the game, and
 # the game's data is Shiro Games' - the generator ships, its output does not.
 out/
@@ -16,3 +20,7 @@ out/
 # Where `bench layouts` writes one report per weapon pair as the sweep runs.
 # Same rule as above: derived from the player's own game data, never committed.
 bench-layouts-*/
+
+# Release artifacts: both are rebuilt by tools/release.mjs and the workflow.
+farever-bench-v*.zip
+FareverBench-v*.exe

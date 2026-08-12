@@ -1,0 +1,279 @@
+# ---------------------------------------------------------------------------
+# Release: check what can be checked, bump, build both downloads, publish them.
+#
+# Run it from the Actions tab (workflow_dispatch) and pick patch/minor/major.
+# It releases the branch it was dispatched FROM - `github.ref_name` - because
+# this repo works on `master` while pull requests target `main`, and a workflow
+# that hard-codes either one silently releases the wrong tree.
+#
+# windows-latest for one reason: `electron-builder --win portable` produces a
+# Windows exe, and building it anywhere else needs wine. Nothing in the build
+# reads the game - electron-builder copies files, it never runs the app - so
+# the runner needs Node and npm and nothing installed from Steam.
+#
+# WHAT THIS JOB CANNOT DO IS RUN THE TEST SUITE. `test/run.mjs` reads the
+# player's own `data.cdb` and `hlboot.dat` and asserts against the values in
+# them; a hosted runner owns no copy of Farever, so the suite cannot pass here
+# and a green tick from a runner that skipped it would be a lie. The suite is
+# gated where a release is actually cut - `tools/release.mjs`, on a machine
+# that owns the game - and this job runs every check that does NOT need the
+# game instead:
+#
+#   * every .js/.mjs/.cjs under bin/ src/ tools/ ui/ parses;
+#   * nothing game-derived is committed. That is the repo's core promise -
+#     "no game data is redistributed" - and a promise worth making is worth
+#     enforcing somewhere that is not a person remembering.
+#
+# Two downloads come out of it, and they are the three documented ways to run
+# the tool: the portable exe, and one zip carrying both `bench ui` and the CLI.
+# ---------------------------------------------------------------------------
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+      notes:
+        description: Extra prose for the top of this version's changelog entry (optional)
+        type: string
+        required: false
+        default: ''
+
+# The version bump is a commit on the branch; two of them racing would fight
+# over the same line of package.json.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write        # push the bump commit + tag, create the release
+    defaults:
+      run:
+        shell: bash          # present on the Windows runners, and the one
+                             # syntax this file is written in. GitHub runs it
+                             # with -eo pipefail, so an unguarded failure ends
+                             # the step.
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # tools/release.mjs lists the commits since the last v* tag, so the
+          # tags and the history have to actually be here.
+          fetch-depth: 0
+
+      # Before anything is built or published: is the tree clean of the game?
+      # Tracked files only - `git ls-files` is exactly the question being
+      # asked, since a build output nobody committed harms nobody, and the
+      # runner's own node_modules and ui/dist would otherwise be scanned for
+      # no reason.
+      - name: Guard - nothing game-derived is committed
+        run: |
+          bad=$(git ls-files | grep -Ei \
+            -e '(^|/)(data\.cdb|res\.pak|res\.light\.pak|hlboot\.dat)$' \
+            -e '\.dds$' \
+            -e '(^|/)farever-atlas' \
+            -e '(^|/)\.cache/' \
+            -e '(^|/)bench-layouts-[^/]*/' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | while IFS= read -r f; do
+              echo "::error file=$f::game-derived, must never be committed"
+            done
+            echo
+            echo "Farever's data is Shiro Games'. The generator ships, its output"
+            echo "does not: everything is read from the player's install at runtime."
+            echo "Delete these, confirm .gitignore covers them, and release again."
+            exit 1
+          fi
+          echo "No game data, no icons, no cached install path, no layout sweep."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The parse is not the test suite and does not pretend to be. It is the
+      # class of break a release must never ship - a file that cannot even be
+      # loaded - and it is the only class this runner can rule out.
+      #
+      # The goal is stated rather than left to Node. `node --check <file>`
+      # infers module-vs-script from the extension and the nearest
+      # package.json; ui/package.json declares no "type", yet index.html loads
+      # ui/web/app.js as `<script type="module">`, so that inference calls a
+      # module a script and the check would fail on correct code. Feeding the
+      # source in on stdin with an explicit `--input-type` says which goal to
+      # use: .mjs is a module, .cjs is a script, and a bare .js is whichever
+      # of the two accepts it - only a file that parses as NEITHER is an
+      # error. The list is `git ls-files`, which is exactly what is being
+      # released and is node_modules-free by construction.
+      - name: Syntax-check every script that ships
+        run: |
+          echo 'export const ok = 1;' | node --input-type=module --check \
+            || { echo "::error::this Node cannot syntax-check ES modules from stdin"; exit 1; }
+
+          for d in bin src tools ui; do
+            [ -d "$d" ] || { echo "::error::$d/ is missing - the checkout is not this repo"; exit 1; }
+          done
+
+          err=$(mktemp)
+          n=0
+          while IFS= read -r f; do
+            case "$f" in
+              *.mjs) goals='module' ;;
+              *.cjs) goals='commonjs' ;;
+              *)     goals='commonjs module' ;;   # last one tried is the one reported
+            esac
+            ok=0
+            for g in $goals; do
+              if node --input-type="$g" --check < "$f" 2>"$err"; then ok=1; break; fi
+            done
+            if [ "$ok" -eq 0 ]; then
+              echo "::error file=$f::does not parse"
+              sed "s|\[stdin\]|$f|" "$err"
+              exit 1
+            fi
+            n=$((n + 1))
+          done < <(git ls-files -- bin src tools ui | grep -E '\.(js|mjs|cjs)$')
+
+          [ "$n" -gt 0 ] || { echo "::error::matched no scripts at all"; exit 1; }
+          echo "$n scripts parse."
+
+      - name: Install UI build deps
+        working-directory: ui
+        # ci when the lockfile is there and in sync, install when it is not.
+        run: npm ci || npm install
+
+      - name: Bump version and write the changelog
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+          NOTES: ${{ inputs.notes }}
+        # Through the environment, never interpolated into the command line:
+        # `notes` is free text from whoever pressed the button. release.mjs
+        # writes it into the notes file itself, so no shell ever parses it.
+        run: |
+          args=("$BUMP" --notes-out "$RUNNER_TEMP/release-notes.md")
+          if [ -n "$NOTES" ]; then args+=(--notes "$NOTES"); fi
+          version=$(node tools/release.mjs "${args[@]}")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$version"
+
+      # The second download: `bench ui` and the CLI, one zip, built by
+      # release.mjs alongside the bump. Checked here rather than at upload
+      # time so a release that would ship half its ways to run it fails before
+      # the tag exists.
+      - name: Check the CLI + UI zip
+        id: zip
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          zip="farever-bench-v$VERSION.zip"
+          if [ ! -f "$zip" ]; then
+            echo "::error::tools/release.mjs did not produce $zip in the repo root."
+            echo "Two of the three documented ways to run the tool ship in that zip;"
+            echo "without it this release would offer only the exe."
+            ls -la
+            exit 1
+          fi
+          echo "path=$zip" >> "$GITHUB_OUTPUT"
+          ls -l "$zip"
+
+      - name: Build the portable exe
+        working-directory: ui
+        run: npm run dist
+
+      - name: Name the exe after the version
+        id: exe
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          test -f ui/dist/FareverBench.exe
+          asset="FareverBench-v$VERSION.exe"
+          cp ui/dist/FareverBench.exe "$asset"
+          echo "path=$asset" >> "$GITHUB_OUTPUT"
+          ls -l "$asset"
+
+      - name: Commit and tag the bump
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        # Named paths, never `git add -A`: both assets are sitting untracked
+        # in the working tree at this point and neither belongs in the repo.
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json ui/package.json CHANGELOG.md
+          if [ -f ui/package-lock.json ]; then git add ui/package-lock.json; fi
+          git commit -m "Release v$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          # HEAD:<the branch this run was dispatched from>. A protected branch
+          # that refuses this push fails the job here, before the release
+          # exists - the tag and the release would otherwise point at a commit
+          # nobody can see.
+          git push origin "HEAD:refs/heads/$GITHUB_REF_NAME"
+          git push origin "refs/tags/v$VERSION"
+
+      # A fixed preamble - what the two downloads are, what each one needs,
+      # and what Windows will say about the unsigned exe - then the CHANGELOG
+      # section release.mjs just wrote. The heredoc is quoted, so the shell
+      # expands nothing inside it: the text is full of backticks, and the only
+      # substitution wanted is the version, which is x.y.z off package.json.
+      - name: Compose the release notes
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          cat > "$RUNNER_TEMP/preamble.md" <<'MD'
+          ### Three ways to run it
+
+          - **`FareverBench-v@VERSION@.exe`** - the desktop app. Download, run, nothing
+            else to install. **Windows 10+ x64 only.**
+          - **`farever-bench-v@VERSION@.zip`**, then `bench ui` - the same UI, in your own
+            browser.
+          - The same zip, then `bench optimize`, `bench sheet`, `bench rank`,
+            `bench layouts`, `bench rotation`, `bench talents`, ... - the command line.
+
+          The zip needs **Node.js 18+** and runs on Windows, Linux and macOS. The exe
+          needs nothing.
+
+          ### All three read your own copy of Farever
+
+          Every number comes out of `data.cdb` and every icon out of `res.pak`, read from
+          your install at runtime. Nothing game-derived is redistributed here, so there is
+          no standalone mode: **you need the game installed**, whichever way you run it.
+
+          The install is found through Steam's own registry keys, which only exist on
+          Windows. Anywhere else, pass `--game <path>` - a Proton install sits at
+          `~/.steam/steam/steamapps/common/Farever`.
+
+          ### The exe is unsigned
+
+          SmartScreen will say *"Windows protected your PC"*. **More info** -> **Run
+          anyway**. Signing it needs a certificate this project does not have; the zip
+          route never raises the dialog.
+
+          ---
+
+          ## Changes
+          MD
+          sed "s/@VERSION@/$VERSION/g" "$RUNNER_TEMP/preamble.md" > "$RUNNER_TEMP/notes.md"
+          printf '\n' >> "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/release-notes.md" >> "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          EXE: ${{ steps.exe.outputs.path }}
+          ZIP: ${{ steps.zip.outputs.path }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "farever-bench v$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --target "$(git rev-parse HEAD)" \
+            "$EXE" "$ZIP"

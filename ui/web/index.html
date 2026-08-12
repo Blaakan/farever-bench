@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Farever Bench</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="css/sheet.css">
+<link rel="stylesheet" href="css/picker.css">
+<link rel="stylesheet" href="css/talents.css">
+<link rel="stylesheet" href="css/runes.css">
+<link rel="stylesheet" href="css/optimize.css">
+</head>
+<body>
+
+<div class="profile-title">Character Profile — farever-bench</div>
+
+<div class="band">
+  <div class="level-wedge">
+    <span class="lvl-word">Level</span>
+    <input class="lvl-num" id="level-input" value="25" maxlength="2">
+  </div>
+  <div class="crest"><div class="crest-flag" id="class-crest"></div></div>
+  <div class="class-name">
+    <select class="class-select" id="class-select"></select>
+  </div>
+  <div class="spacer"></div>
+  <input class="charname" id="char-name" value="Bencher" spellcheck="false">
+  <button class="btn btn-red" id="optimize-btn">Optimize</button>
+</div>
+
+<div class="tabs" id="tabs">
+  <button class="tab active" data-tab="profile">Profile</button>
+  <button class="tab" data-tab="talents">Talents</button>
+  <button class="tab" data-tab="runes">Runes</button>
+</div>
+
+<div id="main" class="split-host">
+  <div id="editor-pane">
+    <div id="view-profile" class="tabview"></div>
+    <div id="view-talents" class="tabview" hidden></div>
+    <div id="view-runes" class="tabview" hidden></div>
+  </div>
+  <div id="result-pane" hidden></div>
+</div>
+
+<div id="modal-host"></div>
+<div id="tooltip-host"></div>
+<div id="toast-host"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

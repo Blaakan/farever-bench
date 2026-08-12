@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------------
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { createEngine, GOALS, FERVOR_SCOPES } from '../src/engine.mjs';
 import { emptyLoadout, classOf } from '../src/loadout.mjs';
@@ -34,7 +35,13 @@ import { buildFingerprint, diffFingerprints, resolveCitations, workList, loadFin
 import { fileURLToPath } from 'node:url';
 import * as f from '../src/format.mjs';
 
-export const VERSION = '0.1.0';
+// Out of package.json, not a constant here. tools/release.mjs moves that one
+// number and ui/api.mjs reads the same file, so a bump cannot leave the CLI
+// printing a version nobody can file a bug against. package.json ships in
+// every layout the bench runs from: the repo, the zip, and the exe's
+// resources/bench (ui/package.json extraResources).
+export const VERSION = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 // --- argument parsing ------------------------------------------------------
 
@@ -428,6 +435,22 @@ function commonSetup(args) {
     seconds: numFlag('fight', 200),
     count: numFlag('fights', 1, { integer: true }),
     targets: numFlag('targets', 1),
+    // A PERCENT on the way in, because that is the number the game prints and
+    // the number a player says out loud - "under 35%" is how the rune's own
+    // tooltip reads. The engine wants the ratio the scripts compare against,
+    // so it is divided here and nowhere else.
+    targetHealth: (() => {
+      // `numFlag` looks a saved default up in the envelope under the FLAG's own
+      // name, and every other fight field is spelled the same in both places.
+      // This one is not - the flag is kebab, the envelope is camelCase like the
+      // rest of its keys - so the saved value is handed in as the fallback
+      // explicitly. Without it `--build` would silently re-run a 35% envelope
+      // at full health and report different numbers for the same file.
+      const pct = numFlag('target-health',
+        typeof env.targetHealth === 'number' ? env.targetHealth * 100 : 100);
+      if (pct > 100) die('--target-health is a percent of the target\'s health, so it cannot exceed 100');
+      return pct / 100;
+    })(),
     // 0 is legal here and means "no lookahead", so it cannot go through numFlag.
     lookahead: (() => {
       if (args.flags.lookahead === true) die('--lookahead needs a value');
@@ -875,7 +898,86 @@ function applyProfile(s, loadout, pins) {
   return pins;
 }
 
+// There is no portable "open this URL", so it is one spawn per platform.
+// Failing to open is not fatal: the address is already on stdout, and a
+// headless or locked-down box simply has nobody to hand it to.
+//
+// ui/server.mjs's standalone block has the same helper and does not export it.
+// Exporting it there deletes this copy.
+function openBrowser(url) {
+  const [cmd, argv] = process.platform === 'win32'
+    ? ['cmd', ['/c', 'start', '', url]]
+    : process.platform === 'darwin'
+      ? ['open', [url]]
+      : ['xdg-open', [url]];
+  try {
+    spawn(cmd, argv, { stdio: 'ignore', detached: true }).unref();
+  } catch {
+    /* no opener on this box - the address is printed */
+  }
+}
+
 const commands = {
+  /**
+   * The same character sheet the packaged desktop app shows, served out of this
+   * process for the browser you already have. Needs Node and your own copy of
+   * Farever and nothing else - no Chromium download, and no unsigned binary to
+   * talk Windows into running - which is also the only way a Linux or macOS
+   * player gets the UI at all.
+   *
+   * ui/server.mjs is imported HERE and nowhere else, dynamically: it pulls in
+   * the icon service, the pak reader and the whole web tree, so a static import
+   * would charge `bench rank` for a UI it never starts, and a copy of the bench
+   * shipped without ui/ would fail before it could run a single command.
+   */
+  async ui(args) {
+    if (args.flags.port === true) die('--port needs a number, or leave it out for any free port');
+    const port = args.flags.port == null ? 0 : Number(args.flags.port);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      die('--port needs a whole number from 0 to 65535 (0, or nothing at all, takes any free one)');
+    }
+    if (args.flags.host === true) die('--host needs an address, e.g. --host 0.0.0.0');
+    const host = typeof args.flags.host === 'string' ? args.flags.host : '127.0.0.1';
+    if (args.flags.game === true) die('--game needs the path to your Farever install');
+
+    // The engine's own answer to "where is Farever", and its own sentence when
+    // there is none: requireGame prints what to do about it and stops, so a
+    // missing install reads as a missing install rather than as a stack out of
+    // the pak reader three imports later. An explicit --game is handed over
+    // rather than left to findGame's default argv, which is this command line
+    // and not the one it expects to parse.
+    const game = requireGame(typeof args.flags.game === 'string' ? ['--game', args.flags.game] : []);
+
+    let startServer;
+    try {
+      ({ startServer } = await import('../ui/server.mjs'));
+    } catch (e) {
+      if (e?.code !== 'ERR_MODULE_NOT_FOUND') throw e;
+      die('ui/ is missing or incomplete in this copy, so there is no UI to serve.\n'
+        + `  ${e.message}\n`
+        + '  Every other command still works. The download that carries the UI is\n'
+        + `  farever-bench-v${VERSION}.zip.`);
+    }
+
+    const benchRoot = fileURLToPath(new URL('..', import.meta.url));
+    const live = await startServer({ benchRoot, host, port, game });
+
+    // A wildcard bind is not an address anyone can open. The loopback one is,
+    // and it is inside the wildcard.
+    const shown = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+    const url = `http://${shown.includes(':') ? `[${shown}]` : shown}:${live.port}/`;
+    console.log(`farever-bench ${VERSION} ui on ${url}`);
+    console.log(f.dim(`  reading ${game}`));
+    // On the BOUND address, not the printed one: a wildcard bind prints as
+    // loopback and is precisely the case worth warning about.
+    if (!['127.0.0.1', '::1', 'localhost'].includes(host)) {
+      console.log(f.warn(`  bound to ${host}, so anything that can reach this machine can read it`));
+    }
+    if (args.flags.open) openBrowser(url);
+    else console.log(f.dim('  (--open launches your browser for you)'));
+    console.log(f.dim('  press Ctrl+C to stop'));
+  },
+
   classes(args) {
     const { engine } = commonSetup(args);
     console.log(f.header(engine, VERSION) + '\n');
@@ -1086,6 +1188,7 @@ const commands = {
         stars: s.stars, rank: s.rank, level: s.level, mix: s.mix,
         rarityRoll: s.rarityRoll,
         fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
+        targetHealth: s.fight.targetHealth,
         lookahead: s.fight.lookahead,
         pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills] },
         build: res.loadout,
@@ -1413,6 +1516,7 @@ const commands = {
       stars: s.stars, rank: s.rank, level: s.level, mix: s.mix,
       rarityRoll: s.rarityRoll,
       fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
+      targetHealth: s.fight.targetHealth,
       lookahead: s.fight.lookahead, restarts,
       main: m.id, mainName: m.name, arsenal: a.id, arsenalName: a.name,
       // The offhand is SEARCHED, not pinned - a one-handed mainhand gets the
@@ -1904,6 +2008,7 @@ const commands = {
         fervorScope: s.engine.opts.assume.fervorScope,
         stars: s.stars, rank: s.rank, level: s.level, mix: s.mix, rarityRoll: s.rarityRoll,
         fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
+        targetHealth: s.fight.targetHealth,
         lookahead: s.fight.lookahead,
         profile: s.profile, profileValues: s.profileValues,
         pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills] },
@@ -2646,6 +2751,8 @@ const commands = {
 
 const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
 
+  bench ui         the character sheet, talent tree, rune page and optimizer in
+                   your own browser, served from this machine only
   bench optimize   fill every unpinned slot and socket with the best combination
   bench rank       rank every item that fits one slot, against your current build
   bench sheet      show the stat sheet a build produces
@@ -2684,6 +2791,21 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
                    optionally one target archetype (--target). --json emits
                    the whole ledger. This is the only command that can report
                    the model wrong without a person deciding that it is.
+
+The UI in your browser
+  The same sheet the packaged desktop app shows, out of this process. It costs
+  no Chromium download and needs no code signature to get past SmartScreen, and
+  it is how a Linux or macOS player gets the UI at all - the packaged build is
+  a Windows binary. Everything is read from your own copy of the game, nothing
+  is sent anywhere, and the server listens on this machine only unless you say
+  otherwise.
+
+  bench ui --open
+
+  --open                  open the default browser once the server is up
+  --port <n>              a fixed port           (default: any free one)
+  --host <h>              bind address    (default 127.0.0.1, this machine only)
+  --game <path>           your Farever install, if it is not auto-detected
 
 Searching a rotation
   What is searched is a POLICY, not a sequence: an ordered list of (skill,
@@ -2748,6 +2870,13 @@ Common flags
   --targets <n>           how many enemies stand in an area  (default 1)
                           Only Area and Aura steps scale with it, and nothing
                           in the data says how many there are - it is an input.
+  --target-health <pct>   what percent of its health the target is standing at
+                          (default 100). Eight script clauses compare the
+                          TARGET's health against a threshold - Execution is
+                          +25% under 35% - and which phase of a fight you are
+                          asking about is an input, not something the tool can
+                          derive. At 100 an execute rider is correctly worth
+                          zero and the output says which ones those were.
   --stars <n|max>         upgrade stars to assume       (default max)
                           Weapons only: the game upgrades weapons, and armour
                           has no upgrade path at all.
@@ -2907,8 +3036,10 @@ async function applyQuestlog(args) {
 async function main(argv) {
   const args = parseArgs(argv);
   const cmd = args._[0];
-  if (!cmd || args.flags.help || args.flags.h) { console.log(USAGE); return; }
+  // Before the usage, so a bare `bench --version` answers the question asked
+  // rather than printing two hundred lines that do not contain the answer.
   if (args.flags.version || args.flags.V) { console.log(VERSION); return; }
+  if (!cmd || args.flags.help || args.flags.h) { console.log(USAGE); return; }
   const fn = commands[cmd];
   if (!fn) die(`unknown command "${cmd}"\n\n${USAGE}`);
   try {

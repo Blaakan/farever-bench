@@ -1,0 +1,163 @@
+/* ---------------------------------------------------------------------------
+   talents.css — talent-tree view extensions.
+   Builds on the .ttree / .trow / .tnode / .tcluster / .torb / .tier-label /
+   .tp-chip kit in style.css; only additions live here.
+--------------------------------------------------------------------------- */
+
+/* row spacing (mock.html carried these as inline styles) */
+.ttree .trow.t1 { margin-top: 26px; }
+.ttree .trow.t2 { margin-top: 20px; }
+.ttree .trow.t3 { margin-top: 24px; }
+.ttree .trow.t4 { margin-top: 26px; }
+
+/* clearance under the absolute top chips */
+.talents-wrap .ttree { padding-top: 10px; }
+.talents-wrap .twarn { margin-top: 50px; }
+
+/* The tree is drawn in a pane that halves when an optimize result shows (both
+   halves do), so the 760px in style.css is a ceiling, not a width. The tier
+   labels hang 46px to the LEFT of every row, so the wrap keeps a gutter for
+   them; below the min-width the clusters would overlap and the pane scrolls
+   instead. Wires are re-measured against the host after any of this moves. */
+.talents-wrap { padding-left: 58px; }
+.ttree { width: 100%; max-width: 760px; min-width: 510px; }
+
+/* Read-only (the optimize result pane): no handlers are bound, so hover is
+   all that is left — and .result-sheet .sheet turns pointer events off for
+   the whole subtree, which would kill the tooltips too. */
+.talents-wrap.readonly { pointer-events: auto; }
+.talents-wrap.readonly .tnode,
+.talents-wrap.readonly .torb { cursor: default; }
+
+/* center the App.icon() tiles inside the round art wells */
+.tnode .art, .torb .art {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* gold ring on a maxed diamond node (.torb.max already exists) */
+.tnode.max .plate {
+  border-color: var(--gold);
+  box-shadow: 0 0 7px rgba(201, 168, 106, .55), 0 2px 5px rgba(70, 45, 20, .25);
+}
+
+/* sigil-granted node: gold SIGIL chip instead of a rank tag, no pointer */
+.tnode.sigil, .torb.sigil { cursor: default; }
+.tnode.sigil .plate { border-color: var(--gold); }
+.tsigil {
+  display: inline-block;
+  background: #4c4238;
+  color: var(--gold-bright);
+  border: 1px solid var(--gold);
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: bold;
+  letter-spacing: .12em;
+  padding: 1px 5px;
+}
+
+/* refusal feedback: quick horizontal shake */
+@keyframes tshake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(3px); }
+}
+.tnode.shake, .torb.shake { animation: tshake .3s ease; }
+
+/* tan Reset button, mirroring the tp-chip top-left */
+.talents-wrap .treset {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 3;
+  background: #b9a58d;
+  padding: 8px 18px;
+  font-size: 14px;
+  box-shadow: 0 2px 0 #97836c, 0 3px 6px rgba(60, 40, 20, .25);
+}
+.talents-wrap .treset:hover { background: #c4b099; }
+.talents-wrap .treset:active { transform: translateY(1px); box-shadow: 0 1px 0 #97836c; }
+
+/* level gate: dim the whole tree, centered explanation chip */
+.talents-wrap.levellocked .ttree {
+  opacity: .45;
+  filter: grayscale(.5);
+  pointer-events: none;
+}
+.tunlock-chip {
+  position: absolute;
+  top: 46%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #4c4238;
+  color: #efe6d8;
+  font-family: Georgia, serif;
+  font-size: 17px;
+  border-radius: 10px;
+  padding: 12px 22px;
+  z-index: 4;
+  box-shadow: 0 4px 14px rgba(20, 10, 5, .4);
+  white-space: nowrap;
+}
+
+/* server-disagreement strip (sheet.talentState.illegal) */
+.twarn {
+  margin: 6px auto 10px;
+  width: 760px;
+  max-width: 100%;
+  background: #7a3428;
+  color: #f5e6d8;
+  border-radius: 8px;
+  font-size: 13px;
+  padding: 8px 12px;
+  box-shadow: 0 2px 6px rgba(60, 20, 10, .3);
+}
+
+/* skeleton diamonds while boot/loadout are still missing */
+.trow.tskel { justify-content: space-around; margin-top: 30px; }
+.tskel-node {
+  width: 62px;
+  height: 62px;
+  margin: 14px 0;
+  border-radius: 8px;
+  transform: rotate(45deg);
+  background: #e2d3bd;
+  animation: tskelpulse 1.2s ease-in-out infinite;
+}
+@keyframes tskelpulse {
+  0%, 100% { opacity: .5; }
+  50% { opacity: 1; }
+}
+
+/* defensive note (class without a tree) */
+.tnote {
+  margin: 60px auto;
+  width: 420px;
+  max-width: 90%;
+  text-align: center;
+  background: var(--parchment-2);
+  border: 1px solid #e0d0ba;
+  border-radius: 10px;
+  padding: 18px;
+  color: var(--ink-soft);
+  font-family: Georgia, serif;
+}
+
+/* gold tooltip title used by talent (and rune) tooltips */
+.tooltip .tname.tgold { color: var(--gold-bright); }
+
+/* the 'bench cannot score this' marker, canonically defined in runes.css —
+   the talent tooltip prints the same dot on its not-modelled line so the
+   symbol means one thing across the whole UI (duplicate rule is harmless) */
+.unmod-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #3a2d20;
+  border: 1px solid #6e5a3f;
+  vertical-align: -1px;
+}

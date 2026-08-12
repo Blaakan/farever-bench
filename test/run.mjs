@@ -3004,17 +3004,30 @@ group('the conduit gauge');
   // the pool above the bound and most spends fire - the live gauge read open
   // at 98.3% of presses. The invariant that survives is that conduits ride
   // SPEND EVENTS, not the GCD: never faster than a couple of seconds.
+  // Measured on the EVENT, not on the hit. `interval` is elapsed/fires and
+  // fires counts every instance, so a conduit slotted twice reads half the
+  // interval while riding exactly the same spends - the two copies fire
+  // together at one `now` (fireConduits, sim.mjs). Multiplying back by the
+  // instance count asks the question the sentence above actually asks.
   ok('...on the spend cadence, not the GCD',
-    lines.every((x) => x.interval > 1.5), lines.map((x) => `${x.id} every ${x.interval.toFixed(1)}s`).join(', '));
+    lines.every((x) => x.interval * (x.instances ?? 1) > 1.5),
+    lines.map((x) => `${x.id} every ${(x.interval * (x.instances ?? 1)).toFixed(1)}s`
+      + ((x.instances ?? 1) > 1 ? ` (x${x.instances})` : '')).join(', '));
 
-  // Conduit: Power stacks to 20 - confirmed in game, +10% MagicMastery when the
-  // pool can feed it - but the gauge fires far too slowly to stand there, so
-  // crediting the cap was the largest overstatement left in the class.
+  // Conduit: Power stacks to 20 - confirmed in game, +10% MagicMastery at the
+  // cap - one stack per conduit trigger, so the cap is a RAMP. Both ends are
+  // measured: a dummy fight reaches twenty and stands there (2026-08-12), the
+  // capture's 15-20s pulls die at 1-4 (2026-08-02). So the invariant is not
+  // "it is refused" - that was the old implementation, and it understated a
+  // long fight by 8% - it is that the credit lands strictly between nothing
+  // and the cap, and moves with the length of the fight.
   const powerBuff = ev2.buffs.find((b) => b.status === 'Mage_Conduit_Power_Status');
   if (powerBuff) {
-    ok('Conduit: Power is not credited at its cap', !(powerBuff.uptime > 0),
-      JSON.stringify({ up: powerBuff.uptime, stacks: powerBuff.stacks }));
-    ok('...and the refusal is named',
+    const ramp = ev2.conduitRamps?.find((r) => r.id === 'Mage_Conduit_Power_Status');
+    ok('Conduit: Power is credited on its ramp, not at its cap',
+      !!ramp && ramp.mean > 0 && ramp.mean < ramp.cap,
+      JSON.stringify(ramp ?? { none: true }));
+    ok('...and the assumption is named',
       ev2.throughput.unmodelled.some((u) => u.id === 'Mage_Conduit_Power_Status'),
       JSON.stringify(ev2.throughput.unmodelled.map((u) => u.id)));
   }
@@ -3416,9 +3429,36 @@ group('a clause refused inside a scored skill is reported');
   // Nor is one behind a rune the build did not slot.
   const m3 = eng.plan.scriptGapsOf('Warrior_Rage_Strike', 3, { runes: new Set() });
   ok('a rune-gated clause is not a gap without the rune', m3.length === 0, JSON.stringify(m3));
-  ok('...and is one with it',
+  // RESTATED, because it stopped measuring what it was written to measure.
+  // It used to read:
+  //
+  //   ok('...and is one with it',
+  //     eng.plan.scriptGapsOf('Warrior_Rage_Strike', 3,
+  //       { runes: new Set(['Warrior_RageStrike_M3']) }).length === 1);
+  //
+  // The intent was "slotting the rune brings its clause into view", and the
+  // count was standing in for that. But the clause it counted was Execution,
+  // and Execution was on the gap list only because its `healthRatio <= 0.35`
+  // was refused. Now that the target's health is stated rather than guessed,
+  // `runeDamage` READS that clause, `scriptGapsOf` dedups it against what is
+  // read, and the count is legitimately 0 - so the old assertion was pinning
+  // a refusal in place and would have failed the moment the refusal was
+  // answered, which is precisely what happened. Asserting `=== 1` again with
+  // some other skill would repeat the mistake.
+  //
+  // What replaces it measures the thing the count was proxying for, on both
+  // sides: the rune's clause is INVISIBLE to the model without the rune and
+  // VISIBLE with it - as a priced rider now rather than as a refusal, which is
+  // a strictly stronger statement than "it appears in the list of things we
+  // could not read".
+  const rdOf = (runes) => (eng.combat.profile('Warrior_Rage_Strike', 3, runes)?.runeDamage ?? []);
+  ok('...and with the rune the clause is READ instead, not listed as a gap',
     eng.plan.scriptGapsOf('Warrior_Rage_Strike', 3,
-      { runes: new Set(['Warrior_RageStrike_M3']) }).length === 1);
+      { runes: new Set(['Warrior_RageStrike_M3']) }).length === 0
+    && rdOf(new Set(['Warrior_RageStrike_M3'])).length === 1,
+    JSON.stringify(rdOf(new Set(['Warrior_RageStrike_M3']))));
+  ok('...and without the rune there is no rider at all',
+    rdOf(new Set()).length === 0, JSON.stringify(rdOf(new Set())));
 }
 
 // --- a refusal names who loses out -------------------------------------------
@@ -4370,6 +4410,125 @@ group('rune vars and duration extension');
     b.extended.to > b.extended.from && Number.isFinite(b.extended.to), JSON.stringify(b.extended));
   ok('...and the uptime follows the extended duration',
     Math.abs(b.uptime - Math.min(1, b.duration / 120)) < 1e-6, `${b.uptime} vs ${b.duration}/120`);
+}
+
+// --- the target's health is stated, not guessed ------------------------------
+// Eight script clauses compare the TARGET's healthRatio against a threshold and
+// all eight were refused, because `healthRatio` sat in UNREAD_COND beside
+// `hasStatus` and `getStatusCount`. It does not belong there: which phase of a
+// fight you are asking about is not live state the tool has to derive, it is an
+// input the player states - the same standing `--targets` has. Six MORE clauses
+// read the OWNER's health and those stay refused, because the fight never
+// models your own health over time.
+group('target health is an input, and the owner\'s is still refused');
+{
+  const eng = createEngine({ quiet: true });
+  const M3 = new Set(['Warrior_RageStrike_M3']);
+
+  // THE TRIPWIRE. If a patch renames the clause or the reader stops matching
+  // it, every assertion below would pass on an empty set and say nothing.
+  const carriers = new Set();
+  for (const row of eng.cdb.lines('skill')) {
+    for (const r of [1, 2, 3]) {
+      const p = eng.combat.profile(row.id, r, new Set((row.mastery ?? []).map((m) => m.id)));
+      if ((p?.runeDamage ?? []).some((rd) => rd.targetHealth)) carriers.add(row.id);
+    }
+  }
+  ok('the sheet still has damage riders gated on the target\'s health',
+    carriers.size > 0, [...carriers].join(', '));
+
+  // ...and NONE of them is one of the six owner-health scripts. Reading
+  // `owner.healthRatio` as the target's would hand a full-health Warrior a
+  // boss's execute bonus.
+  const OWNER = ['Sword_Swarm_Combo', 'DA_Water_Passive', 'Scepter_Flamie_Flamie',
+    'Crimson_Captain_FanaticalFury', 'RobinHoof_Summon', 'InfusedTusk'];
+  ok('an owner-health clause is never read as a target-health one',
+    OWNER.every((id) => !carriers.has(id)), OWNER.filter((id) => carriers.has(id)).join(', '));
+
+  // THE RUNE'S NUMBERS, NOT THE ROW'S. Raging Smash declares damage 0.5 under
+  // threshold 0.2 and Execution replaces BOTH with 0.25 under 0.35 - which is
+  // what its tooltip says, and what `updateSkillInf@20788` does by running
+  // applyVars per slotted mastery on top of the row's own. The old precedence
+  // here was the other way round and would have priced this rune at double its
+  // printed value in a window it does not have. It is the only rider in the
+  // sheet that can tell the two orders apart.
+  const rd = eng.combat.profile('Warrior_Rage_Strike', 3, M3).runeDamage[0];
+  ok('Execution is read at the RUNE\'s magnitude', rd.amount === 0.25, String(rd.amount));
+  ok('...and at the RUNE\'s threshold', rd.targetHealth?.threshold === 0.35,
+    JSON.stringify(rd.targetHealth));
+  ok('...as a `<=` comparison, which is what the script writes',
+    rd.targetHealth?.op === '<=', rd.targetHealth?.op);
+
+  // The comparison is answered EXACTLY against the stated number. In a stated
+  // model `<` and `<=` can differ only at the boundary itself, so the boundary
+  // is where it is checked.
+  const t = eng.combat.foe('dummy', 25);
+  const sheet = new Map([['Strength', 100], ['CritDamage', 100], ['DamageModifier', 100]]);
+  const NO_MODS = { critDamageByType: null, critChanceByType: null, damageByAffinity: null,
+    armorIgnore: null, bleed: null };
+  const at = (health, runes) => {
+    const o = eng.combat.castOutput(eng.combat.profile('Warrior_Rage_Strike', 3, runes), sheet, t,
+      { targets: 1, assume: eng.opts.assume, attackerLevel: 25, targetHealth: health },
+      undefined, NO_MODS);
+    return o.critRoll ? o.critRoll.fixed + o.critRoll.base : o.damage;
+  };
+  const full = at(1, M3);
+  near('at 35% health the rider is worth exactly its printed 25%', at(0.35, M3) / full, 1.25, 1e-9);
+  ok('at the boundary itself `<=` fires', at(0.35, M3) > full, `${at(0.35, M3)} vs ${full}`);
+  ok('...and one point above it does not', at(0.36, M3) === full, `${at(0.36, M3)} vs ${full}`);
+  ok('...nor does anything below change again - it is a step, not a ramp',
+    at(0.01, M3) === at(0.35, M3), `${at(0.01, M3)} vs ${at(0.35, M3)}`);
+  // FULL HEALTH IS NOT A BUG. An execute clause off at 100% is the right answer
+  // for the fight that was described, and the default describes a fight that
+  // never enters the window.
+  ok('at full health the execute rider is simply off', at(1, M3) === at(1, new Set()),
+    `${at(1, M3)} vs ${at(1, new Set())}`);
+  ok('and without the rune the health changes nothing at all',
+    at(0.35, new Set()) === at(1, new Set()), `${at(0.35, new Set())} vs ${at(1, new Set())}`);
+
+  // CACHES. `profile()` and `runeDamage` are memoised for the life of the
+  // process on skill+rank+runes, so they bank the COMPARISON and never its
+  // answer; every cache that could bank an answer - cast pricing, the pool
+  // factor, restat - is built inside one evaluation and dies with it. The proof
+  // is a round trip on ONE engine: if any of them had frozen the first verdict,
+  // the third number here would equal the second.
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: 'Epic', stars: 4, level: 25 };
+  eng.plan.pruneSelection(l);
+  l.runes = { ...(l.runes ?? {}), Warrior_Rage_Strike: ['Warrior_RageStrike_M3'] };
+  const boss = eng.combat.foe('boss', 25);
+  const dpsAt = (h) => eng.evaluate(l, { target: boss, rank: 3, targetHealth: h }).throughput.dps;
+  const d100a = dpsAt(1);
+  const d35 = dpsAt(0.35);
+  const d100b = dpsAt(1);
+  ok('a stated health of 35 beats one of 100 on the same engine', d35 > d100a, `${d35} vs ${d100a}`);
+  ok('...and 100 comes back to its own number afterwards', d100b === d100a, `${d100b} vs ${d100a}`);
+
+  // THE AUDIT EARNS ITS KEEP IN BOTH DIRECTIONS. A rider that is read and
+  // correctly zero leaves no trace anywhere else - the skill is scored, and the
+  // gap list drops the clause precisely because the reader DOES read it - so a
+  // player would see Execution buy nothing and conclude the rune is bad.
+  const offRow = (h) => (eng.evaluate(l, { target: boss, rank: 3, targetHealth: h })
+    .throughput.unmodelled ?? []).find((u) => u.kind === 'off at this target health'
+      && u.id === 'Warrior_Rage_Strike');
+  ok('at full health the report names the rider that switched off', !!offRow(1),
+    JSON.stringify(offRow(1) ?? null));
+  ok('...and says which health would price it', /--target-health 35/.test(offRow(1)?.why ?? ''),
+    offRow(1)?.why);
+  ok('...and says it is READ rather than refused', /READ and worth zero/.test(offRow(1)?.why ?? ''),
+    offRow(1)?.why);
+  ok('once the health is stated the report goes quiet', !offRow(0.35),
+    JSON.stringify(offRow(0.35) ?? null));
+  ok('...and the audit states the health every clause was priced at',
+    createEngine({ quiet: true, fight: { targetHealth: 0.35 } }).audit
+      .some((a) => /target stands at 35% health/.test(a.what)));
+
+  // A ratio, never a percent, and never a dead target.
+  for (const bad of [0, -0.5, 35, 1.0001]) {
+    let threw = false;
+    try { createEngine({ quiet: true, fight: { targetHealth: bad } }); } catch { threw = true; }
+    ok(`targetHealth ${bad} is refused at construction`, threw);
+  }
 }
 
 // --- questlog import -------------------------------------------------------

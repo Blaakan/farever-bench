@@ -1,0 +1,261 @@
+/* ---------------------------------------------------------------------------
+   css/optimize.css - the optimize flow's own chrome.
+
+   The structural classes (.split-host, .result-sheet, .ribbon, .progress-card,
+   .plog, .dmg-*) live in style.css; this file only adds what the flow itself
+   introduces: spinner, indeterminate bar, toolbar, the result pane's own tab
+   strip, expander, unmodelled fold, fallback listings. Everything new is opt-
+   prefixed to stay out of the other components' namespaces.
+
+   The result pane is half the window, so every rule here has to survive at
+   ~500px: the tab strip wraps, the tab body scrolls sideways on its own
+   (rather than the whole pane), and the meter's numeric columns are fixed
+   width with only the name column allowed to shrink.
+
+   NOTE: nothing here may set pointer-events on the result sheet. The pane is
+   read-only because its renderers bind no mutation handlers (backed by a
+   capture-phase click swallow in optimize.js) - hovering must keep working so
+   tooltips and the More-stats toggle stay alive.
+   --------------------------------------------------------------------------- */
+
+.opt-progress-host { margin: 0 16px; }
+.opt-result-host { margin: 0 16px 16px; padding-top: 10px; min-width: 0; }
+
+/* the ribboned wrapper hosts the sheet; the sheet's own 16px side margins
+   would double up inside the already-margined result host */
+.opt-result-host .sheet { margin: 0; }
+
+/* ---------------------------------------------------------- progress card */
+
+.opt-prog-top { display: flex; align-items: center; gap: 10px; }
+
+.opt-title { font-family: Georgia, serif; font-size: 16px; color: var(--ink); }
+
+.opt-stats { margin-left: auto; color: var(--ink-soft); font-size: 13px; }
+.opt-stats .opt-evals { font-weight: bold; color: var(--ink); }
+
+.opt-spinner {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #d3bfa4;
+  border-top-color: var(--red);
+  border-radius: 50%;
+  animation: opt-spin .8s linear infinite;
+}
+@keyframes opt-spin { to { transform: rotate(360deg); } }
+
+.opt-bar {
+  position: relative;
+  height: 4px;
+  margin: 12px 0 0;
+  border-radius: 2px;
+  background: #e0d0ba;
+  overflow: hidden;
+}
+.opt-bar-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 30%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #d98b62, #c96a4b);
+  animation: opt-slide 1.2s ease-in-out infinite;
+}
+@keyframes opt-slide {
+  from { left: -30%; }
+  to   { left: 100%; }
+}
+
+.progress-card .plog { margin-top: 10px; }
+.progress-card .plog:empty { display: none; }
+
+/* error card */
+.progress-card.opt-error { border-color: #d98b7a; }
+.opt-error-msg { color: var(--red-dark); font-size: 14px; margin-bottom: 10px; }
+.opt-btnrow { display: flex; gap: 8px; }
+
+/* ----------------------------------------------------------------- toolbar */
+
+.opt-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+.opt-toolbar .opt-close { margin-left: auto; }
+
+/* style.css only styles .btn-tan inside .pconf; the toolbar and the error
+   card need the same tan button standalone */
+.opt-toolbar .btn-tan,
+.opt-btnrow .btn-tan {
+  background: linear-gradient(180deg, #c7b298, #b9a58d 55%, #a8927a);
+  box-shadow: 0 2px 0 #8f7c66, 0 2px 5px rgba(60,40,20,.25);
+  padding: 8px 16px;
+  font-size: 14px;
+}
+.opt-toolbar .btn-tan:active,
+.opt-btnrow .btn-tan:active { transform: translateY(1px); box-shadow: 0 1px 0 #8f7c66; }
+
+/* -------------------------------------------------- result-pane tab strip */
+
+/* Same shape as the main .tabs but a size down and tinted, so it reads as
+   belonging to the result rather than competing with the page's own tabs.
+   The -1px bottom margin lets the active tab sit on the sheet's border. */
+.opt-tabs {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 4px;
+  margin: 0 0 -1px;
+}
+.opt-tab {
+  font-family: Georgia, serif;
+  font-size: 13px;
+  color: var(--ink-soft);
+  background: #e0cfb8;
+  border: 1px solid #d3c1aa;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  padding: 5px 15px 4px;
+  cursor: pointer;
+}
+.opt-tab:hover { background: #e8dac6; color: var(--ink); }
+.opt-tab.active {
+  /* .result-sheet .sheet is parchment-2, so the active tab blends into it */
+  background: var(--parchment-2);
+  color: var(--ink);
+  font-weight: bold;
+  box-shadow: 0 -2px 4px rgba(90,60,30,.08);
+}
+
+/* The second half of the frozen-copy cue (the 'Optimized' ribbon is the
+   first). It trails the tabs rather than sitting flush right: the ribbon
+   overhangs the strip's right end by design and would clip it there. */
+.opt-ro-chip {
+  margin-left: 10px;
+  align-self: center;
+  padding: 2px 10px 3px;
+  font-size: 11px;
+  letter-spacing: .05em;
+  color: var(--ink-soft);
+  background: #e8dac6;
+  border: 1px dashed #c9b493;
+  border-radius: 999px;
+  cursor: help;
+}
+
+/* The tab body scrolls sideways on its own so the toolbar, the tab strip and
+   the meter stay put when a wide page (the 760px talent tree) is on show. */
+.opt-tabbody { overflow-x: auto; }
+.opt-tabbody.tab-talents .sheet { min-width: fit-content; }
+
+/* Frozen copy: hover feedback stays (it advertises the tooltips) but nothing
+   here answers a click, so nothing should wear a pointer cursor. */
+.opt-tabbody .slot,
+.opt-tabbody .skilltile,
+.opt-tabbody .skillorb,
+.opt-tabbody .sockbtn,
+.opt-tabbody .runechoice,
+.opt-tabbody .tnode,
+.opt-tabbody .torb,
+/* ...except the pane's own control, which optimize.js re-binds */
+.opt-tabbody .opt-allow { cursor: pointer; }
+
+/* ------------------------------------------------------------ damage meter */
+
+.opt-below { margin-top: 12px; }
+
+/* App.icon() renders a div.ico, not the img.icon style.css anticipated */
+.dmgrow .ico {
+  margin-left: 4px;
+  border-radius: 5px;
+  border: 1px solid #00000040;
+}
+.dmgrow .dnum.hits { width: 44px; }
+
+/* half-width survival: the numeric columns keep their width and their digits
+   line up; only the skill name gives ground, and it ellipses instead of
+   pushing the row past the pane */
+.opt-below .dmg-head { flex-wrap: wrap; gap: 0 10px; font-size: 15px; }
+.opt-below .dmgrow .dname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-below .dmgrow .dnum {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.opt-expander {
+  display: block;
+  width: 100%;
+  margin-top: 2px;
+  padding: 5px 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+  text-align: center;
+  background: #e8dac6;
+  border: 1px dashed #c9b493;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.opt-expander:hover { background: #e2cba9; color: var(--ink); }
+
+/* ------------------------------------------------------- unmodelled fold */
+
+.opt-unmodelled {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.opt-unmodelled summary { cursor: pointer; }
+.opt-unmodelled ul { margin: 6px 0 0 18px; padding: 0; }
+.opt-unmodelled li { margin: 2px 0; }
+
+/* ------------------------------- fallbacks (a renderer missing or throwing) */
+
+.opt-fallback {
+  padding: 16px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+/* plain talent/rune listing: readable, hoverable, obviously not the real page */
+.opt-listing { padding: 14px 16px 16px; }
+.opt-listing .ornhead { font-size: 18px; }
+.opt-note {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--ink-soft);
+  margin: 6px 0 10px;
+}
+.opt-lrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: var(--parchment-3);
+  margin-bottom: 5px;
+}
+.opt-lrow .ico { border-radius: 6px; border: 1px solid #00000030; }
+.opt-lmid { flex: 1; min-width: 0; }
+.opt-lname {
+  font-family: Georgia, serif;
+  font-size: 14px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-lsub { font-size: 11px; color: var(--ink-soft); }
+.opt-lsub.empty { font-style: italic; opacity: .75; }
+.opt-lrank {
+  flex: none;
+  font-size: 12px;
+  font-weight: bold;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}

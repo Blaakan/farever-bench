@@ -1,0 +1,234 @@
+/* ---------------------------------------------------------------------------
+   sheet.css - additions for components/sheet.js + components/picker.js on
+   top of style.css. Only rules style.css lacks; nothing is duplicated.
+--------------------------------------------------------------------------- */
+
+/* ------------------------------------------- status strips above the sheet */
+
+.strip {
+  border-radius: 8px;
+  padding: 8px 14px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-family: Georgia, serif;
+}
+.strip.computing {
+  color: var(--ink-soft);
+  font-style: italic;
+  border: 1px solid #e0d0ba;
+  background: linear-gradient(100deg,
+    var(--parchment-2) 35%, #fdf6ea 50%, var(--parchment-2) 65%);
+  background-size: 200% 100%;
+  animation: sheet-shimmer 1.3s linear infinite;
+}
+.strip.illegal {
+  background: #f2e0bf;
+  border: 1px solid #c99a4b;
+  color: #7a4a12;
+}
+@keyframes sheet-shimmer {
+  from { background-position: 130% 0; }
+  to   { background-position: -30% 0; }
+}
+
+/* placeholder stat bars while the first sheet computes */
+.statrow.shimmer {
+  box-shadow: none;
+  animation: stat-pulse 1.1s ease-in-out infinite;
+}
+.statrow.shimmer .val { min-width: 86px; }
+@keyframes stat-pulse {
+  0%, 100% { opacity: .3; }
+  50%      { opacity: .55; }
+}
+
+.morebtn-row { margin-top: 26px; }
+
+/* ----------------------------------------------------------- slot tiles */
+
+/* App.icon() emits a fixed-px .ico, so the mock's .slot .ph sizing cannot
+   apply to it - ghost the empty-slot glyph via a class instead. */
+.slot .ico { pointer-events: none; }
+.slot .ico.ghost { opacity: .35; filter: grayscale(1) brightness(1.6); }
+.slot.forbid { cursor: default; filter: saturate(.5) brightness(.94); }
+
+/* small weapon-card tiles (the mock used inline sizes) */
+.slot.slot-sm { width: 64px; height: 64px; border-radius: 11px; }
+
+/* the class watermark is a real icon element, not a mock circle */
+.doll .watermark .ico { border-radius: 0; }
+
+/* -------------------------------------------------- weapon skill pickers */
+
+.skilltile .ico, .skillorb .ico { pointer-events: none; }
+.skilltile.passive { cursor: default; }
+.skilltile.passive .badge { background: #254d2b; color: #cfe8c2; }
+.skilltile .badge.cnt { color: var(--gold-bright); }
+
+/* ------------------------------------------- augment sockets under cards */
+
+.sockrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.sockbtn {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  flex: none;
+  border: 2px solid #6e5a3f;
+  background: #241c12;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.55);
+}
+.sockbtn:hover { border-color: var(--gold-bright); }
+.sockbtn.filled { border-color: var(--gold); }
+.sockbtn .plus {
+  color: #7a6650;
+  font-size: 17px;
+  line-height: 1;
+  pointer-events: none;
+}
+.sockbtn .ico { pointer-events: none; border-radius: 50%; }
+
+/* ----------------------------------------------------- class-skill bar */
+
+.classbar { display: flex; flex-direction: column; gap: 8px; }
+.cpool {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cpool .plabel {
+  width: 112px;
+  flex: none;
+  font-family: Georgia, serif;
+  font-size: 13px;
+  color: var(--ink-soft);
+  line-height: 1.25;
+}
+.cpool .plabel .pcount {
+  color: var(--ink);
+  font-weight: bold;
+  margin-left: 5px;
+}
+
+/* ------------------------------------------------------- picker additions */
+
+.picker .pbody.single { grid-template-columns: 1fr; }
+
+.pitem .pmid { min-width: 0; }
+.pitem .pnote { font-size: 11px; color: #8a6d2f; font-style: italic; }
+.pitem.action .pname { font-style: italic; color: var(--ink-soft); }
+.pitem .pin-ico {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: var(--ink-soft);
+  border: 1px dashed #cdb897;
+  border-radius: 8px;
+}
+.pitem .pgives { color: var(--ink); }
+.pitem .pacq {
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pconf .hint {
+  font-size: 11px;
+  color: var(--ink-soft);
+  font-style: italic;
+  margin: 6px 0;
+}
+.pconf .btn-red { padding: 8px 18px; font-size: 14px; }
+
+/* inline live preview reuses the tooltip card, un-floated */
+.pconf .preview { margin-top: 14px; }
+.pconf .preview .tooltip {
+  position: static;
+  max-width: none;
+  pointer-events: auto;
+  box-shadow: none;
+}
+
+/* armour-socket pip overlaid on a doll tile (weapon cards use .sockrow rows) */
+.slot .sock-overlay {
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  margin: 0;
+  gap: 2px;
+  z-index: 2;
+}
+.slot .sock-overlay .sockbtn {
+  width: 26px;
+  height: 26px;
+  box-shadow: 0 1px 3px rgba(30,20,10,.45);
+}
+
+.slot .unknown-item {
+  font-family: Georgia, serif;
+  font-size: 26px;
+  color: #d7ecef;
+  opacity: .6;
+}
+
+/* Weapon upgrade rider (3★+) and the rank ladder, inside tooltips. */
+.tooltip .tupgrade-h {
+  color: var(--gold-bright);
+  font-family: Georgia, serif;
+  margin-top: 2px;
+}
+.tooltip .tupgrade { color: #d8c9ad; }
+.tooltip .trank {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  margin-top: 3px;
+}
+.tooltip .trank-n {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #55432e;
+  color: var(--gold-bright);
+  font-size: 11px;
+  font-weight: bold;
+  text-align: center;
+  line-height: 17px;
+}
+.tooltip .trank-d { color: #cbbfa8; }
+.tooltip .trank.off { opacity: .45; }
+.tooltip .trank.off .trank-n { background: #3a2f22; color: #9c8f78; }
+
+/* A passive that is one of a pool's picks: badged like the granted kind, but
+   it dims and lights with selection because taking it costs a slot. */
+.skilltile .badge.pas,
+.skillorb .badge.pas {
+  background: #254d2b;
+  color: #cfe8c2;
+}
+.skillorb .badge.pas {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  font-size: 9px;
+  line-height: 1.35;
+  padding: 0 3px;
+  border-radius: 3px;
+  z-index: 2;
+}

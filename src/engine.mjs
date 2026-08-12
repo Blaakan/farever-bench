@@ -79,11 +79,41 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // authored APL; anything above 0 lets a setup cast win on what it makes the
     // NEXT few seconds worth.
     lookahead: fight.lookahead ?? 0,
+    // The fraction of its health the target is standing at, for the eight
+    // script clauses that ask. It is an INPUT and never a derived number - the
+    // same standing `--targets` has, and for the same reason: nothing in the
+    // data says which phase of a fight you are describing, and the honest
+    // answer is to be told rather than to average over a kill nobody specified.
+    //
+    // It lives BOTH here and on `evaluateOnce`, exactly as `fight` does. The
+    // per-evaluation argument is the real parameter - the UI serves many health
+    // values off one engine - and this is its default, so a call site that does
+    // not mention it inherits what the run was asked for instead of silently
+    // falling back to full health. bench has ~20 evaluate/optimize call sites
+    // and threading a value through every one of them is how a parameter comes
+    // to do nothing on the nineteenth.
+    targetHealth: fight.targetHealth ?? 1,
     seed: fight.seed ?? 0x9e3779b9,
   };
   if (!FERVOR_SCOPES.includes(opts.assume.fervorScope)) {
     throw new Error(`fervorScope must be one of ${FERVOR_SCOPES.join(', ')}`);
   }
+  // A ratio, not a percentage, and never zero: `healthRatio` is what the
+  // scripts read and a target at 0 is one that is already dead. Checked at
+  // BOTH boundaries - construction and every evaluation - because the two take
+  // it from different places: the CLI validates its own flag before building
+  // an engine, while /api/sheet hands a per-call value straight out of request
+  // JSON. Unchecked there, the CLI's own units (`--target-health 35`) sent as
+  // a fraction read as 35, every execute clause silently missed, and a
+  // full-health answer came back with no error at all.
+  const checkTargetHealth = (v) => {
+    if (!(v > 0 && v <= 1)) {
+      throw new Error(`targetHealth must be a fraction in (0, 1], got ${v}`
+        + (v > 1 && v <= 100 ? ` - that looks like a percentage; ${v / 100} is ${v}%` : ''));
+    }
+    return v;
+  };
+  checkTargetHealth(opts.targetHealth);
 
   const baseCache = new Map();
   const baseStatsFor = (unit, level) => {
@@ -135,7 +165,8 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
   }
 
   /** Full evaluation: stat sheet, throughput, survivability, rotation lines. */
-  function evaluate(loadout, { target, rank = 1, mix = 0.5, policy = null, goal = 'dps', fight = null, chainFeeds = null } = {}) {
+  function evaluateOnce(loadout, { target, rank = 1, mix = 0.5, policy = null, goal = 'dps', fight = null, chainFeeds = null, conduitStacks = null, targetHealth = opts.targetHealth } = {}) {
+    checkTargetHealth(targetHealth);
     const cls = classOf(cat, loadout);
     const tgt = target ?? combat.foe('reference', loadout.level);
     const weaponPower = combat.weaponPowerFor(cat, loadout, cls);
@@ -172,6 +203,13 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       // per-minute columns are commensurable with the recorded ones.
       ...(fight > 0 ? { fight } : {}),
       ...(chainFeeds ? { chainFeeds } : {}),
+      // Overrides the engine's default for THIS evaluation. Every cache between
+      // the guard and the damage number was checked against this: the rotation
+      // is structure and cannot see it, `profile()` and `runeDamage` bank the
+      // COMPARISON rather than its answer (see damage.mjs), and `castCache`,
+      // `factorCache` and `restatCache` are all built inside one evaluation and
+      // die with it. So this is the only place the number has to arrive.
+      targetHealth,
       attackerLevel: loadout.level,
       swingAttrs: mainItem
         ? mainItem.aptitudes.map((a) => combat.primaryAtbFor({ aptitude: a })).filter(Boolean)
@@ -747,6 +785,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     };
     const timed = [];
     const conduitBuffGaps = [];
+    const conduitRamps = [];
     // The two rows that must keep folding in permanent at the cap. Named by id
     // rather than by shape, because every shape-based gate catches something
     // else: "chance < 1" also catches Staff_SummonDemon's rank-3 buff and "is a
@@ -820,25 +859,44 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         for (const a of b.affixes) applyAffix(a, b.stacks, b.uptime);
         continue;
       }
-      // A buff applied ONCE PER CONDUIT TRIGGER follows the conduit economy.
-      // When this refusal was written the model's stream fired every ~28s
-      // against the 15-second buff - under one stack on average, and
-      // crediting the 20-stack cap (+10 MagicMastery) was the largest
-      // overstatement left in the Mage. The economy was the error: with the
-      // chain consuming free volleys and the gauge open at ~98% of spends,
-      // the live stream fires every ~2s, the status_on logs ONCE and stays
-      // refreshed - the cap is STOOD AT, not visited. Both regimes were
-      // measured in game (2026-08-02: starved it stacked to 5 and stopped;
-      // fed it reached 20), so the credit follows the regime: a build that
-      // sustains a chain stands at cap and is priced there (the ~40s ramp
-      // from a cold start is the audit's stated assumption); a chainless
-      // build keeps the refusal, named.
+      // A buff applied ONCE PER CONDUIT TRIGGER follows the conduit economy,
+      // and the cap is a RAMP rather than a state: one stack per trigger, so
+      // reaching 20 takes 20 triggers of uninterrupted fighting. Both ends are
+      // measured - a dummy fight reaches the full twenty and stands there
+      // (2026-08-12), while the capture's real 15-20s pulls die at 1-4 stacks
+      // (2026-08-02, three windows, peaks 2/1/4). Neither the old refusal (0)
+      // nor crediting the cap outright describes that; the mean over the fight
+      // does, and `conduitStacks` carries it - measured on a first pass by
+      // `evaluate`, because only the fight knows how often this build spends
+      // Spark from above the gauge.
       if (dur > 0 && !(cd > 0) && b.trigger?.hook === 'onStartConduit') {
         const chained = (evalOpts.empowerments ?? []).some((e2) => e2.chainSpend);
-        if (!chained) {
+        const mean = chained ? null : (conduitStacks?.get(b.status) ?? null);
+        if (!chained && mean == null) {
+          // First pass, or a build whose conduits never fire: refuse, and tell
+          // the wrapper there is a ramp here worth measuring.
           b.timed = false;
           b.uptime = 0;
           conduitBuffGaps.push({ id: b.status, from: b.from, stacks: b.stacks, duration: dur });
+          continue;
+        }
+        if (!chained) {
+          // Priced at the fight's own mean. The affix is FLAT MagicMastery and
+          // damage is linear in it - it sits inside the additive (1 + fervor +
+          // mastery) bracket - so a fight played at a rising stack count and a
+          // fight played at the mean deal the same total, exactly, as long as
+          // damage is spread evenly over the clock. It is not perfectly even
+          // (cooldowns land early, when the ramp is still low), so this reads
+          // slightly HIGH on a build that front-loads; the residual is bounded
+          // by the ramp's share of the fight and is named in the audit.
+          // Deliberately not written to `b.stacks`: the rotation - and these
+          // buff objects with it - is cached across evaluations, so the scale
+          // stays local to this fold.
+          b.timed = false;
+          b.uptime = 1;
+          mods.damageByAffinity.all = (mods.damageByAffinity.all ?? 0) + scriptDmgMult(b, 1);
+          for (const a of b.affixes) if (!isScriptDmgMult(a)) applyAffix(a, mean, 1);
+          conduitRamps.push({ id: b.status, from: b.from, cap: b.stacks, mean, duration: dur });
           continue;
         }
         // falls through: permanent at cap, like the live stream says.
@@ -993,15 +1051,33 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
         source: g.slot,
         why: `the effect ${g.stars} upgrade star${g.stars === 1 ? '' : 's'} unlock is a script proc, not an affix`,
       })),
+      // Priced, not refused - but a mean is still an assumption, so it is
+      // stated rather than left to be discovered.
+      ...conduitRamps.map((g) => ({
+        id: g.id,
+        source: 'conduit',
+        kind: 'assumption',
+        why: `it stacks to ${g.cap} over ${g.duration}s, one stack per conduit trigger, so the cap `
+          + 'is a ramp rather than a state. Priced at this fight\'s own mean of '
+          + `${g.mean.toFixed(1)} of ${g.cap} stacks, measured from the trigger cadence the fight `
+          + 'reports. Both ends are checked in game: a dummy fight reaches the full twenty and '
+          + 'stands there, the capture\'s 15-20s pulls die at 1-4. The mean is exact for a flat '
+          + 'affix as long as damage is spread evenly over the clock; a build that front-loads its '
+          + 'cooldowns spends its opening at a lower stack count than this, so on those it reads '
+          + 'slightly high',
+      })),
       ...conduitBuffGaps.map((g) => ({
         id: g.id,
         source: 'conduit',
         kind: 'no rate',
-        why: `it stacks to ${g.stacks} over ${g.duration}s, one stack per conduit trigger - and the `
-          + 'gauge fires roughly once every 28 seconds against that window, so standing at the cap is '
-          + 'not a thing a fight does. Measured in game both ways: starved of Spark it stacked to '
-          + 'exactly five and stopped, fed Spark it reached the full twenty. Pricing the mean needs '
-          + 'the stack counter on the affix side, so it is refused rather than kept at the cap',
+        why: `it stacks to ${g.stacks} over ${g.duration}s, one stack per conduit trigger - so the `
+          + 'cap is a RAMP, not a state: conduits fire about every 2.6s (the fight\'s own rate, and '
+          + `the capture's refresh gaps agree), which is ~${Math.round(g.stacks * 2.6)}s of `
+          + 'uninterrupted fighting to reach the cap. Both ends were measured in game: a dummy fight '
+          + 'reaches the full twenty and stands at it, while the capture\'s real pulls (15-20s) die '
+          + 'at 1-4 stacks. Pricing the mean needs the stack counter on the affix side, so it is '
+          + 'refused rather than guessed - which UNDERSTATES a long fight, the opposite of the old '
+          + 'cap-crediting error',
       })),
       ...talentDepGaps.map((g) => ({
         id: g.from,
@@ -1031,9 +1107,92 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
             + `${g.field} ${g.amount} behind \`${g.guard}\`, which this reader cannot answer`,
         });
       }
+      // A RIDER THAT IS READ AND SWITCHED OFF BY THE STATED HEALTH. This one is
+      // correctly worth zero, so it is not a gap - and that is exactly why it
+      // needs saying. Every other channel goes quiet on it: the skill is
+      // scored, the gap list above dedups the clause because the reader DOES
+      // read it, and the rune table reports what the rune promises. Left
+      // silent, a player slots Execution, sees it buy nothing at the default
+      // full health, and concludes the rune is bad - when what happened is
+      // that they never told the tool about the execute phase.
+      //
+      // The other direction needs no line here: a rider that FIRED is inside
+      // the number, and the audit says which health every clause was priced at.
+      for (const rd of combat.profile(e.prof.id, rank, new Set(rot.runes ?? []))?.runeDamage ?? []) {
+        const th = rd.targetHealth;
+        if (!th) continue;
+        const on = th.op === '<=' ? targetHealth <= th.threshold
+          : th.op === '<' ? targetHealth < th.threshold
+            : th.op === '>=' ? targetHealth >= th.threshold : targetHealth > th.threshold;
+        if (on) continue;
+        extraGaps.push({
+          id: e.prof.id, name: e.prof.name, source: 'script', kind: 'off at this target health',
+          why: `${e.prof.name} is scored, and one clause of its script is READ and worth zero here: `
+            + `${rd.field} +${rd.amount} while the target is ${th.op} `
+            + `${+(th.threshold * 100).toFixed(2)}% health${rd.rune ? `, from the rune you slotted` : ''}. `
+            + `You stated ${+(targetHealth * 100).toFixed(2)}%, so it never fires - `
+            + `--target-health ${+(th.threshold * 100).toFixed(2)} prices the window it is for`,
+        });
+      }
     }
     if (extraGaps.length) tp.unmodelled = [...tp.unmodelled, ...extraGaps];
-    return { ...r, target: tgt, weaponPower, profile, rotation: rot, buffs, throughput: tp, survivability: sv };
+    return {
+      ...r, target: tgt, weaponPower, profile, rotation: rot, buffs,
+      throughput: tp, survivability: sv,
+      // What the wrapper needs to close the ramp loop, and what a reader needs
+      // to see that it was closed: `pending` is "there is a stacking conduit
+      // buff here that nobody has priced yet", `conduitRamps` is what it was
+      // finally priced at.
+      conduitPending: conduitBuffGaps, conduitRamps,
+    };
+  }
+
+  // The mean stack count of a once-per-trigger buff over a fight of `T`
+  // seconds. It climbs one stack per trigger to `cap` and then holds, so the
+  // time-average is the area under that curve: half the cap while ramping,
+  // then the cap. If the gap between triggers is longer than the buff itself
+  // it never accumulates at all - it is up at one stack for dur/cadence of the
+  // time and down the rest.
+  function rampMeanStacks(cap, cadence, dur, T) {
+    if (!(cadence > 0) || !(T > 0) || !(cap > 0)) return 0;
+    if (cadence >= dur) return Math.min(1, dur / cadence);
+    const toCap = cap * cadence;                       // seconds to reach it
+    return T <= toCap ? T / (2 * cadence) : cap * (1 - toCap / (2 * T));
+  }
+
+  /**
+   * Two passes, and only when the build has one of these buffs.
+   *
+   * A conduit buff's stack count is driven by how often THIS build spends
+   * Spark from above the gauge, which is a thing only the fight knows - so the
+   * first pass measures the trigger cadence with the buff refused, and the
+   * second prices it at the mean that cadence implies. The measurement is not
+   * circular: the buff grants MagicMastery, which changes damage but changes
+   * neither Spark income nor the spend schedule, so the cadence the first pass
+   * reports is the cadence the second pass runs at.
+   */
+  function evaluate(loadout, args = {}) {
+    const first = evaluateOnce(loadout, args);
+    if (!first.conduitPending?.length || args.conduitStacks) return first;
+
+    // The cadence of the TRIGGER EVENT, not of the hits: every instance of a
+    // repeated conduit fires at one `now`, so a doubled conduit reports half
+    // the interval while riding the same spends.
+    const ids = new Set((first.rotation?.triggered ?? [])
+      .filter((t) => t.rule?.kind === 'per-conduit-trigger')
+      .map((t) => t.prof?.id));
+    let cadence = Infinity;
+    for (const line of first.throughput?.lines ?? []) {
+      if (!ids.has(line.id)) continue;
+      const c = line.interval * (line.instances ?? 1);
+      if (c > 0 && c < cadence) cadence = c;
+    }
+    if (!Number.isFinite(cadence)) return first;      // nothing ever fired
+
+    const T = first.throughput?.fight ?? args.fight ?? opts.fight;
+    const stacks = new Map(first.conduitPending.map((g) =>
+      [g.id, rampMeanStacks(g.stacks, cadence, g.duration, T)]));
+    return evaluateOnce(loadout, { ...args, conduitStacks: stacks });
   }
 
   /**
@@ -1044,7 +1203,12 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
    * ehp=0.25" means what it looks like instead of being swamped by whichever
    * metric happens to have the larger units.
    */
-  function makeScorer({ goal = 'dps', weights = null, target, rank = 1, mix = 0.5, ref = null }) {
+  // `targetHealth` rides the scorer for the same reason `rank` does: what the
+  // search is allowed to pick depends on it. At full health Execution is a
+  // rune that adds nothing and the search should not pay a socket for it.
+  function makeScorer({ goal = 'dps', weights = null, target, rank = 1, mix = 0.5, ref = null,
+    targetHealth = opts.targetHealth }) {
+    checkTargetHealth(targetHealth);
     const metrics = (ev) => ({
       dps: ev.throughput.dps,
       hps: ev.throughput.hps,
@@ -1055,7 +1219,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     if (!w && goal !== 'mixed') {
       return {
         metrics,
-        score: (loadout) => metrics(evaluate(loadout, { target, rank, mix, goal }))[goal] ?? 0,
+        score: (loadout) => metrics(evaluate(loadout, { target, rank, mix, goal, targetHealth }))[goal] ?? 0,
         scoreFrom: (ev) => metrics(ev)[goal] ?? 0,
       };
     }
@@ -1073,7 +1237,7 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       metrics,
       // A blend cannot hand the fight a single objective, so the fight keeps
       // its everything-counts criterion for these - see sim.mjs `goalWeights`.
-      score: (loadout) => norm(metrics(evaluate(loadout, { target, rank, mix, goal: 'mixed' }))),
+      score: (loadout) => norm(metrics(evaluate(loadout, { target, rank, mix, goal: 'mixed', targetHealth }))),
       scoreFrom: (ev) => norm(metrics(ev)),
     };
   }
@@ -1126,6 +1290,28 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
            'charges are spent as the bank allows, statuses tick and expire, and the base-attack chain ' +
            'fills what is left. --fight changes the length and --fights rolls the procs for real ' +
            'instead of folding them in at their expected rate.',
+    },
+    {
+      severity: 'assumption',
+      what: opts.targetHealth >= 1
+        ? 'the target stands at FULL health, so every execute clause in the game is off'
+        : `the target stands at ${+(opts.targetHealth * 100).toFixed(2)}% health for every clause that asks`,
+      why: 'Eight script clauses across seven weapons compare the TARGET\'s healthRatio against a '
+        + 'threshold. None of that is live state this reader has to guess at: which phase of a fight '
+        + 'you are asking about is an input, the same standing --targets has. So --target-health states '
+        + 'it and the comparison is answered exactly - no assumption that the fight ends in a kill, '
+        + 'none that damage is even, none that some share of the clock is spent below the line. `<` and '
+        + '`<=` therefore differ only exactly AT the boundary, which is all the precision one stated '
+        + 'number can carry. THREE of the eight are priced today: Execution\'s +25% under 35%, Demonic '
+        + 'Bite\'s +25% and Scatterbloom\'s +50%. The other five ask something else as well as the '
+        + 'health - a recast pair, a skillId disjunction, a status mark, a playStep payload, a `*=` '
+        + 'multiplier - and stay refused on THAT guard, each named on its own line. Hiveborn Blossom\'s '
+        + '+200% ABOVE 80% is among them, so no above-threshold rider is priced today and the default '
+        + 'of 100 has nothing to switch on - it only switches the execute riders off, and says which. '
+        + 'SIX MORE clauses read the OWNER\'s health (Hive Bite, Tide Warlord, Flamie, '
+        + 'Fanatical Fury, RobinHoof_Summon, Infused Tusk) and those stay REFUSED: the target\'s health '
+        + 'is one number the player can state, and your own health over a fight is a trajectory this '
+        + 'model does not simulate - it never takes damage.',
     },
     {
       severity: 'assumption',

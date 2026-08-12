@@ -371,17 +371,37 @@ export function optimize(engine, spec) {
   }
 
   // --- skill choices -------------------------------------------------------
-  // Every way to fill one pool: C(options, slots). Weapons offer three and give
-  // two, so this is three combinations - cheap enough to enumerate exactly.
-  function combinations(options, k) {
-    if (k >= options.length) return [options.slice()];
+  // Every way to fill one pool. Weapons offer three and give two, so that is
+  // three combinations - cheap enough to enumerate exactly.
+  //
+  // A pool that REPEATS is a multiset, not a set: a Mage may put the same
+  // conduit in two slots, so three slots over two conduits is four fills
+  // (SSS, SSP, SPP, PPP) rather than the one that "take every option" gives.
+  // Skipping that was not a missing option but a missing answer - the search
+  // could never reach the doubled conduit the live game shows, and with
+  // slots >= options it did not search the pool at all.
+  //
+  // Order never matters: `resolve` collapses a mechanic pool's picks to counts
+  // and a weapon's two skills are just slotted, so [A,B] and [B,A] are one
+  // fill and enumerating both would only cost evaluations.
+  const MAX_FILLS = 256;          // a runaway pool costs fights, so bound it
+
+  function combinations(options, k, { repeats = false } = {}) {
+    if (!options.length) return [[]];
+    if (!Number.isFinite(k)) return [options.slice()];   // RoguePoison: unbounded
     const out = [];
     const walk = (start, acc) => {
+      if (out.length >= MAX_FILLS) return;
       if (acc.length === k) { out.push(acc.slice()); return; }
-      for (let i = start; i < options.length; i++) { acc.push(options[i]); walk(i + 1, acc); acc.pop(); }
+      for (let i = start; i < options.length; i++) {
+        acc.push(options[i]);
+        walk(repeats ? i : i + 1, acc);   // `i` lets an option be taken again
+        acc.pop();
+      }
     };
+    if (!repeats && k >= options.length) return [options.slice()];
     walk(0, []);
-    return out;
+    return out.length ? out : [options.slice(0, k)];
   }
 
   function ascend(start, rand) {
@@ -421,7 +441,7 @@ export function optimize(engine, spec) {
       // an enchant's value depends on what it is procking off.
       for (const pool of shuffled(engine.plan.pools(cur), rand)) {
         if (pinnedSkills.has(pool.key)) continue;
-        const opts = combinations(pool.options, pool.slots);
+        const opts = combinations(pool.options, pool.slots, { repeats: pool.repeats });
         if (opts.length < 2) continue;
         let bestPick = cur.skills[pool.key];
         let bestScore = best;
