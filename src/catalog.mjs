@@ -184,8 +184,29 @@ export function buildCatalog(cdb, ctx) {
     .filter((t) => (t.props?.augmentTargets ?? []).length)
     .map((t) => ({ id: t.id, targets: t.props.augmentTargets.map((x) => x.itemType) }));
 
+  // AN ITEM WITH NO APTITUDES OF ITS OWN IS NOT COMBAT GEAR.
+  //
+  // Aptitudes are what give an item a stat budget, so an item without them
+  // rolls nothing - `contribute` already returns an empty bag for the bug
+  // net. But the net still collected everything its TYPE CHAIN offered, and
+  // that chain is a lie: `CaptureNet` reaches MainhandWeapon/Weapon only
+  // because it inherits `GreatAxe` for the animation rig (its own row is
+  // `skills: []`, `moveSet: "Staff"`, `setup: Weapon_2H_GreatAxe.prefab`).
+  // Reading that cosmetic inherit as a mechanical one handed a bug-catching
+  // net two augment sockets, a block ability, and - through the first
+  // `<Type>_Upgrade` in the chain - the GREATAXE's upgrade perk, +2
+  // CritChance, worth +4 dps and ~1% on every line of the build.
+  //
+  // It is the same confusion that once handed this same net a Legendary
+  // greatsword's WeaponPower, and it is fixed the same way: by the item's
+  // own aptitudes. Net_Basic is the ONLY aptitude-less item of the 37 that
+  // fit a weapon slot, so nothing a character fights with is touched.
+  function isCombatGear(item) {
+    return !!item && (item.aptitudes ?? []).length > 0;
+  }
+
   function socketsFor(item) {
-    if (!item) return [];
+    if (!isCombatGear(item)) return [];
     return augmentTypes
       .filter((a) => a.targets.some((tgt) => item.chain.includes(tgt)))
       .map((a) => a.id);
@@ -284,7 +305,9 @@ export function buildCatalog(cdb, ctx) {
 
   // Which `<type>_Upgrade` effect this item's stars unlock, or null.
   function upgradeSkillFor(item) {
-    if (!item) return null;
+    // No aptitudes, no upgrade perk: the chain walk is what let the net
+    // inherit `GreatAxe_Upgrade`. See isCombatGear.
+    if (!isCombatGear(item)) return null;
     for (const t of item.chain) {
       const hit = upgradeSkillByType.get(t);
       if (hit) return hit;
@@ -640,7 +663,7 @@ export function buildCatalog(cdb, ctx) {
     cdb, ctx,
     slots, slotById, classes, items, itemById,
     chain, inherited, socketsFor, augmentTypes,
-    effectiveLevel, setDropsScale, maxStars, canUpgrade, upgradeSkillFor,
+    effectiveLevel, setDropsScale, maxStars, canUpgrade, upgradeSkillFor, isCombatGear,
     upgradableTypes: upgradeSkillByType,
     usableBy, payingAptitudes, genericChoices, isWeaponType,
     contribute, applyAffixes, armorReductionFor,

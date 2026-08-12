@@ -3926,6 +3926,44 @@ group('a rune pin is per slot, not per build');
 // WEAPONS ONLY. The live bakes settle it: Necklace_Z2RCraft logged iLevel 210
 // on a level-25 character, its authored 20 exactly, while GA_Craft logged 320
 // against an authored level of 4.
+// --- a cosmetic type inherit is not a mechanical one ------------------------
+// `CaptureNet` inherits `GreatAxe` for the animation rig - its own row is
+// `skills: []`, `moveSet: "Staff"`, `setup: Weapon_2H_GreatAxe.prefab` - and
+// following that for MECHANICS handed a bug-catching net two augment sockets,
+// a block ability and the GREATAXE's upgrade perk (+2 CritChance), worth ~1%
+// on every line of a build. The item's own aptitudes are the discriminator,
+// the same one that stopped this same net from claiming a Legendary
+// greatsword's WeaponPower.
+group('a bug net is not a weapon');
+{
+  const eng = createEngine({ quiet: true });
+  const net = eng.cat.itemById.get('Net_Basic');
+  ok('the net is the only aptitude-less item that fits a weapon slot',
+    eng.cat.items.filter((i) => (i.slots ?? []).some((s) => /Slot_Weapon1|Slot_Weapon2|Slot_OffhandWeapon/.test(s))
+      && !(i.aptitudes ?? []).length).map((i) => i.id).join(',') === 'Net_Basic');
+  ok('...so it inherits no upgrade perk', eng.cat.upgradeSkillFor(net) === null);
+  ok('...and no sockets', eng.cat.socketsFor(net).length === 0);
+  ok('...while a real weapon keeps both',
+    eng.cat.upgradeSkillFor(eng.cat.itemById.get('Staff_Censer')) === 'Staff_Upgrade'
+      && eng.cat.socketsFor(eng.cat.itemById.get('Staff_Censer')).length === 2);
+
+  // The whole point, end to end: an arsenal net must be worth EXACTLY what an
+  // empty arsenal slot is worth - not 4 dps of somebody else's crit perk.
+  const build = (arsenal) => {
+    const l = emptyLoadout(eng.cat, 'Mage', 25);
+    l.gear.Slot_Weapon1 = { item: 'Staff_Censer', rarity: 'Epic', stars: 3 };
+    if (arsenal) l.gear.Slot_Weapon2 = { item: arsenal, stars: 5 };
+    eng.plan.pruneSelection(l);
+    return eng.evaluate(l, { target: eng.combat.foe('reference', 25), rank: 3 });
+  };
+  const empty = build(null);
+  const withNet = build('Net_Basic');
+  near('a net in the arsenal is worth exactly an empty slot',
+    withNet.throughput.dps, empty.throughput.dps, 1e-9);
+  near('...and moves no stat on the sheet',
+    withNet.sheet.get('CritChance'), empty.sheet.get('CritChance'), 1e-9);
+}
+
 group('only a weapon scales, and only a weapon rolls its rarity');
 {
   const eng = createEngine({ quiet: true });

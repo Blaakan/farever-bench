@@ -849,6 +849,60 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
 
   // --- the pools a build has to choose from --------------------------------
   /**
+   * Every talent NODE this build holds. Two routes reach the same place and a
+   * caller may have used either: points spent land in `loadout.talents`, and a
+   * DemonSigil hands a tier-4 node over outright from a socket. `optimize`
+   * writes the sigil's node back into `loadout.talents` itself; `bench sheet`
+   * and the UI do not, so both routes are read here and the set dedupes them.
+   */
+  function heldTalents(loadout) {
+    const out = new Set(Object.keys(loadout.talents ?? {}));
+    for (const [key, augId] of Object.entries(loadout.augments ?? {})) {
+      if (!augId || !key.endsWith('/AugmentDemonSigil')) continue;
+      for (const id of cat.itemById.get(augId)?.skills ?? []) {
+        if (typeOf(id) === 'Talent') out.add(id);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The mechanic skills this build's TALENTS hand it, by mechanic type.
+   *
+   * A talent carries what it grants one row over, in `props.subskills` - and
+   * the Mage's two tier-4 conduit nodes each grant a `MageConduit` row
+   * (Mage_Talent_ConduitSparkExplosion -> ..._Conduit, "Conduit: Spark
+   * Explosion"). In game that row is one more conduit you MAY SLOT against the
+   * same three `Mage_Conduit_Levels` slots. It is not a fourth conduit.
+   *
+   * Reading the pool from `unit.skills` alone left those rows out of every
+   * selection while `resolve`'s talent pass granted them anyway, so the node
+   * was worth a free conduit and the player could not choose it - the one
+   * shape a build tool must never have: an option that is not offered, scoring
+   * as though it had been taken.
+   *
+   * Sorted, because two granted nodes must not order the slots by whichever
+   * order the caller happened to write the talent map in - `rotationFor`'s
+   * cache key sorts the talents, so the pool must be stable under the same
+   * build too.
+   */
+  function grantedMechanicSkills(loadout) {
+    const out = new Map();
+    for (const node of heldTalents(loadout)) {
+      for (const x of skills.get(node)?.props?.subskills ?? []) {
+        if (!x.skill) continue;
+        const t = typeOf(x.skill);
+        if (!t || !MECHANIC_TYPES[t]) continue;
+        const list = out.get(t) ?? [];
+        if (!list.includes(x.skill)) list.push(x.skill);
+        out.set(t, list);
+      }
+    }
+    for (const list of out.values()) list.sort();
+    return out;
+  }
+
+  /**
    * Every selection this loadout has to make, each with its options and how
    * many of them fit. Weapon pools depend on what is equipped, so this is
    * recomputed whenever the gear changes.
@@ -924,9 +978,18 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         });
       }
     }
+    const granted = grantedMechanicSkills(loadout);
     for (const [type, def] of Object.entries(MECHANIC_TYPES)) {
-      const options = classSkills.filter((id) => typeOf(id) === type);
-      if (!options.length) continue;
+      const own = classSkills.filter((id) => typeOf(id) === type);
+      // The pool has to EXIST for this class before a grant may join it. A
+      // sigil is class-gated in game, and minting a `PriestPrayer` pool on a
+      // Mage because a foreign sigil sat in a socket would be a worse bug than
+      // the one below - so the class's own rows decide whether the mechanic is
+      // hers, and the grant only ever widens a pool she already has.
+      if (!own.length) continue;
+      // ...and a talent-granted row of that type is one more OPTION, not a
+      // free extra. See `grantedMechanicSkills`.
+      const options = own.concat((granted.get(type) ?? []).filter((id) => !own.includes(id)));
       // Mechanic slots may REPEAT an option: Mage_Conduit_Projectile's own
       // script fans by getSkillInstanceCount()/getSkillInstanceIndex() with a
       // 0.1s stagger, and the live stream shows every trigger as an
@@ -945,6 +1008,14 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
 
   // The default selection: the first `slots` options, so a build with no
   // explicit choice is still well-defined and deterministic.
+  //
+  // NOTE: a MECHANIC pool with more slots than options is left SHORT here,
+  // while `resolve` cycles it (Projectile x2 + Power). The two disagree, and
+  // this is the reader the CLI and the UI go through - so a pruned Mage
+  // carries two conduits into a three-slot pool and the third slot goes to
+  // nobody. Left alone deliberately: it is a separate bug from the one this
+  // change fixes, it moves every Mage's baseline, and the one assertion that
+  // covers it reads per-hit interval where it means trigger cadence.
   function defaultSelection(loadout) {
     const sel = {};
     for (const p of pools(loadout)) sel[p.key] = p.options.slice(0, p.slots);
@@ -1303,7 +1374,17 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     }
 
     // 2. Slotted weapon skills, from both hands, plus their follow-ups.
-    for (const p of pools(loadout)) {
+    //
+    // Resolved ONCE. Three passes below ask the same question of the same
+    // loadout, and the talent pass needs to know what the mechanic pools were
+    // offering - not just what they picked.
+    const livePools = pools(loadout);
+    // Every mechanic skill this build is OFFERED, slotted or not. The talent
+    // pass at 5 needs the offer rather than the pick: a conduit a talent added
+    // to the pool is the pool's to fire, and a granted row that no pool claims
+    // is still the talent's - so the membership test, not the type test.
+    const mechanicOptions = new Set(livePools.filter((p) => p.mechanic).flatMap((p) => p.options));
+    for (const p of livePools) {
       // A mechanic pool with more slots than options CYCLES: the third
       // conduit slot repeats the first option, which is exactly Emsay's live
       // fill (Projectile x2 + Power, proven by the paired trigger rows).
@@ -1356,7 +1437,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // Six class skills exist and four fit on the bar, so the ones NOT slotted
     // are not yours - handing out all five a level-25 character has learned is
     // a free cooldown. The chosen four came through the pool loop above.
-    const classPool = pools(loadout).find((p) => p.key === 'class/ClassSkill');
+    const classPool = livePools.find((p) => p.key === 'class/ClassSkill');
     const classChosen = new Set(classPool
       ? (sel[classPool.key] ?? classPool.options.slice(0, classPool.slots)).slice(0, classPool.slots)
       : []);
@@ -1399,8 +1480,11 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         if (ACTIVE_TYPES.has(t)) push(active, id, { source: slot.id });
         else pushTriggered(id, slot.id);
       }
-      // The itemType's shared moves (each weapon class's block).
-      for (const s of cat.inherited(item?.type, (t) => t?.skills) ?? []) {
+      // The itemType's shared moves (each weapon class's block) - but only
+      // for real combat gear: the bug net reaches GreatAxe's PhysicalBlock
+      // through an inherit that exists for the animation rig. See
+      // catalog.isCombatGear.
+      for (const s of (cat.isCombatGear(item) ? cat.inherited(item?.type, (t) => t?.skills) : null) ?? []) {
         const id = s.skill ?? s.ref;
         if (!id || seen.has(id) || INERT_TYPES.has(typeOf(id))) continue;
         if (blockShadowed(id)) continue;
@@ -1837,6 +1921,19 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // either answer.
       for (const x of skills.get(id)?.props?.subskills ?? []) {
         if (!x.skill) continue;
+        // ...unless what it grants is a MECHANIC skill, in which case the node
+        // does not hand you the row - it hands you the OPTION. Taking
+        // Mage_Talent_ConduitSparkExplosion adds "Conduit: Spark Explosion" to
+        // the conduits you may slot against the same three Mage_Conduit_Levels
+        // slots; it does not give you a fourth conduit. `pools` puts it in the
+        // pool, the loop at 2 fires it if this build actually slotted it, and
+        // granting it here as well was worth a free ~1000 damage to any Mage
+        // who took the node and never chose the conduit.
+        //
+        // `seen` would not have caught this: the unslotted case never reaches
+        // `seen` at all, which is exactly the case that was wrong. Same guard
+        // the class-skill pass at 3 already uses - handled by its pool.
+        if (mechanicOptions.has(x.skill)) { accountedLate.add(id); continue; }
         pushTriggered(x.skill, 'talent', { grantedBy: id });
         // The NODE is not the gap; the row it grants is, and that row now says
         // so under its own name. Printing both makes one talent appear twice
