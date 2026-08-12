@@ -6,6 +6,11 @@ Every release of farever-bench, newest first:
 `ui/package.json` always carry the same version - `tools/release.mjs` moves
 them together and refuses to run when they disagree.
 
+## [0.2.0] - 2026-08-12
+
+- A boss you fight at your own level, and a buff that stops growing
+- What you made keeps the level you made it at
+
 ## [0.1.0] - 2026-08-12
 
 First numbered version: everything the repo does today, before any release
