@@ -800,14 +800,6 @@ export async function createApi({ benchRoot, game = null }) {
     // branch through the function means a change to it cannot leave the picker
     // claiming one thing while the sheet computes another.
     const scalesByType = new Map();
-    // A crafted row really does have ONE level: you make it, so nothing rolls
-    // it at the level of what dropped it. The `craft` sheet names its output
-    // outright (190 rows, one `item` each), so this is read rather than
-    // guessed from the id - `*RCraft*` naming would have missed recipes that
-    // do not say so and caught items that only look like they do.
-    const craftedItems = new Set(
-      eng.cdb.lines('craft').map((c) => c.item).filter(Boolean));
-
     const typeScales = (typeId) => {
       let hit = scalesByType.get(typeId);
       if (hit === undefined) {
@@ -854,7 +846,7 @@ export async function createApi({ benchRoot, game = null }) {
           allowsOffhand: cat.allowsOffhand(item),
           level: item.level,
           levelScales,
-          crafted: craftedItems.has(item.id),
+          crafted: cat.isCrafted(item.id),
           // Three kinds, not two. A CRAFTED row has one level - you make it, so
           // nothing rolls it. A row that scales tracks YOUR level. Everything
           // else is a DROP, and a drop takes the level of what dropped it: the
@@ -867,7 +859,7 @@ export async function createApi({ benchRoot, game = null }) {
           // runtime. So the range is offered up to the character's level and
           // NOT narrowed to a number this side cannot see.
           levelRange: Number.isFinite(from)
-            ? [from, craftedItems.has(item.id) ? from : Math.max(from, level)]
+            ? [from, cat.isCrafted(item.id) ? from : Math.max(from, level)]
             : null,
           faction: item.faction,
           aptitudes: item.aptitudes,
