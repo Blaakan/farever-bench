@@ -1,17 +1,28 @@
 # ---------------------------------------------------------------------------
-# Release: check what can be checked, bump, build both downloads, publish them.
+# Release: check what can be checked, bump, build all three downloads, publish.
 #
 # Run it from the Actions tab (workflow_dispatch) and pick patch/minor/major.
 # It releases the branch it was dispatched FROM - `github.ref_name` - because
 # this repo works on `master` while pull requests target `main`, and a workflow
 # that hard-codes either one silently releases the wrong tree.
 #
-# windows-latest for one reason: `electron-builder --win portable` produces a
-# Windows exe, and building it anywhere else needs wine. Nothing in the build
-# reads the game - electron-builder copies files, it never runs the app - so
-# the runner needs Node and npm and nothing installed from Steam.
+# TWO JOBS, because a packaged desktop app is only buildable on the platform it
+# runs on. `release` is windows-latest: `electron-builder --win portable`
+# produces a Windows exe and building it anywhere else needs wine. `appimage`
+# is ubuntu-latest for the mirror image of that - electron-builder cannot
+# produce an AppImage on a Windows runner at all. Nothing in either build reads
+# the game - electron-builder copies files, it never runs the app - so both
+# runners need Node and npm and nothing installed from Steam.
 #
-# WHAT THIS JOB CANNOT DO IS RUN THE TEST SUITE. `test/run.mjs` reads the
+# `release` is the job that bumps the version, tags it and creates the release,
+# so `appimage` waits for it, checks out that tag by name and uploads onto the
+# release that already exists. The exe and the zip are therefore published a
+# few minutes before the AppImage joins them, and a Linux build that fails
+# leaves a red run over a release whose notes name an asset that is not there
+# - which is the loud failure, and the one to fix by re-running the workflow's
+# Linux job rather than by cutting a second version.
+#
+# WHAT THIS WORKFLOW CANNOT DO IS RUN THE TEST SUITE. `test/run.mjs` reads the
 # player's own `data.cdb` and `hlboot.dat` and asserts against the values in
 # them; a hosted runner owns no copy of Farever, so the suite cannot pass here
 # and a green tick from a runner that skipped it would be a lie. The suite is
@@ -24,8 +35,9 @@
 #     "no game data is redistributed" - and a promise worth making is worth
 #     enforcing somewhere that is not a person remembering.
 #
-# Two downloads come out of it, and they are the three documented ways to run
-# the tool: the portable exe, and one zip carrying both `bench ui` and the CLI.
+# Three downloads come out of it, and they are the documented ways to run the
+# tool: the portable Windows exe, the Linux AppImage, and one zip carrying both
+# `bench ui` and the CLI.
 # ---------------------------------------------------------------------------
 name: Release
 
@@ -55,6 +67,11 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write        # push the bump commit + tag, create the release
+    # The version this run cut. The Linux job has no way to work it out for
+    # itself - the bump happens here - and it needs the exact tag to check out
+    # and to upload onto.
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
     defaults:
       run:
         shell: bash          # present on the Windows runners, and the one
@@ -226,27 +243,38 @@ jobs:
           git push origin "HEAD:refs/heads/$GITHUB_REF_NAME"
           git push origin "refs/tags/v$VERSION"
 
-      # A fixed preamble - what the two downloads are, what each one needs,
+      # A fixed preamble - what the three downloads are, what each one needs,
       # and what Windows will say about the unsigned exe - then the CHANGELOG
       # section release.mjs just wrote. The heredoc is quoted, so the shell
       # expands nothing inside it: the text is full of backticks, and the only
       # substitution wanted is the version, which is x.y.z off package.json.
+      #
+      # The AppImage is named here before the job that builds it has even
+      # started. That is deliberate: the notes describe the release, and a
+      # release missing an asset its notes promise is a failure worth seeing
+      # rather than one worth hiding by writing vaguer notes.
       - name: Compose the release notes
         env:
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           cat > "$RUNNER_TEMP/preamble.md" <<'MD'
-          ### Three ways to run it
+          ### Three downloads
 
-          - **`FareverBench-v@VERSION@.exe`** - the desktop app. Download, run, nothing
-            else to install. **Windows 10+ x64 only.**
-          - **`farever-bench-v@VERSION@.zip`**, then `bench ui` - the same UI, in your own
-            browser.
-          - The same zip, then `bench optimize`, `bench sheet`, `bench rank`,
-            `bench layouts`, `bench rotation`, `bench talents`, ... - the command line.
+          - **`FareverBench-v@VERSION@.exe`** - the desktop app on Windows. Download, run,
+            nothing else to install. **Windows 10+ x64 only.**
+          - **`FareverBench-v@VERSION@-x86_64.AppImage`** - the same desktop app on Linux.
+            `chmod +x` it and run it. **x86_64 only.**
+          - **`farever-bench-v@VERSION@.zip`** - the same UI in your own browser
+            (`bench ui`), and the command line (`bench optimize`, `bench sheet`,
+            `bench rank`, `bench layouts`, `bench rotation`, `bench talents`, ...).
 
-          The zip needs **Node.js 18+** and runs on Windows, Linux and macOS. The exe
-          needs nothing.
+          The zip needs **Node.js 18+** and runs on Windows, Linux and macOS. Neither
+          desktop build needs anything installed.
+
+          The AppImage is a FUSE 2 image, which is what most distributions stopped
+          shipping by default. If it exits with *"dlopen(): error loading libfuse.so.2"*,
+          either install `libfuse2` or run it as
+          `./FareverBench-v@VERSION@-x86_64.AppImage --appimage-extract-and-run`.
 
           ### All three read your own copy of Farever
 
@@ -255,14 +283,15 @@ jobs:
           no standalone mode: **you need the game installed**, whichever way you run it.
 
           The install is found through Steam's own registry keys, which only exist on
-          Windows. Anywhere else, pass `--game <path>` - a Proton install sits at
-          `~/.steam/steam/steamapps/common/Farever`.
+          Windows. Anywhere else it has to be pointed at the folder once: the AppImage
+          asks on first launch and remembers, the zip takes `--game <path>`. A Proton
+          install sits at `~/.steam/steam/steamapps/common/Farever`.
 
-          ### The exe is unsigned
+          ### The Windows exe is unsigned
 
           SmartScreen will say *"Windows protected your PC"*. **More info** -> **Run
-          anyway**. Signing it needs a certificate this project does not have; the zip
-          route never raises the dialog.
+          anyway**. Signing it needs a certificate this project does not have; the
+          AppImage and the zip never raise the dialog.
 
           ---
 
@@ -285,3 +314,69 @@ jobs:
             --notes-file "$RUNNER_TEMP/notes.md" \
             --target "$(git rev-parse HEAD)" \
             "$EXE" "$ZIP"
+
+  # The Linux download. Its own job on its own runner because an AppImage is
+  # assembled by Linux binaries: electron-builder downloads appimage-12.0.1
+  # and runs its mksquashfs, desktop-file-validate and runtime out of it, and
+  # ELF executables do not run on windows-latest. That is the only thing this
+  # job needs which the release job does not already have.
+  #
+  # It checks out the TAG the release job pushed, not the branch. The AppImage
+  # is stamped with ui/package.json's version, and a branch that moved between
+  # the two jobs would stamp a version this release never cut.
+  appimage:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # add one asset to the release that already exists
+    defaults:
+      run:
+        shell: bash
+    env:
+      # x.y.z, produced by tools/release.mjs, which parses it before it prints
+      # it. Through the environment like every other value here, so nothing
+      # from outside the job is ever pasted into a command line.
+      VERSION: ${{ needs.release.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install UI build deps
+        working-directory: ui
+        # ci when the lockfile is there and in sync, install when it is not.
+        run: npm ci || npm install
+
+      # The same commit wrote the tag and the manifest, so these agree unless
+      # something upstream of here went wrong - and an AppImage stamped with a
+      # version no release ever cut is not something a user can diagnose.
+      - name: Guard - the tag is the version in the manifest
+        run: |
+          have=$(node -p 'require("./ui/package.json").version')
+          if [ "$have" != "$VERSION" ]; then
+            echo "::error::checked out v$VERSION, but ui/package.json says $have"
+            exit 1
+          fi
+          echo "ui/package.json says $have"
+
+      - name: Build the AppImage
+        working-directory: ui
+        run: npm run dist:linux
+
+      - name: Name the AppImage after the version and attach it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Onto the release the windows job created, by tag - never a second
+        # release. --clobber so re-running this job after a failed upload
+        # replaces the asset instead of failing on a name already taken.
+        run: |
+          test -f ui/dist/FareverBench.AppImage
+          asset="FareverBench-v$VERSION-x86_64.AppImage"
+          cp ui/dist/FareverBench.AppImage "$asset"
+          ls -l "$asset"
+          gh release upload "v$VERSION" "$asset" --clobber

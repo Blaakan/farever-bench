@@ -7,7 +7,8 @@
   "scripts": {
     "start": "electron .",
     "serve": "node server.mjs",
-    "dist": "electron-builder --win portable"
+    "dist": "electron-builder --win portable",
+    "dist:linux": "electron-builder --linux AppImage"
   },
   "devDependencies": {
     "electron": "^43.0.0",
@@ -28,6 +29,13 @@
                    "optimize-worker.mjs", "lib/**", "web/**"] }
     ],
     "win": { "target": ["portable"], "icon": "web/appicon.ico" },
-    "portable": { "artifactName": "FareverBench.exe" }
+    "portable": { "artifactName": "FareverBench.exe" },
+    "linux": {
+      "target": [{ "target": "AppImage", "arch": ["x64"] }],
+      "icon": "web/appicon.ico",
+      "category": "Game",
+      "synopsis": "Character sheet, talent tree, rune page and gear optimizer for Farever"
+    },
+    "appImage": { "artifactName": "FareverBench.AppImage" }
   }
 }

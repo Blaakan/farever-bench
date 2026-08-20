@@ -43,7 +43,14 @@ const IMMUTABLE = 'public, max-age=31536000, immutable';
 
 export async function createIconService({ benchRoot, game }) {
   const pak = openPak(join(game, 'res.pak'));
-  const cacheDir = join(benchRoot, '.cache', 'ui-icons');
+  // A packaged build has no writable bench root - the portable exe unpacks to
+  // a temp directory and an AppImage mounts read-only squashfs - so the shell
+  // exports FAREVER_BENCH_CACHE and this follows it. Without that the mkdir
+  // below throws EROFS and EVERY portrait 500s, not just the first, because
+  // cacheDirMade never flips.
+  const cacheDir = process.env.FAREVER_BENCH_CACHE
+    ? join(process.env.FAREVER_BENCH_CACHE, 'ui-icons')
+    : join(benchRoot, '.cache', 'ui-icons');
   let cacheDirMade = false;
 
   // --- magic sniffing, once per pak path ------------------------------------

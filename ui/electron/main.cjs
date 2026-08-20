@@ -14,14 +14,20 @@
 //    error, it is a double-click that does nothing at all. So the install is
 //    resolved HERE, with findGame() (never requireGame()), and FAREVER_DIR -
 //    the supported override, checked before any guessing - is set from the
-//    answer before the server is imported. The optimizer child process
+//    answer before the server is imported. The optimizer worker thread
 //    inherits it, which is why it is an env var and not just an argument.
 //
-//  - the portable exe unpacks to a NEW temp directory on every launch, so
-//    nothing written next to the bundled bench survives. The answer to "where
-//    is your Farever?" therefore lives in Electron's userData directory, and
-//    the bundled .cache is pointed at userData too so the BC7 icon cache is
-//    decoded once in the life of the machine rather than once per launch.
+//  - nothing written next to the bundled bench survives, on either packaged
+//    build: the portable exe unpacks to a NEW temp directory on every launch,
+//    and an AppImage's resources are a read-only squashfs mount. The answer to
+//    "where is your Farever?" therefore lives in Electron's userData
+//    directory, and the bundled .cache is pointed at userData too so the BC7
+//    icon cache is decoded once in the life of the machine rather than once
+//    per launch.
+//
+// Both packaged targets run this file unchanged, so nothing in it may assume
+// Windows: no drive letters, no separators by hand, and no junctions except
+// where a junction is what the platform has (persistCache).
 //
 // `--setup` (or FAREVER_BENCH_SETUP=1) skips the remembered path and asks
 // again - for a moved install, or a second one.
@@ -77,6 +83,8 @@ function rememberGame(dir) {
 // The engine's own test, kept in step with src/lib/game.mjs isGameDir(): a
 // folder without both files is a leftover depot or a half-deleted install,
 // and accepting it only moves the failure somewhere less explainable.
+// Farever.exe is the right test on Linux too - a Proton install is the same
+// Windows depot, unpacked under steamapps/common/Farever.
 function isGameDir(dir) {
   try {
     return !!dir && fs.existsSync(path.join(dir, 'hlboot.dat'))
@@ -100,22 +108,39 @@ function normalise(p) {
 // benchRoot/.cache is where BOTH halves of the bench keep state: ui/icons.mjs
 // decodes portraits into .cache/ui-icons, and src/lib/game.mjs memoises the
 // install path in .cache/game-path.txt. Both derive that directory from
-// benchRoot alone, so a junction is the only redirect available from here -
-// and it is enough, because everything under it is regenerable.
+// benchRoot alone, so the redirect has to happen underneath them - and it is
+// safe to redirect, because everything under it is regenerable.
+//
+// FAREVER_BENCH_CACHE is the portable half. It is exported before the server
+// is imported, so the server and the optimizer worker it spawns both inherit
+// it, and it means the same thing on every platform. ui/icons.mjs does not
+// read it YET - when it does, its cacheDir becomes <FAREVER_BENCH_CACHE>/
+// ui-icons and no link is needed anywhere. Until then a read-only bench root
+// has no writable cache at all: icons.mjs mkdirs its cacheDir on the first
+// DDS portrait and surfaces the EROFS as a 500.
+//
+// The link is what works today. A junction is a Windows concept; everywhere
+// else the same redirect is an ordinary symlink, which needs no privilege.
+// It lands whenever the bench root is writable - the portable exe unpacks to
+// a temp directory, so it is - and fails harmlessly on an AppImage's mount.
 function persistCache() {
   if (!app.isPackaged) return;         // a dev run already has a real .cache
-  const link = path.join(BENCH_ROOT, '.cache');
   // NOT userData/cache: Windows paths are case-insensitive and Chromium's own
   // disk cache is userData/Cache, so that name lands the bench's state inside
   // a directory the browser engine considers its own to empty.
   const target = path.join(app.getPath('userData'), 'bench-cache');
   try {
     fs.mkdirSync(target, { recursive: true });
-    if (fs.existsSync(link)) return;
-    fs.symlinkSync(target, link, 'junction');
   } catch {
-    // No junction: the icon cache is rebuilt each launch. Slower first paint,
-    // nothing broken.
+    return;                            // nowhere writable to point at
+  }
+  process.env.FAREVER_BENCH_CACHE = target;
+  const link = path.join(BENCH_ROOT, '.cache');
+  try {
+    if (fs.existsSync(link)) return;
+    fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch {
+    // A read-only bench root takes the env var and nothing else - see above.
   }
 }
 
@@ -135,6 +160,18 @@ function envGame() {
   if (process.env.FAREVER_DIR) delete process.env.FAREVER_DIR;
   return null;
 }
+
+// What to say when nothing was found. src/lib/game.mjs searches Steam's
+// registry keys and a list of Windows paths, so off Windows it has nothing to
+// look at and comes back empty every time - saying "not in the usual places"
+// there would blame an install that is fine. Name the path instead.
+const NOT_FOUND = process.platform === 'win32'
+  ? 'No Farever install found - not in Steam\'s library list, and not in the '
+    + 'usual places. Point Farever Bench at it once and it will remember.'
+  : 'Farever Bench finds the install through Steam\'s registry, which only '
+    + 'exists on Windows, so here it has to be pointed at the folder once - a '
+    + 'Proton install sits in ~/.steam/steam/steamapps/common/Farever. It will '
+    + 'remember.';
 
 async function autoDetect() {
   try {
@@ -285,9 +322,7 @@ async function boot() {
   ipcMain.on('setup:quit', () => app.quit());
 
   let game = FORCE_SETUP ? null : (savedGame() || envGame() || await autoDetect());
-  let problem = (game || FORCE_SETUP) ? ''
-    : 'No Farever install found - not in Steam\'s library list, and not in the '
-      + 'usual places. Point Farever Bench at it once and it will remember.';
+  let problem = (game || FORCE_SETUP) ? '' : NOT_FOUND;
 
   for (;;) {
     if (!game) {
