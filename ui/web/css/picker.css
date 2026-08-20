@@ -1,9 +1,26 @@
 /* ---------------------------------------------------------------------------
    picker.css — item-picker extensions (components/picker.js).
    The modal shell, list rows and config column live in style.css + sheet.css;
-   only the instance-level control is here, because it is the one control the
-   game's parchment kit has no shape for.
+   the instance-level control is here because it is the one control the game's
+   parchment kit has no shape for, and the edit note with it.
 --------------------------------------------------------------------------- */
+
+/* ------------------------------------------- editing an already-filled slot */
+
+/* The picker opens on the equipped item when the slot has one, so the config
+   column starts pre-filled - without this line those values read as a new
+   pick's defaults and the star count looks wrong rather than current. */
+.pconf .editnote {
+  margin: 0 0 4px;
+  padding: 5px 9px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #6f5a3c;
+  background: #f3e6cd;
+  border: 1px solid #dcc8a4;
+  border-left: 3px solid var(--gold);
+  border-radius: 6px;
+}
 
 /* ------------------------------------------------- instance-level slider */
 

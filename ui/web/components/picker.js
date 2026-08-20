@@ -4,10 +4,14 @@
 //   window.Picker = { openGear(slotId), openAugment(socketKey) }
 //
 // Uses the .modal-veil/.picker classes from style.css (list rows and config
-// column extras in css/sheet.css); the instance-level control is the one
-// piece with its own sheet, css/picker.css. Wires its own keyboard handling:
-// Esc closes, typing anywhere filters the list. All mutations go through
-// App.setGear / App.setAugment / App.clearSlot.
+// column extras in css/sheet.css); the instance-level control and the edit
+// note are the pieces with their own sheet, css/picker.css. Wires its own
+// keyboard handling: Esc closes, typing anywhere filters the list. All
+// mutations go through App.setGear / App.setAugment / App.clearSlot.
+//
+// openGear on a slot that already holds something opens ON that item, with the
+// configuration the loadout holds - it is the edit path as well as the pick
+// path, and there is no other way to restar an equipped weapon.
 // ---------------------------------------------------------------------------
 
 import {
@@ -34,6 +38,44 @@ const fmtPct = (c) => {
 };
 
 const num = (v) => (Number.isFinite(v) ? v : null);
+
+// ------------------------------------------------------------------ search
+
+// A row is matched on everything it shows, not on its name alone: the thing a
+// player types is as often an effect or a drop source as a title.
+//
+// The data writes stats short and glued, so a substring is not enough - the
+// Demon gifts read "-20 CritChanceRtg +20 FervorRtg", and "critical" is inside
+// none of it. Splitting on the camelCase seams gives the words back ("crit",
+// "chance", "rtg"), and a typed word also matches when a data word OPENS it,
+// which is what carries "crit" -> "critical" and "pen" -> "penetration". The
+// three-letter floor is there so a two-letter fragment cannot open everything.
+// Multi-word queries are AND: every word has to land somewhere in the row.
+const HEAD_MIN = 3;
+
+const hayCache = new WeakMap();
+
+const buildHay = (parts) => {
+  const text = parts.filter(Boolean).map(String).join(' ');
+  const words = text.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase().split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= HEAD_MIN);
+  return { low: text.toLowerCase(), words: [...new Set(words)] };
+};
+
+// Keyed on the catalog/bootstrap row itself: those objects are replaced whole
+// when class or level changes, so nothing here goes stale.
+const hayOf = (row, ...parts) => {
+  let h = hayCache.get(row);
+  if (!h) hayCache.set(row, h = buildHay(parts));
+  return h;
+};
+
+const queryTerms = (s) =>
+  String(s ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+
+const hayMatch = (h, terms) => terms.every((t) =>
+  h.low.includes(t) || h.words.some((w) => t.startsWith(w)));
 
 // <datalist> ids have to be unique in the document; the control is rebuilt
 // on every rarity/star change, so a counter is cheaper than bookkeeping.
@@ -114,7 +156,17 @@ function actionRow(sym, name, sub, fn) {
 function openGear(slotId) {
   const slotDef = App.boot?.slots?.find((s) => s.id === slotId);
   const items = App.catalog?.slots?.[slotId] || [];
-  const body = openModal(slotDef?.label || slotId);
+
+  // Editing beats re-picking: a filled slot opens on the item it holds, so
+  // changing one star is a click and Equip rather than finding the row again.
+  // The entry can name an item the catalog no longer lists (a level change
+  // drops rows), and then there is nothing to edit and the picker opens blank.
+  const equipped = App.state?.loadout?.gear?.[slotId] || null;
+  const current = equipped ? items.find((i) => i.id === equipped.item) : null;
+
+  const body = openModal(current
+    ? `${slotDef?.label || slotId} - editing ${snip(current.name, 30)}`
+    : (slotDef?.label || slotId));
   const list = el('plist');
   const conf = el('pconf');
   body.append(list, conf);
@@ -129,6 +181,8 @@ function openGear(slotId) {
 
   let selected = null;
   let selRow = null;
+  // replaced by configOf() the moment anything is selected; nothing reads it
+  // before that, because renderConf() draws the empty hint instead.
   let cfg = { rarity: null, stars: 0, level: null };
   let pvEl = null;
   let pvSeq = 0;
@@ -162,6 +216,12 @@ function openGear(slotId) {
       right.append(a);
     }
     r.append(right);
+    // rebuild() throws the rows away on every keystroke, so the highlight is
+    // re-applied from `selected` rather than kept on a node that is gone.
+    if (selected && it.id === selected.id) {
+      r.classList.add('sel');
+      selRow = r;
+    }
     App.bindTip(r, () => App.api('/api/tooltip/item', {
       class: App.state?.cls, charLevel: App.state?.level,
       item: it.id, slot: slotId,
@@ -172,31 +232,66 @@ function openGear(slotId) {
 
   const rebuild = () => {
     rows.replaceChildren();
+    selRow = null;
     rows.append(actionRow('∅', 'Empty this slot',
       'pin the slot empty — the optimizer keeps it that way',
       () => { App.setGear(slotId, null); close(); }));
     rows.append(actionRow('⟲', 'Unpin',
       'let the optimizer fill this slot',
       () => { App.clearSlot(slotId); close(); }));
-    const q = search.value.trim().toLowerCase();
+    const terms = queryTerms(search.value);
     for (const it of items) {
-      if (q && !it.name.toLowerCase().includes(q)) continue;
+      if (terms.length && !hayMatch(
+        hayOf(it, it.name, it.typeName || it.type, it.faction,
+              it.gives, it.acquire, it.flavor), terms)) continue;
       rows.append(itemRow(it));
     }
   };
 
   // ---- config column ----------------------------------------------------
 
-  const maxStarsOf = () =>
-    selected?.rarities?.find((r) => r.id === cfg.rarity)?.maxStars | 0;
+  const maxStarsFor = (it, rarityId) =>
+    it?.rarities?.find((r) => r.id === rarityId)?.maxStars | 0;
+
+  const maxStarsOf = () => maxStarsFor(selected, cfg.rarity);
+
+  // Stars maxed by default: an upgraded weapon is what a player is comparing
+  // against, and 0/4 is a number nobody keeps.
+  const defaultConfig = (it) => {
+    const rarity = authoredRarity(it)?.id || null;
+    return { rarity, stars: maxStarsFor(it, rarity), level: null };
+  };
+
+  // What the loadout already says about this item. Missing stars mean zero -
+  // Equip writes the field only when a star is lit - and a missing level means
+  // "whatever it dropped at", which is the slider's unset state. Both the
+  // rarity and the level are re-checked against this catalog row, because the
+  // entry was written at some other character level.
+  const equippedConfig = (it) => {
+    const rarity = (it.rarities || []).some((r) => r.id === equipped.rarity)
+      ? equipped.rarity
+      : (authoredRarity(it)?.id || null);
+    const b = levelBounds(it);
+    const lvl = num(equipped.level);
+    const stars = num(equipped.stars) ?? 0;
+    return {
+      rarity,
+      stars: Math.max(0, Math.min(stars, maxStarsFor(it, rarity))),
+      level: lvl == null ? null : Math.max(b.lo, Math.min(b.hi, lvl)),
+    };
+  };
+
+  const isEquipped = (it) => !!equipped && !!it && it.id === equipped.item;
+
+  const configOf = (it) =>
+    (isEquipped(it) ? equippedConfig(it) : defaultConfig(it));
 
   const select = (it, row) => {
     selected = it;
     selRow?.classList.remove('sel');
     selRow = row;
     row.classList.add('sel');
-    const ar = authoredRarity(it);
-    cfg = { rarity: ar?.id || null, stars: 0, level: null };
+    cfg = configOf(it);
     renderConf();
   };
 
@@ -369,6 +464,15 @@ function openGear(slotId) {
     h4.style.color = rarityColor(App.boot, cfg.rarity);
     conf.append(h4);
 
+    // The pre-filled fields are the equipped ones, and the column has to say
+    // so or they read as a fresh pick's defaults.
+    if (isEquipped(it)) {
+      const en = el('editnote');
+      en.textContent = 'equipped - this is your current configuration; '
+        + 'change what you need and press Equip';
+      conf.append(en);
+    }
+
     // rarity --------------------------------------------------------------
     const rl = el('', 'label');
     rl.textContent = 'Rarity';
@@ -383,8 +487,13 @@ function openGear(slotId) {
       rs.append(o);
     }
     rs.addEventListener('change', () => {
+      // A rarity that rolls fewer stars must not leave a higher count behind,
+      // and one that rolls more keeps a maxed pick maxed. Only a count the
+      // user pulled down themselves stays where they put it.
+      const wasMax = cfg.stars >= maxStarsOf();
       cfg.rarity = rs.value;
-      cfg.stars = Math.min(cfg.stars, maxStarsOf());
+      const ms = maxStarsOf();
+      cfg.stars = wasMax ? ms : Math.min(cfg.stars, ms);
       renderConf();
     });
     conf.append(rs);
@@ -445,9 +554,16 @@ function openGear(slotId) {
   };
 
   search.addEventListener('input', rebuild);
+  if (current) {
+    selected = current;
+    cfg = configOf(current);   // itemRow() lights the row while rebuilding
+  }
   rebuild();
   renderConf();
-  search.focus();
+  // Focus first, scroll second: the search box sits inside the list's own
+  // scroller, so focusing after the scroll would drag the row back off screen.
+  search.focus({ preventScroll: true });
+  selRow?.scrollIntoView?.({ block: 'center' });
 }
 
 // ----------------------------------------------------------- augment picker
@@ -529,10 +645,12 @@ function openAugment(socketKey) {
     rows.replaceChildren();
     rows.append(actionRow('∅', 'None', 'pin the socket empty',
       () => { App.setAugment(socketKey, null); close(); }));
-    const q = search.value.trim().toLowerCase();
+    const terms = queryTerms(search.value);
     for (const a of augs) {
-      if (q && !a.name.toLowerCase().includes(q)
-            && !String(a.effect || '').toLowerCase().includes(q)) continue;
+      // Every Demon gift is named "Corrupted Gift"; the effect line is the
+      // only thing that tells them apart, so it has to be searchable.
+      if (terms.length && !hayMatch(
+        hayOf(a, a.name, a.effect, a.acquire), terms)) continue;
       rows.append(augRow(a));
     }
   };
