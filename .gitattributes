@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Line endings, decided here instead of by whoever happened to clone the repo.
+#
+# Every text file here is stored with LF and `* text=auto` keeps it that way
+# whatever an editor writes. What that alone does NOT settle is the WORKING
+# TREE: `core.autocrlf=true` is git's Windows default and is what a
+# windows-latest runner checks out with, so on that machine the bytes on disk
+# are CRLF. tools/release.mjs packs the working tree into the download, and
+# v0.1.0's zip shipped bench-ui.sh with CRLF - `/bin/sh` read the shebang as
+# `/bin/sh\r` and every Linux user got "bad interpreter: /bin/sh^M".
+#
+# So the files a program parses are pinned to LF on disk as well, and the zip
+# writer normalises them again as it packs (tools/release.mjs, lfOnly). Either
+# half alone leaves the hole open for the next file to fall into: attributes
+# fix nobody's existing checkout, and the zip writer fixes nothing a user runs
+# out of their own clone.
+# ---------------------------------------------------------------------------
+
+*            text=auto
+
+*.sh         text eol=lf
+*.mjs        text eol=lf
+*.cjs        text eol=lf
+*.js         text eol=lf
+*.json       text eol=lf
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.md         text eol=lf
+*.html       text eol=lf
+*.css        text eol=lf
+LICENSE      text eol=lf
+.gitignore   text eol=lf
+.gitattributes text eol=lf
+
+# cmd.exe is the only thing that ever reads these two, and CRLF is its native
+# form - it parses a batch file line by line as it runs it, and LF-only files
+# are where `goto` and multi-line blocks go wrong.
+*.cmd        text eol=crlf
+*.bat        text eol=crlf
+
+# Never converted, never diffed as text. The .ico is the app icon both the
+# Windows exe and the Linux AppImage are stamped from; the .png are the
+# README's screenshots.
+*.ico        binary
+*.png        binary
+
+# Nothing game-derived is ever committed - .gitignore covers it and the
+# release workflow fails on it - but a file that slipped past both must not
+# also be corrupted by an end-of-line conversion on its way in.
+*.dds        binary
+*.pak        binary
+*.cdb        binary
+*.dat        binary

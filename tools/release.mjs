@@ -437,6 +437,55 @@ function forBundle(buf) {
   return Buffer.from(text.slice(0, nl + 1) + '\n' + note + text.slice(nl + 1).replace(/^\n+/, ''), 'utf8');
 }
 
+// The zip carries the working tree byte for byte, and the working tree is
+// whatever the builder's git checked out. `core.autocrlf=true` is git's
+// Windows default and is what the windows-latest runner uses, so on the
+// machine that cuts the release bench-ui.sh is CRLF on disk - and v0.1.0's zip
+// shipped it that way, which is `/bin/sh` reading the shebang as `/bin/sh\r`
+// and answering "bad interpreter: /bin/sh^M". .gitattributes pins eol=lf for
+// the checkout; this pins it for the artifact, so the download is right even
+// when built from a tree that is not.
+//
+// Bytes, not text: a script is not guaranteed to be valid UTF-8 and a
+// round-trip through a string would rewrite bytes this has no business
+// touching. Only a CR that is part of a CRLF goes; a lone CR is data.
+function lfOnly(buf) {
+  if (!buf.includes(0x0D)) return buf;
+  const out = Buffer.allocUnsafe(buf.length);
+  let n = 0;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 0x0D && buf[i + 1] === 0x0A) continue;
+    out[n++] = buf[i];
+  }
+  return out.subarray(0, n);
+}
+
+// What a shell or the kernel parses, rather than what a person reads: the .sh,
+// and anything carrying a shebang - bin/*.mjs do, and `#!/usr/bin/env node\r`
+// fails the same way the moment somebody marks one executable. The .cmd files
+// are deliberately left alone: cmd.exe is their only reader and CRLF is its
+// native form.
+const runsAsScript = (rel, data) =>
+  rel.endsWith('.sh') || (data.length > 1 && data[0] === 0x23 && data[1] === 0x21);
+
+// ...and the other direction, for the one reader that wants CRLF. cmd.exe
+// seeks through a batch file byte by byte, so a `goto` in an LF-only .cmd can
+// land in the wrong place - and bench-ui.cmd goes to :failed to keep a
+// double-clicked window open. .gitattributes pins these to CRLF in the working
+// tree; this pins them in the ARTIFACT, so a checkout configured otherwise
+// cannot ship a batch file Windows mis-seeks.
+const NL = String.fromCharCode(10);
+const CRLF = String.fromCharCode(13, 10);
+const wantsCrlf = (rel) => rel.endsWith('.cmd') || rel.endsWith('.bat');
+
+function crlfOnly(buf) {
+  const text = buf.toString('binary');
+  // Normalise to LF first, then raise every LF - idempotent, and it cannot
+  // double a CR that is already there.
+  const out = text.split(CRLF).join(NL).split(NL).join(CRLF);
+  return out === text ? buf : Buffer.from(out, 'binary');
+}
+
 function buildZip(version) {
   const files = [];
   for (const rel of SHIPPED) collect(rel, files);
@@ -444,13 +493,19 @@ function buildZip(version) {
   // leaves one folder rather than twenty files, and two versions can sit side
   // by side.
   const root = `farever-bench-v${version}`;
-  const entries = files.map((rel) => ({
-    name: `${root}/${rel}`,
-    data: rel.endsWith('.md') ? forBundle(readFileSync(join(ROOT, rel))) : readFileSync(join(ROOT, rel)),
-    // S_IFREG, and +x only on the shell script - the one file in here that is
-    // run rather than read.
-    mode: rel.endsWith('.sh') ? 0o100755 : 0o100644,
-  }));
+  const entries = files.map((rel) => {
+    let data = readFileSync(join(ROOT, rel));
+    if (rel.endsWith('.md')) data = forBundle(data);
+    if (runsAsScript(rel, data)) data = lfOnly(data);
+    else if (wantsCrlf(rel)) data = crlfOnly(data);
+    return {
+      name: `${root}/${rel}`,
+      data,
+      // S_IFREG, and +x only on the shell script - the one file in here that
+      // is run rather than read.
+      mode: rel.endsWith('.sh') ? 0o100755 : 0o100644,
+    };
+  });
   const out = join(ROOT, `${root}.zip`);
   const bytes = zipBytes(entries);
   writeFileSync(out, bytes);
