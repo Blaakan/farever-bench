@@ -32,7 +32,7 @@
     "portable": { "artifactName": "FareverBench.exe" },
     "linux": {
       "target": [{ "target": "AppImage", "arch": ["x64"] }],
-      "icon": "web/appicon.ico",
+      "icon": "web/appicon.png",
       "category": "Game",
       "synopsis": "Character sheet, talent tree, rune page and gear optimizer for Farever"
     },
