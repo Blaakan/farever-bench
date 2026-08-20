@@ -6,6 +6,14 @@ Every release of farever-bench, newest first:
 `ui/package.json` always carry the same version - `tools/release.mjs` moves
 them together and refuses to run when they disagree.
 
+## [0.2.1] - 2026-08-20
+
+- A Linux build, and a cache that survives a read-only mount
+- Line endings decided here, not by whoever cloned the repo
+- The optimizer runs in a thread, not a second Electron
+- Edit what is equipped, and search what an item says
+- Fixed an issue that could result in epic rarity performing better than legendary in some cases
+
 ## [0.2.0] - 2026-08-12
 
 - A boss you fight at your own level, and a buff that stops growing
