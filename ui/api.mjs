@@ -3,15 +3,15 @@
 //
 // One default engine serves bootstrap/catalog/tooltips; /api/sheet draws from
 // a small LRU keyed on the engine-construction-time fight options (targets is
-// construction-time only - API.md pitfall 3). The optimizer runs in a child
-// process (ui/optimize-worker.mjs) because a search blocks the event loop for
-// seconds, and its progress comes back as JSON lines relayed over SSE.
+// construction-time only - API.md pitfall 3). The optimizer runs in a worker
+// thread (ui/optimize-worker.mjs) because a search blocks the event loop for
+// seconds, and its messages are relayed over SSE.
 // ---------------------------------------------------------------------------
 
-import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 
 import { createEngine, GOALS } from '../src/engine.mjs';
 import { illegalReason } from '../src/loadout.mjs';
@@ -1287,7 +1287,17 @@ export async function createApi({ benchRoot, game = null }) {
     };
   }
 
-  // --- the optimizer: child process + SSE relay -----------------------------
+  // --- the optimizer: worker thread + SSE relay -----------------------------
+  //
+  // A Worker, not a spawned process. Spawning process.execPath launched a
+  // SECOND Electron binary in the packaged app, and on some machines it died
+  // in Chromium's ICU bootstrap (exit 0x80000003, "Invalid file descriptor to
+  // ICU data received") before running any of our code - see the header of
+  // ui/optimize-worker.mjs. A worker needs no execPath and inherits no handle.
+  //
+  // Everything the UI can observe is unchanged: /api/optimize/start still
+  // answers {job}, the SSE stream still carries progress/done/error, and
+  // /api/optimize/cancel still ends the search - terminate() is the kill.
 
   const jobs = new Map();
   let jobSeq = 0;
@@ -1295,9 +1305,17 @@ export async function createApi({ benchRoot, game = null }) {
 
   function killJob(job, reason) {
     if (!job || job.done) return;
+    // Marked done BEFORE the terminate so the 'exit' it provokes reads as
+    // expected rather than reporting a second, contradictory error.
     job.done = true;
-    try { job.proc.kill(); } catch { /* already gone */ }
+    endWorker(job);
     pushEvent(job, 'error', { error: reason });
+  }
+
+  // terminate() rejects only if the thread is already gone, which is the
+  // outcome being asked for.
+  function endWorker(job) {
+    try { job.worker.terminate().catch(() => {}); } catch { /* already gone */ }
   }
 
   function pushEvent(job, event, data) {
@@ -1317,57 +1335,59 @@ export async function createApi({ benchRoot, game = null }) {
     if (runningJob && !runningJob.done) killJob(runningJob, 'superseded by a new optimize');
 
     const id = 'j' + (++jobSeq);
-    // process.execPath is node in dev and the Electron binary in the packaged
-    // app; ELECTRON_RUN_AS_NODE makes the latter behave as plain node.
-    const proc = spawn(process.execPath, [join(benchRoot, 'ui', 'optimize-worker.mjs')], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-      env: {
-        ...process.env,
-        ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+    // A file: URL, not a path string: the packaged bench is unpacked under a
+    // temp resources directory and either that or a dev clone can contain a
+    // space. The whole job travels in workerData - there is no stdin to race.
+    const worker = new Worker(pathToFileURL(join(benchRoot, 'ui', 'optimize-worker.mjs')), {
+      workerData: {
+        benchRoot, game,
+        loadout: body.loadout,
+        pins: body.pins ?? {},
+        options: { ...(body.options ?? {}), version },
       },
+      // Captured rather than printed, as the child's was: a worker that dies
+      // without a message leaves its last line as the only account of why.
+      stderr: true,
     });
     const job = {
-      id, proc, t0: Date.now(),
+      id, worker, t0: Date.now(),
       events: [], subscribers: new Set(), done: false, stderr: '',
     };
     jobs.set(id, job);
     runningJob = job;
 
-    proc.stdin.on('error', () => { /* worker died before reading the spec */ });
-    proc.stdin.end(JSON.stringify({
-      benchRoot, game,
-      loadout: body.loadout,
-      pins: body.pins ?? {},
-      options: { ...(body.options ?? {}), version },
-    }) + '\n');
+    // Must be drained even though nothing is expected on it: an unread worker
+    // stderr fills and then blocks the thread writing to it.
+    worker.stderr.on('data', (c) => { job.stderr = (job.stderr + c).slice(-4000); });
 
-    let buf = '';
-    proc.stdout.on('data', (chunk) => {
-      buf += chunk;
-      let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        let msg;
-        try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.type === 'progress') {
-          pushEvent(job, 'progress', {
-            evals: msg.evals, elapsed: (Date.now() - job.t0) / 1000,
-          });
-        } else if (msg.type === 'done') {
-          pushEvent(job, 'done', {
-            envelope: msg.envelope, view: msg.view,
-            score: msg.score, elapsed: msg.elapsed,
-          });
-        } else if (msg.type === 'error') {
-          pushEvent(job, 'error', { error: msg.error });
-        }
+    worker.on('message', (msg) => {
+      // Messages already in the port when a job was cancelled still arrive.
+      if (job.done) return;
+      if (msg?.type === 'progress') {
+        pushEvent(job, 'progress', {
+          evals: msg.evals, elapsed: (Date.now() - job.t0) / 1000,
+        });
+      } else if (msg?.type === 'done') {
+        pushEvent(job, 'done', {
+          envelope: msg.envelope, view: msg.view,
+          score: msg.score, elapsed: msg.elapsed,
+        });
+        endWorker(job);
+      } else if (msg?.type === 'error') {
+        pushEvent(job, 'error', { error: msg.error });
+        endWorker(job);
       }
     });
-    proc.stderr.on('data', (c) => { job.stderr = (job.stderr + c).slice(-4000); });
-    proc.on('exit', (code) => {
+    // Anything the worker's own catch cannot see - a failed module load, a
+    // throw after the search returned. The message, never the stack: this
+    // string is rendered as a sentence in the UI's error card.
+    worker.on('error', (err) => {
+      if (job.done) return;
+      pushEvent(job, 'error', { error: String(err?.message ?? err) });
+    });
+    // The backstop, and the reason a job can never hang: however the thread
+    // ends, it ends here, and a job with no answer yet gets one.
+    worker.on('exit', (code) => {
       if (!job.done) {
         pushEvent(job, 'error', {
           error: `optimize worker exited with code ${code}`
