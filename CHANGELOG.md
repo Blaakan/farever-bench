@@ -6,6 +6,10 @@ Every release of farever-bench, newest first:
 `ui/package.json` always carry the same version - `tools/release.mjs` moves
 them together and refuses to run when they disagree.
 
+## [0.2.2] - 2026-08-20
+
+- The Linux icon is a png, which is what the builder can read
+
 ## [0.2.1] - 2026-08-20
 
 - A Linux build, and a cache that survives a read-only mount

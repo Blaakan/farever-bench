@@ -1,6 +1,6 @@
 {
   "name": "farever-bench-ui",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Desktop UI for farever-bench: character sheet, talent tree, rune page, optimizer",
   "private": true,
   "main": "electron/main.cjs",
