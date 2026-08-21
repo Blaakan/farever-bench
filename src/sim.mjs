@@ -58,7 +58,8 @@ function rng(seed) {
  *   rotation,          // as resolved by skills.mjs
  *   cast(prof),        // -> { damage, heal, shield, singleTargetDamage }
  *   dotOutput(dot),    // -> { damage, heal } for ONE tick of a status
- *   cdr,               // 1 + CooldownReduction/100
+ *   cooldownMult,      // max(0, 1 - CooldownReduction/100) - the game's rule
+ *   weaponSkillRefund, // event-earned cooldown per second, WeaponSkills only
  *   fight,             // seconds
  *   fights,            // how many to roll; 1 = deterministic expected value
  *   seed,
@@ -96,7 +97,7 @@ export function simulate(spec) {
 
 function runFight(spec) {
   const {
-    rotation, cast, dotOutput, rollCrit = null, cdr = 1, cdrWeaponSkill = null, fight = 200, fights = 1,
+    rotation, cast, dotOutput, rollCrit = null, cooldownMult = 1, weaponSkillRefund = 0, fight = 200, fights = 1,
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
     poolScale = null, poolFactor = null, goal = null, chainResets = true,
@@ -144,6 +145,7 @@ function runFight(spec) {
       value: spec.start ?? 0,
       factor: spec.factor ?? 1,
       gainAtb: spec.gainAtb ?? null,
+      regen: spec.regen ?? 0,
     });
   }
   const tracked = (atb) => pools.has(atb);
@@ -203,12 +205,21 @@ function runFight(spec) {
   // everything else worth. Those are kept, marked, and the lookahead is what
   // decides whether pressing one pays.
   const bare = makeState();
-  // A weapon skill's cooldown can run faster than everything else's: `Red
-  // Tempo` gives a second back per bleed tick and its own text says "the
-  // cooldown of all your [WeaponSkill]s". A single sheet-wide CooldownReduction
-  // cannot say that, so the divisor is per skill.
+  // The period a skill actually cycles at: the CooldownReduction STAT
+  // multiplies the base by (1 - v/100) - the game's getCooldownModifier@4528,
+  // measured live to 48ms - while an EVENT refund (`Red Tempo` earning
+  // seconds back per bleed tick, WeaponSkills only) divides the period,
+  // because income per second against a fixed cost is a rate, not a discount.
   const isWeaponSkill = (prof) => prof.type === 'WeaponSkill' || prof.type === 'WeaponSubSkill';
-  const cdrFor = (prof) => (cdrWeaponSkill != null && isWeaponSkill(prof) ? cdrWeaponSkill : cdr);
+  const periodFor = (prof) => {
+    const refund = isWeaponSkill(prof) ? weaponSkillRefund : 0;
+    const period = (prof.cooldown * cooldownMult) / (1 + refund);
+    // An AUTHORED zero cooldown means "pool-gated or free" and the press site
+    // maps it to Infinity-after-one-charge; a cooldown REDUCED to zero by 100
+    // CooldownReduction means the opposite - press at will, paced only by the
+    // occupancy clock. Keep a hair of period so the two never collide.
+    return prof.cooldown > 0 ? Math.max(period, 1e-3) : period;
+  };
   const actives = [];
   for (const { prof, source, applies, via } of rotation.active) {
     const out = cast(prof, bare);
@@ -227,7 +238,7 @@ function runFight(spec) {
     // A dps fight does not spend GCDs on a pure heal; an hps fight does not
     // spend them on a nuke. A buff-applier stays - the lookahead prices it.
     if (!worth(out.damage, out.heal, out.shield) && !setsUp && !appliesDot && !appliesSummon) continue;
-    const cooldown = Math.max(prof.cooldown / cdrFor(prof), 0);
+    const cooldown = Math.max(periodFor(prof), 0);
     actives.push({
       prof, source, out, applies, via: via ?? null,
       cooldown,
@@ -731,7 +742,15 @@ function runFight(spec) {
     // `Warrior_InfiniteRage`'s 1 Rage every 3 seconds. Reset per run, and
     // advanced wherever the clock is.
     for (const p of pools.values()) p.value = p.start;
+    // Passive regen rides the same clock as scripted time income, on the
+    // game's own 3-second tick (measured: Spark arrives as 1.95 every 3.0s,
+    // during casts included, never smoothly). Lumping matters: the conduit
+    // gauge asks whether the pool sits ABOVE half at the spend, and a lump
+    // crosses that line at a different moment than a drip.
     const timeIncome = income.time.map((g) => ({ g, next: g.every }));
+    for (const [atb, p] of pools) {
+      if (p.regen > 0) timeIncome.push({ g: { atb, amount: p.regen * 3, every: 3 }, next: 3 });
+    }
     const advanceIncome = (until) => {
       for (const e of timeIncome) {
         while (e.next <= until) { earn(e.g.atb, e.g.amount); e.next += e.g.every; }

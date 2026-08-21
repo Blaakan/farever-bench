@@ -1212,6 +1212,15 @@ export function buildCombat(cdb, ctx, assume = {}) {
       level, spawnLevel: at,
       armor: S.phys * (a + b * at),
       magicArmor: S.mag * (a + b * at),
+      // Hero-sourced damage is also cut by (1 - target Resilience/100), with
+      // NO Raw guard - computeDamage@4841 ops 102-146. Today exactly one unit
+      // row in the game authors Resilience (BaseHero, 70) and no foe inherits
+      // it, so this reads 0 against everything the bench can target - the
+      // term is here so the first patch that gives a foe Resilience moves the
+      // answer instead of silently not.
+      resilience: unitId
+        ? (mergedStats(unitId).find((s) => s.attribute === 'Resilience')?.value ?? 0)
+        : 0,
     };
   }
 
@@ -1257,7 +1266,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
   // quarter of its Armor AND its MagicArmor, `Priest_BeaconOfHope_Status_Debuff`
   // makes it take 10% more, and until the fight could hold state, every one of
   // those was worth exactly zero.
-  const NO_DEBUFF = { armor: 1, magicArmor: 1, taken: 1 };
+  const NO_DEBUFF = { armor: 1, magicArmor: 1, taken: 1, takenRaw: 1 };
   // Per-category damage multipliers a talent confers, which are not stats and
   // so cannot live on the sheet. Empty by default, so a build with none of them
   // computes exactly what it did before.
@@ -1284,24 +1293,35 @@ export function buildCombat(cdb, ctx, assume = {}) {
       }
       // The script-side spelling of DamageTakenModifier: Death Mark's status
       // has no affix at all, just `dmg.dmgMult += 0.15` for the instigator's
-      // hits while it is worn. Read by statusesOf into `scriptTaken`; folded
-      // here exactly where an affix saying the same thing would land.
+      // hits while it is worn. Read by statusesOf into `scriptTaken` - and it
+      // is NOT the same channel as the attribute. computeDamage@4841 seeds
+      // modMult from dmg.dmgMult at op 14, BEFORE the Raw gate at ops 83-87;
+      // only the DamageTakenModifier ATTRIBUTE read is gated. So a script
+      // rider reaches a Raw Hemorrhage tick where an affix saying the same
+      // thing would not - which is why it accumulates separately here.
       if (d.scriptTaken) taken *= 1 + d.scriptTaken * (d.stacks ?? 1);
     }
     return {
       armor: Math.max(0, (1 + add.Armor) * mul.Armor),
       magicArmor: Math.max(0, (1 + add.MagicArmor) * mul.MagicArmor),
       taken: Math.max(0, (1 + add.DamageTakenModifier) * mul.DamageTakenModifier * taken),
+      takenRaw: Math.max(0, taken),
     };
   }
 
   function mitigate(effect, sheet, target, foe = NO_DEBUFF, mods = NO_MODS, attackerLevel = null) {
     const aff = affinityOf(effect.affinity);
-    // Raw bypasses EVERYTHING on the receiving side too: computeDamage@4841
-    // ops 83-87 skips DamageTakenModifier for the Raw affinity and
-    // getAffinityDamageReduction@4510 returns 0 outright.
-    if (aff.root === 'Raw') return 1;
-    if (!aff.resist) return foe.taken;
+    // Hero-sourced damage is cut by (1 - target Resilience/100) with NO Raw
+    // guard - computeDamage@4841 ops 102-146 - so it multiplies every branch
+    // below, the Raw one included. Zero against every current foe.
+    const resil = 1 - Math.min(100, Math.max(0, target.resilience ?? 0)) / 100;
+    // Raw bypasses the ATTRIBUTE side of the receiving pipeline: computeDamage
+    // @4841 ops 83-87 skip the DamageTakenModifier attribute for the Raw
+    // affinity and getAffinityDamageReduction@4510 returns 0 outright. Script
+    // taken-riders are seeded before that gate (op 14), so Death Mark's +15%
+    // still lands on a Raw tick - that is `takenRaw`.
+    if (aff.root === 'Raw') return (foe.takenRaw ?? 1) * resil;
+    if (!aff.resist) return foe.taken * resil;
     const resist = (aff.resist === 'MagicArmor' ? target.magicArmor * foe.magicArmor : target.armor * foe.armor);
     // `armorIgnore` is NOT penetration by another name. Exposed Essence ignores
     // 5% of a bleeding enemy's armour on its own multiply, and penetration
@@ -1322,7 +1342,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       flatReduction: 0, // the target's own flat reductions; a reference foe has none
       formula: ctx.consts.resistFormula,
     });
-    return Math.max(0, 1 - red) * foe.taken;
+    return Math.max(0, 1 - red) * foe.taken * resil;
   }
 
   /**
@@ -1689,14 +1709,23 @@ export function buildCombat(cdb, ctx, assume = {}) {
    * and the target, and hands both to the simulator.
    */
   function throughput(rotation, sheet, target, opts, live = null) {
-    const cdr = 1 + (sheet.get('CooldownReduction') ?? 0) / 100;
+    // The stat MULTIPLIES the cooldown by (1 - v/100), floored at zero -
+    // GameObject.getCooldownModifier@4528 is literally `max(0, 1 - atbVal(21))`,
+    // and 100 CooldownReduction means no cooldown at all. This used to divide
+    // by (1 + v/100), which is the same thing only at v = 0: at 30 CDR the
+    // divide leaves cooldowns 9.9% too long, and it penalises the stat at
+    // every value, so the optimizer's CDR gradient pointed the wrong way.
+    // Measured 2026-08-21: GA_Demon_Skill1 at rank-2 cooldown 20s pressed on
+    // cooldown cycles at exactly impact + 20.000s - the multiply, not the
+    // divide, and not the authored 25 either (rank overrides are separate).
+    const cooldownMult = Math.max(0, 1 - (sheet.get('CooldownReduction') ?? 0) / 100);
     // Cooldown earned back by an EVENT rather than carried as a stat, and only
     // for the skills the event names. `Red Tempo` cuts a second off your weapon
     // skills on a 12% roll per bleed tick, which at one tick every two seconds
-    // is 0.06 seconds per second - the same arithmetic as 6 points of
-    // CooldownReduction, but applying to WeaponSkills alone. The sheet has one
-    // CooldownReduction and cannot say that, so it rides alongside.
-    const cdrWeaponSkill = cdr + (live?.mods?.cooldown?.weaponSkill ?? 0);
+    // is 0.06 seconds of cooldown earned back per second - that one IS a
+    // divisor on the period, and it applies to WeaponSkills alone, so it
+    // rides beside the stat rather than folding into it.
+    const weaponSkillRefund = live?.mods?.cooldown?.weaponSkill ?? 0;
     const restat = live?.restat ?? (() => sheet);
     // A cast is priced AT THE MOMENT IT IS CAST, against whatever is up. That is
     // the whole difference between a priority list and a rotation: with a fixed
@@ -1787,11 +1816,30 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // frozen at rest, the doubling never applied and Berserk's extra Rage
       // was lost exactly inside the +20% window where it pays most.
       const factor = a.gainAtb ? (sheet.get(a.gainAtb) ?? 1) : 1;
+      // Passive regen, from `attribute.regenAtbs`: each entry names the stat
+      // that carries the rate and a factor on it. Entries with conds are
+      // states this fight is never in - Rage's decay waits for 3s OUT of
+      // combat, Spark's fast lane needs 1s out of combat - so only the
+      // condition-free entries pay here. For Spark that is SparkRegen x 1.3,
+      // and SparkRegen is itself 0.005 x MaxSpark, so a 100-cap Mage earns
+      // 0.65/s. MEASURED 2026-08-21: +1.95 per 3.0s tick, depletion-then-idle
+      // 0 -> 76.05 = exactly 39 lumps over 116.63s, ticking during casts,
+      // whole-rotation conservation exact - this income was the largest
+      // missing term in the Mage baseline. The 3s lump rides the game's own
+      // tick; the sim pays it on the same 3s clock so gauge thresholds (the
+      // conduit gate at half pool) cross in steps, not smoothly.
+      const raw = cdb.byId('attribute').get(atb);
+      let regen = 0;
+      for (const r of raw?.regenAtbs ?? []) {
+        if (r.conds && Object.keys(r.conds).length) continue;
+        regen += (sheet.get(r.atb) ?? 0) * (r.factor ?? 1);
+      }
       resources[atb] = {
         max,
         start: a.flags.has('NoAutoFill') ? 0 : max,
         factor: factor > 0 ? factor : 1,
         gainAtb: a.gainAtb ?? null,
+        regen: regen > 0 ? regen : 0,
       };
     }
     // The live gain factor for a pool, priced against the buffs that are up at
@@ -1867,7 +1915,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
     }
 
     return simulate({
-      rotation, cast, dotOutput, rollCrit, cdr, cdrWeaponSkill, resources, poolMultiplier,
+      rotation, cast, dotOutput, rollCrit, cooldownMult, weaponSkillRefund, resources, poolMultiplier,
       sparkGauge: rotation.sparkGauge ?? null,
       poolScale: bleedScoped ? poolScale : null,
       poolFactor,

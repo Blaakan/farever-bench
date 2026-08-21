@@ -5030,6 +5030,31 @@ group('verify: the model against the record');
     }).totals.missing === 0);
 }
 
+// --- CooldownReduction is the game's multiply, not a divide ------------------
+// GameObject.getCooldownModifier@4528 is `max(0, 1 - atbVal(21))` - the stat
+// MULTIPLIES the cooldown by (1 - v/100). Measured live 2026-08-21: a rank-2
+// 20s skill pressed on cooldown cycles at impact + 20.000s across six
+// intervals with 48ms of total spread. The old divide-by-(1 + v/100) agreed
+// only at v = 0 and left every cooldown long by v^2/(100^2 - v^2).
+group('CooldownReduction multiplies the cooldown');
+{
+  const fight = (cooldownMult) => simulate({
+    rotation: {
+      active: [{ prof: { id: 'X', type: 'ClassSkill', cooldown: 20, occupancy: 0.3, charges: 1, costs: [] },
+                 source: 'class', applies: null }],
+      dots: [], summons: [], triggered: [], filler: [], resources: { tracked: [] },
+    },
+    cast: () => ({ damage: 100, heal: 0, shield: 0, critRoll: null }),
+    dotOutput: () => ({ damage: 0, heal: 0 }),
+    cooldownMult, weaponSkillRefund: 0, fight: 200, fights: 1, goal: 'dps',
+  }).lines.find((l) => l.id === 'X').casts;
+  ok('at 0 CDR a 20s skill casts 10 times in 200s', fight(1) === 10, String(fight(1)));
+  // 50 CDR: the multiply gives a 10s period and 20 casts; the old divide gave
+  // 13.3s and 15 - this line is what separates the two rules.
+  ok('at 50 CDR it casts 20 times, not 15', fight(0.5) === 20, String(fight(0.5)));
+  ok('at 100 CDR the cooldown is gone, not halved', fight(0) > 100, String(fight(0)));
+}
+
 // --- a better item never sims lower ----------------------------------------
 // Both blocks below failed before the arm-hold rule in sim.mjs. A Mage carrying
 // a Halos mainhand and a Censer arsenal read 426.93 dps on a LEGENDARY Censer
