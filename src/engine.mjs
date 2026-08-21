@@ -33,11 +33,13 @@ export const DEFAULT_ASSUME = {
   mastery: true,
   // How much of the time basic attacks land from the target's rear half-plane,
   // for the weapon upgrade perks that pay there. The predicate (read from
-  // Daggers_Upgrade's script) is a full 180 degrees of "behind", so 1.0 is the
-  // right claim for a build that repositions - Shadowstep teleports there -
-  // and the one measured dummy session put a drifting melee at 0.68-0.85.
-  // An assumption, not data; --behind-fraction overrides it.
-  behindFraction: 1,
+  // Daggers_Upgrade's script) is a full 180 degrees of "behind", so 1.0 is
+  // the claim for a build that repositions every swing - Shadowstep teleports
+  // there - but nobody sustains it: the 2026-08 capture sweep measured the
+  // player's realized behind-share at ~0.41 across sessions, and the one
+  // dummy session that watched a drifting melee read 0.68-0.85. The default
+  // is the measured number; --behind-fraction 1 restores the optimist.
+  behindFraction: 0.41,
   // Reported from play: casting a skill interrupts the base-attack chain, so
   // the next swing starts the chain over. Everything gated on the combo
   // finisher - Rage income, prayer charging, per-combo procs - rides on this.

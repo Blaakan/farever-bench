@@ -250,7 +250,11 @@ function runFight(spec) {
     actives.push({
       prof, source, out, applies, via: via ?? null,
       cooldown,
-      occupancy: Math.max(prof.occupancy, 0.05),
+      // A cast that never takes the hero's control (takesControl false -
+      // Swirling Embers, Depth Shield) costs no clock at all: the swing chain
+      // plays through it in game, so billing its occupancy both slowed the
+      // fight AND broke the chain the one-clock rule was protecting.
+      occupancy: prof.takesControl === false ? 0 : Math.max(prof.occupancy, 0.05),
       maxCharges: prof.charges ?? 1,
       // A skill with no cooldown that costs a resource is gated by the POOL,
       // not by a charge. Running it through the charge machinery spends its one

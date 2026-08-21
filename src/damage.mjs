@@ -523,6 +523,34 @@ export function buildCombat(cdb, ctx, assume = {}) {
   // Visuals, Summon, SelfEffect do not.
   const EXEC_TYPES = new Set(['Mono', 'Status', 'Area', 'CastSkill', 'EffectTarget',
     'Projectile', 'Teleport', 'ItemEffect', 'Aura', 'SkillObject']);
+
+  // Whether pressing this skill takes CONTROL of the hero - reported from
+  // play (Swirling Embers and Depth Shield cast during autos; Eruption and
+  // Hive's Sunder stop the combo cold) and read from the bytecode: goState
+  // stays UseSkill until no PLANNED step is running or pending
+  // (isInRecovery@6135 / isPreventingStop@5892 / isPlanned@5890), and only
+  // planned `on`s - Start, CastEnd, a StepEnd chain - hold it. Event steps
+  // (Hit, Code, ProjectileHit) never do. A skill whose planned span is zero -
+  // a bare Status application, a pure script - never leaves Idle in any way
+  // the swing chain can feel: it costs no clock and the chain plays on.
+  function takesControlOf(skill) {
+    const steps = skill.steps ?? [];
+    if (steps.some((st) => typeof st.cond?.castHoldStep === 'number')) return true;
+    const onCastEnd = stepOnNames.indexOf('CastEnd');
+    const onStepEnd = stepOnNames.indexOf('StepEnd');
+    let span = 0;
+    for (const st of steps) {
+      const on = st.on ?? 0;
+      if (on !== 0 && on !== onCastEnd && on !== onStepEnd) continue;
+      const tn = stepTypeNames[st.type ?? -1] ?? '';
+      const start = Math.max(0, skillVal(st.delay, skill, 0));
+      // A lingering step holds the hero only until it SPAWNS; its lifetime
+      // runs unattended (an Area expires on its own, a Status just sits).
+      const hold = LINGERING_STEPS.has(tn) ? 0 : Math.max(0, skillVal(st.duration, skill, 0));
+      span = Math.max(span, start + hold);
+    }
+    return span > 1e-9;
+  }
   function execOffsetOf(skill) {
     const steps = skill.steps ?? [];
     const onStart = 0;
@@ -909,6 +937,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // The cooldown/cost anchor - see execOffsetOf. The press-to-press cycle
       // of a cooldown skill is execOffset + cooldown, never cooldown alone.
       ...(() => { const e = execOffsetOf(s); return { execOffset: e.offset, execAnchor: e.anchor }; })(),
+      // Whether the press takes the hero's control - see takesControlOf. A
+      // control-free cast rides alongside the swing chain: zero occupancy,
+      // no chain reset.
+      takesControl: takesControlOf(s),
       // A row that IS a status prices as a status tick: no attacker
       // fervor/mastery bracket (the tick's SkillContext belongs to the
       // carrier). See castOutput.
