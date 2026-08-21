@@ -1362,6 +1362,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
   function amountOf(effect, sheet, swingAttrs = null, weaponMixFlats = null) {
     let a = effect.baseVal;
     for (const s of effect.scaling) {
+      // The game adds a scaling row only when its ratio is strictly positive
+      // (getStepEffectScaling@20778 ops 131-137: `0 < ratio` gates the add).
+      // No row in today's data is zero or negative - this guard is for the
+      // patch that authors one, so the bench skips it the day the game does.
+      if (!(s.ratio > 0) && s.ratio != null) continue;
       let v = sheet.get(s.atb) ?? 0;
       // WeaponPower is the weapon's flat base PLUS the mean of the ITEM's
       // aptitude attributes. The expanded tooltips render it outright:
