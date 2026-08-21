@@ -149,14 +149,22 @@ function runFight(spec) {
     });
   }
   const tracked = (atb) => pools.has(atb);
+  // A cost derived from a cooldown follows the EFFECTIVE cooldown, not the
+  // authored one: getSparkCost@7986 reads cooldownDuration after the CDR
+  // modifier, so a CDR-stacking Mage pays less Spark per weapon skill, not
+  // just more often. The plan attaches the formula (`cdCost`) because it
+  // cannot know the sheet; the amount resolves here, where cooldownMult is.
+  const costOf = (c, prof) => (c.cdCost
+    ? Math.round(Math.max(c.cdCost.min, prof.cooldown * cooldownMult * c.cdCost.ratio))
+    : c.amount);
   const canPay = (prof) => (prof.costs ?? []).every((c) => {
     const p = pools.get(c.atb);
-    return !p || p.value >= c.amount - 1e-9;
+    return !p || p.value >= costOf(c, prof) - 1e-9;
   });
   const pay = (prof, share = 1) => {
     for (const c of prof.costs ?? []) {
       const p = pools.get(c.atb);
-      if (p) p.value = Math.max(0, p.value - c.amount * share);
+      if (p) p.value = Math.max(0, p.value - costOf(c, prof) * share);
     }
   };
   // What is up right now, for the gain factor below. The fight sets this to
@@ -455,10 +463,10 @@ function runFight(spec) {
     // resource it does not have and scores a rotation nobody can play.
     const bank = new Map([...pools].map(([k, p]) => [k, p.value]));
     const affordable = (prof) => (prof.costs ?? []).every((c) => !bank.has(c.atb)
-      || bank.get(c.atb) >= c.amount - 1e-9);
+      || bank.get(c.atb) >= costOf(c, prof) - 1e-9);
     const spend = (prof) => {
       for (const c of prof.costs ?? []) {
-        if (bank.has(c.atb)) bank.set(c.atb, Math.max(0, bank.get(c.atb) - c.amount));
+        if (bank.has(c.atb)) bank.set(c.atb, Math.max(0, bank.get(c.atb) - costOf(c, prof)));
       }
     };
     const gain = (atb, amount) => {
@@ -1209,7 +1217,7 @@ function runFight(spec) {
         // its own gain in the same instant.
         const sparkBefore = gaugePool ? gaugePool.value : 0;
         const sparkCost = gaugePool
-          ? (a.prof.costs ?? []).reduce((s, c) => (c.atb === gauge.atb ? s + c.amount : s), 0) : 0;
+          ? (a.prof.costs ?? []).reduce((s, c) => (c.atb === gauge.atb ? s + costOf(c, a.prof) : s), 0) : 0;
         // An armed register makes this cast free with probability p, so the
         // expected spend is `cost x (1 - p)`.
         const reg = emp.get(a.prof.id);
@@ -1226,7 +1234,7 @@ function runFight(spec) {
           for (const c of a.prof.costs ?? []) {
             if (c.atb === gauge?.atb) continue;   // the free half, per fn 44855
             const p2 = pools.get(c.atb);
-            if (p2) p2.value = Math.max(0, p2.value - c.amount * (reg ? 1 - reg.p : 1));
+            if (p2) p2.value = Math.max(0, p2.value - costOf(c, a.prof) * (reg ? 1 - reg.p : 1));
           }
         } else {
           pay(a.prof, reg ? 1 - reg.p : 1);
@@ -1387,6 +1395,20 @@ function runFight(spec) {
       // above the threshold.
       if (link.prof.isCombo && gauge?.finisherCost > 0) spendAndGauge(gauge.finisherCost, t);
       let swingOut = hit(link.prof, now);
+      // Chain Strike: +dmgMult on BASE attacks (never the finisher - the game
+      // gate is isBaseAttack, types 0-3) while the Chaincast register is
+      // armed. The armed flag below is the very status the script checks.
+      if (rotation.chainStrike && !link.prof.isCombo
+        && comboRegs.some((r) => r.chainSpend && r.armed)) {
+        const m = rotation.chainStrike;
+        swingOut = {
+          ...swingOut,
+          damage: swingOut.damage * m,
+          critRoll: swingOut.critRoll
+            ? { ...swingOut.critRoll, base: swingOut.critRoll.base * m, fixed: swingOut.critRoll.fixed * m }
+            : swingOut.critRoll,
+        };
+      }
       // The combo registers spend HERE: the finisher's own cast is the
       // consumer (onUseSkill isFinalAttack -> critChance += 1, consume). Same
       // expectation blend the active-cast registers use, cleared either way.

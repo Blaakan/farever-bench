@@ -2270,7 +2270,13 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         if (a.prof.type !== 'WeaponSkill' && a.prof.type !== 'WeaponSubSkill') continue;
         const amount = Math.round(Math.max(minCost, a.prof.cooldown * ratio));
         if (!(amount > 0)) continue;
-        a.prof = { ...a.prof, costs: [...(a.prof.costs ?? []), { atb: 'Spark', amount }] };
+        // `amount` is the resting price; `cdCost` is the formula, because
+        // getSparkCost@7986 reads the cooldown AFTER the CDR modifier - a
+        // CDR-stacking Mage pays less Spark per weapon skill, and only the
+        // sim knows the sheet's CooldownReduction. The sim resolves cdCost
+        // against the effective cooldown; the flat amount stands wherever no
+        // sheet is in play.
+        a.prof = { ...a.prof, costs: [...(a.prof.costs ?? []), { atb: 'Spark', amount, cdCost: { min: minCost, ratio } }] };
       }
       // The finisher's own cost is a FLAT constant with no cooldown term, and
       // it is the spend that actually drives the gauge on a naked Mage: five
@@ -2451,6 +2457,18 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       summons,
       chargeDump,
       wsRider,
+      // Mage_Talent_ChainStrike: `onInflictDamageEval - if isBaseAttack() and
+      // Mage_Talent_Chaincast_Status is up, dmgMult += vars.damage` per rank.
+      // isBaseAttack is skill types 0-3, so the finisher is EXCLUDED, and the
+      // Chaincast status is exactly the armed chain register the fight already
+      // tracks - the sim applies this to base swings while a register is
+      // armed, which is the window between a finisher and the next weapon
+      // skill. Contributed exactly zero before, on a state the sim had.
+      chainStrike: (() => {
+        const r = loadout.talents?.Mage_Talent_ChainStrike ?? 0;
+        const v = skills.get('Mage_Talent_ChainStrike')?.vars?.damage ?? 0;
+        return r > 0 && v > 0 ? 1 + v * r : null;
+      })(),
     };
   }
 
