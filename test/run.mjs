@@ -3709,8 +3709,11 @@ group('cooldown earned off an event, not only off a bleed');
   // of spread on a 20s skill. This line used to assert the press-anchored 10.
   const execOff = eng.combat.profile('Sword_Start_Skill1', 2).execOffset;
   ok('the exec offset is real and under a second', execOff > 0 && execOff < 1, String(execOff));
+  // The reported interval is fight/casts, so it quantizes at the bell: a
+  // 10.65s cycle fits 19 casts into 200s and reads 200/19, not 10.65.
+  const casts = Math.floor(200 / (10 + execOff)) + 1;
   near('at rank 2 the weapon skill waits its exec offset plus its whole cooldown',
-    at(2).interval, 10 + execOff, 1e-9);
+    at(2).interval, 200 / casts, 1e-9);
   ok('at rank 3 the finisher buys it back', at(3).interval < 9 + execOff,
     `${at(2).interval} -> ${at(3).interval}`);
 }
