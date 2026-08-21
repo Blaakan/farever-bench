@@ -419,6 +419,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
     const loop = step.props?.loop;
     let ticks = 1;
     let spread = false;
+    let spreadMult = 1;
     if (loop && (loop.tick != null)) {
       spread = !!((loop.flags ?? 0) & LOOP_SPREAD) || stepTypeName === 'SelfEffect';
       const tick = skillVal(loop.tick, skill, 0.5); // the column's own default
@@ -426,24 +427,35 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // -1 means "until the owner ends", which for a status is its lifetime.
       if (span < 0 || span === 0) span = ownDuration;
       if (tick > 0 && span > 0) {
-        const first = ((loop.flags ?? 0) & LOOP_DIRECT_START) ? 0 : tick;
-        // The epsilon is not cosmetic: `span / tick` is a float division and a
-        // duration of 9 at a tick of 3 can land at 2.9999999999999996, which
-        // floors to 2 and silently drops a third of the DoT.
-        //
-        // A SPREAD loop divides by the game's own count - initTicks@5882 sets
-        // baseExpectedTicks = floor(duration / tick), with no start-tick +1
-        // whatever the flags say - and RayOfSpark is the row that shows the
-        // difference: dur 1 at tick 0.25 with DIRECT_START read 5 here while
-        // the game divides (and fires) 4. Every 2s-tick status row lands on
-        // the same number under both formulas, which is how the +1 hid.
-        ticks = spread
-          ? Math.max(1, Math.floor(span / tick + 1e-9))
-          : Math.floor((span - first) / tick + 1e-9) + 1;
-        if (step.props?.area?.skipFirstTick) ticks -= 1;
+        // The interval schedule is the same N whichever way the loop starts:
+        // SkillStep.start@5885 ops 81-101 applies a DIRECT_START at t=0 and
+        // then schedules from 1.05 x tick, while a plain loop starts at
+        // 0.95 x tick - both land floor(span/tick) interval events. The old
+        // `+1` for DIRECT_START priced every such loop one tick high (all 9
+        // authored DIRECT_START non-spread rows are foe skills, so it was a
+        // tripwire, not a live error). The epsilon is not cosmetic: 9/3 can
+        // float to 2.9999... and silently drop a third of the DoT.
+        const N = Math.max(1, Math.floor(span / tick + 1e-9));
+        // An INSTANTIATED area fires one extra hit AT SPAWN, before the loop:
+        // SkillArea.startHit__impl@5174 ops 58-59, skipped only by
+        // props.area.skipFirstTick. MEASURED on GS_Nova_Skill1 - 13/14 events
+        // in the capture where the loop alone says 12 - and every looping
+        // player area without a targetCooldown was short that hit.
+        const spawnHit = !!step.props?.area && !step.props?.area?.skipFirstTick ? 1 : 0;
+        ticks = N + spawnHit;
+        // targetCooldown gates the SPAWN hit and the re-hits alike: the same
+        // target may be touched at t=0 and then once per window, and a window
+        // closing exactly at the step's end pays nothing (Smite ticks fifteen
+        // times and touches each enemy once).
         const tc = step.props?.area?.targetCooldown;
-        if (tc > 0) ticks = Math.min(ticks, 1 + Math.floor((span - first) / tc + 1e-9));
+        if (tc > 0) ticks = Math.min(ticks, 1 + Math.floor(span / tc - 1e-9));
         ticks = Math.max(0, ticks);
+        // A SPREAD loop divides the declared TOTAL by the game's own divisor -
+        // round(dur/tick), AreaStep.getExpectedTicks@5971 - but every EVENT
+        // pays a share, the spawn hit included. So an area spread loop pays
+        // (N + 1)/N x the declared total (Radiant Verdict 1.25x, Blazing Beam
+        // 13/12x), and a non-area one pays it exactly once.
+        if (spread) spreadMult = ticks / Math.max(1, Math.round(span / tick));
       }
     }
     // A projectile-hit step lands once per projectile the skill generated - and
@@ -461,7 +473,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
       }
       if (n > 0) projectiles = n;
     }
-    return { ticks, spread, projectiles, mult: (spread ? 1 : ticks) * projectiles };
+    return { ticks, spread, projectiles, mult: (spread ? spreadMult : ticks) * projectiles };
   }
 
   // How long the actor is committed to a cast.
@@ -491,6 +503,64 @@ export function buildCombat(cdb, ctx, assume = {}) {
   // A Visuals step is left behind exactly the way a persistent area is - an FX
   // that outlives the cast is not a commitment.
   const LINGERING_STEPS = new Set(['Area', 'Aura', 'Summon', 'SkillObject', 'Status', 'Visuals']);
+
+  // Where the cooldown clock, the resource cost and the charge actually
+  // anchor: the EXEC STEP's start, not the button press. getCDStyle@7943 picks
+  // "on exec-step start" for every player skill that has one; onStartStep@7993
+  // fires tryConsumeCharge@7994 when the started step IS the exec step, which
+  // triggers the cooldown and pays the cost. MEASURED 2026-08-21: GA_Demon_
+  // Skill1 pressed on cooldown cycles at impact + 20.000s (48ms spread, n=6),
+  // an exec delay of ~0.72s per cast the press-anchored model never billed -
+  // cast-bar weapon skills cycle 9-16% slower in game than a press anchor
+  // says.
+  //
+  // Selection (initSteps@6032 L463-466): a step with props.flags & 2 (the
+  // "TriggerCD" bit) ALWAYS overwrites - last flagged wins; otherwise the
+  // FIRST step passing isSkillExecutionStep@20770 while none is chosen yet.
+  // isSkillExecutionStep: never Trigger/Code `on`, never a rank/mastery-
+  // conditioned step; then by TYPE - the instant payload types qualify,
+  // Channel qualifies, Cast only when castFlags & 4 (channelled); Dash,
+  // Visuals, Summon, SelfEffect do not.
+  const EXEC_TYPES = new Set(['Mono', 'Status', 'Area', 'CastSkill', 'EffectTarget',
+    'Projectile', 'Teleport', 'ItemEffect', 'Aura', 'SkillObject']);
+  function execOffsetOf(skill) {
+    const steps = skill.steps ?? [];
+    const onStart = 0;
+    const onCastEnd = stepOnNames.indexOf('CastEnd');
+    const onTrigger = stepOnNames.indexOf('Trigger');
+    const onCode = stepOnNames.indexOf('Code');
+    const conded = (st) => {
+      const c = st.cond ?? {};
+      return c.minRank != null || c.maxRank != null || c.equalRank != null
+        || c.mastery != null || c.masteryExclude != null;
+    };
+    let flagged = null, typed = null;
+    for (const st of steps) {
+      if ((st.props?.flags ?? 0) & 2) { flagged = st; continue; }
+      if (typed) continue;
+      const on = st.on ?? 0;
+      if (on === onTrigger || on === onCode || conded(st)) continue;
+      const tn = stepTypeNames[st.type ?? -1] ?? '';
+      const castFlags = st.props?.castFlags ?? 0;
+      if (EXEC_TYPES.has(tn) || tn === 'Channel' || (tn === 'Cast' && (castFlags & 4))) typed = st;
+    }
+    const exec = flagged ?? typed;
+    if (!exec) return { offset: 0, anchor: 'press' };
+    const delay = Math.max(0, skillVal(exec.delay, skill, 0));
+    if ((exec.on ?? 0) === onCastEnd) {
+      // The offset is the cast bar itself plus the exec step's own delay.
+      let castEnd = 0;
+      for (const st of steps) {
+        if ((st.on ?? 0) !== onStart || conded(st)) continue;
+        const tn = stepTypeNames[st.type ?? -1] ?? '';
+        if (tn !== 'Cast' && tn !== 'Channel') continue;
+        castEnd = Math.max(castEnd,
+          Math.max(0, skillVal(st.delay, skill, 0)) + Math.max(0, skillVal(st.duration, skill, 0)));
+      }
+      return { offset: castEnd + delay, anchor: 'cast-end' };
+    }
+    return { offset: delay, anchor: 'exec-step' };
+  }
   function occupancyOf(skill, typeName) {
     let end = 0, lingering = 0;
     for (const st of skill.steps ?? []) {
@@ -544,7 +614,14 @@ export function buildCombat(cdb, ctx, assume = {}) {
     // always in scope.
     let props = s.props ?? {};
     let vars = s.vars ?? {};
-    for (const ov of (s.props?.rankOverride ?? []).slice().sort((a, b) => (a.minRank ?? 0) - (b.minRank ?? 0))) {
+    // AUTHORED order, not minRank order: updateSkillInf@20788 loops the array
+    // as written and Reflect-merges every entry the rank clears, so a later
+    // authored entry wins per-field whatever its minRank says. Every current
+    // row is authored ascending, so the two orders agree today - this is the
+    // order that keeps agreeing when one is not. Measured 2026-08-21:
+    // GA_Demon_Skill1 cycles at exactly its rank-2 override (20s, not the
+    // authored 25) - press-to-press = impact + 20.000s.
+    for (const ov of s.props?.rankOverride ?? []) {
       if ((ov.minRank ?? 0) > rank) continue;
       props = { ...props, ...(ov.props ?? {}) };
       vars = { ...vars, ...(ov.vars ?? {}) };
@@ -829,6 +906,9 @@ export function buildCombat(cdb, ctx, assume = {}) {
       nature: natureName,
       cooldown: num(props.cooldown, num(s.cooldown)),
       occupancy: occupancyOf(s, typeName),
+      // The cooldown/cost anchor - see execOffsetOf. The press-to-press cycle
+      // of a cooldown skill is execOffset + cooldown, never cooldown alone.
+      ...(() => { const e = execOffsetOf(s); return { execOffset: e.offset, execAnchor: e.anchor }; })(),
       // A row that IS a status prices as a status tick: no attacker
       // fervor/mastery bracket (the tick's SkillContext belongs to the
       // carrier). See castOutput.

@@ -258,6 +258,11 @@ function runFight(spec) {
       // per fight - `Warrior_Rage_Strike` read one cast in 200 seconds when its
       // income supports one every eight.
       poolGated: cooldown <= 0 && (prof.costs ?? []).some((c) => pools.has(c.atb)),
+      // The cooldown clock starts at the EXEC STEP, not the press - measured
+      // to 48ms on GA_Demon_Skill1 - so the cycle a press buys is
+      // execOffset + cooldown. The cost is still paid at press here (the game
+      // pays at exec too, but nothing in this fight earns inside the gap).
+      execOffset: Math.max(0, prof.execOffset ?? 0),
       // The base priority: what a second of your time buys toward the goal,
       // before anything is up. With a lookahead this is only the tiebreak;
       // without one it is the whole player model.
@@ -557,7 +562,7 @@ function runFight(spec) {
       if (chose >= 0) {
         const a = actives[chose];
         if (!a.poolGated) {
-          if (cd[chose].charges === a.maxCharges) cd[chose].nextCharge = t + (a.cooldown > 0 ? a.cooldown : Infinity);
+          if (cd[chose].charges === a.maxCharges) cd[chose].nextCharge = t + a.execOffset + (a.cooldown > 0 ? a.cooldown : Infinity);
           cd[chose].charges--;
         }
         spend(a.prof);
@@ -1210,7 +1215,7 @@ function runFight(spec) {
       if (pressed >= 0) {
         const a = actives[pressed], st = state[pressed];
         if (!a.poolGated) {
-          if (st.charges === a.maxCharges) st.nextCharge = t + (a.cooldown > 0 ? a.cooldown : Infinity);
+          if (st.charges === a.maxCharges) st.nextCharge = t + a.execOffset + (a.cooldown > 0 ? a.cooldown : Infinity);
           st.charges--;
         }
         // Pay BEFORE the cast pays you, so a skill can never fund itself out of

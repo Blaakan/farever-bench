@@ -3704,8 +3704,14 @@ group('cooldown earned off an event, not only off a bleed');
     const ev = eng.evaluate(l, { target: eng.combat.foe('dummy', 25), rank });
     return ev.throughput.lines.find((x) => x.id === 'Sword_Start_Skill1');
   };
-  near('at rank 2 the weapon skill waits its whole cooldown', at(2).interval, 10, 1e-9);
-  ok('at rank 3 the finisher buys it back', at(3).interval < 9,
+  // The cycle is execOffset + cooldown, not the cooldown alone: the clock
+  // starts when the exec step starts (getCDStyle@7943), measured live to 48ms
+  // of spread on a 20s skill. This line used to assert the press-anchored 10.
+  const execOff = eng.combat.profile('Sword_Start_Skill1', 2).execOffset;
+  ok('the exec offset is real and under a second', execOff > 0 && execOff < 1, String(execOff));
+  near('at rank 2 the weapon skill waits its exec offset plus its whole cooldown',
+    at(2).interval, 10 + execOff, 1e-9);
+  ok('at rank 3 the finisher buys it back', at(3).interval < 9 + execOff,
     `${at(2).interval} -> ${at(3).interval}`);
 }
 
