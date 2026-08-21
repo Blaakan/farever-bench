@@ -204,7 +204,29 @@ export function buildCombat(cdb, ctx, assume = {}) {
     if (hit) return hit;
     hit = [];
     const body = String(s.script).replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
-    for (const m of body.matchAll(/\w+\.(dmgMult|critDmgMult)\s*\+=\s*vars\.([A-Za-z0-9_]+)/g)) {
+    // `critChance` rides the same eval-time family: evalDamage@6017 runs the
+    // skill's own hooks BEFORE criticalRoll@6211, so `hit.critChance += x`
+    // raises landed crit in fraction space, and `hit.critChance = 100` is a
+    // guaranteed crit (the literal is percent; the roll is a fraction).
+    // Blazing Beam measured 93/93 at rank >= 2 with the tooltip saying so.
+    for (const m of body.matchAll(/\w+\.critChance\s*=\s*100\b/g)) {
+      const before = body.slice(0, m.index);
+      const line = before.slice(before.lastIndexOf('function'));
+      const rune = /hasMastery\s*\(\s*(?:Mastery\.)?([A-Za-z0-9_]+)/.exec(line)?.[1];
+      if (rune && !runes?.has(rune)) continue;
+      if (!/\|\|/.test(line)) {
+        let rankOk = true;
+        for (const r of line.matchAll(/\brank\s*(>=|<=|==|!=|>|<)\s*(\d+)/g)) {
+          const n = Number(r[2]);
+          rankOk = rankOk && (r[1] === '>=' ? rank >= n : r[1] === '<=' ? rank <= n
+            : r[1] === '>' ? rank > n : r[1] === '<' ? rank < n
+              : r[1] === '==' ? rank === n : rank !== n);
+        }
+        if (!rankOk) continue;
+      }
+      hit.push({ field: 'critChance', amount: 1, forced: true, gate: null, targetHealth: null, singleTarget: false });
+    }
+    for (const m of body.matchAll(/\w+\.(dmgMult|critDmgMult|critChance)\s*\+=\s*vars\.([A-Za-z0-9_]+)/g)) {
       const field = m[1];
       const before = body.slice(0, m.index);
       const line = before.slice(before.lastIndexOf('function'));
@@ -1599,12 +1621,21 @@ export function buildCombat(cdb, ctx, assume = {}) {
             : th.op === '<' ? health < th.threshold
               : th.op === '>=' ? health >= th.threshold : health > th.threshold);
         let scriptCritDmg = 0;
+        // ...and crit CHANCE riders, the family evalDamage@6017 runs before
+        // the roll (criticalRoll@6211: critChance >= random()). Ten live
+        // writers in the sheet do `hit.critChance += vars.x` in fraction
+        // space, and Blazing Beam simply assigns 100: MEASURED 93/93 crits
+        // at rank >= 2, and the tooltip prints "Always critically strikes".
+        // These were dropped whole - up to +43% missing on one skill.
+        let scriptCritCh = 0, forcedCrit = false;
         for (const rd of prof.runeDamage ?? []) {
-          if (rd.field !== 'critDmgMult') continue;
+          if (rd.field !== 'critDmgMult' && rd.field !== 'critChance') continue;
           if (rd.singleTarget && wantTargets !== 1) continue;
           if (!gateOn(rd.gate)) continue;
           if (!healthOk(rd.targetHealth)) continue;
-          scriptCritDmg += rd.amount * gateVal(rd.gate);
+          if (rd.field === 'critDmgMult') scriptCritDmg += rd.amount * gateVal(rd.gate);
+          else if (rd.forced) forcedCrit = true;
+          else scriptCritCh += rd.amount * gateVal(rd.gate);
         }
         // A swing-triggered status tick rolls inside the swing's hit context,
         // so its by-type key is the SWING's category, not the status row's
@@ -1625,10 +1656,10 @@ export function buildCombat(cdb, ctx, assume = {}) {
         const rawAff = aff.root === 'Raw';
         const statusTick = prof.isStatusTick === true;
         const tickCrits = statusTick && prof.tickCanCrit === true && prof.tickCarrierSelf === true;
+        const pLocal = forcedCrit ? 1 : Math.min(1, critChance + chanceBonus + scriptCritCh);
         const localCrit = statusTick && !tickCrits ? 1
-          : (critBonus || chanceBonus)
-            ? 1 + Math.min(1, critChance + chanceBonus)
-              * ((sheet.get('CritDamage') ?? 100) / 100 + critBonus - 1)
+          : (critBonus || chanceBonus || scriptCritCh || forcedCrit)
+            ? 1 + pLocal * ((sheet.get('CritDamage') ?? 100) / 100 + critBonus - 1)
             : critMult;
         // Raw damage bypasses every global multiplier: getDamageScale@5146
         // returns 1 for Raw before fervor, mastery or DamageModifier enter.
@@ -1650,7 +1681,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // (a weapon-skill bonus), or across the board.
         let riders = 0;
         for (const rd of prof.runeDamage ?? []) {
-          if (rd.field === 'critDmgMult') continue;   // handled at `critBonus`
+          if (rd.field === 'critDmgMult' || rd.field === 'critChance') continue;   // handled at the crit bracket
           if (rd.singleTarget && wantTargets !== 1) continue;
           if (!gateOn(rd.gate)) continue;
           if (!healthOk(rd.targetHealth)) continue;
@@ -1718,7 +1749,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
           const whole = raw * m * targets;
           const base = localCrit > 0 ? whole / localCrit : whole;
           if (localCrit > 1) {
-            critRoll.p = Math.min(1, critChance + chanceBonus);
+            critRoll.p = pLocal;
             critRoll.cd = (sheet.get('CritDamage') ?? 100) / 100 + critBonus;
             critRoll.hits += e.hits ?? 1;
             critRoll.base += base;
@@ -1753,7 +1784,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
           if (aff.root === 'Physical') totalPhysical += banked;
           else if (aff.root === 'Magic') totalMagic += banked;
           if (localCrit > 0) {
-            const pEff = Math.min(1, critChance + chanceBonus);
+            const pEff = pLocal;
             const cdEff = (sheet.get('CritDamage') ?? 100) / 100 + critBonus;
             const critShare = (raw * m * targets) * (pEff * cdEff) / localCrit / dmgMod;
             if (aff.root === 'Physical') critPhysical += critShare;
