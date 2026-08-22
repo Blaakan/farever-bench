@@ -2564,9 +2564,18 @@ group('affix stacking');
   near('MRatio compounds', A.composeMul('TAttribute_MRatio', 1, 0.6), 0.6);
   near('MRatio compounds twice', A.composeMul('TAttribute_MRatio', 0.6, 0.5), 0.3);
   // Min(base 1) takes the strongest and does NOT compound: two 30% slows are a
-  // 30% slow.
-  near('MRatioMin takes the strongest', A.composeMul('TAttribute_MRatioMin', 1, 0.7), 0.7);
-  near('MRatioMin does not compound', A.composeMul('TAttribute_MRatioMin', 0.7, 0.7), 0.7);
+  // 30% slow. And it is its own CHANNEL - atbValModMul@4795 aggregates the
+  // Mul product and the Min separately and multiplies the results - so a Min
+  // entering a chain turns the accumulator into a {mul,min} pair that
+  // resolveMul settles.
+  near('MRatioMin takes the strongest', A.resolveMul(A.composeMul('TAttribute_MRatioMin', 1, 0.7)), 0.7);
+  near('MRatioMin does not compound',
+    A.resolveMul(A.composeMul('TAttribute_MRatioMin', A.composeMul('TAttribute_MRatioMin', 1, 0.7), 0.7)), 0.7);
+  // The mixed chain is the case one accumulator got wrong: MRatio 1.2 then
+  // MRatioMin 0.5 is 1.2 x 0.5 = 0.6 in the game, where a single min() fold
+  // read 0.5.
+  near('the two channels multiply',
+    A.resolveMul(A.composeMul('TAttribute_MRatioMin', A.composeMul('TAttribute_MRatio', 1, 1.2), 0.5)), 0.6);
   ok('the sheet still says so', ctx.affix.stacking.get('TAttribute_MRatioMin')?.case === 'Min'
     && ctx.affix.stacking.get('TAttribute_MRatio')?.case === 'Multiplicative');
 
