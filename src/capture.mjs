@@ -5,6 +5,15 @@
 //
 //   ts_ms,event,source,target,skill_id,amount,crit,stacks,max_stacks,extra
 //
+// Probe v7 (2026-08-23) enriches inflict rows with the TARGET's live facts in
+// extra: tlvl (spawn level - the number no data file can derive), thp (current
+// health - every execute clause), tmax/tarm/tmarm/tdtm (MaxHealth, Armor,
+// MagicArmor, DamageTakenModifier off the live attribute map - group shreds
+// and taken-amps included). And a snapshot event snap_buff: every active
+// status on the hero (ore buffs, food, flasks - the consumables that were
+// invisible). Rows older than v7 simply lack the keys; parseExtra is tolerant
+// either way.
+//
 // This file is the only authoritative thing the bench has. Everything else in
 // src/ is a claim about how Farever computes damage; this is a record of what
 // Farever computed. Where the two disagree, this wins.

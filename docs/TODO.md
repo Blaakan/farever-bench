@@ -89,6 +89,34 @@ a patch turns it on).
   defaults in the bootstrap payload so the front-end cannot drift.
 - Expose `--rotation-file` and `--target-level` in the UI.
 
+## Verify — the group-content pass (unblocked by probe v7)
+
+The 2026-08-22 Rogue verify taught three lessons, all from the author's own
+challenge. (1) Per-hit rows were POOLED across instances of an archetype,
+which is wrong exactly when instances differ in debuff state — the rift case.
+(2) External debuffs were not accounted for and they DOMINATE boss windows:
+live basics hit DemonSuperElite HARDER than rift trash (34.5 vs 25-28 mean
+non-crit), an inversion armour cannot produce at any spawn level — the
+party's shreds and taken-amps did it, and the "DemonSuperElite spawns at
+rift level" reading is NOT separable from them in v6 data. (3) OreAffix_Ice
+is a consumable prebuff, not a model gap.
+
+Probe v7 makes the honest version buildable — work items:
+
+- **Debuff-aware, per-instance verify**: group by target INSTANCE, price each
+  hit against the row's own tarm/tmarm/tdtm instead of a derived foe — the
+  spawn-level question and the shred question both become one subtraction.
+- **tlvl closes the fitted spawn levels**: retire FITTED_LEVELS in favour of
+  logged levels wherever v7 rows exist; keep the fits only for old captures.
+- **thp turns execute clauses into measured windows** (Demonic Bite's +25%
+  under 35% shows today as a persistent −5% on its row).
+- **snap_buff folds prebuffs into the verify loadout** (ore weapon buffs,
+  food, flasks) instead of the standing "consumables not captured" caveat.
+- Open model-side finding from that ledger, target-independent in size:
+  Daggers_Demondash_Passive_Status per-hit at −65.7% (model 32.9 vs live
+  95.9 dps) — signature of a live stack count ~3x what the model credits on
+  that ScaleWithStacks burn.
+
 ## Verify / tooling
 
 - Per-category crit buckets in `bench verify` (weapon-path vs spell-path) so
