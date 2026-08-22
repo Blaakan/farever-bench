@@ -5156,6 +5156,28 @@ group('the arsenal inversion stays fixed');
     legFlat >= epiFlat - 1e-9, `${legFlat.toFixed(4)} vs ${epiFlat.toFixed(4)}`);
 }
 
+// --- a summoner is worth its pets ------------------------------------------
+// The Silhouette of Almaz was priced at 1.1 pet hits per fight: the summon
+// window read the ROW's duration - the 0.3s cast - instead of the Summon
+// step's authored 12. The spec must read the step, the pets must be material,
+// and the imps' +15% crit rider (always true on the pet line) must price.
+group('the Almaz imps live twelve seconds, not a cast');
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Mage', 25);
+  l.gear.Slot_Weapon1 = { item: 'Staff_SummonDemon', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const sp = (r.rotation.summons ?? [])[0];
+  ok('the summon spec exists', !!sp, JSON.stringify(sp ?? null));
+  near('...with the STEP\'s window', sp.duration, 12, 1e-9);
+  near('...the documented swing cycle', sp.period, 3.8, 1e-9);
+  near('...and the imps\' own crit rider', sp.petCritBonus, 0.15, 1e-9);
+  const pets = r.throughput.lines.find((x) => /#pets$/.test(x.id));
+  ok('the pets land a material number of swings', (pets?.hits ?? 0) > 30,
+    `${pets?.hits} hits, ${((pets?.total.damage ?? 0) / 200).toFixed(1)} dps`);
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

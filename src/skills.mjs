@@ -2182,20 +2182,46 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const autoId = (unitRow?.skills ?? []).map((x) => x.skill ?? x.ref ?? x).find(Boolean);
       const auto = autoId ? profileOf(autoId) : null;
       if (!auto || !(auto.effects ?? []).some((e) => e.kind === 'Damage')) return null;
-      // The pet's swing period from its own authored steps: every step's
-      // delay + duration, summed - cast 0.3 + 2.2 and recovery 1.3 for the
-      // imp, 3.8s authored against a measured 3.23s (the recovery overlaps
-      // partially live; the authored number is kept, conservative and cited).
-      const period = (cdb.byId('skill').get(autoId)?.steps ?? [])
-        .reduce((s2, x) => s2 + (Number(x.delay) || 0) + (Number(x.duration) > 0 ? Number(x.duration) : 0), 0) || 3.8;
-      const dur = Number(row.duration) || row.vars?.dur1 || 12;
+      // The pet's swing period from its own authored steps. Not every step is
+      // clock: Visuals and the Projectile's flight overlap the action, so
+      // summing EVERY delay+duration read the imp at 7.0s where the measured
+      // cycle is 3.23s. The cycle the comment always described is the longest
+      // action step's end plus the Wait recovery - FreeRotation 0.3+2.2 and
+      // Wait 1.3 = 3.8 for the imp, against 3.23 measured (the recovery
+      // overlaps partially live; the authored number stays, conservative).
+      const petSteps = cdb.byId('skill').get(autoId)?.steps ?? [];
+      const stepEnd = (x) => (Number(x.delay) > 0 ? Number(x.delay) : 0)
+        + (Number(x.duration) > 0 ? Number(x.duration) : 0);
+      const actionEnd = petSteps.reduce((m, x) => {
+        const tn = stepTypeNames[x.type ?? -1] ?? '';
+        return (tn === 'Visuals' || tn === 'Wait') ? m : Math.max(m, stepEnd(x));
+      }, 0);
+      const waits = petSteps.reduce((s2, x) => s2
+        + ((stepTypeNames[x.type ?? -1] ?? '') === 'Wait' && Number(x.duration) > 0 ? Number(x.duration) : 0), 0);
+      const period = (actionEnd + waits) || 3.8;
+      // How long the pets LIVE is the SUMMON STEP's duration - the row's own
+      // `duration` is the cast length. Reading the row first priced the
+      // Silhouette of Almaz's imps at a 0.3-SECOND window per 20s cycle -
+      // 1.1 pet hits per fight, a summoner priced at zero with a straight
+      // face. Step duration, then the vars the scripts name, then the row.
+      const dur = (Number(st.duration) > 0 ? Number(st.duration) : null)
+        ?? (typeof st.duration === 'string' ? row.vars?.[st.duration] : null)
+        ?? row.vars?.dur1
+        ?? (Number(row.duration) || 12);
       // onSummonElapsed -> checkProba(vars.chance) -> a charge, per expiry.
       const body = liveScript(row.script ?? '');
       const el = /onSummonElapsed[\s\S]{0,160}?checkProba\s*\(\s*vars\.(\w+)\s*\)/.exec(body);
+      // The summoner's own script can raise its PETS' crit: the Almaz reads
+      // `if (hit.sourceUnit.kind == Unit.Summon_Imp) hit.critChance += 0.15`.
+      // That guard is unanswerable for the player's own casts and stays
+      // refused there - but for the PET line it is always true.
+      const pc = new RegExp('sourceUnit[\\s\\S]{0,80}?kind\\s*==\\s*(?:Unit\\.)?' + unitId
+        + '[\\s\\S]{0,80}?critChance\\s*\\+=\\s*vars\\.(\\w+)').exec(body);
       return {
         from: id, unit: unitId, count: st.props.summon.count ?? 1,
         duration: dur, period, petProf: auto,
         elapsedChargeChance: el ? (row.vars?.[el[1]] ?? 0) : 0,
+        petCritBonus: pc ? (row.vars?.[pc[1]] ?? 0) : 0,
       };
     };
     // A summoner that fell into unmodelled earns its slot back: its worth is

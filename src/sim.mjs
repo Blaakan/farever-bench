@@ -697,9 +697,19 @@ function runFight(spec) {
     // combat timer and the summon-expiry proc feed the same bank; the charge
     // dump spends the whole bank as one multiplied cast. All expectations,
     // like everything else in the deterministic fight.
-    const summonState = (rotation.summons ?? []).map((sp) => ({
-      sp, out: cast(sp.petProf, bare), until: 0, hits: 0, damage: 0,
-    }));
+    const summonState = (rotation.summons ?? []).map((sp) => {
+      let out = cast(sp.petProf, bare);
+      // The summoner's own script can raise its pets' crit chance - the
+      // Almaz grants its imps +15% - and the guard that is unanswerable on
+      // the player's casts is always TRUE on the pet line. Expectation-
+      // priced: the crit-damage factor comes off the priced cast when it
+      // rolled one, else the game's flat 1.5.
+      if (sp.petCritBonus > 0) {
+        const cd = out.critRoll?.cd ?? 1.5;
+        out = { ...out, damage: out.damage * (1 + sp.petCritBonus * (cd - 1)) };
+      }
+      return { sp, out, until: 0, hits: 0, damage: 0 };
+    });
     const chargeBank = rotation.chargeDump ? { ...rotation.chargeDump, value: 0 } : null;
     // The next-weapon-skill register: armed per combo finisher, spent by the
     // next weapon-skill cast at +amount in the additive bracket. Applied as a

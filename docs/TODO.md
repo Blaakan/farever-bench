@@ -119,6 +119,13 @@ Probe v7 makes the honest version buildable — work items:
 
 ## Verify / tooling
 
+- **Pet damage attribution**: live imp hits log under source=Summon_Imp#id,
+  not the owner, so verify's source filter skips every pet line (the Almaz
+  fix makes this visible - the model now HAS a pets line and the fold cannot
+  match it). Either verify learns to adopt Summon_* sources near the
+  character, or probe v8 adds  to summon-sourced inflict
+  rows - the second is exact.
+
 - Per-category crit buckets in `bench verify` (weapon-path vs spell-path) so
   a ZealousFighter-class rider shows as its own column instead of a residual.
 - Run `tools/timing-audit.mjs` as part of the patch-day pipeline
