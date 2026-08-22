@@ -548,8 +548,32 @@ function commonSetup(args) {
     if (!Number.isFinite(v) || v < 0) die(`--${flag} needs a number of stat points, zero or more`);
     profileValues[key] = v;
   }
+  // An AUTHORED rotation, played as authored instead of the derived order and
+  // the lookahead. The file is the APL shape `bench rotation --json` writes -
+  // {entries: [{skill, cond}], excluded} - or, hand-written, a bare array of
+  // skill ids / {skill} objects, which becomes a plain priority list. Skills
+  // not on the list are never pressed; that is what "authored" means.
+  let policy = null;
+  if (typeof args.flags['rotation-file'] === 'string') {
+    let raw;
+    try { raw = JSON.parse(readFileSync(args.flags['rotation-file'], 'utf8')); } catch (e) {
+      die(`${args.flags['rotation-file']}: ${e.message}`);
+    }
+    let apl = raw?.apl ?? raw;
+    if (Array.isArray(apl)) {
+      apl = {
+        entries: apl.map((e) => (typeof e === 'string' ? { skill: e, cond: { kind: 'always' } }
+          : { skill: e.skill, cond: e.cond ?? { kind: 'always' } })),
+        excluded: [],
+      };
+    }
+    if (!Array.isArray(apl?.entries) || !apl.entries.every((e) => typeof e?.skill === 'string')) {
+      die(`${args.flags['rotation-file']}: not a rotation - expected {entries:[{skill,...}]} or ["Skill_A", ...]`);
+    }
+    policy = makePolicy(apl);
+  }
   return {
-    engine, stars, rarities, goal, targetName, targetLevel, rank, mix, exclude, rarityCap, talentPoints,
+    engine, stars, rarities, goal, targetName, targetLevel, rank, mix, exclude, rarityCap, talentPoints, policy,
     saved, fight, numFlag, profile, profileValues,
     // A bare loadout carries its own level, and the foe, the rating->percent
     // conversions and the candidate list all have to agree with it. Reporting a
@@ -646,6 +670,7 @@ function compareAcrossProfiles(s, args, profileIds) {
       if (!args.flags['no-arsenal']) pinnedGear.delete('Slot_Weapon2');
       try {
         const r = optimize(s.engine, {
+      policy: s.policy ?? null,
           loadout, pinnedGear, pinnedAug: new Set(), goal: s.goal, weights: s.weights, target,
           rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
           exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
@@ -774,6 +799,7 @@ function sweepWeaponPairs(s, args, top) {
     const pinnedGear = new Set(s.engine.cat.combatSlots().map((x) => x.id));
     try {
       const r = optimize(s.engine, {
+      policy: s.policy ?? null,
         loadout, pinnedGear, pinnedAug: new Set(), goal: s.goal, weights: s.weights, target,
         rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
         exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
@@ -1040,7 +1066,7 @@ const commands = {
     const pins = applyProfile(s, loadout,
       applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
     const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
-    const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s) });
+    const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s), policy: s.policy ?? null });
     console.log(f.header(s.engine, VERSION) + '\n');
     if (ev.profile) console.log(f.profileBlock(ev.profile) + '\n');
     console.log(f.gearBlock(s.engine, loadout) + '\n');
@@ -1102,6 +1128,7 @@ const commands = {
 
     const t0 = Date.now();
     const res = optimize(s.engine, {
+      policy: s.policy ?? null,
       loadout, ...pins, goal: s.goal, weights: s.weights, target,
       rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
       exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap, pinnedSkills: pins.pinnedSkills,
@@ -1592,6 +1619,7 @@ const commands = {
       loadout.gear.Slot_Weapon2 = gearFor(a);
       try {
         const res = optimize(s.engine, {
+      policy: s.policy ?? null,
           loadout, pinnedGear: new Set(['Slot_Weapon1', 'Slot_Weapon2']), pinnedAug: new Set(),
           goal: s.goal, weights: s.weights, target,
           rank: s.rank, mix: s.mix, rarities: s.rarities, stars: s.stars,
@@ -2606,7 +2634,7 @@ const commands = {
         return -1;
       };
     }
-    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy, fight: fightLen, chainFeeds });
+    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy: s.policy ?? policy, fight: fightLen, chainFeeds });
     const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed });
 
     if (args.flags.json) {
@@ -2880,6 +2908,10 @@ Common flags
   --fights <n>            roll the procs for real n times and report the mean
                           and the spread; 1 folds them in at their expected
                           rate, which is the same mean without the sampling
+  --rotation-file <json>  play an AUTHORED rotation instead of the derived
+                          order and the lookahead: the file bench rotation
+                          --json writes, or a bare ["Skill_A", ...] priority
+                          list. Skills not listed are never pressed
   --lookahead <s>         seconds of rollout when choosing a cast (default 8);
                           0 gives a plain first-available priority list. The
                           fight is played both ways and the better kept.
