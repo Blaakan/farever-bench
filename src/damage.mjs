@@ -2136,6 +2136,14 @@ export function buildCombat(cdb, ctx, assume = {}) {
 
     return simulate({
       rotation, cast, dotOutput, rollCrit, cooldownMult, weaponSkillRefund, resources, poolMultiplier,
+      // Inner Demon's register, with its shield priced here where the sheet
+      // is: the shield equals the life paid, health x lifeFrac, and the
+      // resting claim is current ~ max.
+      wsReset: rotation.wsReset ? {
+        ...rotation.wsReset,
+        shieldAmount: rotation.wsReset.shieldFrac > 0
+          ? rotation.wsReset.shieldFrac * (sheet.get('MaxHealth') ?? 0) : 0,
+      } : null,
       sparkGauge: rotation.sparkGauge ?? null,
       poolScale: bleedScoped ? poolScale : null,
       poolFactor,

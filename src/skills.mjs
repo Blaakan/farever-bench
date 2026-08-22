@@ -2240,6 +2240,49 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const spec = summonSpecOf(a.prof.id);
       if (spec) summons.push(spec);
     }
+
+    // A WEAPON-SKILL COOLDOWN RESET on an internal cooldown - Inner Demon's
+    // whole shape, read from its script: `onSkillProc` guarded on
+    // isWeaponSkill, the `!isInCooldown()/consumeCooldown()` idiom whose
+    // period is the row's own cooldown, and `ctx.skill.resetCooldown()` as
+    // the payload. Every <cd> seconds the next weapon-skill cast is handed
+    // back. The life it costs (payLife of health x var1) is survivability
+    // this model does not track - for a dps answer the reset is pure upside,
+    // and the cost is NAMED rather than hidden. At rank >= 3 the same proc
+    // shields for the life paid; the fraction rides along and damage.mjs
+    // prices it off the sheet's MaxHealth (current ~ max, the resting claim).
+    let wsReset = null;
+    const wsResetOf = (id) => {
+      const row = skills.get(id);
+      const body = liveScript(row?.script ?? '');
+      if (!(row?.cooldown > 0)) return null;
+      const m = /onSkillProc[\s\S]{0,120}?isInCooldown\s*\(\s*\)[\s\S]{0,80}?isWeaponSkill[\s\S]{0,600}?resetCooldown\s*\(\s*\)/.exec(body);
+      if (!m) return null;
+      const lifeFrac = (() => {
+        const lf = /health\s*\*\s*vars\.(\w+)/.exec(body);
+        return lf ? (row.vars?.[lf[1]] ?? 0) : 0;
+      })();
+      const shieldGate = /rank\s*>=\s*(\d+)[\s\S]{0,200}?setShield/.exec(body);
+      const shieldMinRank = shieldGate ? Number(shieldGate[1]) : null;
+      return {
+        from: id, every: row.cooldown,
+        // the shield equals the life paid, so one fraction serves both
+        shieldFrac: shieldMinRank != null && rank >= shieldMinRank ? lifeFrac : 0,
+        lifeFrac,
+      };
+    };
+    for (let i = unmodelled.length - 1; i >= 0 && !wsReset; i--) {
+      const spec = wsResetOf(unmodelled[i].id);
+      if (!spec) continue;
+      unmodelled.splice(i, 1);
+      wsReset = spec;
+    }
+    if (!wsReset) {
+      for (const p of passive) {
+        const spec = wsResetOf(p.prof.id);
+        if (spec) { wsReset = spec; break; }
+      }
+    }
     // The charge dump's whole shape, off its script: an enable gate on the
     // charge count, a shoot per charge, pet hits and a combat timer feeding
     // it, and the cap on the Charge status row.
@@ -2531,6 +2574,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       summons,
       chargeDump,
       wsRider,
+      wsReset,
       // Mage_Talent_ChainStrike: `onInflictDamageEval - if isBaseAttack() and
       // Mage_Talent_Chaincast_Status is up, dmgMult += vars.damage` per rank.
       // isBaseAttack is skill types 0-3, so the finisher is EXCLUDED, and the

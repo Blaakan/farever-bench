@@ -100,7 +100,7 @@ function runFight(spec) {
     rotation, cast, dotOutput, rollCrit = null, cooldownMult = 1, weaponSkillRefund = 0, fight = 200, fights = 1,
     timedBuffs = [], lookahead = 0, seed = 0x9e3779b9, resources = null,
     poolMultiplier = 1, poolHealShare = 0, critChance = 0, policy = null,
-    poolScale = null, poolFactor = null, goal = null, chainResets = true,
+    poolScale = null, poolFactor = null, goal = null, chainResets = true, wsReset = null,
     swingVariance = 0, comboWindow = 0.6, empowerments = [], stackProcs = [], markProcs = [], chainFeeds = [],
   } = spec;
   // The objective the derived player maximises - see `goalWeights`.
@@ -716,6 +716,8 @@ function runFight(spec) {
     // straight multiplier here - the cast's other riders are ~4%, so the
     // additive-bracket exact form differs by under a point, stated not hidden.
     let wsArmed = false;
+    let wsResetReadyAt = wsReset ? wsReset.every : Infinity;
+    let wsResetShield = 0, wsResetFires = 0;
     let summonCursor = 0;
     const advanceSummons = (until) => {
       if (!(until > summonCursor)) return;
@@ -1280,6 +1282,17 @@ function runFight(spec) {
           if (st.charges === a.maxCharges) st.nextCharge = t + a.execOffset + (a.cooldown > 0 ? a.cooldown : Infinity);
           st.charges--;
         }
+        // Inner Demon's register: every `every` seconds, the next
+        // weapon-skill cast is handed its cooldown back - the ICD starts at
+        // the consume, and the rank-3 shield (the life paid) is credited to
+        // the passive's own line. The health cost itself is survivability
+        // this fight does not track, and that is stated in the plan.
+        if (wsReset && weaponSkillIds.has(a.prof.id) && t >= wsResetReadyAt) {
+          wsResetReadyAt = t + wsReset.every;
+          st.nextCharge = t + a.execOffset;
+          if (wsReset.shieldAmount > 0) wsResetShield += wsReset.shieldAmount;
+          wsResetFires++;
+        }
         // Pay BEFORE the cast pays you, so a skill can never fund itself out of
         // its own gain in the same instant.
         const sparkBefore = gaugePool ? gaugePool.value : 0;
@@ -1557,6 +1570,7 @@ function runFight(spec) {
         from: s2.sp.from, unit: s2.sp.unit, prof: s2.sp.petProf,
         hits: s2.hits, damage: s2.damage,
       })),
+      wsReset: wsReset ? { from: wsReset.from, fires: wsResetFires, shield: wsResetShield } : null,
     };
   }
 
@@ -1622,6 +1636,12 @@ function runFight(spec) {
       const e = acc.pet.get(p2.from) ?? { hits: 0, damage: 0, prof: p2.prof, unit: p2.unit };
       e.hits += p2.hits; e.damage += p2.damage;
       acc.pet.set(p2.from, e);
+    }
+    if (last.wsReset?.shield > 0) {
+      shield += last.wsReset.shield;
+      const e = acc.wsReset ?? { from: last.wsReset.from, fires: 0, shield: 0 };
+      e.fires += last.wsReset.fires; e.shield += last.wsReset.shield;
+      acc.wsReset = e;
     }
     totals.push({ damage, heal, shield, ...last });
   }
@@ -1762,6 +1782,19 @@ function runFight(spec) {
       postHoc: true, petSource: true,
       why: `the ${e.unit}'s own swings while summoned - logged live under source=${e.unit}, not the player, `
         + 'so the verify fold skips this line and the dps headline keeps it',
+    });
+  }
+  // Inner Demon's rank-3 shield: the life the reset costs, handed back as a
+  // shield. The reset itself shows up as extra casts on the weapon-skill
+  // lines; this line carries the defensive half.
+  if (acc.wsReset && acc.wsReset.shield > 0) {
+    const fires = acc.wsReset.fires / rolls;
+    lines.push({
+      id: `${acc.wsReset.from}#shield`, name: 'Inner Demon (shield)', kind: 'triggered', source: acc.wsReset.from,
+      perCast: { damage: 0, heal: 0, shield: fires > 0 ? (acc.wsReset.shield / rolls) / fires : 0 },
+      total: { damage: 0, heal: 0, shield: acc.wsReset.shield / rolls },
+      hits: fires, interval: fires > 0 ? elapsed / fires : Infinity, share: 0, postHoc: true,
+      why: 'the life the cooldown reset costs, returned as a shield at rank 3',
     });
   }
 

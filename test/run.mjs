@@ -5176,6 +5176,15 @@ group('the Almaz imps live twelve seconds, not a cast');
   const pets = r.throughput.lines.find((x) => /#pets$/.test(x.id));
   ok('the pets land a material number of swings', (pets?.hits ?? 0) > 30,
     `${pets?.hits} hits, ${((pets?.total.damage ?? 0) / 200).toFixed(1)} dps`);
+  // Inner Demon was "a status that declares nothing readable" - its script is
+  // an ICD'd weapon-skill cooldown reset (every 30s, the row's own cd), paid
+  // in half your health, shielded back at rank 3. All of that is in the row.
+  const wr = r.rotation.wsReset;
+  ok('Inner Demon reads as the reset register it is', !!wr && wr.every === 30
+    && Math.abs(wr.shieldFrac - 0.5) < 1e-9, JSON.stringify(wr ?? null));
+  const sh = r.throughput.lines.find((x) => /#shield$/.test(x.id));
+  ok('...and the rank-3 shield is on its own line', (sh?.total.shield ?? 0) > 0,
+    `${((sh?.total.shield ?? 0) / 200).toFixed(1)} shield/s over ${sh?.hits} fires`);
 }
 
 // --- summary ---------------------------------------------------------------
