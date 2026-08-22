@@ -394,9 +394,10 @@ function runFight(spec) {
       on: tr.rule.kind === 'per-parent-cast' ? 'parent'
         : tr.rule.kind === 'per-combo' ? 'combo'
           : tr.rule.kind === 'per-dot-tick' ? 'dot-tick'
-            : tr.rule.kind === 'per-weapon-skill' ? 'weapon-skill'
-              : tr.rule.kind === 'per-conduit-trigger' ? 'conduit'
-                : tr.rule.kind === 'per-attack-or-combo' ? 'attack-or-combo' : 'attack',
+            : tr.rule.kind === 'per-dot-apply' ? 'dot-apply'
+              : tr.rule.kind === 'per-weapon-skill' ? 'weapon-skill'
+                : tr.rule.kind === 'per-conduit-trigger' ? 'conduit'
+                  : tr.rule.kind === 'per-attack-or-combo' ? 'attack-or-combo' : 'attack',
       parent: tr.rule.parent ?? null,
       // A crit gate is a rate, not a mystery: the fight already computes a crit
       // expectation for every hit it prices, so a rider that only plays on a
@@ -961,9 +962,39 @@ function runFight(spec) {
         g.shield += out.shield * share;
       }
     };
+    // The APPLICATION clock, for status-named onInflictStatusEval riders:
+    // GameObject.addStacks@4562 is the hook's only dispatch site, so the
+    // rider fires once per application or stack-gain of the status it names
+    // and never on a tick. Virulent Magic's 71k captured procs sit within
+    // 5ms of Lethal Poison applications; the tick lane above never sees it.
+    const fireDotApply = (statusId, expected = 1) => {
+      if (!(expected > 0)) return;
+      for (const g of triggers) {
+        if (g.on !== 'dot-apply') continue;
+        if (g.statusFilter && g.statusFilter !== statusId) continue;
+        const share = (rand ? (rand() < g.chance ? 1 : 0) : g.chance) * expected;
+        if (!share) continue;
+        const out = hit(g.prof, now);
+        g.fires += share;
+        g.damage += out.damage * share;
+        g.heal += out.heal * share;
+        g.shield += out.shield * share;
+      }
+    };
 
-    const put = (list, at) => {
+    const put = (list, at, hits = 1) => {
       for (const entry of list) {
+        // The APPLICATION CLOCK counts expected applications, per HIT: the
+        // script rolls its chance on every damage instance a swing lands, so
+        // a dual-dagger swing at 20% is 0.4 expected applications - and the
+        // capture's 2.35 applications/s only reconciles per-hit. The status
+        // instance below still applies at most once per event (the thinning
+        // gate); the rider clock must not be thinned with it.
+        {
+          const d0 = entry.d ?? entry;
+          const p0 = entry.chance ?? d0.chance ?? 1;
+          fireDotApply(d0.status, p0 * Math.max(1, hits));
+        }
         // A channel wrapper carries its own chance and its own thinning
         // credit; the descriptor underneath is shared, so every channel feeds
         // the SAME live status instance - which is the whole point.
@@ -1049,10 +1080,14 @@ function runFight(spec) {
     };
     const applyDots = (skillId, at, ev = {}) => {
       const { weaponSkill = false, attack = false, combo = false, cast: wasCast = false } = ev;
+      // A cast-attached status applies once per cast; the per-hit channels
+      // roll their chance on every damage instance the event landed - a
+      // dual-dagger swing rolls twice.
+      const hits = Math.max(1, ev.hits ?? 1);
       put(onCast.get(skillId) ?? [], at);
-      if (weaponSkill) put(onWeaponSkill, at);
-      if (attack) put(onAttack, at);
-      if (combo) put(onCombo, at);
+      if (weaponSkill) put(onWeaponSkill, at, hits);
+      if (attack) put(onAttack, at, hits);
+      if (combo) put(onCombo, at, hits);
       // Resources ride the same events. `excludeSignature` is the Warrior's own
       // rule: a signature skill does not generate the Rage it spends.
       if (hasIncome) {
@@ -1101,8 +1136,9 @@ function runFight(spec) {
       // Procs ride the same events. Deterministic runs credit the expected
       // fraction of a fire; rolled ones roll. Priced against live state too.
       for (const g of triggers) {
-        // A dot-tick proc is raised by `tickTo`, not by a cast or a swing.
-        const fires = g.on === 'dot-tick' || g.on === 'conduit' ? false
+        // A dot-tick proc is raised by `tickTo`, a dot-apply one by the
+        // application site, a conduit by the gauge - not by a cast or swing.
+        const fires = g.on === 'dot-tick' || g.on === 'dot-apply' || g.on === 'conduit' ? false
           : g.on === 'parent' ? (wasCast && g.parent === skillId)
             : g.on === 'weapon-skill' ? weaponSkill
               : g.on === 'attack-or-combo' ? (attack || combo)
@@ -1358,6 +1394,7 @@ function runFight(spec) {
           cast: true,
           weaponSkill: weaponSkillIds.has(a.prof.id),
           signature: a.prof.type === 'SignatureSkill',
+          hits: out.hits ?? 1,
         });
         // A register armed by an ACTIVE cast rather than the finisher -
         // Mage_Blink_M3's "your next [WeaponSkill]" is the shape.
@@ -1474,7 +1511,7 @@ function runFight(spec) {
       link.shield = (link.shield ?? 0) + swingOut.shield * roll;
       feedPools(swingOut, t, link.prof.id, roll);
       setUp(link.applies, t);
-      applyDots(link.prof.id, t, { attack: !link.prof.isCombo, combo: link.prof.isCombo });
+      applyDots(link.prof.id, t, { attack: !link.prof.isCombo, combo: link.prof.isCombo, hits: swingOut.hits ?? 1 });
       const end = t + link.occupancy;
       tickTo(end); advanceIncome(end);
       fillerTime += link.occupancy;

@@ -869,6 +869,37 @@ export function buildCombat(cdb, ctx, assume = {}) {
       if (playedByScript && into.length) scripted.push({ stepId: st.id ?? null, effects: into });
     }
 
+    // `props.startSteps` chains: SkillStep.apply@5897 ops 9-45 play every
+    // step an applied step's startSteps names, on the SAME event, after its
+    // own payload. Crescent_FlowerSpiral's script plays StartBaseArea whose
+    // startSteps carry BaseArea - the child's effects sat in `scripted` under
+    // the child's own id, where no playStep site names them, so the whole
+    // press payload priced at zero as "no rate". Re-keying a chained child
+    // under the ROOT the script actually plays gives it the root's clock and
+    // guard; chains resolve transitively.
+    {
+      const byStepId = new Map();
+      for (const st of s.steps ?? []) if (st.id) byStepId.set(st.id, st);
+      // Seed from EVERY named step, not just the ones that carry effects: the
+      // played root can be a bare launcher (StartBaseArea has no payload of
+      // its own), and it is the root's id a playStep site names.
+      const queue = [...byStepId.keys()].map((id) => ({ rootKey: id, from: id }));
+      const seenChain = new Set();
+      while (queue.length) {
+        const { rootKey, from } = queue.shift();
+        const parent = from ? byStepId.get(from) : null;
+        for (const entry of parent?.props?.startSteps ?? []) {
+          const childId = entry?.step ?? entry;
+          const key = rootKey + '>' + childId;
+          if (seenChain.has(key)) continue;
+          seenChain.add(key);
+          const donor = scripted.find((x) => x.stepId === childId);
+          if (donor?.effects?.length) scripted.push({ stepId: rootKey, effects: donor.effects, viaStartStep: childId });
+          queue.push({ rootKey, from: childId });
+        }
+      }
+    }
+
     // The tick schedule of a status skill, which is what makes it a DoT rather
     // than a lump. `ticks` and `spread` are already resolved per effect, so
     // this only has to carry the lifetime the uptime arithmetic needs.
@@ -1727,9 +1758,15 @@ export function buildCombat(cdb, ctx, assume = {}) {
           if (!healthOk(rd.targetHealth)) continue;
           riders += rd.amount * gateVal(rd.gate);
         }
+        // ...including the CATEGORY keys. The engine routes attack- and
+        // combo-scoped dmgMult modifiers into damageByAffinity under
+        // 'Attack'/'AttackCombo', and this read never consulted them - an
+        // answerable attack-scoped rider priced at zero. tickCat is the same
+        // category key the crit brackets use, so a swing-triggered tick pays
+        // under its swing's category here too.
         riders += (mods.damageByAffinity?.[aff.root] ?? 0)
           + (mods.damageByAffinity?.all ?? 0)
-          + (prof.type === "WeaponSkill" ? (mods.damageByAffinity?.WeaponSkill ?? 0) : 0);
+          + (tickCat ? (mods.damageByAffinity?.[tickCat] ?? 0) : 0);
         // BASIC attacks only. `isBasicAttack` is skill types Attack..Attack4
         // (BaseSkill.isBasicAttack@6045) and the combo finisher is AttackCombo,
         // a type outside that set - so a rider that says "your basic attacks"

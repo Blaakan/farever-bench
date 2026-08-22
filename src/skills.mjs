@@ -271,11 +271,17 @@ function scopeOf(block, rank = null) {
   // Zealous Fighter's +8pp crit reads `isBaseAttack || isFinalCombo`, and the
   // finisher never saw it.
   {
-    const base = /isBaseAttack|isBasicAttack/.test(guard);
+    // Two near-twin predicates with different reach: isBaseAttack@6046 is
+    // skill types 0-4 - the FINISHER included - while isBasicAttack@6045
+    // stops at 3. Scripts use both deliberately, and folding them onto one
+    // scope handed a future isBasicAttack rider to the finisher and stripped
+    // the finisher from every bare isBaseAttack guard.
+    const baseIncl = /isBaseAttack/.test(guard);
+    const basic = /isBasicAttack/.test(guard);
     const fin = /isFinalCombo|isFinalAttack/.test(guard);
-    if (base && fin) return { scope: 'attack-or-combo', targetBleeding };
+    if (baseIncl || (basic && fin)) return { scope: 'attack-or-combo', targetBleeding };
     if (fin) return { scope: 'combo', targetBleeding };
-    if (base) return { scope: 'attack', targetBleeding };
+    if (basic) return { scope: 'attack', targetBleeding };
   }
   if (fromStatus) {
     // WHICH bleed is kept, not collapsed. The statusType sheet subtypes them
@@ -2722,12 +2728,30 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         if (onDotTick) {
           const held = selfHeld ? `, while ${selfHeld} is on the target - which this skill applies itself, and which the model assumes is up whenever a tick lands` : '';
           const capped = maxStacked ? `, once ${maxStacked} is fully stacked - assumed held for the whole fight, so the ramp before the cap is credited as if it fired` : '';
-          const which = dotStatus ? `every tick of ${dotStatus}` : bleedOnly ? 'every tick of a bleed' : 'every tick of a damage-over-time';
-          rule = {
-            kind: 'per-dot-tick', chance, critGated, bleedOnly,
-            status: dotStatus,
-            why: `${label} is played on ${which}${crit}${roll}${held}${capped}`,
-          };
+          // A STATUS-NAMED onInflictStatusEval rider fires on the status's
+          // APPLICATION clock, not its tick clock: the sole dispatch site is
+          // GameObject.addStacks@4562, once per application or stack-gain,
+          // never on the tick path. The capture agrees to the millisecond -
+          // 98.8% of 71,578 Virulent Magic procs land within 5ms of a Lethal
+          // Poison application row, while ticks hold a fixed 2s cadence
+          // through refresh storms. The old per-tick-x-stacks read matched
+          // live totals only because the at-cap application rate happened to
+          // sit near stacks/tick - the LAW was wrong even when the number was
+          // close.
+          if (hook === 'onInflictStatusEval' && dotStatus) {
+            rule = {
+              kind: 'per-dot-apply', chance, critGated,
+              status: dotStatus,
+              why: `${label} is played each time ${dotStatus} is applied or gains a stack${crit}${roll}${held}${capped}`,
+            };
+          } else {
+            const which = dotStatus ? `every tick of ${dotStatus}` : bleedOnly ? 'every tick of a bleed' : 'every tick of a damage-over-time';
+            rule = {
+              kind: 'per-dot-tick', chance, critGated, bleedOnly,
+              status: dotStatus,
+              why: `${label} is played on ${which}${crit}${roll}${held}${capped}`,
+            };
+          }
         } else if (ev.has('attack') && ev.has('combo')) {
           rule = { kind: 'per-attack-or-combo', chance, critGated, why: `${label} is played on a base attack or a combo finisher${crit}${roll}` };
         } else if (ev.has('combo')) {
