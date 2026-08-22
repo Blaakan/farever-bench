@@ -206,12 +206,31 @@ export function buildAffixRules(cdb) {
   };
 
   /** Fold one multiplicative value into whatever is already there. */
+  // MRatio and MRatioMin are TWO channels, not one fold: atbValModMul@4795
+  // ops 36-48 aggregate kind 2 (product, from 1) and kind 3 (min, from 1)
+  // separately and MULTIPLY the two results. One order-dependent accumulator
+  // gets a mixed chain wrong - MRatio 1.2 then MRatioMin 0.5 is 0.6 in the
+  // game and was 0.5 here. Every MRatioMin row today targets MoveSpeedFactor,
+  // which nothing scores, so the pair costs nothing and is ready the day the
+  // channels meet on a scored stat. A pure-Mul chain stays a plain number.
   function composeMul(ref, current, value) {
     const st = stacking.get(ref);
-    if (st?.case === 'Min') return Math.min(current, value);
+    if (st?.case === 'Min') {
+      const p = typeof current === 'number' ? { mul: current, min: 1 } : { ...current };
+      p.min = Math.min(p.min, value);
+      return p;
+    }
+    if (typeof current !== 'number') {
+      const p = { ...current };
+      if (st?.case === 'Max') p.mul = Math.max(p.mul, value);
+      else p.mul *= value;
+      return p;
+    }
     if (st?.case === 'Max') return Math.max(current, value);
     return current * value;             // Multiplicative, and the default
   }
+  // What a composed multiplier is WORTH: the two channels' product.
+  const resolveMul = (x) => (x == null ? 1 : typeof x === 'number' ? x : x.mul * x.min);
 
   /**
    * Scale a modifier by a slot factor (the arsenal's 0.4) or an uptime.
@@ -224,7 +243,7 @@ export function buildAffixRules(cdb) {
     return KIND[ref] === 'mulRatio' ? 1 + (value - 1) * factor : value * factor;
   }
 
-  return { stacking, kindOf: (ref) => KIND[ref] ?? null, composeMul, scaleValue };
+  return { stacking, kindOf: (ref) => KIND[ref] ?? null, composeMul, resolveMul, scaleValue };
 }
 
 // --- constants -------------------------------------------------------------
@@ -288,7 +307,8 @@ export function computeSheet(ctx, { base, mods, level, force = null }) {
 
     const f = flat.get(a.id) ?? 0;
     const mAdd = 1 + (addRatio.get(a.id) ?? 0);
-    const mMul = mulRatio.get(a.id) ?? 1;
+    const mm = mulRatio.get(a.id);
+    const mMul = mm == null ? 1 : typeof mm === 'number' ? mm : mm.mul * mm.min;
 
     let v = (stored + scaled + f) * mAdd * mMul;
     // `RoundUp` is the flag's NAME, not its behaviour on this path. Checked

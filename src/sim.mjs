@@ -1010,11 +1010,17 @@ function runFight(spec) {
           // Every data-driven application is exactly ONE stack:
           // `props.status.stacks` is authored on none of the 100 Status steps,
           // so `?? 1` at SkillStep.hx:262 is what every one of them uses.
-          const carried = d.stacking === 'DurationBased'
-            ? Math.ceil(st.stacks * Math.max(0, (st.expires - at) / Math.max(1e-9, st.window)))
-            : st.stacks;
+          // `Override` STOPS the old instance and creates a fresh one
+          // (addStatus@4561 ops 40-48): stacks reset to the new application's
+          // own, and the duration can SHORTEN - never-shorten belongs to
+          // refresh. The three rows authoring it today are inert item
+          // carriers, so this branch waits for the first combat Override.
+          const carried = d.stacking === 'Override' ? 0
+            : d.stacking === 'DurationBased'
+              ? Math.ceil(st.stacks * Math.max(0, (st.expires - at) / Math.max(1e-9, st.window)))
+              : st.stacks;
           st.stacks = Math.min(d.stacks ?? 1, carried + 1);
-          st.window = Math.max(expires, st.expires) - at;
+          st.window = d.stacking === 'Override' ? expires - at : Math.max(expires, st.expires) - at;
           if (d.stacking === 'DurationBased') {
             const ticks = Math.max(1, Math.round(
               (Number.isFinite(d.duration) ? d.duration : fight) / d.tick));
@@ -1025,8 +1031,9 @@ function runFight(spec) {
             };
           }
           // Status.refresh@14446: the window is max(new duration, what was
-          // left) - a refresh never SHORTENS a status.
-          st.expires = Math.max(expires, st.expires);
+          // left) - a refresh never SHORTENS a status. Override is the one
+          // policy that CAN shorten, because it is a stop-and-recreate.
+          st.expires = d.stacking === 'Override' ? expires : Math.max(expires, st.expires);
           st.out = out;
         } else {
           live.set(d, {

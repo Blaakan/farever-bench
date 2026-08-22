@@ -410,7 +410,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // is left right now, which no sheet knows.
         const mh = /^(?:owner\.maxHealth\s*\*\s*(vars\.\w+)|(vars\.\w+)\s*\*\s*owner\.maxHealth)$/.exec(expr);
         const r = mh ? varOf(mh[1] ?? mh[2]) : null;
-        if (r != null) fill = { scaling: [{ atb: 'MaxHealth', ratio: r }] };
+        if (r != null) fill = { scaling: [{ atb: 'MaxHealth', ratio: r, fromScript: true }] };
       }
       if (!fill) continue;
       (hit ??= new Map()).set(m[3] + '#' + m[1], fill);
@@ -702,9 +702,17 @@ export function buildCombat(cdb, ctx, assume = {}) {
     // projectiles a projectile-hit step is answering for.
     const stepLives = (st) => {
       const c = st.cond ?? {};
-      if (c.minRank != null && rank < c.minRank) return false;
-      if (c.maxRank != null && rank > c.maxRank) return false;
-      if (c.equalRank != null && rank !== c.equalRank) return false;
+      // RANK ZERO BYPASSES THE RANK BLOCK ENTIRELY: matchesEffectConds@20781
+      // ops 4-6 run the minRank/maxRank/equalRank tests only `if (0 <
+      // viewRank)`. A status with no instigator skill views rank 0 and SUMS
+      // rows that are mutually exclusive at any real rank (the Halos passive
+      // reads 0.7 + 0.875 Int that way). profile(id, 0) is that reading;
+      // callers pricing talent- or script-applied statuses should ask for it.
+      if (rank > 0) {
+        if (c.minRank != null && rank < c.minRank) return false;
+        if (c.maxRank != null && rank > c.maxRank) return false;
+        if (c.equalRank != null && rank !== c.equalRank) return false;
+      }
       if (typeof c.castHoldStep === 'number' && c.castHoldStep !== maxHold) return false;
       // Rune-gated: the step exists only while that rune is slotted.
       if (c.mastery && !runes?.has(c.mastery)) return false;
@@ -1373,12 +1381,21 @@ export function buildCombat(cdb, ctx, assume = {}) {
   // --- one cast ------------------------------------------------------------
   function amountOf(effect, sheet, swingAttrs = null, weaponMixFlats = null) {
     let a = effect.baseVal;
+    // An AUTHORED row whose FIRST scaling entry is MaxHealth reads the
+    // TARGET's sheet for every entry (getStepEffectVal@20775 ops 51-71 flip
+    // scaleSource to hit.target). All 21 such rows today are foe or
+    // environment damage, and a foe target carries no player-style sheet
+    // here, so they price zero WITH THIS NOTE rather than silently reading
+    // the caster. The script-derived fills (`owner.maxHealth * vars.x`) are
+    // caster-sourced by construction and carry fromScript to stay that way.
+    const targetSourced = effect.scaling[0]?.atb === 'MaxHealth' && !effect.scaling[0]?.fromScript;
     for (const s of effect.scaling) {
       // The game adds a scaling row only when its ratio is strictly positive
       // (getStepEffectScaling@20778 ops 131-137: `0 < ratio` gates the add).
       // No row in today's data is zero or negative - this guard is for the
       // patch that authors one, so the bench skips it the day the game does.
       if (!(s.ratio > 0) && s.ratio != null) continue;
+      if (targetSourced) continue;
       let v = sheet.get(s.atb) ?? 0;
       // WeaponPower is the weapon's flat base PLUS the mean of the ITEM's
       // aptitude attributes. The expanded tooltips render it outright:
@@ -1452,10 +1469,13 @@ export function buildCombat(cdb, ctx, assume = {}) {
       // thing would not - which is why it accumulates separately here.
       if (d.scriptTaken) taken *= 1 + d.scriptTaken * (d.stacks ?? 1);
     }
+    // A composed multiplier may be a {mul,min} pair once an MRatioMin row
+    // has entered the chain - resolve to its product either way.
+    const rm = (x) => (typeof x === 'number' ? x : x.mul * x.min);
     return {
-      armor: Math.max(0, (1 + add.Armor) * mul.Armor),
-      magicArmor: Math.max(0, (1 + add.MagicArmor) * mul.MagicArmor),
-      taken: Math.max(0, (1 + add.DamageTakenModifier) * mul.DamageTakenModifier * taken),
+      armor: Math.max(0, (1 + add.Armor) * rm(mul.Armor)),
+      magicArmor: Math.max(0, (1 + add.MagicArmor) * rm(mul.MagicArmor)),
+      taken: Math.max(0, (1 + add.DamageTakenModifier) * rm(mul.DamageTakenModifier) * taken),
       takenRaw: Math.max(0, taken),
     };
   }
