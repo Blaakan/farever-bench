@@ -171,17 +171,22 @@ function runFight(spec) {
   // its live state as it runs; the rollout deliberately does not - it is a
   // bounded heuristic and keeps the frozen resting factor.
   const stateRef = { now: null };
-  const earn = (atb, amount) => {
+  const earn = (atb, amount, liveFactor = true) => {
     const p = pools.get(atb);
     if (!p || !(amount > 0)) return;
     // `attribute.gainAtb` is a multiplier on INCOME, and it is a live stat:
     // `Warrior_BerserkStatus` carries RageGainFactor ARatio +1, so Rage earned
-    // inside a Berserk window doubles. Read against what is up when the income
-    // arrives, not against the resting sheet the fight started from.
-    let f = p.factor;
-    if (poolFactor && p.gainAtb && stateRef.now) {
-      const live = poolFactor(p.gainAtb, stateRef.now);
-      if (live > 0) f = live;
+    // inside a Berserk window doubles. But only the script addAtb path reads
+    // it (Unit.addAtb@4797 op 21) - addResource@4806, authored GainAtb steps
+    // and passive regen take the raw stored factor, so a Berserk window
+    // doubles your per-attack Rage and not the InfiniteRage trickle.
+    let f = 1;
+    if (liveFactor) {
+      f = p.factor;
+      if (poolFactor && p.gainAtb && stateRef.now) {
+        const live = poolFactor(p.gainAtb, stateRef.now);
+        if (live > 0) f = live;
+      }
     }
     p.value = Math.min(p.max, p.value + amount * f);
   };
@@ -770,7 +775,7 @@ function runFight(spec) {
     }
     const advanceIncome = (until) => {
       for (const e of timeIncome) {
-        while (e.next <= until) { earn(e.g.atb, e.g.amount); e.next += e.g.every; }
+        while (e.next <= until) { earn(e.g.atb, e.g.amount, false); e.next += e.g.every; }
       }
     };
 
@@ -915,7 +920,7 @@ function runFight(spec) {
       }
       // ConduitResidues: +Spark at a chance, once per trigger EVENT (its
       // hook is onConduitTriggers, raised once by triggerAllConduits@29170).
-      if (gauge?.residues > 0 && conduitTriggers.length) earn(gauge.atb, gauge.residues);
+      if (gauge?.residues > 0 && conduitTriggers.length) earn(gauge.atb, gauge.residues, false);
     };
     /** Spend, then fire if the pool was above the gauge BEFORE the spend. */
     const spendAndGauge = (amount, at) => {
@@ -1049,7 +1054,7 @@ function runFight(spec) {
           for (const g of list) {
             if (g.excludeSignature && isSig) continue;
             // A crit-gated gain pays on the fraction of hits that crit.
-            earn(g.atb, g.amount * (g.chance ?? 1) * (g.critGated ? critChance : 1));
+            earn(g.atb, g.amount * (g.chance ?? 1) * (g.critGated ? critChance : 1), g.liveFactor !== false);
           }
         };
         if (weaponSkill) award(income['weapon-skill']);
@@ -1208,7 +1213,7 @@ function runFight(spec) {
       // strictly lower. The rollout could not catch it: it never models the
       // register at all, so it prices every arm at zero.
       if (pressed >= 0 && anyArmRival && chain.length && armWorth[pressed] >= 0
-        && comboRegs.some((r) => r.chainSpend && r.armed)) {
+        && comboRegs.some((r) => r.chainSpend && r.armed && t - (r.armedAt ?? 0) <= 15)) {
         const occ = actives[pressed].occupancy, w0 = armWorth[pressed];
         for (let j = 0; j < actives.length; j++) {
           if (armWorth[j] <= w0 || state[j].charges > 0) continue;
@@ -1236,7 +1241,7 @@ function runFight(spec) {
         // cooldown handed back, and the forced-crit register planted.
         let chain = null;
         if (comboRegs.length && weaponSkillIds.has(a.prof.id)) {
-          chain = comboRegs.find((r) => r.chainSpend && r.armed) ?? null;
+          chain = comboRegs.find((r) => r.chainSpend && r.armed && t - (r.armedAt ?? 0) <= 15) ?? null;
           if (chain) chain.armed = false;
         }
         if (chain?.chainSpend?.freeSpark) {
@@ -1312,9 +1317,18 @@ function runFight(spec) {
         if (comboRegs.length) {
           activeCasts++;
           for (const r of comboRegs) {
-            if (r.every > 0 && activeCasts % r.every === 0) {
-              if (r.chainSpend) r.armed = true;
-              else {
+            if (r.every > 0 && r.chainSpend) {
+              // The chain counter FREEZES while an arm is banked - Chaincast
+              // @44894 returns outright when the armed status is up - and the
+              // arm itself expires unspent after 15 seconds. Counting modulo
+              // forever banked free chains through every cooldown-starved
+              // stretch.
+              if (r.armed && t - (r.armedAt ?? 0) > 15) r.armed = false;
+              if (r.armed) continue;
+              r.count = (r.count ?? 0) + 1;
+              if (r.count % r.every === 0) { r.armed = true; r.armedAt = t; }
+            } else if (r.every > 0 && activeCasts % r.every === 0) {
+              {
                 r.p += (1 - r.p) * r.chance;
                 if (r.firesConduits && conduitTriggers.length) fireConduits(t);
               }
@@ -1330,7 +1344,7 @@ function runFight(spec) {
         // A GainAtb effect on the skill itself - Warrior_SurgingForce returns
         // Rage, Mage_RayOfSpark returns a share of MaxSpark - which is authored
         // in ordinary columns and needs the sheet, so it arrives with the cast.
-        for (const g of out.gains ?? []) earn(g.atb, g.amount);
+        for (const g of out.gains ?? []) earn(g.atb, g.amount, false);
         feedPools(out, t, a.prof.id);
         setUp(a.applies, t);
         applyDots(a.prof.id, t, {
@@ -1338,6 +1352,9 @@ function runFight(spec) {
           weaponSkill: weaponSkillIds.has(a.prof.id),
           signature: a.prof.type === 'SignatureSkill',
         });
+        // A register armed by an ACTIVE cast rather than the finisher -
+        // Mage_Blink_M3's "your next [WeaponSkill]" is the shape.
+        if (rotation.wsRider && rotation.wsRider.armedBy === a.prof.id) wsArmed = true;
         const end = t + a.occupancy;
         tickTo(end); advanceIncome(end);
         busy += a.occupancy;
@@ -1393,7 +1410,7 @@ function runFight(spec) {
       }
       chainIndex++;
       if (link.prof.isCombo) combos++; else swings++;
-      if (rotation.wsRider && link.prof.isCombo) wsArmed = true;
+      if (rotation.wsRider?.armedBy === 'combo' && link.prof.isCombo) wsArmed = true;
       // The finisher arms every register the build carries. `isFinalAttack@6047`
       // is `inf.type == 4` (AttackCombo), which is exactly `isCombo` here.
       if (link.prof.isCombo && emp.size) armAll();

@@ -1218,6 +1218,19 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         from: 'Rogue_ComboPoints', fromName: 'Combo Points',
         why: 'read from tryGetComboPoint@44698: +1 per distinct weapon skill or combo finisher',
       });
+      // The finisher's rune adds a second lane: tryGetComboPoint@44698 ops
+      // 16-24 pay +1 more when the hit CRITS and the mastery is slotted. At
+      // 30-50% crit that is up to ~1.5x the point rate - materially more
+      // finishers - and it was not in the income at all. The per-kind dedupe
+      // the base gain carries applies here too; expectation-priced via the
+      // crit chance of the paying event.
+      if (runes.has('Rogue_Finisher_M1')) {
+        gains.push({
+          atb: 'ComboPoint', amount: 1, on: ['weapon-skill', 'combo'], critGated: true,
+          from: 'Rogue_Finisher_M1', fromName: 'Combo Points (critical)',
+          why: 'tryGetComboPoint@44698 ops 16-24: a critical with the mastery pays one more point',
+        });
+      }
     }
     const tracked = new Set(gains.map((g) => g.atb));
 
@@ -2222,19 +2235,48 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // sheet; the FIGHT arms it per finisher and spends it on the next
     // weapon-skill cast, which is what live shows (8 of 23 Demondash_Skill1
     // hits at the +25% plateau).
+    // A next-weapon-skill REGISTER: a status some cast applies to the owner,
+    // whose script waits for the next qualifying use, adds dmgMult once, and
+    // stops itself. Two script shapes say it:
+    //   * onInflictDamageEval + isWeaponSkill() + dmgMult += vars.x + stop()
+    //     (Demondash's finisher status), and
+    //   * onSkillProc(ctx) { ctx.dmgMult += X; stop() } - the hook
+    //     tryConsumeCharge@7994 raises once per skill USE, which the model
+    //     refused wholesale as "an event this fight does not produce". It
+    //     fires on every press: DS_Bladeleaf's finisher arms +50% for the
+    //     next weapon skill this way, and pricing it at zero read that
+    //     Rogue's weapon-skill line ~1.5x low.
+    // The ARMER generalises too: the finisher is the common case, but
+    // Mage_Blink_M3 arms the same register shape off a class-skill cast, so
+    // the rider records who arms it and the fight listens for that cast.
     let wsRider = null;
+    const riderShape = (row) => {
+      const body = liveScript(row?.script ?? '');
+      let m = /onInflictDamageEval[\s\S]{0,200}?isWeaponSkill\s*\(\s*\)[\s\S]{0,160}?dmgMult\s*\+=\s*vars\.(\w+)[\s\S]{0,100}?stop\s*\(\s*\)/.exec(body);
+      if (m) { const v = row.vars?.[m[1]]; return typeof v === 'number' && v > 0 ? v : null; }
+      m = /onSkillProc\s*\([\s\S]{0,120}?\.dmgMult\s*\+=\s*(?:vars\.(\w+)|([0-9.]+))[\s\S]{0,100}?stop\s*\(\s*\)/.exec(body);
+      if (m) { const v = m[1] != null ? row.vars?.[m[1]] : Number(m[2]); return typeof v === 'number' && v > 0 ? v : null; }
+      return null;
+    };
+    const riderFrom = (armerId, armedBy) => {
+      const body = liveScript(skills.get(armerId)?.script ?? '');
+      const add = /addStatus\s*\(\s*owner\s*,\s*(?:Skill\.)?(\w+)/.exec(body);
+      if (!add) return null;
+      const gate = /rank\s*>=\s*(\d+)/.exec(body.slice(0, add.index));
+      if (gate && rank < Number(gate[1])) return null;
+      const v = riderShape(skills.get(add[1]));
+      return v ? { amount: v, status: add[1], armedBy } : null;
+    };
     for (const x of filler) {
       if (!x.prof.isCombo) continue;
-      const body = liveScript(skills.get(x.prof.id)?.script ?? '');
-      const add = /addStatus\s*\(\s*owner\s*,\s*(?:Skill\.)?(\w+)/.exec(body);
-      if (!add) continue;
-      const gate = /rank\s*>=\s*(\d+)/.exec(body.slice(0, add.index));
-      if (gate && rank < Number(gate[1])) continue;
-      const row = skills.get(add[1]);
-      const m = /onInflictDamageEval[\s\S]{0,200}?isWeaponSkill\s*\(\s*\)[\s\S]{0,160}?dmgMult\s*\+=\s*vars\.(\w+)[\s\S]{0,100}?stop\s*\(\s*\)/
-        .exec(liveScript(row?.script ?? ''));
-      const v = m ? row.vars?.[m[1]] : null;
-      if (typeof v === 'number' && v > 0) { wsRider = { amount: v, status: add[1] }; break; }
+      wsRider = riderFrom(x.prof.id, 'combo');
+      if (wsRider) break;
+    }
+    if (!wsRider) {
+      for (const a of active) {
+        wsRider = riderFrom(a.prof.id, a.prof.id);
+        if (wsRider) break;
+      }
     }
 
     // Costs the data does not declare, read from the bytecode instead.
@@ -3765,7 +3807,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       for (const e of prof.effects) {
         if (e.kind !== 'GainAtb' || !e.atb || !e.baseVal) continue;
         out.push({
-          atb: e.atb, amount: e.baseVal, on: 'time', every: periodic,
+          atb: e.atb, amount: e.baseVal, on: 'time', every: periodic, liveFactor: false,
           from: skillId, fromName: name,
           why: `${name} declares ${e.baseVal} ${e.atb} every ${periodic}s`
             + (prof.enableCond?.length ? ` while ${prof.enableCond.join('/')}` : ''),
@@ -3809,6 +3851,12 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         out.push({
           atb, amount, chance,
           critGated, affinity,
+          // Which factor path this income rides: Unit.addAtb@4797 op 21 reads
+          // the LIVE gain factor (Berserk's doubled RageGainFactor reaches
+          // per-attack Rage), while addResource@4806 uses the raw stored
+          // factor - the InfiniteRage trickle and SurgingForce's return never
+          // double, and neither does an authored GainAtb step.
+          liveFactor: m[1] === 'addAtb',
           // A crit-gated gain rides every damaging event, not just the ones the
           // guard happens to name - a crit is a property of the hit, not of
           // which button produced it.

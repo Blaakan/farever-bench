@@ -1051,6 +1051,18 @@ export function buildCombat(cdb, ctx, assume = {}) {
       duration: ownDuration,
       periodic,
       statusRefs,
+      // Whether this cast APPLIES a Stun/Root/Slow-TYPED status to its own
+      // target - the states Domination's guard actually tests. MEASURED
+      // 2026-08-21: Charge's stun lands the same millisecond BEFORE its
+      // damage, so a stun-attached nuke pays its own CC rider on a clean
+      // target (five clean-dummy Charges at exactly x1.25), while a
+      // MoveSpeedFactor "slow" on a Debuff-typed status - Tear Reality -
+      // fires nothing, exactly as reported from play. Only the TYPED states
+      // count.
+      appliesCC: statusRefs.some((r) => {
+        const types = skills.get(r.ref)?.props?.status?.types ?? [];
+        return types.some((x) => x?.type === 'Stun' || x?.type === 'Root' || x?.type === 'Slow');
+      }),
       // Steps this cast does NOT play - see the note where they are collected.
       scripted,
     };
@@ -1606,8 +1618,11 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // The three the capture proved live are all here: the combo's +20% vs
         // a bleeding target, Bonethrow's rank-3 +20% crit damage, and
         // Domination's +25% inside a stun window.
-        const gateOn = (g) => g == null || (opts.gates?.[g] ?? 0) > 0;
-        const gateVal = (g) => (g == null ? 1 : (opts.gates?.[g] ?? 0));
+        // A cast that applies its own Stun/Root/Slow satisfies the cc gate
+        // for its own hits - the CC lands before the damage evaluates.
+        const ccSelf = prof.appliesCC === true;
+        const gateOn = (g) => g == null || (g === 'cc' && ccSelf) || (opts.gates?.[g] ?? 0) > 0;
+        const gateVal = (g) => (g == null ? 1 : (g === 'cc' && ccSelf) ? 1 : (opts.gates?.[g] ?? 0));
         // ...and the one live-state guard that is not a guess, because it is
         // STATED. `opts.targetHealth` is the fraction of its health the target
         // is standing at, and the comparison is answered EXACTLY against it:
