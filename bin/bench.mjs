@@ -2334,7 +2334,7 @@ const commands = {
     // whole bonus-damage hook is behind that gate, and evaluating at the
     // default rank of 1 silently priced a quarter of the build's damage at
     // zero. Every other command takes this from commonSetup; so does this one.
-    const { engine, rank, mix, targetLevel } = commonSetup(args);
+    const { engine, rank, mix, targetLevel, policy: authoredPolicy } = commonSetup(args);
     const game = requireGame(args._);
     const character = args.flags.character ?? args.flags.char;
     if (typeof character !== 'string') {
@@ -2634,7 +2634,7 @@ const commands = {
         return -1;
       };
     }
-    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy: s.policy ?? policy, fight: fightLen, chainFeeds });
+    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy: authoredPolicy ?? policy, fight: fightLen, chainFeeds });
     const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed });
 
     if (args.flags.json) {
