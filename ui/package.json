@@ -1,6 +1,6 @@
 {
   "name": "farever-bench-ui",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Desktop UI for farever-bench: character sheet, talent tree, rune page, optimizer",
   "private": true,
   "main": "electron/main.cjs",
@@ -17,25 +17,62 @@
   "build": {
     "appId": "bench.farever.ui",
     "productName": "Farever Bench",
-    "directories": { "output": "dist" },
+    "directories": {
+      "output": "dist"
+    },
     "files": [
       "electron/**",
       "package.json"
     ],
     "extraResources": [
-      { "from": "..", "to": "bench", "filter": ["src/**", "bin/**", "package.json", "LICENSE"] },
-      { "from": ".", "to": "bench/ui",
-        "filter": ["server.mjs", "api.mjs", "view.mjs", "icons.mjs",
-                   "optimize-worker.mjs", "lib/**", "web/**"] }
+      {
+        "from": "..",
+        "to": "bench",
+        "filter": [
+          "src/**",
+          "bin/**",
+          "package.json",
+          "LICENSE"
+        ]
+      },
+      {
+        "from": ".",
+        "to": "bench/ui",
+        "filter": [
+          "server.mjs",
+          "api.mjs",
+          "view.mjs",
+          "icons.mjs",
+          "optimize-worker.mjs",
+          "lib/**",
+          "web/**"
+        ]
+      }
     ],
-    "win": { "target": ["portable"], "icon": "web/appicon.ico" },
-    "portable": { "artifactName": "FareverBench.exe" },
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "web/appicon.ico"
+    },
+    "portable": {
+      "artifactName": "FareverBench.exe"
+    },
     "linux": {
-      "target": [{ "target": "AppImage", "arch": ["x64"] }],
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "web/appicon.png",
       "category": "Game",
       "synopsis": "Character sheet, talent tree, rune page and gear optimizer for Farever"
     },
-    "appImage": { "artifactName": "FareverBench.AppImage" }
+    "appImage": {
+      "artifactName": "FareverBench.AppImage"
+    }
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "farever-bench",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "A gear bench for Farever: pick a class, pin what you want, and get the best legal combination of equipment, weapons, enchants and gems",
   "type": "module",
   "license": "MIT",
@@ -15,5 +15,11 @@
     "bench": "node bin/bench.mjs"
   },
   "dependencies": {},
-  "keywords": ["farever", "theorycraft", "simulationcraft", "castledb", "hashlink"]
+  "keywords": [
+    "farever",
+    "theorycraft",
+    "simulationcraft",
+    "castledb",
+    "hashlink"
+  ]
 }
