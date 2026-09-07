@@ -6,6 +6,15 @@ Every release of farever-bench, newest first:
 `ui/package.json` always carry the same version - `tools/release.mjs` moves
 them together and refuses to run when they disagree.
 
+## [0.4.0] - 2026-09-07
+
+- A bee nobody summoned, a bank nobody spent, and pets counted twice
+- Inner Demon was readable all along: a reset every thirty seconds, paid in blood
+- The owner the shell swallowed
+- A summoner is worth its pets, for the whole twelve seconds
+- The probe's seventh eye, written into the reader and the plan
+- Verify reads the authored rotation from the right scope
+
 ## [0.3.0] - 2026-08-22
 
 The model audit release: nine combat subsystems were traced op-by-op through
