@@ -1105,6 +1105,22 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
       })),
     ];
     for (const u of unreadMods) {
+      // A PER-COUNT rider on one named skill earns its own sentence. The amount
+      // is right there in the row and so is the skill it names; the only
+      // missing half is how many stacks the target carries when the cast lands.
+      // "A category this fight does not separate" points the reader at the
+      // wrong problem, and the thing it replaced - a flat first term booked as
+      // the whole rider, with nothing anywhere marking it a guess - was worse
+      // than either.
+      if (u.scope === 'one-skill-per-count') {
+        extraGaps.push({
+          id: u.from, name: u.name, source: 'talent', kind: 'rider not read',
+          why: `${u.name} multiplies ${u.skillName} by ${u.amount} PER \`${u.countExpr}\`, `
+            + 'and that count is live state this reader cannot answer. It used to be priced at a '
+            + 'flat one of those, which read low by the whole count',
+        });
+        continue;
+      }
       extraGaps.push({
         id: u.from, source: 'talent',
         why: `it modifies ${u.field} for ${u.scope} damage, which is a category this fight does not separate`,
@@ -1119,11 +1135,22 @@ export function createEngine({ game, assume = {}, fight = {}, quiet = false, cla
     // weapon cooldowns run faster than modelled because of it.
     for (const e of [...(rot.filler ?? []), ...(rot.active ?? []), ...(rot.triggered ?? []),
       ...(rot.passive ?? [])]) {
-      for (const g of plan.scriptGapsOf(e.prof.id, rank, { runes: new Set(rot.runes ?? []) })) {
+      // ...and the HOST of a grafted entry, not only the row that was grafted.
+      // A skill whose own payload is empty is rescued into the rotation under
+      // its STATUS's id - `Heat Emission` enters as `Scepter_Flamie_Skill1_Shield`
+      // - so reading gaps off `prof.id` alone never asked the host script
+      // anything. Heat Emission was consequently silent in BOTH directions at
+      // rank 3: no damage line, and no gap line either, while its script starts
+      // a row worth 8,633 hits in the capture. `via` is the host, and it has
+      // been on the entry all along.
+      for (const gapOf of [...new Set([e.prof.id, e.via].filter(Boolean))])
+      for (const g of plan.scriptGapsOf(gapOf, rank, { runes: new Set(rot.runes ?? []) })) {
         extraGaps.push({
           id: g.id, name: g.name, source: 'script', kind: 'rider not read',
-          why: `${g.name} is scored, but one clause of its script is not: `
-            + `${g.field} ${g.amount} behind \`${g.guard}\`, which this reader cannot answer`,
+          // A gap that knows how to say itself says itself; the rest take the
+          // shape this loop has always built.
+          why: g.why ?? (`${g.name} is scored, but one clause of its script is not: `
+            + `${g.field} ${g.amount} behind \`${g.guard}\`, which this reader cannot answer`),
         });
       }
       // A RIDER THAT IS READ AND SWITCHED OFF BY THE STATED HEALTH. This one is

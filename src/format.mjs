@@ -325,6 +325,10 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
       ['chain', 'the weapon\'s base-attack chain is shorter than its moveSet declares'],
       ['crowd control', 'a stun, root or slow - worth nothing while the simulated foe does not act'],
       ['foe is passive', 'it fires on a block or on being hit, and the simulated foe never attacks'],
+      // ...and the half-and-half case, which used to be filed under the line
+      // above and was therefore only half true of it.
+      ['half of it fires', 'it hooks damage you DEAL as well as damage you take - so "the foe is '
+        + 'passive" is only half the reason it is worth nothing here'],
       ['status', 'its payload is a status that declares nothing readable'],
       ['debuff', 'it only debuffs the target, and nothing it debuffs changes damage'],
       ['script magnitude', 'the amount is computed by a script from the hit that applied it'],
@@ -362,7 +366,11 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
         // for this one the kind is not the useful half: the user needs the
         // threshold and the flag that reaches it, per rider, or "correctly
         // worth zero" reads as "this rune is worthless".
-        if (kind === 'off at this target health' && u.why) out.push('      ' + dim(u.why));
+        // ...and the same exception again, for the same reason: the blurb says
+        // a script is half live, and the half a reader needs is WHICH half.
+        if ((kind === 'off at this target health' || kind === 'half of it fires') && u.why) {
+          out.push('      ' + dim(u.why));
+        }
       }
       if (list.length > 8) out.push(dim(`    ... and ${list.length - 8} more`));
       byKind.delete(kind);

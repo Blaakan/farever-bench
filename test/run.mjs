@@ -5187,6 +5187,266 @@ group('the Almaz imps live twelve seconds, not a cast');
     `${((sh?.total.shield ?? 0) / 200).toFixed(1)} shield/s over ${sh?.hits} fires`);
 }
 
+// --- a summon hosted on a status is still a summon --------------------------
+// Pocket Hive's whole reason to exist lives on a STATUS: `Mad Buzz` rolls 20%
+// per damage event to stack `Buzzing`, whose onStacksChange summons an Angry
+// Bee at its tenth stack and then spends the lot. `carriesPayload` counts
+// Damage, Heal and Shield effects and a Summon step is none of those, so the
+// passive fell through to the "declares nothing readable" branch and was filed
+// by what its script mentions - onReceiveDamage - as "foe is passive". True of
+// half its script; its onInflictDamage half fires on every hit you land.
+group('Pocket Hive summons bees, and the reader finds them on the status');
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Priest', 25);
+  l.gear.Slot_Weapon1 = { item: 'GM_MassGrab', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const sp = (r.rotation.summons ?? []).find((x) => x.from === 'GM_MassGrab_Passive');
+  ok('the summon is found on the STATUS, not on the passive that applies it',
+    !!sp && sp.host === 'GM_MassGrab_Passive_Status' && sp.unit === 'Summon_Bee',
+    JSON.stringify(sp ? { from: sp.from, host: sp.host, unit: sp.unit } : null));
+  near('...with the Summon STEP\'s window, not the status row\'s', sp.duration, 15, 1e-9);
+  ok('...on a damage-event roll at the authored chance and cap',
+    sp.trigger?.on === 'damageEvent' && Math.abs(sp.trigger.chance - 0.2) < 1e-9
+      && sp.trigger.stacks === 10 && sp.trigger.window === 10,
+    JSON.stringify(sp.trigger ?? null));
+  // The counter's own duration is what makes ten stacks a run rather than a
+  // count, so the fight must be handed it.
+  ok('...and the onReceiveDamage half is READ, so the rate can be called a floor',
+    sp.trigger.alsoOnReceive === true, String(sp.trigger.alsoOnReceive));
+  // extendSummonDuration scopes to one Status instance and every cycle rebuilds
+  // it, so the rank-3 rider extends an empty set. Crediting it stretched a
+  // 15-second bee to 16.75, which is the flattering direction.
+  ok('...the rank-3 extension is refused rather than credited', sp.extend === 0, String(sp.extend));
+  // Slowest of steps (1.0), cooldown (1) and row duration (2).
+  near('...and the bee swings on the slowest number its row authors', sp.period, 2, 1e-9);
+  const pets = r.throughput.lines.find((x) => x.id === 'GM_MassGrab_Passive#pets');
+  // A counter is rarely fed by one thing: Honey Crush's onFirstHit adds two
+  // stacks per cast, ungated, and reading only the passive's own 20% roll put
+  // the cap 26 seconds apart where the two feeds together author 14.
+  const feed = (sp.trigger.feeds ?? [])[0];
+  ok('...and the ungated per-cast feed is read too',
+    !!feed && feed.from === 'GM_MassGrab_Combo' && feed.amount === 2 && feed.hook === 'onFirstHit',
+    JSON.stringify(sp.trigger.feeds ?? []));
+  ok('the bees land a material number of bolts', (pets?.hits ?? 0) > 20,
+    `${Math.round(pets?.hits ?? 0)} bolts, ${((pets?.total.damage ?? 0) / 200).toFixed(1)} dps`);
+  ok('...and Mad Buzz is no longer refused as "foe is passive"',
+    !(r.rotation.unmodelled ?? []).some((u) => u.id === 'GM_MassGrab_Passive'),
+    (r.rotation.unmodelled ?? []).map((u) => u.id).join(', '));
+}
+
+// --- the headline is the sum of its own lines -------------------------------
+// Pet damage was counted TWICE from the day the first summoner landed: the run
+// folds it into its own total AND the pets ride a postHoc line the aggregation
+// adds again. It needs no game to catch - the repartition simply has to close -
+// and it cost the Silhouette of Almaz 5.6% of a headline nobody could tie out.
+group('the repartition closes on the headline, summons included');
+for (const [cls, item] of [['Mage', 'Staff_SummonDemon'], ['Priest', 'GM_MassGrab']]) {
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, cls, 25);
+  l.gear.Slot_Weapon1 = { item, rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const t = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 }).throughput;
+  const sum = t.lines.reduce((a, x) => a + (x.total?.damage ?? 0), 0);
+  const pets = t.lines.filter((x) => x.petSource).reduce((a, x) => a + (x.total?.damage ?? 0), 0);
+  ok(`${cls}/${item}: the pets are material`, pets > 0, pets.toFixed(1));
+  near(`...and the headline equals the sum of every line`, t.dps * t.elapsed, sum, 1e-6);
+}
+
+// The same mechanism, the opposite error. Eternal Flower Heart summons the same
+// bee on a 5% weapon-skill roll, and being a payload-less Passive it was
+// reclaimed into the rotation and PRESSED - so its window opened on a GCD.
+group('Eternal Flower Heart summons on a roll, not on a press');
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Priest', 25);
+  l.gear.Slot_Weapon1 = { item: 'GM_MassGrab', rarity: 'Legendary', stars: 5 };
+  l.gear.Slot_Trinket = { item: 'Trinket_Bee', rarity: 'Rare', stars: 0 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const sp = (r.rotation.summons ?? []).find((x) => x.from === 'Trinket_Bee');
+  ok('the trinket reads as a weapon-skill proc',
+    sp?.trigger?.on === 'weaponSkillCast' && Math.abs(sp.trigger.chance - 0.05) < 1e-9,
+    JSON.stringify(sp?.trigger ?? null));
+  near('...and carries the step\'s own concurrent limit', sp.limit, 1, 1e-9);
+  ok('...and is not a skill anybody presses',
+    !(r.rotation.active ?? []).some((a) => a.prof.id === 'Trinket_Bee'),
+    (r.rotation.active ?? []).map((a) => a.prof.id).join(', '));
+}
+
+// --- a bank the actives fill and one press spends ---------------------------
+// Tide Rising Uppercut was worth NOTHING - not refused, not named, absent from
+// every channel. `DMG_FIELD` demands a bare `vars.X` on the right of the `+=`
+// and the clause is `hit.dmgMult += getStatusCount(owner, Skill.S)*vars.var2`,
+// so a weapon skill worth six times its base hit at the cap priced at its base
+// hit with no sentence saying so. Silence is worse than a refusal.
+group('Tide Rising Uppercut spends the bank its actives fill');
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Rogue', 25);
+  l.gear.Slot_Weapon1 = { item: 'Fists_WaterUppecut', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const sm = r.rotation.stackMult;
+  ok('the own-stack multiplier is read at all',
+    !!sm && sm.skill === 'Fists_WaterUppercut_S1' && sm.status === 'Fists_WaterUppercut_S3',
+    JSON.stringify(sm ?? null));
+  near('...+50% per stack, off the skill\'s own vars', sm.per, 0.5, 1e-9);
+  near('...to the status\'s authored cap', sm.cap, 10, 1e-9);
+  near('...and the status\'s own duration as the window', sm.window, 6, 1e-9);
+  const up = r.throughput.lines.find((x) => x.id === 'Fists_WaterUppercut_S1');
+  // 81.2 was the bare hit. Anything near it means the bank was dropped again.
+  ok('the uppercut is priced as a multiple of its base hit, not at it',
+    (up?.perCast.damage ?? 0) > 200, `${(up?.perCast.damage ?? 0).toFixed(1)} per cast`);
+  // ...and the number explains itself, which is the half of this that a player
+  // actually reads.
+  const m = /([0-9.]+) stacks of Tide Rising on average, \+50% each - x([0-9.]+)/.exec(up?.why ?? '');
+  ok('...and the line says how many stacks it spent', !!m, up?.why ?? '(no why)');
+  // The multiplier stated has to BE the multiplier the stacks imply: the bonus
+  // is linear in the count, so the mean of the products is the product of the
+  // means and this is an identity, not an approximation.
+  // The tolerance is the PRINTING: stacks carry one decimal and the factor
+  // two, so half a display step in the count is 0.025 in the product.
+  near('...consistently with the count it names', Number(m[2]), 1 + 0.5 * Number(m[1]), 0.03);
+}
+
+// THE BANK IS SIMULATED, NOT CLOSED-FORM, and this is the case that proves it
+// has to be. Rank 2 presses at exactly the same rate as rank 1 - the rank
+// changes the uppercut's own cooldown, 22s to 18s, and nothing else - yet it
+// banks FEWER stacks, because the press it lands on falls the other side of the
+// six-second window that resets the whole climb. `min(cap, rate x cooldown)` is
+// monotonic in the cooldown and would get this backwards.
+group('the stack bank is spacing-sensitive, not rate-sensitive');
+{
+  const stacksAt = (rank) => {
+    const eng = createEngine();
+    const l = emptyLoadout(eng.cat, 'Rogue', 25);
+    l.gear.Slot_Weapon1 = { item: 'Fists_WaterUppecut', rarity: 'Legendary', stars: 5 };
+    eng.plan.pruneSelection(l);
+    const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank });
+    const up = r.throughput.lines.find((x) => x.id === 'Fists_WaterUppercut_S1');
+    return Number(/([0-9.]+) stacks/.exec(up?.why ?? '')?.[1] ?? NaN);
+  };
+  const [r1, r2, r3] = [stacksAt(1), stacksAt(2), stacksAt(3)];
+  ok('every rank banks something', r1 > 0 && r2 > 0 && r3 > 0, `${r1} / ${r2} / ${r3}`);
+  ok('...rank 2 banks FEWER than rank 1 on a shorter cooldown', r2 < r1, `${r2} < ${r1}`);
+  ok('...and no rank exceeds the authored cap', Math.max(r1, r2, r3) <= 10, `${Math.max(r1, r2, r3)}`);
+}
+
+// --- a script is not its defensive half --------------------------------------
+// "It fires when you block or when you are hit, and the simulated foe never
+// attacks" was decided by asking whether a DEFENSIVE hook appears in the script
+// text - never whether an offensive one appears too. Shell of the Devourer
+// declares onGameBeat(AttackBlock) AND onInflictHit AND onInflictDamage, and
+// `receiveDamage@4834` ops 97-114 raise onInflictDamage on the INSTIGATOR, so
+// two of its three hooks fire on every hit you land. The old sentence told a
+// player the zero belonged to the fight model when half of it belonged here.
+group('a half-offensive script is reported as half, not as wholly defensive');
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_OffhandWeapon = { item: 'Shield_OrbitWater', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const u = (r.rotation.unmodelled ?? []).find((x) => x.id === 'Shield_OrbitWater_P');
+  ok('the mixed-hook script is still refused, on its own kind', u?.kind === 'half of it fires',
+    JSON.stringify(u ? { id: u.id, kind: u.kind } : null));
+  // Naming the hooks is the point: "half of it fires" without saying which half
+  // is no better than the sentence it replaces.
+  ok('...and the refusal names which half fires',
+    /onInflictHit/.test(u?.why ?? '') && /onInflictDamage/.test(u?.why ?? '')
+      && /a block/.test(u?.why ?? ''), u?.why ?? '(none)');
+  // NOT a floor: the half that fires here only stacks Water Infusion, and the
+  // one damage step in the chain hangs off a status a block applies. The
+  // number stays zero; it is the REASON the old sentence got wrong.
+  // ...and claims nothing about WHEN they fire. This reader does not read
+  // their guards: onInflictHit here is gated on `isFinalCombo && isFirstHit`
+  // and onInflictDamage on a status only a block applies, so 'fires on every
+  // hit you land' would have been wrong on both.
+  ok('...without claiming when they fire',
+    /is further than this reader follows/.test(u?.why ?? '')
+      && !/fire on every hit/.test(u?.why ?? ''), u?.why ?? '');
+}
+
+// The other side of it: a script with ONLY a defensive hook keeps the sentence,
+// which was always right about those. Infused Tusk's emergency shield is real in
+// game and correctly worth zero against a foe that never swings.
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Warrior', 25);
+  l.gear.Slot_Trinket = { item: 'InfusedTusk', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const u = (r.rotation.unmodelled ?? []).find((x) => x.id === 'InfusedTusk');
+  ok('a defensive-ONLY script still reads "foe is passive"', u?.kind === 'foe is passive',
+    JSON.stringify(u ? { id: u.id, kind: u.kind } : null));
+}
+
+// --- a wrong number is worse than a missing one -----------------------------
+// `ONE_SKILL` had no trailing anchor, so it matched the PREFIX of a longer
+// expression and booked its first term as the whole rider. Two of the five rows
+// it matches in the sheet are prefix matches: Venomous Finisher's
+// `dmg.dmgMult += vars.damage * dmg.target.getStatusCount(...)` was booked at a
+// flat +5% against a count that reaches seven, and Ramp-up's the same way.
+group('a count-scaled rider is named, not booked at its first term');
+{
+  const eng = createEngine();
+  // The three legitimately flat riders must survive the anchor untouched.
+  for (const [id, amount] of [['Priest_Talent_Authority', 0.2],
+    ['Bow_Craft_Passive_Status', 0.25], ['DM_Multispin_Passive_Status2', 0.75]]) {
+    const m = eng.plan.talentModifiers(id, 3).find((x) => x.scope === 'one-skill');
+    near(`${id} still reads as a flat one-skill rider`, m?.amount ?? -1, amount, 1e-9);
+  }
+  // ...and the two count-scaled ones ride out under a scope that refuses them.
+  for (const id of ['Rogue_Talent_VenomousFinisher', 'Rogue_UrgeToKill_Status2']) {
+    const mods = eng.plan.talentModifiers(id, 3);
+    ok(`${id} is refused rather than booked flat`,
+      mods.every((x) => x.scope !== 'one-skill')
+        && mods.some((x) => x.scope === 'one-skill-per-count' && x.countExpr),
+      JSON.stringify(mods.map((x) => x.scope)));
+  }
+  // The talent view and the sheet must not disagree about the same row: the
+  // refused mod used to make the node `readable` and print "+5% damage" beside
+  // a talent the sheet was calling "rider not read". The sheet side is pinned
+  // in the build below.
+}
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Rogue', 25);
+  l.talents = { Rogue_Talent_VenomousFinisher: 1 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  const g = (r.throughput.unmodelled ?? []).find((x) => x.id === 'Rogue_Talent_VenomousFinisher');
+  ok('the sheet names Venomous Finisher rather than dropping it',
+    !!g && /PER `dmg\.target\.getStatusCount/.test(g.why ?? ''), g?.why ?? '(absent)');
+}
+
+// --- a skill whose damage is in another row is not silent --------------------
+// `Heat Emission` has `steps: []` and its whole payload is
+// `startSkill(Skill.Scepter_Flamie_Skill1_Area, ...)`. At rank 3 it is rescued
+// into the rotation under its STATUS's id for the shield it also applies, so
+// reading gaps off `prof.id` never asked its own script anything: no damage
+// line and no gap line, while the capture carries 8,633 hits of the row it
+// starts.
+group('a skill that starts another row for its damage says so');
+{
+  const eng = createEngine();
+  const l = emptyLoadout(eng.cat, 'Priest', 25);
+  l.gear.Slot_Weapon1 = { item: 'Scepter_Flamie', rarity: 'Legendary', stars: 5 };
+  eng.plan.pruneSelection(l);
+  const r = eng.evaluate(l, { target: eng.combat.foe('boss', 25), rank: 3 });
+  // It really is grafted in under the status id - that is the condition that
+  // made it invisible, so pin it.
+  ok('the host is rescued under its status id', (r.rotation.active ?? [])
+    .some((a) => a.prof.id === 'Scepter_Flamie_Skill1_Shield'),
+    (r.rotation.active ?? []).map((a) => a.prof.id).join(', '));
+  const g = (r.throughput.unmodelled ?? []).find((x) => x.id === 'Scepter_Flamie_Skill1');
+  ok('...and the host script is still read for gaps', !!g,
+    (r.throughput.unmodelled ?? []).map((x) => x.id).join(', '));
+  ok('...naming the row it starts', /Scepter_Flamie_Skill1_Area/.test(g?.why ?? ''), g?.why ?? '');
+}
+
 // --- summary ---------------------------------------------------------------
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) {

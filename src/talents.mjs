@@ -251,8 +251,16 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       healShare: 'of it healed back',
     };
     const SCOPE = { attack: 'on attacks', weaponSkill: 'on weapon skills', magic: 'on magic', bleed: 'on bleeds', all: '' };
-    const modLabel = mods.length
-      ? [...new Set(mods.map((m) => `${m.amount > 0 ? '+' : ''}${Math.round(m.amount * 100)}% `
+    // A mod this reader REFUSED does not make a node readable. The count-scaled
+    // one-skill shape rides out as a mod so the SHEET can name it as a gap, and
+    // counting it here printed "+5% damage" beside the very talent the sheet
+    // was simultaneously calling "rider not read" - two commands, opposite
+    // claims, same tree. Venomous Finisher is the row: its rider is
+    // `vars.damage * target.getStatusCount(...)`, and the flat first term is
+    // exactly what this label used to print.
+    const readMods = mods.filter((m) => m.scope !== 'one-skill-per-count');
+    const modLabel = readMods.length
+      ? [...new Set(readMods.map((m) => `${m.amount > 0 ? '+' : ''}${Math.round(m.amount * 100)}% `
         + `${FIELD[m.field] ?? m.field} ${SCOPE[m.scope] ?? m.scope}`.trim()
         + (m.targetBleeding ? ' vs bleeding' : '')))].join(', ')
       : '';
@@ -264,7 +272,7 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     v = {
       affixes, buffs, effects, granted, dots, mods, gains, needs,
       readable: affixes.length > 0 || buffs.length > 0 || effects.length > 0
-        || dots.length > 0 || mods.length > 0 || gains.length > 0,
+        || dots.length > 0 || readMods.length > 0 || gains.length > 0,
       kind: affixes.length ? 'affix' : buffs.length ? 'status'
         : dots.length ? `${Math.round(dots[0].pool.fraction * 100)}% of `
           + `${dots[0].pool.magic ? 'magic' : dots[0].pool.physical ? 'physical' : 'its'} `

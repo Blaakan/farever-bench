@@ -226,7 +226,14 @@ export function buildCombat(cdb, ctx, assume = {}) {
       }
       hit.push({ field: 'critChance', amount: 1, forced: true, gate: null, targetHealth: null, singleTarget: false });
     }
-    for (const m of body.matchAll(/\w+\.(dmgMult|critDmgMult|critChance)\s*\+=\s*vars\.([A-Za-z0-9_]+)/g)) {
+    // ANCHORED for the same reason `ONE_SKILL` is, and this reader could not
+    // have caught the case any other way: the `rest` refusal below is built
+    // from `body.slice(0, m.index)` - the text BEFORE the match - so anything
+    // to the RIGHT of the captured `vars.X` is invisible to it. A rider
+    // written `dmgMult += vars.X * <a count>` therefore booked `vars.X` alone
+    // and nothing anywhere said a count had been dropped. Requiring the
+    // statement to END at the var is the only place that can see it.
+    for (const m of body.matchAll(/\w+\.(dmgMult|critDmgMult|critChance)\s*\+=\s*vars\.([A-Za-z0-9_]+)\s*(?=[;}])/g)) {
       const field = m[1];
       const before = body.slice(0, m.index);
       const line = before.slice(before.lastIndexOf('function'));
@@ -1558,7 +1565,7 @@ export function buildCombat(cdb, ctx, assume = {}) {
    * empty because placement lives in level data. So a single-target figure is
    * the default and everything else is asked for.
    */
-  function castOutput(prof, sheet, target, opts, foe = NO_DEBUFF, mods = NO_MODS) {
+  function castOutput(prof, sheet, target, opts, foe = NO_DEBUFF, mods = NO_MODS, extraRider = 0) {
     const critChance = Math.min(1, Math.max(0, (sheet.get('CritChance') ?? 0) / 100));
     const critMult = 1 + critChance * ((sheet.get('CritDamage') ?? 100) / 100 - 1);
     const dmgMod = (sheet.get('DamageModifier') ?? 100) / 100;
@@ -1788,6 +1795,21 @@ export function buildCombat(cdb, ctx, assume = {}) {
         // share one bracket, and the carrier's fervor bracket cancels out of
         // the ratio entirely.
         riders += e.ctxDmgAdd ?? 0;
+        // A rider the FIGHT knows and the sheet cannot: a bank of stacks the
+        // build fills and this press spends. It joins the same bracket as
+        // everything above because that is where the game puts it -
+        // computeDamage@4841 op 14 seeds ONE modMult scalar from hit.dmgMult
+        // and every rider only `+=`s it. Multiplying the finished cast instead
+        // would compound the bank against the other riders: at +500% next to a
+        // 4% rider that is 3.3% high, all of it in the flattering direction.
+        // ...but only the FIRST resolved target of an area takes it.
+        // `onDamage` runs `removeStatus` per hit and
+        // `AreaStep.areaHit@5972` loops its targets in-frame, so target two
+        // evaluates a count of zero. Spread over the step's target count, that
+        // is one empowered hit and N-1 bare ones - measured, of 93 multi-target
+        // Clawdius casts at three stacks or more, 82 have exactly one empowered
+        // hit, 11 have none, and not one has two.
+        riders += extraRider / Math.max(1, targets);
         m *= 1 + riders;
         // Fervor and the matching mastery share ONE additive bracket -
         // getDamageRatio@4505: (1 + fervor + mastery) x DamageModifier - and
@@ -1956,14 +1978,19 @@ export function buildCombat(cdb, ctx, assume = {}) {
     // handful of distinct (buffs up, debuffs up) combinations thousands of
     // times, so pricing is memoised on that signature rather than recomputed.
     const castCache = new Map();
-    const cast = (prof, state) => {
-      const key = state ? state.key : '';
+    // `extraRider` is a per-PRESS additive rider - a stack bank spent by this
+    // cast - and it goes in the CACHE KEY rather than being applied after the
+    // lookup, so the bracket stays exact. It is an integer count times a fixed
+    // per-stack amount, so it takes at most `maxStacks + 1` values and the
+    // cache stays bounded.
+    const cast = (prof, state, extraRider = 0) => {
+      const key = (state ? state.key : '') + (extraRider ? `|+${extraRider}` : '');
       let byState = castCache.get(prof);
       if (!byState) { byState = new Map(); castCache.set(prof, byState); }
       let hit = byState.get(key);
       if (!hit) {
         hit = castOutput(prof, state ? restat(state.self) : sheet, target, opts,
-          state ? targetState(state.target) : NO_DEBUFF, live?.mods ?? NO_MODS);
+          state ? targetState(state.target) : NO_DEBUFF, live?.mods ?? NO_MODS, extraRider);
         byState.set(key, hit);
       }
       return hit;
@@ -2469,7 +2496,99 @@ export function buildCombat(cdb, ctx, assume = {}) {
            'state is refused with the hook named. A rider on the host\'s OWN cast - onDamage, onHit, ' +
            'onStart, onAreaElapsed - is folded back into the cast at its chance, because its schedule IS ' +
            'the cast\'s and separating them would leave a delayed detonation like Staff_Censer_Skill2 ' +
-           'with no parent to hang off.' },
+           'with no parent to hang off. The one Code step that is NOT refused on its hook is a SUMMON: ' +
+           'a pet swings on its own clock for as long as it lives, so what the hook has to supply is a ' +
+           'rate rather than a schedule, and the entry below says how each of the two shapes gets one.' },
+    { severity: 'verified', what: 'a damage multiplier scaled by a status COUNT is a bank, and the fight now keeps one',
+      why: 'Tide Rising Uppercut is the shape and it was worth NOTHING - not refused, not named, absent '
+        + 'from every channel at once. DMG_FIELD is the only regex that finds a damage rider in a '
+        + 'script and it demands a bare vars.X on the right of the +=; this clause reads '
+        + '`hit.dmgMult += getStatusCount(owner, Skill.Fists_WaterUppercut_S3)*vars.var2`, so nothing '
+        + 'matched, scriptGapsOf returned an empty list, and a weapon skill worth SIX TIMES its base '
+        + 'hit at the cap priced at exactly its base hit. Fifteen sites in the sheet write a count '
+        + 'into a damage field and twelve are player-reachable. The runtime, read op by op: '
+        + 'onSkillProc fires once per skill USE (tryConsumeCharge@7994, latched by triggeredCD and '
+        + 'cleared by reset@7990 from BaseSkill.start@6038); ctx.isSkill is '
+        + '`isWeaponSkill() || isClassSkill() || isSignature()` (get_isSkill@5103), which is skill '
+        + 'types 7, 9 and 17-20 - the fight\'s ACTIVE set exactly, so the four base attacks and the '
+        + 'combo finisher bank NOTHING; onDamageEval runs strictly before onDamage '
+        + '(receiveDamage@4834 op 36 -> computeDamage@4841 -> evalDamage@6017 -> onDamageEval@6491, '
+        + 'against onDamage@6501 at op 93), so the bonus is real and not self-cancelling; '
+        + 'getStatusCount@4555 returns the STACK count of one status; removeStatus@6635 clears the '
+        + 'lot; and hit.dmgMult is ONE ADDITIVE BRACKET - computeDamage@4841 op 14 seeds a single '
+        + 'modMult scalar from it and every rider only +=s that, which is why the bank is entered as '
+        + 'a rider rather than multiplied onto the finished cast (at +500% beside a 4% rider the '
+        + 'shortcut reads 3.3% high). Only the FIRST resolved target takes it: onDamage runs '
+        + 'removeStatus per hit and AreaStep.areaHit@5972 loops its targets in-frame, so target two '
+        + 'evaluates a count of zero - measured, of 93 multi-target Clawdius casts at three stacks or '
+        + 'more, 82 have exactly one empowered hit, 11 have none, and not one has two.' },
+    { severity: 'assumption', what: 'the stack bank is simulated, because its DURATION binds and not its cap',
+      why: 'The counter refreshes on every application onto ONE shared timer (Status.refresh@14446; '
+        + 'Tide Rising declares no stackingPolicy, so policy 0), so what limits it is the longest GAP '
+        + 'between qualifying presses, not the cast rate. A Rogue at rank 2 has the same 0.335 presses '
+        + 'a second as at rank 1 and banks three fewer stacks, because its gaps fall either side of '
+        + 'the six seconds - min(cap, rate x cooldown) gets rank 3 about right and rank 2 wrong by '
+        + 'three, which is the difference between a weapon worth pressing and one that is not. So the '
+        + 'bank is an event in the fight like every other, filled by each active press and emptied by '
+        + 'the one that spends it. THE CAPTURE IS THE REFEREE, on 206 other players\' Clawdius: the '
+        + 'multiplier is exactly 1 + 0.5k, confirmed against live server output at every k from 1 to '
+        + '10 (one dummy-parse reads 78.44 base -> 470 at ten stacks, x6.000 to three decimals); the '
+        + 'combo finisher really does bank nothing (1,497 presses -> 9 applications, 0.6%, against '
+        + '0.945-1.000 for the actives); and across 1,357 real spends (status_off reason=ForceEnd, '
+        + 'which is this script\'s own removeStatus) the mean is 4.69 stacks, x3.34. This model reads '
+        + '5.4 on a Rogue dummy, ABOVE live, and the gap is the fight: a dummy has no downtime, no '
+        + 'target switch and no deaths, while 57.6% of real banks expire unspent. The rank-3 stun '
+        + 'rider on slowed targets is separately real (a 6.8x lift on stunned-after-uppercut in the '
+        + 'capture) and carries no damage, so it stays unmodelled. What no capture can settle here is '
+        + 'a per-fight TOTAL: Clawdius appears in zero of the capture\'s 9,073 snap_gear rows, so '
+        + 'bench verify has no ledger to fold this against.' },
+    { severity: 'verified', what: 'a summon can be hosted on a status or on a proc, not only on a cast',
+      why: 'Thirteen skills carry a type-23 Summon step and three shapes host one. CAST-HOSTED (Start or ' +
+           'CastEnd) is the Silhouette of Almaz and Tidal Totem, and the cast schedules it. STATUS-HOSTED ' +
+           'is Pocket Hive: Mad Buzz rolls checkProba(0.2) on every damage event to stack Buzzing, whose ' +
+           'onStacksChange summons an Angry Bee at its tenth stack and then consumes the lot - the step ' +
+           'is `on: Code` and lives on the STATUS, not on the passive that applies it. SELF-HOSTED AND ' +
+           'SCRIPT-PLAYED is Eternal Flower Heart, 5% per weapon-skill cast. The last two were both wrong ' +
+           'before: Mad Buzz was refused whole as "the foe is passive" because its script mentions ' +
+           'onReceiveDamage, though its onInflictDamage half fires on every hit you land ' +
+           '(receiveDamage@4834 ops 97-114 raise it on the INSTIGATOR); and the trinket, being a ' +
+           'payload-less Passive reclaimed into the rotation, was PRESSED, so its bee opened a window on ' +
+           'a GCD instead of on a 5% roll. A pet\'s damage is the OWNER\'s: getStepEffectVal@20775 reads ' +
+           'GameObject.resolveProxy@4545, and Foe.getSkillProxy@6724 returns summonOwner whenever that owner is ' +
+           'a Hero, so the bolt\'s 0.8 x Faith is YOUR Faith, and initVars@5150 hands the pet your ' +
+           'CritChance, CritDamage, Fervor, mastery and DamageModifier too. Being a Totem changes none of ' +
+           'it - Unit.type has no call site in the damage chain.' },
+    { severity: 'assumption', what: 'a stack-driven summon is priced as a run of successes, not a plain count',
+      why: 'The counter refreshes on every application rather than ageing per stack (Status.refresh@14446 ' +
+           'keeps one timer; Buzzing declares no props.status.stackingPolicy and absent is policy 0), so ' +
+           'a gap longer than the row\'s own duration loses the WHOLE climb. Reaching ten stacks therefore ' +
+           'needs nine consecutive procs inside ten seconds, whose expected wait is the classic ' +
+           'E = (1 - q^r)/(q^r (1 - q)) with q = 1 - e^(-rho x window). At a high event rate q tends to 1 ' +
+           'and E to r, so it collapses to "one bee per ten procs" exactly where that is right, and ' +
+           'stretches where a thin build really does time the counter out. A counter is rarely fed by ' +
+           'ONE thing, and reading only the roll halved this bee: GM_MassGrab_Combo\'s ' +
+           'onFirstHit adds TWO stacks per Honey Crush with no rank gate and no roll, which is 0.28 ' +
+           'stacks/s against the roll\'s 0.44, so the cap arrives every 14 seconds rather than every 26. ' +
+           'Only an UNGUARDED feed on a per-cast hook is counted; one behind a roll, a rank gate or a ' +
+           'status test is a rate this reader does not have, and stays out. Three clauses around it are ' +
+           'READ AND REFUSED rather than credited, each in the flattering direction: the onReceiveDamage ' +
+           'half of the roll, real in game and worth zero against a foe that never attacks, which makes ' +
+           'the rate a FLOOR; the rank-2 enrage, GM_MassGrab_Skill2\'s onHit putting a x1.5 ' +
+           'DamageModifier on a bee that walks through Brood Leap\'s area, which is a position this fight ' +
+           'does not have; and the rank-3 extension, which extendSummonDuration@6659 scopes to one Status ' +
+           'INSTANCE (getSummons@6140 filters summonSourceSkill == this) while every cycle consumes and ' +
+           'rebuilds that instance, so the set it extends is empty. THE CAPTURE CHECKS WHAT IT CAN, on ' +
+           'other players\' Pocket Hives: 190 distinct Buzzing owners, 3,470 applications against 3,374 ' +
+           'removals, and 9,616 Summon_Bee bolts. Two readings come straight out of it. The bee\'s ' +
+           'cadence: 9,063 gaps between consecutive bolts from one bee, median 2.066s, against the 2.0 ' +
+           'this model takes - the SLOWEST of the three numbers the bee\'s own row authors, steps, ' +
+           'cooldown and duration, chosen because the Foe AI loop that would settle it is not read, and ' +
+           'vindicated. And the REFRESH semantics the run-of-successes formula rests on: 22,193 ' +
+           'status_refresh rows against 3,470 status_on, so re-application overwhelmingly renews one ' +
+           'timer rather than opening a second. What the capture cannot check is a per-fight TOTAL - no ' +
+           'character in the modkit\'s inventory dumps owns Pocket Hive, so bench verify has no ledger ' +
+           'to fold this against, and live bolts-per-bee is depressed by combat ending rather than by ' +
+           'the schedule, which makes it a bound and not a correction.' },
     { severity: 'unmodelled', what: 'most of what a rune or a talent does, pending the script kernel',
       why: 'Most talent nodes and most runes declare nothing this model reads, but they DO ship hscript ' +
            'bodies calling a small, closed set of host functions - so the gap is the script kernel, not ' +

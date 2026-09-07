@@ -628,7 +628,8 @@ function runFight(spec) {
     // The pricing cache in damage.mjs is keyed on state, so the roll has to
     // happen here rather than inside `cast` - a cached roll is the same roll
     // every time, which is how a die stops being one.
-    const hit = rand && rollCrit ? (prof, st) => rollCrit(cast(prof, st), rand) : cast;
+    const hit = rand && rollCrit
+      ? (prof, st, xr) => rollCrit(cast(prof, st, xr), rand) : cast;
     for (const a of actives) { a.casts = 0; a.hits = 0; a.damage = 0; a.heal = 0; a.shield = 0; }
     for (const d of dots) { d.damage = 0; d.heal = 0; d.ticks = 0; d.credit = 0; }
     for (const w of dotChannels) w.credit = 0;
@@ -711,6 +712,27 @@ function runFight(spec) {
       return { sp, out, until: 0, hits: 0, damage: 0 };
     });
     const chargeBank = rotation.chargeDump ? { ...rotation.chargeDump, value: 0 } : null;
+    // --- an OWN-STACK MULTIPLIER: a bank the actives fill and one press spends
+    //
+    // Clawdius is the shape. Every ACTIVE press banks a stack of `Tide Rising`
+    // and `Tide Rising Uppercut` spends the whole bank for +50% each - x6.0 at
+    // the ten-stack cap, measured in game to the integer.
+    //
+    // It is SIMULATED rather than closed-form because the answer is
+    // spacing-sensitive, not merely rate-sensitive: the bank's own six-second
+    // duration refreshes on each application, so what binds is the longest GAP
+    // between presses, not the cast rate. A Rogue at rank 2 has the same
+    // 0.335 presses a second as at rank 1 and banks three fewer stacks, because
+    // its gaps fall either side of six seconds. min(cap, rate x cooldown) gets
+    // rank 3 about right and rank 2 wrong by three stacks, which is the whole
+    // difference between a weapon that is worth pressing and one that is not.
+    const stackMult = rotation.stackMult
+      ? { ...rotation.stackMult, value: 0, last: -Infinity, spent: 0, presses: 0 }
+      : null;
+    // What the bank holds NOW: the whole climb is lost, not one stack of it,
+    // when the gap since the last application exceeds the status's duration.
+    const bankAt = (at) => (!stackMult || at - stackMult.last > stackMult.window
+      ? 0 : Math.min(stackMult.cap, stackMult.value));
     // The next-weapon-skill register: armed per combo finisher, spent by the
     // next weapon-skill cast at +amount in the additive bracket. Applied as a
     // straight multiplier here - the cast's other riders are ~4%, so the
@@ -747,6 +769,11 @@ function runFight(spec) {
     let swings = 0, combos = 0, busy = 0, fillerTime = 0;
     // Non-DoT physical damage EVENTS, which is what a stack counter arms on.
     let physicalHits = 0;
+    // EVERY damage instance, of any affinity, which is what an onInflictDamage
+    // hook rolls on - the same quantity engine.mjs estimates before the fight
+    // to price a proc-applied buff's uptime, except that here the fight has
+    // already produced it and no estimate is needed.
+    let damageEvents = 0;
 
     // The state everything is priced against, rebuilt only when it changes.
     let now = bare;
@@ -926,6 +953,7 @@ function runFight(spec) {
         for (let i = 0; i < (g.instances ?? 1); i++) {
           const out = hit(g.prof, now);
           g.fires += 1;
+          damageEvents += out.hits ?? 0;
           g.damage += out.damage;
           g.heal += out.heal;
           g.shield += out.shield;
@@ -969,6 +997,7 @@ function runFight(spec) {
         if (!share) continue;
         const out = hit(g.prof, now);
         g.fires += share;
+        damageEvents += (out.hits ?? 0) * share;
         g.damage += out.damage * share;
         g.heal += out.heal * share;
         g.shield += out.shield * share;
@@ -988,6 +1017,7 @@ function runFight(spec) {
         if (!share) continue;
         const out = hit(g.prof, now);
         g.fires += share;
+        damageEvents += (out.hits ?? 0) * share;
         g.damage += out.damage * share;
         g.heal += out.heal * share;
         g.shield += out.shield * share;
@@ -1335,6 +1365,17 @@ function runFight(spec) {
         // crit is worth in expectation. Spending clears the register whether or
         // not it was armed - the status is one-shot either way.
         let out = hit(a.prof, now);
+        // The bank is SPENT here, before every other rider, so that the
+        // empowerment register, the weapon-skill register and the charge dump
+        // all compose on top of a correctly priced cast rather than on a base
+        // one. `removeStatus` empties it whether or not it was full.
+        if (stackMult && a.prof.id === stackMult.skill) {
+          const k = bankAt(t);
+          stackMult.value = 0;
+          stackMult.spent += k;
+          stackMult.presses++;
+          if (k > 0) out = hit(a.prof, now, stackMult.per * k);
+        }
         if (reg && reg.p > 0 && out.critRoll) {
           // The cast already decomposes as `fixed + base x (1 + p(cd-1))`, so a
           // guaranteed crit is that same expression at p = 1 and needs no
@@ -1372,6 +1413,17 @@ function runFight(spec) {
             critMagic: (out.critMagic ?? 0) * k,
           };
         }
+        // ...and every OTHER active press fills it. `ctx.isSkill` is
+        // `isWeaponSkill() || isClassSkill() || isSignature()`
+        // (BaseSkillAccess.get_isSkill@5103), which is skill types 7, 9 and
+        // 17-20 - the fight's ACTIVE set exactly. The four base attacks and the
+        // combo finisher are types 0-4 and bank NOTHING, which the capture
+        // confirms from the other side: 1,497 presses of the Clawdius combo
+        // produced 9 applications, 0.6%, against 0.945-1.000 for the actives.
+        if (stackMult && a.prof.id !== stackMult.skill) {
+          stackMult.value = bankAt(t) + 1;
+          stackMult.last = t;
+        }
         // A summoner's cast opens (or extends) its window.
         const sum2 = summonState.find((x) => x.sp.from === a.prof.id);
         if (sum2) sum2.until = Math.max(sum2.until, t + sum2.sp.duration);
@@ -1404,6 +1456,7 @@ function runFight(spec) {
         a.casts++;
         a.hits = (a.hits ?? 0) + (out.hits ?? 0);
         physicalHits += out.hitsPhysical ?? 0;
+        damageEvents += out.hits ?? 0;
         a.damage += out.damage;
         a.heal += out.heal;
         a.shield += out.shield;
@@ -1528,6 +1581,7 @@ function runFight(spec) {
         ? 1 + (rand() * 2 - 1) * swingVariance : 1;
       link.hits = (link.hits ?? 0) + (swingOut.hits ?? 0);
       physicalHits += swingOut.hitsPhysical ?? 0;
+      damageEvents += swingOut.hits ?? 0;
       link.fires = (link.fires ?? 0) + 1;
       link.damage = (link.damage ?? 0) + swingOut.damage * roll;
       link.heal = (link.heal ?? 0) + swingOut.heal * roll;
@@ -1558,6 +1612,78 @@ function runFight(spec) {
       p.heal = p.damage * scale.healShare;
     }
 
+    // --- summons whose window opens on a PROC, not on a press ---------------
+    //
+    // A cast-hosted summon is scheduled by the cast above. One whose step is
+    // `on: Code` has no press to hang off - a script plays it - so its worth is
+    // closed form, the way every other rate this fight cannot enact is.
+    //
+    //   * `damageEvent`. A counter status stacked by a roll on every damage
+    //     instance, summoning at its cap and then spending the lot. The counter
+    //     REFRESHES rather than ageing per stack, so a gap longer than its own
+    //     duration loses the WHOLE climb: reaching `stacks` needs `stacks - 1`
+    //     consecutive procs inside `window`, which is the classic wait for a
+    //     run of successes, E = (1 - q^r) / (q^r (1 - q)) with
+    //     q = 1 - e^(-rho x window). At a high event rate q -> 1 and E -> r, so
+    //     it collapses to "one per `stacks` procs" exactly where that is the
+    //     right answer, and stretches where the counter really does time out -
+    //     which is the difference between a bee every 24 seconds and a bee
+    //     never, for a build whose damage is spread thin.
+    //   * `weaponSkillCast`. A roll per qualifying press, counted off the
+    //     fight's own weapon-skill casts.
+    //
+    // `floor` on the count is the same cold-start convention the stack procs
+    // keep: a climb still unfinished at the bell summons nothing, and stacks
+    // nobody spent are not damage.
+    const dotTicks = dots.reduce((s2, d) => s2 + (d.ticks ?? 0), 0)
+      + poolDots.reduce((s2, d) => s2 + (d.ticks ?? 0), 0);
+    for (const s2 of summonState) {
+      const tr = s2.sp.trigger;
+      if (!tr || tr.on === 'cast') continue;
+      let fires = 0;
+      if (tr.on === 'damageEvent') {
+        // Every stack the build authors, not only the rolled ones: an
+        // unguarded per-cast feed arrives on that skill's own clock.
+        let fed = 0;
+        for (const f of tr.feeds ?? []) {
+          let casts = 0;
+          for (const a of actives) if (a.prof.id === f.from) casts += a.casts ?? 0;
+          for (const link of chain) if (link.prof.id === f.from) casts += link.fires ?? 0;
+          for (const g of triggers) if (g.prof?.id === f.from) casts += g.fires ?? 0;
+          fed += casts * f.amount;
+        }
+        const rho = ((damageEvents + dotTicks) * tr.chance + fed) / fight;
+        const r = Math.max(1, tr.stacks - 1);
+        const q = tr.window > 0 ? 1 - Math.exp(-rho * tr.window) : 1;
+        const runs = q > 1 - 1e-9 ? r : (1 - q ** r) / (q ** r * (1 - q));
+        fires = Math.floor((fight * rho) / (1 + runs));
+      } else if (tr.on === 'weaponSkillCast') {
+        let casts = 0;
+        for (const a of actives) if (weaponSkillIds.has(a.prof.id)) casts += a.casts ?? 0;
+        fires = Math.floor(casts * tr.chance);
+      }
+      s2.fires = fires;
+      if (!(fires > 0)) continue;
+      // Summoning one more can extend the ones already out - Pocket Hive's
+      // rank-3 clause. Over a pet's life it gains `extend` per summon landing
+      // inside it, so D' = D + extend x D'/T: the same closed form the
+      // self-extending buffs use, and it only bites when pets actually overlap.
+      const gap = fight / fires;
+      const life = s2.sp.extend > 0 && gap > s2.sp.extend
+        ? s2.sp.duration / (1 - s2.sp.extend / gap)
+        : s2.sp.duration;
+      let petSeconds = fires * life;
+      // A concurrent cap the step declares: a second pet replaces the first
+      // rather than doubling the line.
+      if (s2.sp.limit > 0) petSeconds = Math.min(petSeconds, s2.sp.limit * fight);
+      const petSwings = petSeconds * s2.sp.count / s2.sp.period;
+      s2.hits += petSwings;
+      s2.damage += petSwings * s2.out.damage;
+      if (chargeBank && chargeBank.petFed) {
+        chargeBank.value = Math.min(chargeBank.cap, chargeBank.value + petSwings);
+      }
+    }
+
     // The denominator is the FIGHT, not the moment the last cast happened - a
     // damage meter divides by the clock, and so must this.
     advanceSummons(fight);
@@ -1569,8 +1695,16 @@ function runFight(spec) {
       pets: summonState.map((s2) => ({
         from: s2.sp.from, unit: s2.sp.unit, prof: s2.sp.petProf,
         hits: s2.hits, damage: s2.damage,
+        trigger: s2.sp.trigger, fires: s2.fires ?? null, life: s2.sp.duration,
       })),
       wsReset: wsReset ? { from: wsReset.from, fires: wsResetFires, shield: wsResetShield } : null,
+      // What the bank was actually worth, so the report can say it rather than
+      // leaving a tripled number unexplained.
+      stackMult: stackMult
+        ? { skill: stackMult.skill, spent: stackMult.spent, presses: stackMult.presses,
+          per: stackMult.per, cap: stackMult.cap, window: stackMult.window,
+          statusName: stackMult.statusName }
+        : null,
     };
   }
 
@@ -1633,9 +1767,17 @@ function runFight(spec) {
     }
     for (const p2 of last.pets ?? []) {
       damage += p2.damage;
-      const e = acc.pet.get(p2.from) ?? { hits: 0, damage: 0, prof: p2.prof, unit: p2.unit };
-      e.hits += p2.hits; e.damage += p2.damage;
+      const e = acc.pet.get(p2.from) ?? {
+        hits: 0, damage: 0, fires: 0, prof: p2.prof, unit: p2.unit,
+        trigger: p2.trigger ?? null, life: p2.life,
+      };
+      e.hits += p2.hits; e.damage += p2.damage; e.fires += p2.fires ?? 0;
       acc.pet.set(p2.from, e);
+    }
+    if (last.stackMult) {
+      const e = acc.stackMult ?? { ...last.stackMult, spent: 0, presses: 0 };
+      e.spent += last.stackMult.spent; e.presses += last.stackMult.presses;
+      acc.stackMult = e;
     }
     if (last.wsReset?.shield > 0) {
       shield += last.wsReset.shield;
@@ -1703,6 +1845,21 @@ function runFight(spec) {
       hits: (e.hits ?? 0) / rolls,
       interval: elapsed / casts, share: (casts * a.occupancy) / elapsed,
       casts,
+      // A press whose price is a BANK owes the reader the count it spent -
+      // without it the number is three times the tooltip's and nothing says
+      // why.
+      ...(acc.stackMult && acc.stackMult.skill === a.prof.id && acc.stackMult.presses > 0
+        ? (() => {
+          const k = acc.stackMult.spent / acc.stackMult.presses;
+          return {
+            why: `${k.toFixed(1)} stacks of ${acc.stackMult.statusName} on average, `
+              + `+${Math.round(acc.stackMult.per * 100)}% each - x${(1 + acc.stackMult.per * k).toFixed(2)} `
+              + `on the first target it hits. Every OTHER active press banks one, to a cap of `
+              + `${acc.stackMult.cap}, and the whole bank is lost if ${acc.stackMult.window}s pass `
+              + 'between presses',
+          };
+        })()
+        : {}),
     });
   }
   // A STACK COUNTER, priced AFTER the fight rather than played inside it.
@@ -1771,7 +1928,14 @@ function runFight(spec) {
   // attributes it to source=Summon_*, not the player, so source-filtered
   // verification must skip it - the flag is the skip.
   for (const [from, e] of acc.pet) {
-    if (!(e.damage > 0)) continue;
+    // A PROC-driven summon that never fired still gets its line. Zero because
+    // the counter never filled is an answer, and the silent version of it is
+    // the bug this whole path exists to fix: a weapon whose gimmick is worth
+    // nothing in YOUR build has to say so, not vanish. A cast-hosted summoner
+    // that dealt nothing keeps the old silence - it is in the rotation table
+    // already, on its own press.
+    const procDriven = !!e.trigger && e.trigger.on !== 'cast';
+    if (!(e.damage > 0) && !procDriven) continue;
     const hits = e.hits / rolls;
     lines.push({
       id: `${from}#pets`, name: `${e.prof?.name ?? e.unit} (summon)`, kind: 'summon', source: from,
@@ -1781,7 +1945,22 @@ function runFight(spec) {
       interval: hits > 0 ? elapsed / hits : Infinity, share: 0,
       postHoc: true, petSource: true,
       why: `the ${e.unit}'s own swings while summoned - logged live under source=${e.unit}, not the player, `
-        + 'so the verify fold skips this line and the dps headline keeps it',
+        + 'so the verify fold skips this line and the dps headline keeps it'
+        + (e.trigger && e.trigger.on !== 'cast'
+          ? `; ${Math.round(e.fires / rolls)} summoned over the fight, ${e.life}s each - `
+            + (e.trigger.on === 'damageEvent'
+              ? `${Math.round(e.trigger.chance * 100)}% per damage event to stack a counter `
+                + `that summons at ${e.trigger.stacks} and spends the lot`
+                + ((e.trigger.feeds ?? []).length
+                  ? ', plus ' + e.trigger.feeds
+                    .map((f) => `${f.amount} per ${f.name} cast`).join(' and ')
+                  : '')
+                + (e.trigger.alsoOnReceive
+                  ? ', and the same roll fires when you are HIT, which this passive foe never does - '
+                    + 'so this rate is a floor'
+                  : '')
+              : `${Math.round(e.trigger.chance * 100)}% per weapon-skill cast`)
+          : ''),
     });
   }
   // Inner Demon's rank-3 shield: the life the reset costs, handed back as a
@@ -1926,7 +2105,14 @@ function runFight(spec) {
   // The post-hoc lines are real damage and belong in the headline, or the
   // repartition would not close on it. They are added here rather than inside
   // the run because they are priced from the run's own event count.
-  const extra = lines.filter((l) => l.postHoc)
+  //
+  // The PET line is the exception, and was double-counted from the day the
+  // summoner landed: `damage += p2.damage` already folds the pets into the
+  // roll's own total, so adding the line again put the Silhouette of Almaz 5.6%
+  // over its own repartition. The test is arithmetic and needs no game: the
+  // headline must equal the sum of every line, and it did not - it exceeded it
+  // by exactly the pets.
+  const extra = lines.filter((l) => l.postHoc && !l.petSource)
     .reduce((a, l) => ({
       damage: a.damage + (l.total?.damage ?? 0),
       heal: a.heal + (l.total?.heal ?? 0),

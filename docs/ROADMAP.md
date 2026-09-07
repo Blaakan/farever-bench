@@ -394,9 +394,12 @@ has the most refusals outstanding):
   (foe passive), and **8 refused for causes that are mostly fixable** — five of
   those (four Stones + PrismaticPearl) only because of the `hasStatus`
   self-block above, and all five are exactly computable. `Trinket_Demon`'s DoT is
-  fully authored and worth 0 today. `Trinket_Bee` is genuinely blocked (summoned
-  pet AI cadence). `PurifiedHeart` is blocked by a magic-crit trigger **and is
-  flagged `Bug` by the authors on all three of its rows**.
+  fully authored and worth 0 today. `Trinket_Bee` now prices: its summon step is
+  `on: Code`, played by a 5%-per-weapon-skill roll rather than by a press, and
+  the pet's cadence is taken as the slowest of the three numbers its own row
+  authors (steps, cooldown, duration), with the Foe AI loop named as unread.
+  `PurifiedHeart` is blocked by a magic-crit trigger **and is flagged `Bug` by
+  the authors on all three of its rows**.
 - **The conduit gauge** — the missing rate behind three Mage refusals. Every
   equipped conduit fires *together* when the Spark gauge crosses its threshold;
   `Reverberate` forces a second full volley 0.4s after a Chaincast consumption,

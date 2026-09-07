@@ -352,6 +352,14 @@ const RANK_CMP = /\brank\s*(>=|<=|==|!=|>|<)\s*(\d+)/g;
 // literal word "Mastery" as the id, finds no such rune, and silently deletes the
 // branch - which is worse than not reading the guard at all.
 const HAS_BUILD = /\b(?:hasTalent|hasMastery|hasGlobalMastery)\s*\(\s*(?:[A-Za-z_$][A-Za-z0-9_$]*\s*,\s*)?(?:(?:Mastery|Skill|Talent|Attribute)\.)?([A-Za-z0-9_]+)/g;
+// A damage multiplier scaled by the COUNT of a status the owner carries -
+// `hit.dmgMult += getStatusCount(owner, Skill.S) * vars.X`. `DMG_FIELD` cannot
+// see it, because it demands a bare `vars.X` on the right of the `+=`, and
+// `DMG_MULT` is only ever applied to status scripts. Fifteen sites in the sheet
+// write a count into a damage field and twelve are player-reachable.
+const OWN_STACK_MULT =
+  /(?:hit|dmg|ctx)\.dmgMult\s*\+=\s*getStatusCount\s*\(\s*owner\s*,\s*(?:Skill\.)?(\w+)\s*\)\s*\*\s*vars\.(\w+)/;
+
 const UNREAD_COND = /\b(hasStatusMaxStacked|hasStatusApplied|hasStatusType|hasStatus|getStatusCount|getStatusesCount|getStatusTypeCount|isStatusType|isInCooldown|isSkillInCooldown|getMaxStacks|getEffectCount|haveProc|canRecast|haveRecast|isUnderAnyCC|isCCImmune|checkComboPoints|getCp|critical|isCrit|healthRatio|isPhysical|isMagic|totalHits|hitCount)\b/;
 
 const cmpOk = (a, op, b) => (op === '>=' ? a >= b : op === '<=' ? a <= b
@@ -416,6 +424,39 @@ const blank = (s) => s.replace(/[^\n]/g, ' ');
 const liveScript = (src) => String(src)
   .replace(/\/\*[\s\S]*?\*\//g, blank)
   .replace(/\/\/[^\n]*/g, blank);
+
+// WHICH HALF of a script the fight can raise.
+//
+// A hook that waits for a block, or for being hit, never fires against a foe
+// that does not attack. A hook that fires on damage you DEAL fires on every hit
+// you land - `receiveDamage@4834` ops 97-114 raise onInflictDamage on the
+// INSTIGATOR, not on the victim. Asking only whether a DEFENSIVE hook is
+// PRESENT therefore reported a script that is half offensive as wholly
+// defensive. `Shell of the Devourer` is the case that shows it: onGameBeat
+// with GameBeat.AttackBlock alongside onInflictHit AND onInflictDamage, filed
+// under "it fires when you block or when you are hit, and the simulated foe
+// never attacks" - true of one of its three hooks. A player reading that
+// concludes the zero belongs to the fight model, when half of it belongs to the
+// reader.
+//
+// Returns null when nothing defensive is declared, else the two hook lists and
+// whether an offensive one rides along. Naming the hooks is the point: "half of
+// it fires" without saying WHICH half is not an improvement on the old lie.
+const DEF_HOOK_NAME = /^on(?:ReceiveDamage|ReceiveDamageEval|ReceiveHit|BlockEval)$/;
+const OFF_HOOK_NAME = /^on(?:InflictDamage|InflictDamageEval|InflictHit|SkillProc|FirstHit|StacksChange|Damage|DamageEval|Hit|Cast|UseSkill|Kill)$/;
+function foeGating(script) {
+  const body = liveScript(script ?? '');
+  if (!body) return null;
+  const names = [...body.matchAll(/function\s+(on\w+)\s*\(/g)].map((m) => m[1]);
+  const def = names.filter((n) => DEF_HOOK_NAME.test(n));
+  // Two block beats, not one: `AttackBlock` and `BlockWellTimed` split the
+  // twelve GameBeat hooks in the sheet evenly, and reading only the first is
+  // how Shield Bash's whole rider stayed invisible to this test.
+  if (/GameBeat\.(?:AttackBlock|BlockWellTimed)/.test(body)) def.push('a block');
+  if (!def.length) return null;
+  const off = names.filter((n) => OFF_HOOK_NAME.test(n));
+  return { mixed: off.length > 0, def, off };
+}
 
 // The text of the innermost block still OPEN at the end of `src`, with every
 // closed sibling block removed. Given
@@ -1618,14 +1659,21 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         }
         // A trigger that only fires when you BLOCK or when you are HIT never
         // fires here - the simulated foe does not attack - and that is a
-        // statement about the fight model, not about the data.
-        const defGated = !!skills.get(id)?.script
-          && /GameBeat\.AttackBlock|onReceiveDamage|onReceiveHit/.test(String(skills.get(id).script));
-        if (defGated) {
+        // statement about the fight model, not about the data. A trigger that
+        // does BOTH is a different sentence: half of it fires on every hit you
+        // land, so the zero is a floor rather than an answer.
+        const gate = foeGating(skills.get(id)?.script);
+        if (gate) {
           unmodelled.push({
-            id, name: prof.name, source, kind: 'foe is passive',
-            why: 'it fires when you block or when you are hit, and the simulated foe never attacks - '
-              + 'real in game, correctly worth zero here' + keepAlwaysOn(),
+            id, name: prof.name, source,
+            kind: gate.mixed ? 'half of it fires' : 'foe is passive',
+            why: (gate.mixed
+              ? `its script declares ${gate.off.join(' and ')} alongside ${gate.def.join(' and ')} - hooks on `
+                        + 'damage you DEAL, not only on damage you take - so "the foe is passive" is not the '
+                        + 'whole reason this is worth zero here. What those hooks are guarded on, and where '
+                        + 'their payload lands, is further than this reader follows'
+              : 'it fires when you block or when you are hit, and the simulated foe never attacks - '
+                + 'real in game, correctly worth zero here') + keepAlwaysOn(),
           });
           return;
         }
@@ -1804,14 +1852,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // emergency shield are real in game and rightly worth zero here - but
       // "worth zero because the foe is passive" is a different sentence from
       // "no rate can be derived", and the report should say which.
-      const defenceGated = !!s?.script
-        && /GameBeat\.AttackBlock|onReceiveDamage|onReceiveHit/.test(String(s.script));
+      const gate = foeGating(s?.script);
+      const defenceGated = !!gate && !gate.mixed;
+      const mixedHooks = !!gate && gate.mixed;
       // ...and a defensive payload is the same sentence again. A shield that
       // absorbs damage nothing deals is worth zero for the same reason a block
       // proc is, and "its payload is a status that declares nothing readable"
       // was simply wrong about it: Halos_Demon_Passive's absorb is 0.7 x
       // Intellect, right there on the status's Refresh step.
-      const shieldOnly = !defenceGated && st.all.length > 0 && !st.dots.length
+      const shieldOnly = !gate && st.all.length > 0 && !st.dots.length
         && st.all.some((id2) => {
           const p2 = combat.profile(id2, rank, runes);
           return !!p2?.effects.some((e) => e.kind === 'Shield' && (e.baseVal || e.scaling.length));
@@ -1822,6 +1871,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         });
       const kind = st.unreadable.length ? 'script magnitude'
         : (prof.costs.length || feedsResource || runeFeedsResource) ? 'resource'
+          : mixedHooks ? 'half of it fires'
           : shieldOnly ? 'foe is passive'
           : defenceGated ? 'foe is passive'
             : noTick.length ? 'no rate'
@@ -1853,6 +1903,34 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
           + (runePromises.length > 1 ? ` (and ${runePromises.length - 1} more like it)` : '');
       } else if (st.unreadable.length) {
         why = st.unreadable[0].why;
+      } else if (mixedHooks) {
+        // NOT a floor, and the hooks are NAMED rather than characterised.
+        // This reader does not read their GUARDS: `Shell of the Devourer`
+        // guards `onInflictHit` on `isFinalCombo && isFirstHit`, so it fires
+        // on the combo finisher and not on every hit, and guards
+        // `onInflictDamage` on `dmg.skillId == ..._StatusBlockBuffed`, so that
+        // one fires only AFTER a block and pays a cooldown reduction rather
+        // than damage. Saying which hooks are DECLARED is all this can honestly
+        // do.
+        //
+        // And the zero itself is right here: the one DAMAGE step in the whole
+        // chain hangs off that same block-applied status, so the half that does
+        // fire fills a bucket only a block empties. What the old sentence got
+        // wrong is its REASON, not its number - which is why this one claims no
+        // floor. The row that proves the
+        // difference: its `onInflictHit` really does fire here, on every combo
+        // finisher, and really does stack Water Infusion - but the only DAMAGE
+        // step in its chain hangs off `Shield_OrbitWater_P_StatusBlockBuffed`,
+        // which a block and nothing else applies, and its `onInflictDamage` is
+        // itself gated on that same status. So the half that fires fills a
+        // bucket only a block empties, and the total really is zero. What is
+        // wrong with the old sentence is its REASON, not its number - and a
+        // sentence promising a floor would have been wrong in the flattering
+        // direction on the one row this kind currently reaches.
+        why = `its script declares ${gate.off.join(' and ')} alongside ${gate.def.join(' and ')} - hooks on `
+                        + 'damage you DEAL, not only on damage you take - so "the foe is passive" is not the '
+                        + 'whole reason this is worth zero here. What those hooks are guarded on, and where '
+                        + 'their payload lands, is further than this reader follows';
       } else if (defenceGated) {
         why = 'it fires when you block or when you are hit, and the simulated foe never attacks - '
           + 'real in game, correctly worth zero here, and the zero is a statement about the fight '
@@ -2145,17 +2223,20 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // Same split as the trigger path: an applier that fires on a block or
       // on being hit is dead because the foe is passive, not because the
       // data withheld a rate.
-      const applierScript = skills.get(d.from)?.script;
-      const defGated = !!applierScript
-        && /GameBeat\.AttackBlock|onReceiveDamage|onReceiveHit/.test(String(applierScript));
+      const gate = foeGating(skills.get(d.from)?.script);
       unmodelled.push({
         id: d.status,
         name: d.name,
         source: d.source,
-        kind: defGated ? 'foe is passive' : 'no rate',
-        why: defGated
-          ? `${d.fromName} applies it on a block or on being hit, and the simulated foe never attacks`
-          : `${d.fromName} applies it, but nothing gives ${d.from} a rate this model can price`,
+        kind: !gate ? 'no rate' : gate.mixed ? 'half of it fires' : 'foe is passive',
+        why: !gate
+          ? `${d.fromName} applies it, but nothing gives ${d.from} a rate this model can price`
+          : gate.mixed
+            ? `${d.fromName} applies it from ${gate.off.join(' and ')}, which fire on every hit you `
+              + `land, and from ${gate.def.join(' and ')}, which the simulated foe never triggers - `
+              + 'so "the foe is passive" is only half the reason, and what the other half is worth '
+              + 'depends on where its payload lands'
+            : `${d.fromName} applies it on a block or on being hit, and the simulated foe never attacks`,
       });
     }
 
@@ -2172,11 +2253,117 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
     // combat at rank >= 2 (onRegUpdate), and 20% per summon expiry - live
     // 14.9 hits per press against the model's one. Both are authored; the
     // reader hands the fight the spec and the fight schedules it.
+    // WHERE a summon step lives. Three shapes exist in this data and only the
+    // first was ever read as itself:
+    //
+    //   * CAST-HOSTED. The step is the summoner's own and runs at Start or
+    //     CastEnd - the Silhouette of Almaz's imps, Tidal Totem's totem. The
+    //     window opens when the skill is pressed, which is what `active` does.
+    //   * STATUS-HOSTED. The step lives on a STATUS the skill applies, `on:
+    //     Code`, played only by that status's own script. Pocket Hive is the
+    //     shape: `Mad Buzz` rolls 20% per damage event to stack `Buzzing`, and
+    //     `Buzzing`'s onStacksChange summons an Angry Bee at its tenth stack
+    //     and then spends the lot.
+    //   * SELF-HOSTED, SCRIPT-PLAYED. The step is the skill's own but `on:
+    //     Code`, played by a proc in its own script - Eternal Flower Heart
+    //     rolls 5% per weapon-skill cast.
+    //
+    // The second was refused whole. `carriesPayload` counts Damage, Heal and
+    // Shield effects and a Summon step is none of those, so Mad Buzz fell
+    // through to the "declares nothing readable" branch and was filed by
+    // whatever its script mentioned. It mentions `onReceiveDamage`, so a
+    // passive that is HALF offensive was reported as wholly defensive - "it
+    // fires when you block or when you are hit, and the simulated foe never
+    // attacks" - while its `onInflictDamage` half fires on every hit you land.
+    // A whole weapon's gimmick sat behind a sentence that was true of one line
+    // of its script.
+    //
+    // The third was worse than refused: it was priced as a CAST. A payload-less
+    // Passive reclaimed into `active` is a skill the fight PRESSES, so Eternal
+    // Flower Heart's bee opened its window on a press instead of on the roll
+    // the script authors, and nothing in the report said which.
     const summons = [];
+    const summonHostOf = (id) => {
+      const stepOf = (sid) => (skills.get(sid)?.steps ?? []).find((x) => x.props?.summon?.unit);
+      const own = stepOf(id);
+      if (own) return { hostId: id, step: own };
+      // The link from an applier to its counter lives in script text and
+      // nowhere else - `addStatus(owner, Skill.GM_MassGrab_Passive_Status)` -
+      // so it is read here the way every other status link in this file is,
+      // aliases resolved first.
+      const linked = new Set(statusIdsOf(id, { runes, rank, talents }));
+      const body = liveScript(skills.get(id)?.script ?? '');
+      const alias = new Map();
+      SKILL_ALIAS.lastIndex = 0;
+      for (let m; (m = SKILL_ALIAS.exec(body));) alias.set(m[1], m[2]);
+      ADD_STATUS.lastIndex = 0;
+      for (let m; (m = ADD_STATUS.exec(body));) {
+        if (!SELF_TARGETS.has(m[1])) continue;
+        linked.add(alias.get(m[2]) ?? m[2]);
+      }
+      for (const sid of linked) {
+        const step = stepOf(sid);
+        if (step) return { hostId: sid, step };
+      }
+      return null;
+    };
+    // WHEN the window opens. A step played by the cast keeps the behaviour the
+    // Almaz established; a `Code` step is played by a script, and the script
+    // says what pays for it. A shape neither of these reads is REFUSED rather
+    // than guessed at - a summon priced on an invented rate is the flattering
+    // direction, and this file does not take it.
+    const summonTriggerOf = (id, hostId, step) => {
+      if ((stepOnNames[step.on ?? -1] ?? '') !== 'Code') return { on: 'cast' };
+      const hostRow = skills.get(hostId);
+      const hostBody = liveScript(hostRow?.script ?? '');
+      if (step.id && !new RegExp(`playStep\\s*\\(\\s*Steps\\.${step.id}\\b`).test(hostBody)) return null;
+      // STACK-DRIVEN. The host is a counter status that summons at its cap and
+      // then spends every stack; what feeds the counter is the APPLIER's roll.
+      if (hostId !== id && /hasStatusMaxStacked/.test(hostBody)) {
+        const stacks = maxStacksOf(hostId, rank);
+        if (!Number.isFinite(stacks) || stacks < 2) return null;
+        const body = liveScript(skills.get(id)?.script ?? '');
+        if (!new RegExp(`addStatus\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?${hostId}\\b`).test(body)) return null;
+        const ch = /checkProba\s*\(\s*vars\.(\w+)\s*\)/.exec(body);
+        const chance = ch ? (skills.get(id)?.vars?.[ch[1]] ?? 0) : 1;
+        if (!(chance > 0)) return null;
+        // WHICH events roll it. `onInflictDamage` is every damage instance you
+        // deal, and the fight counts those; `onReceiveDamage` is one the
+        // simulated foe never produces. Both hooks are NAMED so the rate can be
+        // reported as the floor it is, instead of a hook set being mistaken for
+        // its defensive half - which is exactly how this weapon came to be
+        // worth zero.
+        if (!/function\s+onInflictDamage\b/.test(body)) return null;
+        return {
+          on: 'damageEvent',
+          chance,
+          stacks,
+          alsoOnReceive: /function\s+onReceiveDamage\b/.test(body),
+          // The counter REFRESHES on every application: `Buzzing` declares no
+          // `props.status.stackingPolicy`, and absent is refresh - the same
+          // reading the dot ledger takes. So a gap longer than the row's own
+          // duration loses the WHOLE climb rather than one stack of it, and the
+          // window is what the fight needs in order to price that.
+          window: Number(hostRow?.duration) > 0 ? Number(hostRow.duration) : 0,
+        };
+      }
+      // CAST-PROC-DRIVEN. The skill's own script rolls on a qualifying press.
+      const m = /onUseSkill[\s\S]{0,240}?isWeaponSkill[\s\S]{0,240}?checkProba\s*\(\s*vars\.(\w+)\s*\)/.exec(hostBody);
+      if (m) {
+        const chance = hostRow?.vars?.[m[1]] ?? 0;
+        if (chance > 0) return { on: 'weaponSkillCast', chance };
+      }
+      return null;
+    };
     const summonSpecOf = (id) => {
-      const row = skills.get(id);
-      const st = (row?.steps ?? []).find((x) => x.props?.summon?.unit);
-      if (!st) return null;
+      const found = summonHostOf(id);
+      if (!found) return null;
+      const { hostId, step: st } = found;
+      const trigger = summonTriggerOf(id, hostId, st);
+      if (!trigger) return null;
+      // Vars come off the HOST row, because the step's `duration` names one of
+      // the host's - `Buzzing`'s "dur1" is 15 and lives on `Buzzing`.
+      const row = skills.get(hostId);
       const unitId = st.props.summon.unit;
       const unitRow = cdb.byId('unit').get(unitId);
       const autoId = (unitRow?.skills ?? []).map((x) => x.skill ?? x.ref ?? x).find(Boolean);
@@ -2198,7 +2385,19 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       }, 0);
       const waits = petSteps.reduce((s2, x) => s2
         + ((stepTypeNames[x.type ?? -1] ?? '') === 'Wait' && Number(x.duration) > 0 ? Number(x.duration) : 0), 0);
-      const period = (actionEnd + waits) || 3.8;
+      // ...and a pet cannot swing faster than its own row's COOLDOWN, nor
+      // start the next cast before the current one's DURATION is out. The
+      // Angry Bee's steps come to one second, its cooldown is 1 and its row
+      // duration is 2, so the three disagree and the fight takes the slowest -
+      // the AI loop that would settle it is not read, and the fast number is
+      // the flattering direction. The imp is untouched by this: its 1.5-second
+      // row sits well inside the 3.8 its steps author.
+      const authored = (actionEnd + waits) || 3.8;
+      const period = Math.max(
+        authored,
+        Number(auto.cooldown) > 0 ? Number(auto.cooldown) : 0,
+        Number(auto.duration) > 0 ? Number(auto.duration) : 0,
+      );
       // How long the pets LIVE is the SUMMON STEP's duration - the row's own
       // `duration` is the cast length. Reading the row first priced the
       // Silhouette of Almaz's imps at a 0.3-SECOND window per 20s cycle -
@@ -2208,8 +2407,51 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         ?? (typeof st.duration === 'string' ? row.vars?.[st.duration] : null)
         ?? row.vars?.dur1
         ?? (Number(row.duration) || 12);
+      // A COUNTER IS RARELY FED BY ONE THING, and reading only the applier's
+      // own roll halved this bee. `Buzzing` also takes TWO stacks from every
+      // Honey Crush - `GM_MassGrab_Combo`'s
+      // `onFirstHit(hit) { addStatus(owner, Skill.GM_MassGrab_Passive_Status, 2); }`
+      // with no rank gate and no roll in front of it, and the row's own
+      // `vars.var1 = 2` printed in its tooltip as "generating 2 stacks". Two
+      // feeds put the counter at its cap every 14 seconds where the roll alone
+      // takes 26, so the weapon's own combo is half the gimmick. It is not a
+      // Pocket Hive quirk either: the only other 10-stack, 10-second counter in
+      // the sheet, `DM_Multispin_Passive_Status`, is fed by a hit hook and a
+      // timer both.
+      //
+      // Only an UNGUARDED feed on a per-cast hook counts. A roll, a rank gate
+      // or a status test in front of it is a rate this reader does not have,
+      // and a feed on some other hook is a schedule it cannot name - both stay
+      // uncounted, which leaves the summon rate a floor rather than a guess.
+      if (trigger.on === 'damageEvent') {
+        trigger.feeds = [];
+        for (const e of [...active, ...filler, ...triggered]) {
+          const fid = e.prof?.id;
+          if (!fid || fid === id) continue;
+          const fbody = liveScript(skills.get(fid)?.script ?? '');
+          if (!fbody) continue;
+          ADD_STATUS_3.lastIndex = 0;
+          for (let m; (m = ADD_STATUS_3.exec(fbody));) {
+            if (!SELF_TARGETS.has(m[1]) || m[2] !== hostId) continue;
+            const fn = [...fbody.slice(0, m.index).matchAll(/function\s+(\w+)\s*\(/g)].pop()?.[1] ?? '';
+            if (!/^(onFirstHit|onCast|onUseSkill|onStartCast)$/.test(fn)) continue;
+            if (/checkProba|rank\s*>=|hasStatus/.test(enclosingBlock(fbody.slice(0, m.index)))) continue;
+            const arg = m[3].trim();
+            const n = Number(arg) || (skills.get(fid)?.vars?.[arg.replace(/^vars\./, '')] ?? 0);
+            if (n > 0) {
+              trigger.feeds.push({
+                from: fid, amount: n, hook: fn,
+                name: skills.get(fid)?.texts?.name ?? fid,
+              });
+            }
+          }
+        }
+      }
+      // The charge and crit riders are the SUMMONER's, not the host's. For a
+      // cast-hosted summon the two are the same row, so this is the read it
+      // always was.
+      const body = liveScript(skills.get(id)?.script ?? '');
       // onSummonElapsed -> checkProba(vars.chance) -> a charge, per expiry.
-      const body = liveScript(row.script ?? '');
       const el = /onSummonElapsed[\s\S]{0,160}?checkProba\s*\(\s*vars\.(\w+)\s*\)/.exec(body);
       // The summoner's own script can raise its PETS' crit: the Almaz reads
       // `if (hit.sourceUnit.kind == Unit.Summon_Imp) hit.critChance += 0.15`.
@@ -2217,27 +2459,63 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // refused there - but for the PET line it is always true.
       const pc = new RegExp('sourceUnit[\\s\\S]{0,80}?kind\\s*==\\s*(?:Unit\\.)?' + unitId
         + '[\\s\\S]{0,80}?critChance\\s*\\+=\\s*vars\\.(\\w+)').exec(body);
+      // Pocket Hive's rank-3 clause says summoning one more extends the ones
+      // already out, and it is READ AND REFUSED rather than credited.
+      // `extendSummonDuration@6659` scopes to one skill INSTANCE -
+      // `BaseSkill.getSummons@6140` filters `f.summonSourceSkill == this` -
+      // and `Buzzing` is consumed and removed on every cycle, so each climb
+      // builds a brand-new Status. `onStacksChange@44356` calls the extend at
+      // op37, synchronously, after a `playStep` deferred to the next frame:
+      // this instance has summoned nothing yet, and the bees still in the air
+      // carry the PREVIOUS instance as their `summonSourceSkill`. The set it
+      // extends is empty. Crediting it stretched a 15-second bee to 16.75 and
+      // the fight's dps with it, which is the flattering direction on a rider
+      // the runtime does not appear to deliver. The capture would settle it -
+      // lifetimes clustered at 15s confirm, 18s or more refute - and no
+      // character in the modkit's dumps owns this weapon, so it stays refused
+      // and named.
       return {
-        from: id, unit: unitId, count: st.props.summon.count ?? 1,
-        duration: dur, period, petProf: auto,
-        elapsedChargeChance: el ? (row.vars?.[el[1]] ?? 0) : 0,
-        petCritBonus: pc ? (row.vars?.[pc[1]] ?? 0) : 0,
+        from: id, host: hostId, unit: unitId, count: st.props.summon.count ?? 1,
+        // A concurrent cap where the step declares one: Eternal Flower Heart's
+        // summon step says `limit: 1`, so a second bee replaces the first
+        // rather than doubling the line. Pocket Hive declares none.
+        limit: Number(st.props.summon.limit) > 0 ? Number(st.props.summon.limit) : null,
+        duration: dur, period, petProf: auto, trigger,
+        // Nothing in this data extends a live pet in a way the runtime
+        // delivers, so the field the fight reads is zero - see above. It stays
+        // on the spec because the fight's arithmetic for it is general and the
+        // next patch may author one that does.
+        extend: 0,
+        elapsedChargeChance: el ? (skills.get(id)?.vars?.[el[1]] ?? 0) : 0,
+        petCritBonus: pc ? (skills.get(id)?.vars?.[pc[1]] ?? 0) : 0,
       };
     };
     // A summoner that fell into unmodelled earns its slot back: its worth is
-    // its pets', which the fight now schedules.
+    // its pets', which the fight now schedules. Only a CAST-hosted one earns a
+    // place in the ROTATION with it - a passive whose script summons on a proc
+    // is not a skill anybody presses, and pressing it is how a 5%-per-weapon-
+    // skill bee came to be priced at one press per fight.
     for (let i = unmodelled.length - 1; i >= 0; i--) {
       const spec = summonSpecOf(unmodelled[i].id);
       if (!spec) continue;
       const prof = profileOf(unmodelled[i].id);
       if (!prof) continue;
       unmodelled.splice(i, 1);
-      active.push({ prof, source: 'class', applies: { self: [], target: [] } });
+      if (spec.trigger.on === 'cast') {
+        active.push({ prof, source: 'class', applies: { self: [], target: [] } });
+      }
       summons.push(spec);
     }
     for (const a of active) {
       if (summons.some((sp) => sp.from === a.prof.id)) continue;
       const spec = summonSpecOf(a.prof.id);
+      if (spec) summons.push(spec);
+    }
+    // ...and one nothing else reclaimed: a PASSIVE the build owns outright,
+    // kept for the stat it grants, whose script also summons.
+    for (const p of passive) {
+      if (summons.some((sp) => sp.from === p.prof.id)) continue;
+      const spec = summonSpecOf(p.prof.id);
       if (spec) summons.push(spec);
     }
 
@@ -2300,6 +2578,53 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       const tm = /onRegUpdate[\s\S]{0,300}?rank\s*>=\s*(\d+)[\s\S]{0,300}?vars\.(\w+)/.exec(body);
       const timerPeriod = tm && rank >= Number(tm[1]) ? row.vars?.[tm[2]] ?? null : null;
       chargeDump = { skill: a.prof.id, status: statusId, cap, petFed, timerPeriod };
+      break;
+    }
+
+    // --- an OWN-STACK MULTIPLIER: a bank the actives fill and one press spends
+    //
+    // Tide Rising Uppercut is the shape, and it was worth NOTHING - not
+    // refused, not named, simply absent from every channel at once. `DMG_FIELD`
+    // is the only regex in this file that finds a damage rider in a script and
+    // it requires the right-hand side to be a bare `vars.X;`. This clause reads
+    //
+    //   onDamageEval(hit) { hit.dmgMult += getStatusCount(owner, Skill.S)*vars.var2 }
+    //
+    // so nothing matched, `scriptGapsOf` returned an empty list, and a weapon
+    // skill worth SIX TIMES its base hit at the cap priced at exactly its base
+    // hit with no sentence anywhere saying so. Silence is the worst of the
+    // three outcomes this file can produce: a refusal at least tells a player
+    // where to stop trusting the number.
+    //
+    // THREE clauses must agree before any of it is read, because a bank with no
+    // feed and no spend is not a rate:
+    //   * the EVAL  - `dmgMult += getStatusCount(owner, S) * vars.X`
+    //   * the FEED  - `onSkillProc(ctx) { if (ctx.isSkill && ...) addStatus(owner, S) }`
+    //   * the SPEND - `onDamage` -> `removeStatus(owner, S)`
+    // Anything that declares only some of them keeps whatever it had before.
+    let stackMult = null;
+    for (const a of active) {
+      const row = skills.get(a.prof.id);
+      const body = liveScript(row?.script ?? '');
+      const m = OWN_STACK_MULT.exec(body);
+      if (!m) continue;
+      const statusId = m[1];
+      const statusRow = skills.get(statusId);
+      const per = row?.vars?.[m[2]];
+      if (!(per > 0) || !statusRow) continue;
+      const cap = maxStacksOf(statusId, rank);
+      if (!Number.isFinite(cap) || cap < 2) continue;
+      const has = (re) => new RegExp(re + '\\s*\\(\\s*owner\\s*,\\s*(?:Skill\\.)?' + statusId + '\\b').test(body);
+      if (!/onSkillProc[\s\S]{0,240}?isSkill/.test(body) || !has('addStatus')) continue;
+      if (!/function\s+onDamage\s*\(/.test(body) || !has('removeStatus')) continue;
+      // The bank's own duration, which is what BINDS - see the fight.
+      const window = Number(statusRow.duration) > 0 ? Number(statusRow.duration) : 0;
+      if (!(window > 0)) continue;
+      stackMult = {
+        skill: a.prof.id, name: a.prof.name, status: statusId,
+        statusName: statusRow.texts?.name ?? statusId,
+        per, cap, window,
+      };
       break;
     }
 
@@ -2573,6 +2898,7 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       resources: { gains, tracked: [...tracked], capOverride: poolCapOverride },
       summons,
       chargeDump,
+      stackMult,
       wsRider,
       wsReset,
       // Mage_Talent_ChainStrike: `onInflictDamageEval - if isBaseAttack() and
@@ -4007,6 +4333,39 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
    * difference between a gap and a silent one.
    */
   const gapCache = new Map();
+  // A skill whose damage lives in ANOTHER ROW, named only by its script.
+  // `Heat Emission` is the case: `steps: []`, and its whole payload is
+  // `startSkill(Skill.Scepter_Flamie_Skill1_Area, flamie.owner)` once per live
+  // flamie - 8,633 hits of it in the capture and not one of them modelled. At
+  // rank 3 the row is rescued into the rotation for the shield it also applies,
+  // so it was not even in the unscored list: SILENT, which is the worst of the
+  // three things this file can do with a row.
+  //
+  // The row it names is perfectly readable. What is missing is the FAN - how
+  // many it starts - which is one per status the owner is carrying and so is
+  // live state. Naming it is what this is for; pricing it is not, because a fan
+  // this reader has to guess at is the flattering direction.
+  //
+  // Five rows in the sheet start a damaging skill from script and three are
+  // player-reachable: Heat Emission, its own Flamie status's rank-3 free proc,
+  // and Power of the Tides, which starts an AoE at each of its totems.
+  const startsDamage = (skillId, rank, runes) => {
+    const body = liveScript(skills.get(skillId)?.script ?? '');
+    if (!body) return [];
+    const out = [];
+    const seen = new Set();
+    const RE = /startSkill\s*\(\s*(?:Skill\.)?(\w+)/g;
+    RE.lastIndex = 0;
+    for (let m; (m = RE.exec(body));) {
+      if (seen.has(m[1]) || !skills.get(m[1])) continue;
+      seen.add(m[1]);
+      const p2 = combat.profile(m[1], rank, runes);
+      if (!p2?.effects?.some((e) => e.kind === 'Damage' && (e.baseVal || e.scaling.length))) continue;
+      out.push(m[1]);
+    }
+    return out;
+  };
+
   function scriptGapsOf(skillId, rank = 1, { asTalent = false, runes = null } = {}) {
     const key = skillId + '@' + rank + (asTalent ? '' : '#skill')
       + (runes?.size ? '@' + [...runes].sort().join('+') : '');
@@ -4077,6 +4436,15 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       };
       look(/reduce(?:Weapons)?Cooldown\s*\(\s*vars\.([A-Za-z0-9_]+)\s*(?:,\s*[\w.?]+\s*)?\)/g, 'cooldown');
       look(new RegExp(DMG_FIELD.source, 'g'), 'damage');
+    }
+    for (const other of startsDamage(skillId, rank, runes)) {
+      const name = s?.texts?.name ?? skillId;
+      hit.push({
+        id: skillId, name, field: 'startSkill', amount: other, guard: `startSkill(${other})`,
+        why: `${name} is scored, but its script also starts ${other} - a row that carries real `
+          + 'damage of its own - once per status the owner is carrying, and how many that is is '
+          + 'live state this reader cannot count',
+      });
     }
     gapCache.set(key, hit);
     return hit;
@@ -4172,7 +4540,25 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
       // Skill.Priest_Prayer_Smite -> dmgMult += vars.damage`. Only when the
       // named row is a castable skill: the same guard naming a STATUS is the
       // companion-hook family the dot pipeline reads.
-      const ONE_SKILL = /if\s*\(\s*\w+\.skillId\s*==\s*Skill\.(\w+)\s*\)\s*\{\s*\w+\.dmgMult\s*\+=\s*vars\.(\w+)/g;
+      // ANCHORED, and the anchor is the whole point. Without the trailing
+      // lookahead this matched the PREFIX of a longer expression and booked its
+      // FIRST TERM as if it were the whole rider. Two of the five rows it
+      // matches in the sheet are prefix matches, and both were priced wrong for
+      // it: Venomous Finisher's `dmg.dmgMult += vars.damage *
+      // dmg.target.getStatusCount(Skill.Rogue_Talent_LethalPoison_Status)`
+      // booked a flat +5% where the script multiplies by up to seven stacks,
+      // and Ramp-up's `+= vars.var1 * status.stacks` booked a flat +10% the
+      // same way. A number that is WRONG is worse than one that is missing,
+      // because nothing in the report marks it as a guess - so the anchor
+      // refuses both.
+      //
+      // The pass below names ONE of the two. Venomous Finisher is a TALENT, so
+      // its mod reaches `unreadMods` and prints as a gap; Ramp-up is borne by a
+      // STATUS, and `if (!asTalent && mod.field !== 'cooldownPerTick') continue`
+      // in engine.mjs drops every status-borne mod before it gets there. So
+      // Ramp-up trades a wrong number for a silence - the lesser of the two
+      // evils, and still one of them.
+      const ONE_SKILL = /if\s*\(\s*\w+\.skillId\s*==\s*Skill\.(\w+)\s*\)\s*\{\s*\w+\.dmgMult\s*\+=\s*vars\.(\w+)\s*(?=[;}])/g;
       ONE_SKILL.lastIndex = 0;
       for (let m; (m = ONE_SKILL.exec(body));) {
         const v = varAtRank(m[2]);
@@ -4181,6 +4567,25 @@ export function buildSkillPlan(cdb, ctx, cat, combat, { classSkillSlots = CLASS_
         out.push({
           field: 'dmgMult', scope: 'one-skill', skill: m[1], statusType: null,
           targetBleeding: undefined, amount: v, from: skillId, name: s.texts?.name ?? skillId,
+        });
+      }
+      // ...and the same shape with a COUNT on the right of the var, which this
+      // reader will not price: the multiplier is per stack of a status the
+      // TARGET carries, and how many are on it when the cast lands is live
+      // state rather than a column. It rides out under its own scope so the
+      // engine can NAME it - which is what the anchor above would otherwise
+      // have turned into a fresh silence.
+      const ONE_SKILL_COUNT =
+        /if\s*\(\s*\w+\.skillId\s*==\s*Skill\.(\w+)\s*\)\s*\{\s*\w+\.dmgMult\s*\+=\s*vars\.(\w+)\s*\*\s*([^;\n]+);/g;
+      ONE_SKILL_COUNT.lastIndex = 0;
+      for (let m; (m = ONE_SKILL_COUNT.exec(body));) {
+        const v = varAtRank(m[2]);
+        const row = skills.get(m[1]);
+        if (typeof v !== 'number' || v <= 0 || !row) continue;
+        out.push({
+          field: 'dmgMult', scope: 'one-skill-per-count',
+          skill: m[1], skillName: row.texts?.name ?? m[1],
+          amount: v, countExpr: m[3].trim(), from: skillId, name: s.texts?.name ?? skillId,
         });
       }
       // A rider on every status tick the OWNER CARRIES - Radiance is
