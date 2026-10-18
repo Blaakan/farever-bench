@@ -6,7 +6,7 @@ Every release of farever-bench, newest first:
 `ui/package.json` always carry the same version - `tools/release.mjs` moves
 them together and refuses to run when they disagree.
 
-## [Unreleased]
+## [0.5.0] - 2026-10-18
 
 The September 30 update (Farever build 25782799, bytecode v6), end to end,
 and the two hotfix builds that followed it (25933712 on 2026-10-14, 25959898
@@ -21,6 +21,37 @@ new build; `bench audit` says, entry by entry, which of it the capture
 measured (44 of its 121 entries are verified) and which is still an
 assumption, with both numbers where the read and the rows disagree. The
 capture is of build 25782799; nothing has been measured on either hotfix.
+
+### Known issues
+
+What the 2026-10-13 capture or the reads already show is off in this
+version. Each one is an entry in `bench audit`, with both figures where the
+read and the rows disagree.
+
+- **Base attacks run 5-8% fast in rate.** In game the hero stands in a Free
+  state for a frame before every link of the chain; the fight does not, so
+  every line that rides the chain is over-rated by that much a second (per
+  hit they agree).
+- **Infusion sets have never been measured.** They are read from their
+  scripts; no captured character wore one. Their own lines are 3-12% of
+  each class's default build, and three of those builds also count Wet's
+  +6% damage taken.
+- **The Rogue's rate reads 4.8% high** over sixteen rotation steps, like
+  for like, and Urge to Kill is in no number: the model's Finishers spend
+  2.1 points where the capture's spent 4.1.
+- **Domination's rank-3 bonus is averaged** over the share of the fight the
+  foe is controlled, where the game pays it per hit (Raging Smash +5.5%,
+  Tear Reality +4.9% in their own blocks).
+- **The Raclette Pan's crit stacks are priced as read** (+0.5 CritChance
+  each), and the one wearer measured did not show them: 16.1% critical at
+  ten stacks against 21.7% priced.
+- **The search can stop short.** The Warrior's default search settles at
+  841.7 where its previous optimum still prices 846.3 on the same rows.
+- **Read and not priced:** Spark Surge and the Spark Cube, six Mage talents,
+  Expulse beyond one orb, Going With the Flow, Water Veil's heal. Each says
+  so in `bench audit` and under `--verbose`.
+- **Nothing is measured on the two hotfix builds**, and heroic targets are
+  read from the client, not measured.
 
 ### Fixed
 

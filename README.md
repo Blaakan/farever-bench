@@ -365,7 +365,7 @@ provenance first — the tool's version, the fingerprint of the `data.cdb` and
 `hlboot.dat` it read, and where it read them:
 
 ```
-farever-bench 0.3.0
+farever-bench 0.5.0
 cdb bc7ee48e  boot c7173926  game E:\SteamLibrary\steamapps\common\Farever
 ```
 
