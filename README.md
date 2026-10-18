@@ -28,13 +28,13 @@ between them is a matter of taste, not of installing anything twice.
 
 ### The shortest path to a first result
 
-**The desktop app.** Take `FareverBench-v0.1.0.exe` from
+**The desktop app.** Take `FareverBench-v<version>.exe` from
 [Releases](https://github.com/Blaakan/farever-bench/releases), run it, click
 past SmartScreen, pick a class, press **Optimize**. On first run it finds the
 game through Steam's library list; if it cannot, it asks for the folder — the
 one holding `Farever.exe` and `hlboot.dat` — and remembers the answer.
 
-**The UI in your browser.** Take `farever-bench-v0.1.0.zip` from the same
+**The UI in your browser.** Take `farever-bench-v<version>.zip` from the same
 place, unzip it, and from the folder it makes:
 
 ```bash
@@ -60,9 +60,26 @@ and nothing to install, because the tool has no runtime dependencies:
 ```bash
 git clone https://github.com/Blaakan/farever-bench
 cd farever-bench
-node test/run.mjs                    # 948 checks against your own game data
+node test/run.mjs                    # about 4,300 checks against your own game data, 40-55 minutes
 node bin/bench.mjs optimize --class Warrior
 ```
+
+`node test/run.mjs --list` prints the suite's group titles and `--only
+"<regex>"` runs the groups whose title matches. A group that asserts
+nothing fails, and a throw costs only its own group.
+
+**The numbers are your patch's, and the tool says when it has not caught up
+with it.** Every command opens with the fingerprint of the game files it
+read. If that is not the build the model was last accepted on, the next line
+says so:
+
+```
+this install is not the build the model was accepted on (2026-08-11) - run bench update
+```
+
+The numbers are computed either way; they are not vouched for until
+[`bench update`](#two-more-commands) has been worked through. The UI carries
+the same sentence as a strip across the page.
 
 ### Finding the game
 
@@ -95,7 +112,7 @@ fight is stated with every number rather than assumed. The defaults:
 | | default | what it means |
 |---|---|---|
 | fight length | `--fight 200` | a 200-second fight, which is what a damage meter reports |
-| target | `--target boss` | a **named boss** (Ratsar) — not a dummy, and not the game's own `Armor_ExpectedReduction` constant, which sits well under what you actually fight |
+| target | `--target boss` | a **named boss** (ul'Serous, Herald Avatar: 40% / 40%) standing at your own level, immune to crowd control — not the training dummy, and not the game's own `Armor_ExpectedReduction` constant, which sits well under what you actually fight |
 | target health | `--target-health 100` | it stands at **full** health, so every execute rider in the game is off |
 | enemies hit | `--targets 1` | honest single-target: nothing scales with a crowd |
 | weapon mastery | `--rank max` | rank 3 — a weapon you have finished. Every skill it grants, passives included, takes two upgrades |
@@ -113,10 +130,19 @@ rather than a derived number for a reason the data itself gives:
   compare the target's health against a threshold. Which phase of a fight you
   are asking about is not something a table can answer, so you say it, and the
   comparison is then answered exactly.
-- **`--target <t>`** — `dummy | small | trash | big | elite | boss | dungeon |
-  reference`, or any unit id. What penetration buys depends entirely on this:
-  nothing at all against a 0-armour dummy, +16.9% against the default boss,
-  +35.4% against an elite. `bench targets` prints the whole ladder.
+- **`--target <t>`** — `none | dummy | reference | trash | small | big | elite
+  | boss | dungeon | heroic`, or any unit id. What penetration buys depends
+  entirely on this: at 50% penetration, nothing against `none`, +5.3% on the
+  training dummy, +25.0% against the default boss. Two things about that list
+  changed with the September 30 update. **The training dummy is not a zero
+  any more**: its row authors 40% armour and it stands at level 1, so a
+  level-25 character loses about 10% on it; `none` is the target that
+  mitigates nothing. And a target has a **level**: a unit id stands where its
+  row puts it in Normal difficulty, `<unit>@veteran` and `<unit>@heroic` stand
+  it at the level cap (Heroic also reads its heroic armour rows),
+  `<unit>@scaled` builds its pool at your level as a rift does, and
+  `--target-level <n>` overrides any of them. `bench targets` prints the
+  whole ladder, heroic bosses included.
 - **`--fight <s>`** — a 20-second pull and a 200-second one weight cooldowns
   completely differently. The default matches what a meter shows you.
 
@@ -145,16 +171,24 @@ game's own layout, with the game's own icons and tooltips.
 
 Twelve armour slots down the middle in the game's visual order, attributes on
 the left, weapons on the right. Click a slot to pick an item; right-click it to
-unpin it again. A number in a slot's corner is the item's own level, the stars
-under the icon are its upgrade level, and the small disc at the bottom right is
-its socket — click that instead and you are choosing the enchant or the gem
-rather than the item.
+unpin it again. A number in a slot's corner is the level the piece is
+**priced at** — its instance level, which for a drop is yours and for a
+crafted or authored piece is its row's — the stars under the icon are its
+upgrade level, and the small disc at the bottom right is its socket — click
+that instead and you are choosing the enchant or the gem rather than the item.
 
 Every slot you touch becomes a **pin**: **Optimize** holds it and searches
 around it. A slot you never touch is left free. Those are three different
 states and the picker names all three — an item, *Empty this slot* (pinned
 empty, and the optimizer keeps it that way), and *Unpin* (let the optimizer
-fill it).
+fill it). One thing on a pinned piece can still be left to the search: its
+**infusion** is pinned only when the picker states one (or states "none");
+otherwise the optimizer chooses it.
+
+The screenshots on this page were taken before the September 30 update. The
+layout is the same; what they do not show is the Infusions block under the
+sheet, the infusion controls in the picker and its *Not offered* list, all
+described below.
 
 The left column starts on the five primaries. **More stats** turns it over to
 everything else — the same second page the game shows you, with the conversions
@@ -170,21 +204,34 @@ number alone means nothing without the target it was computed against.
 ![The item picker: rarity, stars, drop level, and the full tooltip](docs/img/item-picker.png)
 
 The list is every item legal in that slot for that class, at that level. The
-right-hand pane is what you are about to equip, and the four controls above it
-are the four things about an item that are not fixed by its row:
+right-hand pane is what you are about to equip, and the controls above it are
+the things about an item that are not fixed by its row:
 
 - **Rarity** — a weapon rolls its rarity when it drops, so the dropdown gives
-  every rarity it can roll and the chance of each *at your level*. Gear does
-  not roll: its rarity is authored, and the dropdown says so.
+  every rarity it can roll and the share of each *at your level*. Gear does
+  not roll: its rarity is its row's, an Epic chest is a different item from
+  the Rare one, and the dropdown says so.
 - **Stars** — upgrade level. **Only weapons can be upgraded**; the game's own
   window text says so and the twenty `<WeaponType>_Upgrade` skills exist for
   weapon types only. Armour has no star row at all.
-- **Drop level** — a weapon is *generated* at the level of whatever dropped it,
-  so the slider is which instance you are holding. Gear is authored and keeps
-  its own level, so the slider does not appear for it.
+- **Drop level** — a weapon or a piece of armour that a kill generates takes
+  the level of whatever dropped it, so the slider is which instance you are
+  holding. Jewellery and crafted pieces keep the level on their row, and an
+  Epic piece can only be made at the level cap, so its band is one level.
+- **Infusion** — on a piece that can carry one (Epic armour with a faction),
+  three more controls: which infusion — or *the optimizer's choice*, or
+  *none* — which rating its bonus line rolled, and whether the piece is
+  Prismatic. The list is the infusions something in your install hands out.
 - **The tooltip** — the exact affix bake, the weapon's damage range and
-  WeaponPower, the skills it grants, its faction, and **where it drops**, down
-  to the merchant's coordinates.
+  WeaponPower, the skills it grants, its faction, and **where it comes
+  from**: the modkit atlas's coordinates when that file is present, otherwise
+  what the install's own loot tables, merchants and recipes say.
+
+The list ends with a **Not offered** section: rows nothing in your install
+hands out (on the September 30 build, 26 Epic pieces that sit only in loot
+tables nothing opens) and rows whose every copy is made above your level,
+dimmed, each with the sentence that says why. You can still equip one. The
+optimizer never picks one, and its result lists what it was not offered.
 
 Sockets are their own picker, listing every augment the socket can host with
 what each one pays and what crafting it costs:
@@ -197,7 +244,11 @@ what each one pays and what crafting it costs:
 
 Under each weapon are the skills it offers. A lit tile with a tick is slotted;
 a dimmed one is not. **A weapon offers three skills and you get two**, so this
-is a real build decision — click a tile to change it.
+is a real build decision — click a tile to change it. A pool is held for the
+optimizer only once your selection **fills** it, and a held pool wears a gold
+pip; click the pip to hand the choice back. (Before that rule any click
+pinned the pool, deselecting included, and the optimizer quietly returned
+your own half-made selection.)
 
 The **arsenal** is the second weapon. It contributes `ceil(stat × 0.4)` of its
 stats and its two slotted skills, and nothing else: you do not swap to it, so
@@ -246,9 +297,21 @@ if I take this*.
 ### Optimize
 
 Press **Optimize** and the search fills every slot and socket you did not pin,
-picks the skills, allocates the tree, slots the runes, and plays a 200-second
-fight. It runs in its own process and streams progress while it goes; a full
-class from nothing takes about a minute.
+picks the skills, allocates the tree, slots the runes, hands out infusions,
+and plays a 200-second fight. It runs in a worker thread and streams progress
+while it goes; a full class from nothing takes about three minutes (Warrior,
+Mage), eight (Priest) and twelve (Rogue) on build 25959898, as timed for
+this page one after the other on a machine that was running the suite and
+two other searches beside them - alone each is quicker. The Priest's
+is the one that grew: a build that holds Sunlight is played in several
+orders (see [The fight](#the-fight)).
+
+The **Infusions** block under the sheet is where the set layer is read and
+steered. On your side it chooses what the optimizer may hand out (the lit
+orbs) and what it takes an unowned piece's bonus roll to be. On the result it
+shows the sets worn — pieces, the set rank reached — what of each set is in
+the number, everything the set does that is NOT scored, folded under it, and
+each piece's bonus line: lit, dark (and why), or not stated.
 
 The answer arrives on a **second sheet beside yours**, marked `read-only`:
 
@@ -294,17 +357,23 @@ of the answer worth reading before you trust the rest of it.
 | [`update`, `verify`](#two-more-commands) | the patch-day pipeline, and the model against a recorded capture |
 
 Every command takes `--class`, `--level`, `--target`, `--fight`, `--goal`,
-`--game` and the pins; `bench --help` prints the lot. Every command prints its
+`--game` and the pins; `bench --help` prints the lot. A flag the command line
+does not read is refused with the nearest names (`unknown flag --target-lvl -
+did you mean --target-level?`) where it used to run the defaults in silence.
+Every command prints its
 provenance first — the tool's version, the fingerprint of the `data.cdb` and
 `hlboot.dat` it read, and where it read them:
 
 ```
-farever-bench 0.1.0
-cdb b7a48efb  boot 90b98741  game E:\SteamLibrary\steamapps\common\Farever
+farever-bench 0.3.0
+cdb bc7ee48e  boot c7173926  game E:\SteamLibrary\steamapps\common\Farever
 ```
 
 That header is elided from the examples below. Long outputs are trimmed, and
-the trim is marked `...`.
+the trim is marked `...`. Every sample on this page was regenerated on
+2026-10-17 from the commands shown, on Farever build 25959898 (the second
+hotfix after the September 30 update) at level 25; your numbers follow your
+own install.
 
 ### Pinning
 
@@ -316,18 +385,29 @@ optimised around it.
 --pin weapon1=Sword_Swarm*3          # fix an item at 3 upgrade stars
 --pin trinket=none                   # force a slot empty
 --pin feet/enchantfeet=none          # force one socket empty
---pin chest=Chest_RManfish_Cle@Epic  # assume a particular drop rarity
+--pin weapon1=Spear_Eruption@Epic    # a weapon at the rarity it rolled
 --pin weapon1=Spear_Eruption^10*0    # the instance that dropped at level 10, unupgraded
+--pin chest=Chest_EBee_Fig~Infusion_Bee_DPS/CritChance   # an infused piece
 --no-augment weapon1                 # no augments at all on that slot
 ```
 
-The grammar on an item is `id` `^instanceLevel` `@rarity` `*stars`, every
-suffix optional but in that order, and `none` in place of an item pins the slot
-empty. Slot and item names are matched loosely — `chest`, `Chest`, `Slot_Chest`
-and `fingerleft` all work — and an ambiguous name is an error that lists the
-candidates rather than a silent guess. With no `@rarity` given you get the best
-the slot can reach, the same "assume the good version" default `--stars max`
-already applies.
+The grammar on an item is `id` `^instanceLevel` `@rarity` `*stars`
+`~infusion`, every suffix optional but in that order, and `none` in place of
+an item pins the slot empty. Slot and item names are matched loosely —
+`chest`, `Chest`, `Slot_Chest` and `fingerleft` all work — and an ambiguous
+name is an error that lists the candidates rather than a silent guess.
+
+`@rarity` is for **weapons only**: only a weapon rolls one. Gear keeps its
+row's rarity, so `--pin chest=Chest_RBee_Fig@Epic` is refused with the id of
+the row that IS the Epic piece. With no `@rarity` on a weapon you get the
+best the slot can reach, the same "assume the good version" default
+`--stars max` already applies.
+
+`~<infusion>` puts an infusion on a piece that can carry one (Epic armour
+with a faction), by id or by name. `/<rating>` after it states the rating its
+bonus line rolled, and a trailing `!` says the piece is Prismatic; `~none`
+pins it not infused, and with no `~` part at all the search chooses the
+infusion.
 
 Three more pins are not gear:
 
@@ -354,97 +434,174 @@ bench optimize --class Warrior
 ```
 
 ```
-Warrior 25 - maximising dps vs named boss (Ratsar: S 1.10/1.10) @L6.9 (rift-R1 fit)
-upgrade stars: max for rarity   weapon mastery: rank 3, fully mastered   rarities: all   drop-rarity: rolled   excluding /^GM_/
+Warrior 25 - maximising dps vs named boss (Ulserous: S 0.67/0.67)
+upgrade stars: max for rarity   weapon mastery: rank 3, fully mastered   rarities: all   drop-rarity: rolled
+withheld: 13 stat-bearing rows nothing in this install hands out (--include-all offers them; `bench audit` says how that was read)
 
-SLOT           ITEM                     RAR        UPG    iLVL  FACTION  GIVES
-Weapon1        Judgement                Legendary  *****   350  World    ArmorPenetration         rolled
-Weapon2        Worldsplitter            Legendary  *****   350  Demon    Fervor+SpellPenetration  rolled
+SLOT           ITEM                                RAR        UPG    iLVL  FACTION  GIVES              INFUSION
+Weapon1        Judgement                           Legendary  *****   370  World    ArmorPenetration                       rolled
+Weapon2        Twin Pillars of Justice             Legendary  *****   370  Crimson  Fervor+CritChance                      rolled
 OffhandWeapon  (empty)
-Head           Crown of the Sea         Rare               260  Manfish  ArmorPenetration
-Neck           Necklace of Precision    Uncommon           150  Crit     CritChance
-Shoulders      Gaping Mouths Pauldrons  Rare               260  Demon    Fervor
-Chest          Whirring Gem of Apix     Rare               260  Bee      ArmorPenetration
-Back           Crimson Wings            Rare               260  Crimson  Fervor
-Hands          Unholy Crimson Gloves    Rare               260  Crimson  Fervor
-Waist          Caryapsid's Coccyx       Rare               260  Craft    ArmorPenetration
-Legs           Wrong Trousers           Rare               260  Kobold   CritChance
-Feet           Demonic Crushers         Rare               260  Demon    Fervor
-FingerLeft     Set Eye of Zeal          Rare               260  Fervor   Fervor
-Trinket        Raclette Pan             Rare               260  Kobold   ArmorPenetration
-FingerRight    Set Eye of Zeal          Rare               260  Fervor   Fervor
+Head           Visor of the Sea Titan              Epic               300  Manfish  ArmorPenetration   Overwhelming Tides
+Neck           Necklace of Fracture                Uncommon           150  ArPen    ArmorPenetration
+Shoulders      Jaws From Another World             Epic               300  Demon    Fervor             Balance of Justice
+Chest          Cuirass of the Queenslayer          Epic               300  Bee      ArmorPenetration   Hive Venom
+Back           Shroud of the Ancient King          Epic               300  Crimson  Fervor             Balance of Justice
+Hands          Holy Crimson Gloves                 Epic               300  Crimson  Fervor             Balance of Justice
+Waist          Shell Swimming Belt                 Epic               300  Manfish  ArmorPenetration   Overwhelming Tides
+Legs           Mine Estrone's Safety Thigh Guards  Epic               300  Kobold   CritChance         Balance of Justice
+Feet           Sabatons of the Golden Swarm        Epic               300  Bee      ArmorPenetration   Hive Venom
+FingerLeft     Set Eye of Fracture                 Rare               260  ArPen    ArmorPenetration
+Trinket        Raclette Pan                        Epic               300  Kobold   ArmorPenetration
+FingerRight    Set Eye of Fracture                 Rare               260  ArPen    ArmorPenetration
+
+INFUSION
+  SET                 PIECES  RANK        SCORED
+  Balance of Justice       4  2  (4) Set  +2.5 PhysicalMastery
+                                          +2.5 MagicMastery
+                                          +5 PhysicalMastery (Infusion_Crimson_DPS_Physical) and +5 MagicMastery (Infusion_Crimson_DPS_Magic), swapped every 10s in combat - one at a time, each up its share of the fight
+  Hive Venom               2  1  (2) Set  Hive Venom (Infusion_Bee_DPS_Dot) on the foe: stacking to 5, applied on every status you land on the foe
+  Overwhelming Tides       2  1  (2) Set  Wet (Infusion_Manfish_DPS_Status) on the foe: +2% DamageTakenModifier a stack, up to 3, one stack on every crowd control you try to apply and every knockback one of your hits applies
+  Balance of Justice in this fight: +5 PhysicalMastery: up 50% of the fight; +5 MagicMastery: up 50% of the fight
+  Hive Venom in this fight: Hive Venom: 100 ticks, 26.1 dps
+  Overwhelming Tides in this fight: Wet: 2.99 of 3 stacks on the foe on average, up 100% of the fight, 145 applications
+  bonus stat: 8 with no roll stated, priced at 0 (up to 65 rating if the faction-matched ones are lit)
+  searched: 13 of 15 infusions; an unowned piece's bonus roll is priced at 0 (--infusion-stat best|<rating> to ask)
+  withheld: Resine Armor - Queen Honeyzabeth drops it on Heroic only (loot table Cleodora_LT2), and Heroic is not released for Honeyzabeth’s Hivetrunk (heroicReleaseStatus Development, which $HData.checkStatus@21563 refuses)
+  withheld: Honorable Defender - High Inquisitor Chakram drops it on Heroic only (loot table Phrixes_LT2), and Heroic is not released for Chakram's Chapel (heroicReleaseStatus Development, which $HData.checkStatus@21563 refuses)
+  (--infusions all offers them anyway)
 
 AUGMENTS
-SLOT         SOCKET         AUGMENT                         EFFECT
-Weapon1      EnchantWeapon  Magic Formula: Zealot
-Weapon1      Demon          Corrupted Gift                  -40 SpellPenetrationRtg +40 CritChanceRtg
-Weapon2      EnchantWeapon  Magic Formula: Devote
-Weapon2      Demon          Corrupted Gift                  -40 SpellPenetrationRtg +40 FervorRtg
-Head         DemonSigil     Sigil of Bet'Hatesht            grants Surge of Violence - a next-cast register
-Neck         Jeweller       Cursed Eye of Brutality         +9 CritChanceRtg +9 FervorRtg +9 ArmorPenetrationRtg -9 SpellPenetrationRtg
+SLOT         SOCKET         AUGMENT                           EFFECT
+Weapon1      EnchantWeapon  Magic Formula: Devote
+Weapon1      Demon          Corrupted Gift                    -40 SpellPenetrationRtg +40 ArmorPenetrationRtg
+Weapon2      EnchantWeapon  (none)
+Weapon2      Demon          Corrupted Gift                    -40 SpellPenetrationRtg +40 ArmorPenetrationRtg
+Head         DemonSigil     Sigil of Bet'Hatesht              grants Surge of Violence - a next-cast register
+Neck         Jeweller       Cursed Eye of Brutality           +9 CritChanceRtg +9 FervorRtg +9 ArmorPenetrationRtg -9 SpellPenetrationRtg
 ...
 
 TALENTS
   16 of 16 points spent, 1 granted by a sigil
-  TIER  BRANCH  TALENT             RANK          GIVES
-  4     Left    Surge of Violence  from sigil    a next-cast register
-  0     Root    Hemorrhage                       35% of physical crits as a bleed
-  1     Center  Sever                            +20% crit damage on weapon skills
-  1     Left    Seasoned Soldier                 +1 Rage per crit
-  2     Left    Bloodletting       2/2           +20% damage on bleeds
-  ...
+  TIER  BRANCH  TALENT             RANK                    GIVES
+  4     Left    Surge of Violence  from sigil              a next-cast register
+  0     Root    Hemorrhage                                 35% of physical crits as a bleed
+  1     Center  Sever                                      +20% crit damage on weapon skills
+  1     Left    Seasoned Soldier                           +1 Rage per crit
+  2     Left    Bloodletting       2/2                     +20% damage on bleeds
+  3     Left    Bruise                                     +4% damage physical
+  2     Left    Exsanguination     2/2                     +20% crit chance on bleeds
+  3     Left    Master-at-arms     1/2                     +15% crit damage attack-or-combo
+  1     Right   Rage Shield                    gate point  nothing readable
+  2     Right   Bloodfeast         2/2                     +30% of it healed back on bleeds
+  3     Right   Hold the Line      2/2                     status
+  3     Right   Zealous Warrior    2/2                     +4 Fervor
 
 SKILLS
 POOL              SLOTS  TAKEN
-main-hand skills  2/2    Rampage, Shockwave                                 always on: Domination
-arsenal skills    2/3    Tear Reality, Dark Gift                            not taken: Resilience of the Unkillable Demon King
-class skills      4/5    Ignore Pain, Battle Shout, Surging Force, Berserk  not taken: Charge
+main-hand skills  2/2    Rampage, Shockwave                            always on: Domination
+arsenal skills    2/3    Iron Cyclone, Zeal                            not taken: Zealous Spins
+class skills      4/5    Charge, Battle Shout, Surging Force, Berserk  not taken: Ignore Pain
 
-not scored in this build (2) - --verbose for what and why
+not scored in this build (5) - --verbose for what and why
 
 RUNES
   SKILL          SLOTTED              READABLE  WHAT IT CHANGES
   Raging Smash   Scent of Battle      3/3       changes its cost
-  Charge         (none)               3/3
+  Charge         Juggernaut           3/3       +5 Rage
   Ignore Pain    (none)               0/3
   Battle Shout   Battle Fury          1/3       nothing this model can read
   Surging Force  Concentrated Impact  2/3       +40% damage at one target
   Berserk        Releasing the Beast  1/3       overrides cooldown
-  ...
+...
 
 Primary
   attribute  value
-  Strength     166
-  Dexterity     28
+  Strength     195
+  Dexterity     46
   Intellect     28
-  Faith         42
-  Vitality     214
+  Faith         28
+  Vitality     249
 
 Offence
   attribute                value
   WeaponPower              49.43
-  CritChanceRating           148  -> CritChance 7.79pp   +1 = +0.0526pp
-  CritChance               25.77
-  CritDamage              153.88
-  ArmorPenetrationRating     243  -> ArmorPenetration 31.98pp   +1 = +0.1316pp
-  ArmorPenetration         31.98
-  ...
+  CritChanceRating            84  -> CritChance 4.42pp   +1 = +0.0526pp
+  CritChance               14.46
+  CritDamage              154.46
+  ArmorPenetrationRating     479  -> ArmorPenetration 63.05pp   +1 = +0.1316pp
+  ArmorPenetration         63.05
+...
 
 DAMAGE
                                DPS   DAMAGE  SHARE  HITS
-  overall                    656.3  131,252          339
-  Hemorrhage                 149.7   29,932  22.8%    99
-  Rampage                    135.5   27,093  20.6%    17
-  Raging Smash                86.9   17,382  13.2%    40
-  GA_Base_Attack              63.9   12,790   9.7%    47
-  GA_Base_Attack2             52.9   10,574   8.1%    39
-  Brutal Frenzy (filler)      47.2    9,448   7.2%    25
-  GA_Base_Attack3             40.4    8,072   6.1%    30
-  Tear Reality                32.4    6,481   4.9%    11
-  Shockwave                   31.9    6,372   4.9%     9
-  Brutal Frenzy (triggered)    7.8    1,557   1.2%    17
-  Surging Force                7.8    1,551   1.2%     5
+  overall                    841.7  168,339          512
+  Hemorrhage                 181.8   36,360  21.6%   100
+  Rampage                    168.2   33,641  20.0%    13
+  Iron Cyclone               124.1   24,813  14.7%    76
+  Raging Smash               107.4   21,477  12.8%    45
+  Brutal Frenzy (filler)      52.0   10,395   6.2%    29
+  GA_Base_Attack              43.0    8,609   5.1%    49
+  Shockwave                   42.7    8,533   5.1%     8
+  GA_Base_Attack2             29.0    5,800   3.4%    33
+  GA_Base_Attack3             27.1    5,418   3.2%    31
+  Hive Venom                  26.1    5,224   3.1%   100
+  Charge                      22.3    4,454   2.6%    13
+  Brutal Frenzy (triggered)   10.9    2,181   1.3%    10
+  Surging Force                7.2    1,435   0.9%     5
 ```
+
+Four things in that output arrived with the September 30 update, and each is
+a statement about what the number does and does not contain:
+
+- **`withheld:`** — rows the item sheet authors and nothing in your install
+  hands out are not offered. `--include-all` offers them; `bench items`
+  prints each one's reason.
+- **The INFUSION block.** An infusion is a set passive on a piece of Epic
+  faction armour, and its rank is the count of pieces carrying the SAME one
+  against 2 / 4 / 6. `SCORED` is what of each set is in the number, one row
+  per part, followed by what that part came to in this fight. When a set
+  also does something NOT scored, a line under it counts those sets and
+  `--verbose` names what is left out; none of these three does.
+- **`bonus stat: ... priced at 0`.** An infused piece also rolls a bonus
+  rating when it is looted. Nobody owns the pieces a search invents, so the
+  roll is not assumed: `--infusion-stat best` or `--infusion-stat CritChance`
+  asks what it would be worth, and a pin states one outright.
+- **What an infusion does is read; when it fires is partly measured; how
+  much it deals is not.** None of the four captured characters wears one.
+  Other players in the same log do - 9,657 rows of 20 infusion statuses and
+  steps from 33 of them, with no build, sheet or set rank behind them. Those
+  rows settle when three sets fire and how often (Seals of Atonement once
+  per damage instance of the wearer's own swings, Hive Venom's two-second
+  clock and its stacks, Fermentation one stack per damage instance of a
+  weapon skill) and no amount. `bench audit` has an entry per priced set
+  with its counts and the reading that would settle the rest.
+
+One line of that output is a correction the first capture on this build
+forced: `Weapon2 EnchantWeapon (none)`. An enchant is a skill its formula
+grants, and the weapon in your arsenal hands out no skill from its sockets.
+READ: `st.item.Gear.getSkills@9762` skips its first loop for a piece in
+`Slot_Weapon2` (ops 4-6) and runs its second only when `canGiveSlotSkills`
+holds (ops 76-79), which `st.item.Weapon.canGiveSlotSkills@9839` answers
+false for the hero's secondary weapon (the numbers of build 25959898). MEASURED 2026-10-13: a Rogue with
+Devote in her arsenal daggers logged not one Devote stack in 15,489 damage
+rows, beside 1,531 Flaming Weapon hits from her main hand. The stat lines of
+a socketed augment are affixes and still count, which is why Corrupted Gift
+stays in the arsenal's Demon socket. Until then the search had put a second
+enchant there and priced it.
+
+In TALENTS, `gate point` tags a node the bench cannot read and the
+allocation cannot lose: a tier it took stands on that point. A point in an
+unreadable node that nothing stands on is handed back rather than spent
+blind - the default Mage search prints `14 of 16 points spent, 2 unspent` -
+and `bench talents` says both.
+
+`--infusions learnable|all|none|<list>` says which infusions the search may
+hand out (the default leaves out the ones your install shows to be
+unobtainable), and `--tick-source instigator|carrier` switches whose Fervor,
+mastery and crit a status tick takes — the unit that applied it, which is
+what this build's code reads, or the unit wearing it, which is what the
+previous build measured.
 
 `--verbose` adds back everything that *explains* a number rather than being
 one: the search trace, the rotation and its reasoning, the cause of every
@@ -463,7 +620,7 @@ bench sheet --class Warrior --pin weapon1=GA_Craft
 
 ```
 SLOT           ITEM       RAR        UPG    iLVL  FACTION  GIVES
-Weapon1        Judgement  Legendary  *****   350  World    ArmorPenetration  rolled
+Weapon1        Judgement  Legendary  *****   370  World    ArmorPenetration  rolled
 Weapon2        (empty)
 ...
 
@@ -472,44 +629,54 @@ POOL              SLOTS  TAKEN
 main-hand skills  2/2    Rampage, Shockwave                                always on: Domination
 class skills      4/5    Charge, Ignore Pain, Battle Shout, Surging Force  not taken: Berserk
 
-not scored in this build (2), by cause:
+not scored in this build (3), by cause:
   conditional  it procs, but only while something this reader cannot evaluate holds
     Rampage (GA_Craft_Skill1)
   gated off  its script gates it on a rank or a talent this build does not have
     Ignore Pain (Warrior_IgnorePain#SelfHeal)
+  off against this target  read and correctly worth zero against this target - a stunnable one moves it
+    Domination (GA_Craft_Passive)
+      Domination is read, and its clause is worth zero here: dmgMult +0.25 on every hit against a crowd-controlled target, and this target is immune to crowd control (unit flags: Boss) - nothing this build casts can put it in that state
 
 Primary
   attribute  value
-  Strength      81
+  Strength      88
   Dexterity     28
   Intellect     28
   Faith         28
-  Vitality      99
+  Vitality     108
 ...
 
 METRIC                        VALUE
-damage / s                    142.2  <- goal
+damage / s                    141.3  <- goal
 healing / s                     0.0
 shielding / s                   0.0
-effective HP                  1,076
-  physical / magical  1,076 / 1,076  reduction 0.0% / 0.0%
-time on cooldowns             42.3%  57.6% swinging, 0.1% idle
+effective HP                  1,174
+  physical / magical  1,174 / 1,174  reduction 0.0% / 0.0%
+time on cooldowns             38.0%  62.0% swinging, 0.1% idle
 fight                          200s  one 200s fight, procs at their expected rate
 
-ROTATION   attacks 0.63/s, combos 0.14/s
-  played both ways over a 8s lookahead and kept the better: priority order 142.2, sequenced 142.0 - nothing here rewards ordering, so priority order stands
+ROTATION   attacks 0.66/s, combos 0.17/s
+  played both ways over a 8s lookahead and kept the better: priority order 141.3, sequenced 140.5 - nothing here rewards ordering, so priority order stands
   SKILL            KIND       PER CAST    EVERY  SHARE
-  Rampage          active        520.3   12.50s    24%
-  GA_Base_Attack   filler         80.6    4.26s    18%
-  Brutal Frenzy    filler        123.8    6.90s    12%
-  GA_Base_Attack2  filler         80.2    4.76s    15%
-  GA_Base_Attack3  filler         80.6    5.41s    13%
-  Raging Smash     active        114.4    8.33s     5%
-  Shockwave        active        232.7   25.00s     4%
-  Charge           active         85.7   15.38s     7%
-  Brutal Frenzy    triggered      21.1   10.58s         Brutal Frenzy's Attack step is played on a base attack, 15% of the time
+  Rampage          active        764.8   15.38s    20%
+  Brutal Frenzy    filler        111.2    5.71s    15%
+  GA_Base_Attack   filler         54.5    4.00s    19%
+  Raging Smash     active        107.0    8.00s     5%
+  Shockwave        active        313.9   25.00s     4%
+  GA_Base_Attack2  filler         54.3    4.55s    15%
+  GA_Base_Attack3  filler         54.4    5.41s    13%
+  Charge           active         80.2   15.38s     7%
+  Brutal Frenzy    triggered      68.8   17.14s         Brutal Frenzy's Attack step is played on the combo finisher, once for every hit the swing lands, 25% of the time - and again on its own hit, which rolls the same chance
   ...
 ```
+
+The unscored list is grouped by **cause**, and three of the causes are not
+gaps at all: `off against this target`, `off at this target health` and
+`off in this build` are things the tool read, answered, and found worth zero
+for the fight you described — with what would switch each on printed under
+it. Here Domination's rank-3 bonus needs the target to be crowd-controlled
+and the default boss cannot be; `--target dummy` moves it.
 
 Nothing is searched here: `sheet` evaluates exactly the build you describe,
 which makes it the command to reach for when you want to know what one specific
@@ -526,20 +693,30 @@ bench rank --class Warrior --slot chest --pin weapon1=GA_Craft
 ```
 
 ```
-Warrior 25 - ranking Chest by dps vs named boss (Ratsar: S 1.10/1.10) @L6.9 (rift-R1 fit)
 
-  ITEM                      RAR       ROLL  UPG  FACTION  GIVES                                DPS   DELTA
-  Chest_RBee_Fig            Rare                 Bee      ArmorPenetration                   155.0  +8.97%
-  Chest_RCrimson_Fig_Craft  Rare                 Craft    ArmorPenetration                   155.0  +8.97%
-  Chest_RCrimson_FigCle     Rare                 Crimson  Fervor                             149.9  +5.39%
-  Chest_RKobold_FigAss      Rare                 Craft    ArmorPenetration+CritChance        149.3  +4.95%
-  Chest_RDemon_FigCle       Rare                 Demon    Fervor+SpellPenetration            148.9  +4.66%
-  Chest_RManfish_FigWiz     Rare                 Manfish  ArmorPenetration+SpellPenetration  148.7  +4.53%
-  Chest_Z1U1_FigAss         Uncommon             -        -                                  147.7  +3.82%
+Warrior 25 - ranking Chest by dps vs named boss (Ulserous: S 0.67/0.67)
+
+  ITEM                      RAR       ROLL  UPG  FACTION  GIVES                                DPS    DELTA
+  Chest_EBee_Fig            Epic                 Bee      ArmorPenetration                   156.7  +10.89%
+  Chest_RBee_Fig            Rare                 Bee      ArmorPenetration                   153.3   +8.52%
+  Chest_RCrimson_Fig_Craft  Rare                 Craft    ArmorPenetration                   149.9   +6.11%
+  Chest_ECrimson_FigCle     Epic                 Crimson  Fervor                             149.5   +5.83%
+  Chest_EKobold_FigAss      Epic                 Kobold   CritChance+ArmorPenetration        148.9   +5.36%
+  Chest_EManfish_FigWiz     Epic                 Manfish  ArmorPenetration+SpellPenetration  148.5   +5.15%
+  Chest_EDemon_FigCle       Epic                 Demon    Fervor+SpellPenetration            148.3   +4.95%
+  Chest_RCrimson_FigCle     Rare                 Crimson  Fervor                             148.2   +4.87%
+  Chest_RManfish_FigWiz     Rare                 Manfish  ArmorPenetration+SpellPenetration  147.4   +4.31%
+  Chest_RDemon_FigCle       Rare                 Demon    Fervor+SpellPenetration            147.1   +4.15%
   ...
 
-... 9 more (--all to see them)
+... 14 more (--all to see them)
 ```
+
+The Epic chest and the Rare one of the same family are two rows of the
+ranking, because they are two items: gear does not roll a rarity. The `ROLL`
+column is filled on a weapon slot, where one weapon is one row per rarity a
+drop at your level can come out as, with its share (`--slot weapon2`:
+Legendary 1%, Epic 27%).
 
 Every row is the whole objective re-evaluated with that item equipped, not a
 stat weight — see [why not stat weights](docs/MODEL.md#why-not-stat-weights).
@@ -553,28 +730,57 @@ bench items --class Warrior --slot chest
 ```
 
 ```
-Warrior 25 - Chest - 24 legal (item, rarity) pairs
 
-ITEM                      NAME                                  RAR       ROLL  MAX UPG       LVL  FACTION  GIVES                              SKILLS
-Chest_C_BaseClothes       White Shirt                           Common                0  (scales)  -        -
-Chest_Starter_Fig         Squire's Brigandine                   Common                0         1  -        -
-Chest_Z1U1_Fig            Reinforced Hauberk of the Exile       Uncommon              0         2  -        -
-Chest_Z1U2_Fig            Reinforced Hauberk of the Trespasser  Uncommon              0         8  -        -
-Chest_RBee_Fig            Whirring Gem of Apix                  Rare                  0  (scales)  Bee      ArmorPenetration
-Chest_RCrimson_Fig_Craft  Scarlet Breastplate                   Rare                  0        20  Craft    ArmorPenetration
-Chest_Z2U1_Fig            Reinforced Hauberk of the Adventurer  Uncommon              0        13  -        -
-Chest_Z2U2_Fig            Reinforced Hauberk of the Nomad       Uncommon              0        18  -        -
-Chest_RKobold_FigAss      Cantal Goya's Breastplate             Rare                  0         6  Craft    ArmorPenetration+CritChance
+
+
+Chest_C_BaseClothes       White Shirt                           Common                0     (scales)  -        -                                          -
+Chest_Starter_Fig         Squire's Brigandine                   Common                0   25 (row 1)  -        -                                          -
+Chest_Z1U1_Fig            Reinforced Hauberk of the Exile       Uncommon              0   25 (row 2)  -        -                                          -
+Chest_Z1U2_Fig            Reinforced Hauberk of the Trespasser  Uncommon              0   25 (row 8)  -        -                                          -
+Chest_RBee_Fig            Whirring Gem of Apix                  Rare                  0     (scales)  Bee      ArmorPenetration                           -
+Chest_EBee_Fig            Cuirass of the Queenslayer            Epic                  0     (scales)  Bee      ArmorPenetration                           CritChance/Fervor/SpellPenetration
+Chest_RCrimson_Fig_Craft  Scarlet Breastplate                   Rare                  0           20  Craft    ArmorPenetration                           -
 ...
-Chest_RManfish_FigWiz     Fin Armor                             Rare                  0  (scales)  Manfish  ArmorPenetration+SpellPenetration
+Chest_RKobold_FigAss      Cantal Goya's Breastplate             Rare                  0            6  Craft    ArmorPenetration+CritChance                -
+Chest_EKobold_FigAss      Breastplate of Chuck "No Rice"        Epic                  0     (scales)  Kobold   CritChance+ArmorPenetration                Fervor/SpellPenetration
 ...
-Chest_RDemon_FigCle       Soul Visage                           Rare                  0         1  Demon    Fervor+SpellPenetration
+Chest_RManfish_FigWiz     Fin Armor                             Rare                  0     (scales)  Manfish  ArmorPenetration+SpellPenetration          -
+Chest_EManfish_FigWiz     Warplate of the Meropsian Reef        Epic                  0     (scales)  Manfish  ArmorPenetration+SpellPenetration          CritChance/Fervor
+...
+Chest_RCrimson_FigCle     Breastplate of Recklessness           Rare                  0     (scales)  Crimson  Fervor                                     -
+Chest_ECrimson_FigCle     Vestplate of the First Zealot         Epic                  0     (scales)  Crimson  Fervor                                     CritChance/ArmorPenetration/SpellPenetration
+...
+Chest_RDemon_FigCle       Soul Visage                           Rare                  0   25 (row 1)  Demon    Fervor+SpellPenetration                    -
+Chest_EDemon_FigCle       Chaotic Embrace                       Epic                  0   25 (row 1)  Demon    Fervor+SpellPenetration                    CritChance/ArmorPenetration
+
+LVL: the level an unpinned piece is priced at. "N (row n)": the row authors level n and the piece is priced at N - a weapon or worn armour as a drop at yours, its row level being a floor, or a piece every source of which makes it higher (--drops authored prices a drop at n; --pin <slot>=<item>^n names one instance).
+
+INFUSE: the ratings the piece's infusion bonus can roll (the ones it does not already pay).
 ```
 
 `GIVES` is the item's secondary stat, and it is decided by the **faction**, not
 by the item: the same Manfish chest gives a Priest Fervor and a Warrior
 ArmorPenetration out of one data row. Gear with no faction has no secondary
 stat at all.
+
+`INFUSE` marks the pieces that can carry an infusion — Epic armour with a
+faction — with the ratings its bonus line can roll. A `SOURCE` column
+appears when nothing in your install hands a row out, with the reason
+printed under the table: the tool reads the loot tables, the level files
+inside the paks and the compiled code to say so, and a row it cannot judge
+is offered, not withheld. No chest is withheld on build 25959898, so the
+column is absent above; on 25782799 two were, the Epic chests of the Heroic
+loot tables of Munster Chuck and Robin Hoof, whose dungeons the hotfix
+opened. On a weapon slot `ROLL` carries the share of each rarity.
+
+`LVL` is the level the piece is priced at, not the one its row authors. A
+weapon and a piece of worn armour stand at the level of the drop, with the
+row's level as a floor, so a row that authors level 1 prints `25 (row 1)` on a
+level-25 character; `(scales)` marks a row that authors none. The 2026-10-13
+capture holds it for armour (eight Demon armour rows that author level 1 were
+logged at 25 or 24). Jewellery is priced at its row's level, which is an
+assumption the same capture does not hold - two necklaces that author 15 were
+logged at 17 - and `bench audit` carries both numbers.
 
 ### `bench weapons`
 
@@ -585,31 +791,38 @@ bench weapons --class Warrior --profile armorpen
 ```
 
 ```
-Warrior 25 - every mainhand, ranked by dps vs named boss (Ratsar: S 1.10/1.10) @L6.9 (rift-R1 fit)
+Warrior 25 - every mainhand, ranked by dps vs named boss (Ulserous: S 0.67/0.67)
 profile: ArmorPenetrationRating at 100  - every stat pinned to 50, ArmorPenetrationRating to 100
-  pinned: Strength 50   Dexterity 50   Intellect 50   Faith 50   ...
+  pinned: Strength 50   Dexterity 50   Intellect 50   Faith 50   Vitality 50   Armor 50   MagicArmor 50   CritChanceRating 50   ArmorPenetrationRating 100   SpellPenetrationRating 50   FervorRating 50
   ! these stats are pinned to flat values, not earned from gear - the number is a comparison between builds on the same rig, never a dps anyone will read in game
-13 weapons in 18.9s   weapon mastery: rank 3   skills, talents and runes chosen per weapon   arsenal: searched   no armour, no offhand, no augments
+14 weapons in 88.2s   weapon mastery: rank 3   skills, talents and runes chosen per weapon   arsenal: searched   no armour, no offhand, no augments
 
   DPS  VS BEST  WEAPON                                   HANDS       CHAIN  SLOTS  SKILLS TAKEN                          GAPS
-259.2     0.0%  Worldsplitter                            THWeapon    4      2/2    Tear Reality, Dark Gift               2
-243.1    -6.2%  Judgement                                THWeapon    4      2/2    Rampage, Shockwave                    2
-224.5   -13.4%  Martyr of Enripit                        THWeapon    4      2/2    Wild Whirlwind, Outburst              3
-222.2   -14.3%  Beefury, Blessed Blade of the Farseeker  OHWeapon    4      1/1    Hive's Sunder                         1
-219.9   -15.2%  Cheese Moon                              OHWeapon    4      1/1    Bonethrow                             2
-218.8   -15.6%  Lady Bee's Ceremonial Stinger            LongWeapon  4      2/2    Stingerang, Apix Dash                 4
-212.1   -18.2%  Twin Pillars of Justice                  DualWeapon  5      2/2    Zealous Spins, Iron Cyclone           4
-205.7   -20.6%  Iron Fins of the Leviathan               DualWeapon  5      2/2    Abyssal Fury, Groundswell Strike      3
-196.1   -24.3%  Wingsabers                               DualWeapon  5      2/2    Hiveborn Blossom, Swarmstrike Accord  4
-190.8   -26.4%  Glory                                    OHWeapon    4      1/1    Conquer                               3
-184.3   -28.9%  Light Practice Sword                     OHWeapon    4      1/1    Cleave                                1
-157.8   -39.1%  Amon Ram, the Creator                    OHWeapon    4      1/1    Ram Veil                              5
- 92.9   -64.1%  Large Butterfly Net                      THWeapon    0                                                   3
+245.8     0.0%  Judgement                                THWeapon    4      2/2    Rampage, Shockwave                    3
+233.7    -4.9%  Wingsabers                               DualWeapon  5      2/2    Hiveborn Blossom, Swarmstrike Accord  2
+217.6   -11.4%  Twin Pillars of Justice                  DualWeapon  4      2/2    Zealous Spins, Iron Cyclone           5
+211.8   -13.8%  Pocket Hive                              THWeapon    4      2/2    Reverse Honey Spin, Brood Leap        5
+206.5   -16.0%  Iron Fins of the Leviathan               DualWeapon  5      2/2    Abyssal Fury, Groundswell Strike      3
+184.6   -24.9%  Worldsplitter                            THWeapon    4      2/2    Tear Reality, Dark Gift               3
+181.4   -26.2%  Lady Bee’s Ceremonial Stinger            LongWeapon  4      2/2    Stingerang, Apix Dash                 6
+174.1   -29.2%  Beefury, Blessed Blade of the Farseeker  OHWeapon    4      1/1    Hive's Sunder                         2
+173.0   -29.6%  Cheese Moon                              OHWeapon    4      1/1    Bonethrow                             2
+166.7   -32.2%  Martyr of Enripit                        THWeapon    4      2/2    Wild Whirlwind, Outburst              4
+158.5   -35.5%  Light Practice Sword                     OHWeapon    4      1/1    Cleave                                1
+156.7   -36.3%  Amon Ram, the Creator                    OHWeapon    4      1/1    Ram Veil                              4
+155.1   -36.9%  Glory                                    OHWeapon    4      1/1    Conquer                               5
+ 78.0   -68.3%  Large Butterfly Net                      THWeapon    0                                                   2
 
-NOT SCORED (21) - what these weapons declare that the model cannot price
+NOT SCORED (27) - what these weapons declare that the model cannot price
   Rampage  Rampage's own damage IS scored; what is not is the cooldown it gives Shockwave - its script resets Shockwave's cooldown from an onKill hook, an event this fight does not produce, so Shockwave comes back slower here than in game
+  Domination  Domination is read, and its clause is worth zero here: dmgMult +0.25 on every hit against a crowd-controlled target, and this target is immune to crowd control (unit flags: Boss) - nothing this build casts can put it in that state
   ...
 ```
+
+`CHAIN` is the number of links the weapon's own row lists, finisher included,
+and nothing pads it: Twin Pillars of Justice plays 4 where its weapon class
+declares 5, because nothing in the September 30 build reads that length any
+more. The run says so on the weapon's own line under `NOT SCORED`.
 
 The `--profile` is the point of this command and is explained
 [below](#comparing-weapons-without-the-gear-in-the-way): it pins every stat to
@@ -630,53 +843,52 @@ bench layouts --class Warrior --main GA_Craft --restarts 1 --show 1
 ```
 
 ```
-Warrior 25 - the best full layout for every ordered (mainhand, arsenal) pair, by dps vs named boss (Ratsar: S 1.10/1.10) @L6.9 (rift-R1 fit)
-  1 mainhands x 17 arsenals = 16 pairs, each a full optimize (1 restart) over armour, offhand, augments, arsenal skills, talents and runes
+Warrior 25 - the best full layout for every ordered (mainhand, arsenal) pair, by dps vs named boss (Ulserous: S 0.67/0.67)
+  1 mainhands x 18 arsenals = 17 pairs, each a full optimize (1 restart) over armour, offhand, augments, arsenal skills, talents and runes
   reports land in bench-layouts-Warrior-dps/ as they finish - index.json is the ranking so far, each pair file reloads with --build, and an existing file resumes instead of recomputing
 
   DPS  VS BEST  MAIN HAND  OFFHAND  ARSENAL                                  ARSENAL SKILLS                                       TALENTS
-662.1     best  Judgement  -        Worldsplitter                            GA_Demon_Skill1, GA_Demon_Skill2                     12 nodes
-644.0   -2.73%  Judgement  -        Twin Pillars of Justice                  DM_Multispin_Skill1, DM_Multispin_Skill2             12 nodes
-642.4   -2.97%  Judgement  -        Cheese Moon                              Axe_Boomerang_Skill1, Axe_Boomerang_Skill_Passive    12 nodes
-641.9   -3.05%  Judgement  -        Martyr of Enripit                        GS_Nova_Skill2, GS_Nova_Passive                      13 nodes
-632.2   -4.52%  Judgement  -        Lady Bee’s Ceremonial Stinger            Spear_Goo_Skill1, Spear_Goo_Passive                  12 nodes
-625.0   -5.59%  Judgement  -        Beefury, Blessed Blade of the Farseeker  Sword_Swarm_Skill1, Sword_Swarm_Passive              12 nodes
-607.8   -8.20%  Judgement  -        Glory                                    Sword_Craft_Skill1, Sword_Craft_Passive              11 nodes
-606.5   -8.39%  Judgement  -        Iron Fins of the Leviathan               DA_Water_Skill1, DA_Water_Skill2                     12 nodes
-591.0  -10.74%  Judgement  -        Light Practice Sword                     Sword_Start_Skill1                                   11 nodes
-584.3  -11.75%  Judgement  -        Wingsabers                               DS_Bladeleaf_Skill2, DS_Bladeleaf_Passive            12 nodes
-553.2  -16.44%  Judgement  -        Dominion                                 Shield_Craft_Skill1, Shield_Craft_Passive            12 nodes
-544.8  -17.71%  Judgement  -        Rough Shield                             Shield_Start_Skill1                                  12 nodes
-541.2  -18.26%  Judgement  -        Crabgantua's Kneecap                     Shield_OrbitWater_S1, Shield_OrbitWater_P            12 nodes
-527.3  -20.35%  Judgement  -        Amon Ram, the Creator                    Mace_Benediction_Skill1, Mace_Benediction_Passive    11 nodes
-517.4  -21.85%  Judgement  -        Large Butterfly Net                      -                                                    11 nodes
-455.9  -31.14%  Judgement  -        Magma Mia                                Shield_Firebreath_Skill1, Shield_Firebreath_Passive  12 nodes
-  16 of 16 pairs legal, 602.6s
+841.7     best  Judgement  -        Twin Pillars of Justice                  DM_Multispin_Skill2, DM_Multispin_Passive            12 nodes
+783.7   -6.90%  Judgement  -        Martyr of Enripit                        GS_Nova_Skill1, GS_Nova_Passive                      12 nodes
+746.7  -11.29%  Judgement  -        Worldsplitter                            GA_Demon_Skill1, GA_Demon_Skill2                     11 nodes
+724.6  -13.92%  Judgement  -        Wingsabers                               DS_Bladeleaf_Skill1, DS_Bladeleaf_Passive            11 nodes
+708.3  -15.85%  Judgement  -        Cheese Moon                              Axe_Boomerang_Skill1, Axe_Boomerang_Skill_Passive    12 nodes
+699.5  -16.90%  Judgement  -        Beefury, Blessed Blade of the Farseeker  Sword_Swarm_Skill1, Sword_Swarm_Passive              12 nodes
+698.5  -17.01%  Judgement  -        Iron Fins of the Leviathan               DA_Water_Skill1, DA_Water_Skill2                     12 nodes
+697.4  -17.14%  Judgement  -        Pocket Hive                              GM_MassGrab_Skill2, GM_MassGrab_Passive              13 nodes
+692.4  -17.74%  Judgement  -        Light Practice Sword                     Sword_Start_Skill1                                   13 nodes
+675.9  -19.70%  Judgement  -        Lady Bee’s Ceremonial Stinger            Spear_Goo_Skill1, Spear_Goo_Passive                  12 nodes
+660.5  -21.52%  Judgement  -        Rough Shield                             Shield_Start_Skill1                                  11 nodes
+639.9  -23.97%  Judgement  -        Glory                                    Sword_Craft_Skill1, Sword_Craft_Passive              12 nodes
+633.2  -24.77%  Judgement  -        Dominion                                 Shield_Craft_Skill1, Shield_Craft_Passive            12 nodes
+620.5  -26.28%  Judgement  -        Large Butterfly Net                      -                                                    11 nodes
+613.7  -27.09%  Judgement  -        Crabgantua's Kneecap                     Shield_OrbitWater_S1, Shield_OrbitWater_P            13 nodes
+603.7  -28.27%  Judgement  -        Amon Ram, the Creator                    Mace_Benediction_Skill1, Mace_Benediction_Passive    12 nodes
+568.2  -32.49%  Judgement  -        Magma Mia                                Shield_Firebreath_Skill1, Shield_Firebreath_Passive  12 nodes
+  17 of 17 pairs legal, 2979.8s
 
 ==============================================================================
-Judgement  +  Worldsplitter (arsenal)   dps 662.1
+Judgement  +  Twin Pillars of Justice (arsenal)   dps 841.7
 ==============================================================================
 
-SLOT           ITEM                   RAR        UPG    iLVL  FACTION  GIVES
-Weapon1        Judgement              Legendary  *****   350  World    ArmorPenetration         pinned
-Weapon2        Worldsplitter          Legendary  *****   350  Demon    Fervor+SpellPenetration  pinned
+SLOT           ITEM                                RAR        UPG    iLVL  FACTION  GIVES              INFUSION
+Weapon1        Judgement                           Legendary  *****   370  World    ArmorPenetration                       pinned
+Weapon2        Twin Pillars of Justice             Legendary  *****   370  Crimson  Fervor+CritChance                      pinned
 OffhandWeapon  (empty)
-Head           Crown of the Sea       Rare               260  Manfish  ArmorPenetration
-Neck           Necklace of Precision  Uncommon           150  Crit     CritChance
-Shoulders      Miner Ramparts         Rare               260  Kobold   CritChance
-Chest          Whirring Gem of Apix   Rare               260  Bee      ArmorPenetration
-Back           Crimson Wings          Rare               260  Crimson  Fervor
-Hands          Unholy Crimson Gloves  Rare               260  Crimson  Fervor
-Waist          Caryapsid's Coccyx     Rare               260  Craft    ArmorPenetration
-Legs           Wrong Trousers         Rare               260  Kobold   CritChance
-Feet           Demonic Crushers       Rare               260  Demon    Fervor
-FingerLeft     Set Eye of Precision   Rare               260  Crit     CritChance
-Trinket        Raclette Pan           Rare               260  Kobold   ArmorPenetration
+Head           Visor of the Sea Titan              Epic               300  Manfish  ArmorPenetration   Overwhelming Tides
+Neck           Necklace of Fracture                Uncommon           150  ArPen    ArmorPenetration
+Shoulders      Jaws From Another World             Epic               300  Demon    Fervor             Balance of Justice
+Chest          Cuirass of the Queenslayer          Epic               300  Bee      ArmorPenetration   Hive Venom
 ...
 ```
 
-That run was 16 pairs at the cheapest setting and took ten minutes. Drop
-`--main` and it sweeps every mainhand too, which on the Warrior is 13 × 17.
+That run was 17 pairs at the cheapest setting and took fifty minutes, with the
+full suite and two other searches running on the same machine. Each pair is a
+full optimize: a search that also plans infusion sets plays 1.2 to 2 times
+the fights it did before the September 30 update, and a Priest's, which plays
+a build holding Sunlight in several orders, about four fights an evaluation
+where it played one. Its best pair is the default optimum above, 841.7. Drop
+`--main` and it sweeps every mainhand too, which on the Warrior is 14 × 18.
 Which is why **every report is written to disk as it finishes**: the default
 `bench-layouts-<class>-<goal>/` (moved with `--out <dir>`) holds one JSON per
 pair plus a live `index.json`, re-running skips pairs already on disk, and a
@@ -695,51 +907,58 @@ bench rotation --class Warrior --profile armorpen \
 ```
 
 ```
-Warrior 25 - searching for a rotation, maximising dps vs named boss (Ratsar: S 1.10/1.10) @L6.9 (rift-R1 fit)
+Warrior 25 - searching for a rotation, maximising dps vs named boss (Ulserous: S 0.67/0.67)
 profile: ArmorPenetrationRating at 100  - every stat pinned to 50, ArmorPenetrationRating to 100
   ...
 main hand GA_Craft   arsenal GA_Demon
-359071 simulated fights in 248.5s over 3 rounds of (rotation, then kit)
-549866 lists considered - 190795 of them were lists this search had already played, and were re-scored from the memo
+1167525 simulated fights in 1306.5s over 3 rounds of (rotation, then kit)
+1697752 lists considered - 530227 of them were lists this search had already played, and were re-scored from the memo
 
 ROTATION  - walk it top to bottom, press the first line that is ready
-  #  SKILL         WHEN                            PER CAST    EVERY
-  1  Berserk       always                               0.0   66.67s
-  2  Battle Shout  buff.Battle Shout.down               0.0  200.00s
-  3  Shockwave     always                             303.4   22.22s
-  4  Raging Smash  debuff.Tear Reality.remains>=1     109.9    6.90s
-  5  Dark Gift     cd.Tear Reality<=0.5                 0.0   33.33s
-  6  Tear Reality  always                             341.4   18.18s
-  7  Raging Smash  buff.Berserk.remains>=1            109.9    6.90s
-  8  Rampage       always                             696.3   11.11s
-  not pressed: Ignore Pain, Surging Force - the search found the clock better spent elsewhere
+  #   SKILL          WHEN                                         PER CAST    EVERY
+  1   Dark Gift      cd.Surging Force<=1                               0.0   33.33s
+  2   Berserk        cd.Rampage<=0.5                                   0.0   66.67s
+  3   Raging Smash   buff.Battle Shout.up                             86.2    7.14s
+  4   Shockwave      always                                          287.7   20.00s
+  5   Rampage        always                                          918.5   13.33s
+  6   Battle Shout   ready.Tear Reality                                0.0  100.00s
+  7   Dark Gift      debuff.Tear Reality.remains>=0.5 & rage>=10       0.0   33.33s
+  8   Surging Force  debuff.Tear Reality.down                         45.5   40.00s
+  9   Tear Reality   always                                          369.4   18.18s
+  10  Raging Smash   holding.Dark Gift                                86.2    7.14s
+  11  Charge         debuff.Tear Reality.remains>=1                   69.7   18.18s
+  12  Dark Gift      cd.Tear Reality<=3                                0.0   33.33s
   anything not listed is never pressed; when no line matches, you swing.
 
 WHAT IT IS WORTH
                                                       DPS  VS DERIVED
-  derived order (what every other command reports)  246.6
-  searched rotation                                 253.8       2.92%
+  derived order (what every other command reports)  210.1
+  searched rotation                                 234.7      11.69%
   ROUND  SEARCHED    DPS  FIGHTS
-  1      rotation  253.8  359071
-  1      kit       252.5
+  1      rotation  223.8  378670
+  1      kit       225.8
+  2      rotation  231.6  371827
+  2      kit       232.9
+  3      rotation  234.7  417028
+  3      kit       231.9
 
 AND WHETHER IT SURVIVES THE DICE  - 200 fights each, procs and crits rolled rather than averaged
-                      MEAN        SD
-  derived order      211.2      8.21
-  searched rotation  217.1      8.66
-  difference         +5.90  +/- 0.84  clears the noise
+                       MEAN        SD
+  derived order       210.0      5.13
+  searched rotation   234.3      4.03
+  difference         +24.33  +/- 0.46  clears the noise
 
 AND WHETHER IT TRANSFERS  - the same rotation, re-evaluated at other stat corners
-  PROFILE                 DERIVED  THIS ROTATION   GAIN
-  zero                      125.6          127.5  1.49%  holds
-  mid                       243.0          250.0  2.92%  holds
-  crit                      248.7          253.7  2.02%  holds
-  armorpen  (tuned here)    246.6          253.8  2.92%  holds
-  fervor                    248.3          255.5  2.92%  holds
+  PROFILE                 DERIVED  THIS ROTATION    GAIN
+  zero                      107.2          100.9  -5.88%  LOSES to the derived order
+  mid                       205.6          229.6  11.68%  holds
+  crit                      209.8          225.2   7.34%  holds
+  armorpen  (tuned here)    210.1          234.7  11.67%  holds
+  fervor                    210.1          234.7  11.68%  holds
   A rotation that only wins where it was tuned is a rotation for that corner.
   One that holds everywhere is a rotation for the weapon, which is the thing worth having.
 
-  29 of 60 independent restarts reached this score; worst reached 250.4.
+  18 of 60 independent restarts reached this score; worst reached 222.7.
 ```
 
 Three things are checked rather than claimed, and they are the three lines
@@ -749,10 +968,23 @@ other stat corners. The rotation is followed by the kit it was searched
 alongside — the talent allocation, the skills, the runes — because the two were
 optimised against each other, in alternating rounds, until neither moved.
 
-The restart count is worth reading twice: **29 of 60**. The vocabulary grew
-when `remains` and `cd` landed, and a richer vocabulary makes the basin around
-the best list narrower, not wider — which is exactly why the search kicks the
-incumbent instead of restarting at random. `--across-search` asks the stronger
+The gain is **+11.7%** here, where the same command found +2.9% before the
+September 30 update. Two lines of the list suggest why, and they are offered
+as a reading of the list, not as a measured decomposition: `Shockwave`
+(line 4) sits above `Rampage` (line 5), so when both are ready the stun goes
+first, and on this build a stun arms a register on Judgement's passive that
+the next weapon skill spends as a certain critical strike; which weapon
+skill follows the stun is the kind of decision a derived priority order
+cannot make. The search ran three rounds this time, and in two of them the
+kit round moved the number the rotation round had reached.
+
+This list does NOT hold everywhere: at the `zero` corner, where nothing is
+statted, it loses 5.9% to the derived order, so by the output's own closing
+line it is a rotation for the corners with stats on them, not for the weapon.
+The restart count is worth reading twice: **18 of 60**. A richer vocabulary
+and a mechanic that rewards ordering make the basin around the best list
+narrower, not wider — which is exactly why the search kicks the incumbent
+instead of restarting at random. `--across-search` asks the stronger
 question and is described [below](#searching-a-rotation).
 
 ### `bench talents`
@@ -764,17 +996,17 @@ bench talents --class Warrior
 ```
 
 ```
-Warrior - 22 nodes, 18 this model can read, 16 points at level 25
+Warrior - 22 nodes, 19 this model can read, 16 points at level 25
   TIER  BRANCH  TALENT               READS AS                                                              WHAT
-  0     Root    Hemorrhage           35% of physical crits as a bleed                                      no affix, no effect, no status
-  1     Left    Seasoned Soldier     +1 Rage per crit                                                      no affix, no effect, no status
-  2     Left    Bloodletting         +10% damage on bleeds                                                 no affix, no effect, no status
+  0     Root    Hemorrhage           35% of physical crits as a bleed                                      its script - no affix, effect or Status step in the row
+  1     Left    Seasoned Soldier     +1 Rage per crit                                                      its script - no affix, effect or Status step in the row
+  2     Left    Bloodletting         +10% damage on bleeds                                                 its script - no affix, effect or Status step in the row
   ...
-  3     Left    Fighting Spirit      affix                                                                 +2 CritChance
-  4     Left    Surge of Violence    nothing                                                               no affix, no effect, no status
-  1     Center  Sever                +20% crit damage on weapon skills                                     no affix, no effect, no status
+  3     Left    Master-at-arms       +15% crit damage attack-or-combo                                      its script - no affix, effect or Status step in the row
+  4     Left    Surge of Violence    a next-cast register                                                  its script - no affix, effect or Status step in the row
+  1     Center  Sever                +20% crit damage on weapon skills                                     its script - no affix, effect or Status step in the row
   ...
-  3     Center  Exposed Essence      +5% magic armour ignored vs bleeding, +5% armour ignored vs bleeding  no affix, no effect, no status
+  3     Center  Exposed Essence      +5% magic armour ignored vs bleeding, +5% armour ignored vs bleeding  its script - no affix, effect or Status step in the row
   ...
   1     Right   Rage Shield          nothing                                                               Hold the Line needs it; no affix, no effect, no status
   ...
@@ -791,13 +1023,16 @@ RULES   every one of them out of the data
                    not count toward its branch thresholds
 
 WHY THIS IS MOSTLY STRUCTURE
-  49 of 88 talent nodes declare something a data-driven model can
-  read - a stat affix, a self-buff status, or a damage effect. The other
-  39 declare no affix, no effect and no status - but 72 of them DO
-  ship an hscript body, and between them those scripts call only 63
-  distinct names - about 39 real host functions once the entry hooks and
-  built-ins are removed. So the talent layer is blocked on the same small
-  script kernel the rest of the skill work needs, not on absent data.
+  62 of 88 talent nodes declare something this model reads - a stat affix,
+  a self-buff status, a damage effect, or one of the script shapes the fight
+  plays (a scoped modifier, a pool, a status on a named event, a rider on a
+  status's own hits, cooldown handed to a named skill). The other 26 read as
+  nothing here: 25 of them ship an hscript body the readers behind this
+  table do not take (the fight scores a few of those through readers of
+  its own - a next-cast register, the Mage's chain), and the rest declare
+  nothing at all. So what is left of the talent layer is blocked on script
+  shapes, not on absent data. Every one of the 88 nodes also carries a
+  texts.desc to check an implementation against.
   ...
 
   Runes are the same shape. 28 skills offer a choice, 84 runes in all, and 31 of them
@@ -807,6 +1042,11 @@ WHY THIS IS MOSTLY STRUCTURE
       9  override a prop    mastery[].props (charges, cooldown)
       5  gate a stat affix  affixes[].conds.mastery
 ```
+
+`WHAT` says where the reading comes from: an affix or an effect the row
+declares, or `its script` when the row declares nothing and the value was
+read out of the node's hscript. The second paragraph is computed from the
+same table, so it cannot contradict it.
 
 ### `bench targets`
 
@@ -819,28 +1059,73 @@ bench targets
 ```
 What the world resists at level 25, and what penetration buys against it.
 
-TARGET     UNIT                                     PHYS  MAG  ARMOUR  NO PEN  25% PEN  50% PEN  GAIN @50%
-dummy      Dummy: S 0.00/0.00                         0%   0%       0  100.0%   100.0%   100.0%          -
-reference  Armor_ExpectedReduction 0.25              25%  25%     962   75.0%    80.0%    85.7%     +14.3%
-trash      W_Base: S 0.43/0.43                       30%  30%   1,236   70.0%    75.7%    82.4%     +17.6%
-small      W_Base_Small: S 0.76/0.76                 43%  43%   2,198   56.8%    63.6%    72.4%     +27.6%
-big        W_Base_Big: S 0.97/0.97                   49%  49%   2,790   50.8%    58.0%    67.4%     +32.6%
-elite      W_Base_Elite: S 1.10/1.10                 52%  52%   3,160   47.7%    54.9%    64.6%     +35.4%
-boss       Ratsar: S 1.10/1.10) @L6.9 (rift-R1 fit   52%  52%   1,177   71.0%    76.6%    83.1%     +16.9%
-dungeon    D_Base_Big: S 0.97/0.97                   49%  49%   2,790   50.8%    58.0%    67.4%     +32.6%
+TARGET     WHAT                            PHYS  MAG  LEVEL  ARMOUR  NO PEN  25% PEN  50% PEN  GAIN @50%  CC
+none       no mitigation                     0%   0%     25       0  100.0%   100.0%   100.0%          -  lands
+dummy      training dummy (Dummy)           40%  40%      1     323   89.9%    92.3%    94.7%      +5.3%  lands
+reference  Armor_ExpectedReduction 0.25     25%  25%     25     962   75.0%    80.0%    85.7%     +14.3%  lands
+trash      world trash (W_Base)             30%  30%     25   1,236   70.0%    75.7%    82.4%     +17.6%  lands*
+small      small world mob (W_Base_Small)   25%  25%     25     962   75.0%    80.0%    85.7%     +14.3%  lands*
+big        big world mob (W_Base_Big)       35%  35%     25   1,553   65.0%    71.2%    78.8%     +21.2%  no stun*
+elite      world elite (W_Base_Elite)       40%  40%     25   1,923   60.0%    66.7%    75.0%     +25.0%  immune*
+boss       named boss (Ulserous)            40%  40%     25   1,923   60.0%    66.7%    75.0%     +25.0%  immune
+dungeon    dungeon mob (D_Base_Big)         35%  35%     25   1,553   65.0%    71.2%    78.8%     +21.2%  no stun*
+heroic     heroic dungeon boss (Nepsilon)   40%  40%     25   1,923   60.0%    66.7%    75.0%     +25.0%  immune
+  PHYS / MAG is what the unit row authors: the reduction it would be at its own level.
+  ARMOUR is the pool the game builds from it at LEVEL, and the PEN columns are what gets
+  through to a level-25 striker. CC: `immune` refuses every crowd control (the unit
+  flags a skill reads as isCCImmune); `no stun` is not immune - a root or a slow lands -
+  and still refuses a stun (unit flag NoStun); `lands` takes all of it. * is assumed from
+  the units built on that archetype, not read off a unit (bench audit has the counts).
 
-  420 units resolve an armour intent through inheritance, so --target also
+HEROIC  the 10 bosses that author a heroic loot table in a dungeon whose Heroic is released:
+  the unit row in Normal, the heroic rows at level 25 in Heroic
+UNIT          NAME           NORMAL  LVL  ARMOUR  NO PEN  HEROIC  LVL  ARMOUR  NO PEN
+Nepsilon      Nepsilon          30%    5     379   88.4%     40%   25   1,923   60.0%
+Reblochonk    Reblochonk        30%    8     508   85.0%     40%   25   1,923   60.0%
+...
+RobinHoof     Robin Hoof        30%   23   1,151   71.5%     40%   25   1,923   60.0%
+  `--target heroic` is the Heroic column: 10 of 10 resolve the same row. `--target <unit>@heroic` names one.
+  not listed: Phrixes (High Inquisitor Chakram) authors a heroic loot table, and Heroic is not released for Chakram's Chapel (heroicReleaseStatus Development, which $HData.checkStatus@21563 refuses)
+  not listed: Cleodora (Queen Honeyzabeth) authors a heroic loot table, and Heroic is not released for Honeyzabeth’s Hivetrunk (heroicReleaseStatus Development, which $HData.checkStatus@21563 refuses)
+
+  433 units resolve an armour intent through inheritance, so --target also
   accepts any unit id directly.
   ...
 ```
 
-Two things follow, and both matter for gearing. **Physical and magical
-reduction are equal on every real foe** — only the dev punching bags split them
-— so ArmorPenetration and SpellPenetration are worth the same against
-everything currently in the game, and which one you want is decided by your
+Four things follow, and all four matter for gearing.
+
+**A target is a rating at a level, not a percentage.** The pool is built at
+the foe's level and divided at yours, so a foe below you mitigates less than
+its row says: King Ratsar authors 40% and lets 75.8% through to a level-25
+character in Normal, where he stands at level 10, and 60.0% in Heroic, where
+everything stands at the level cap. The archetype shortcuts stand at your
+own level; a unit id stands where its row puts it, and `@veteran`,
+`@heroic`, `@scaled` or `--target-level` move it.
+
+**The training dummy is not a zero.** Since the September 30 update its row
+authors 40% and it stands at level 1: a level-25 character gets 89.9%
+through. Anything you calibrate on it has that in it; `--target none` is the
+target that mitigates nothing. (READ from the unit's row, and MEASURED on
+2026-10-13: every dummy hit that logged a level logged level 1, and hits
+that do not vary land on that pool to the integer. A level-25 Warrior at
+48.3% penetration gets 0.9453 of a hit through, and Rampage at full charge
+prices 852.5 where the log reads 853, nine hits of nine. The 89.9% is the
+same pool with no penetration.)
+
+**Physical and magical reduction are equal on almost every foe** — the
+exceptions are the 17 golems, harder to hit than to burn, and three rows that
+author a split outright — so ArmorPenetration and SpellPenetration are worth
+the same against everything else, and which one you want is decided by your
 class and your gear's faction, never by the fight. And
 `Armor_ExpectedReduction` (0.25) is well below what you actually fight, which
 is why the default target is a boss and not that constant.
+
+**Crowd control is a property of the target too.** `immune` targets refuse
+every stun, root and slow, so a bonus that needs the target controlled is
+worth nothing there — and the default boss is one. `no stun` targets take a
+slow and refuse a stun. The build output names every rider that went to zero
+for that reason, under `off against this target`.
 
 ### `bench profiles`
 
@@ -903,24 +1188,25 @@ bench slots --class Warrior
 ```
 
 ```
-SLOT           CATEGORY  STAT FACTOR  HOSTS AUGMENT
-Weapon1        Weapons                EnchantWeapon, Demon
-Weapon2        Weapons   x0.4         EnchantWeapon, Demon
-OffhandWeapon  Weapons                Demon
-Head           Left                   DemonSigil
-Neck           Left                   Jeweller
-Shoulders      Left                   -
-Chest          Left                   Blacksmith
-Back           Left                   Outfitter
-Hands          Right                  EnchantHands
-Waist          Right                  -
-Legs           Right                  -
-Feet           Right                  EnchantFeet
-FingerLeft     Left                   Jeweller
-Trinket        Right                  -
-FingerRight    Right                  Jeweller
+SLOT           CATEGORY  STAT FACTOR  HOSTS AUGMENT         INFUSION
+Weapon1        Weapons                EnchantWeapon, Demon  -
+Weapon2        Weapons   x0.4         EnchantWeapon, Demon  -
+OffhandWeapon  Weapons                Demon                 -
+Head           Left                   DemonSigil            15 of 53 rows
+Neck           Left                   Jeweller              -
+Shoulders      Left                   -                     15 of 51 rows
+Chest          Left                   Blacksmith            15 of 78 rows
+Back           Left                   Outfitter             15 of 73 rows
+Hands          Right                  EnchantHands          15 of 72 rows
+Waist          Right                  -                     15 of 71 rows
+Legs           Right                  -                     15 of 74 rows
+Feet           Right                  EnchantFeet           15 of 76 rows
+FingerLeft     Left                   Jeweller              -
+Trinket        Right                  -                     -
+FingerRight    Right                  Jeweller              -
 
 Slot factor: Slot_Weapon2 (the arsenal weapon) contributes 40% of its stats.
+Infusion: Epic armour with a faction can carry one of 15 set passives; 2 / 4 / 6 pieces of the SAME one are its rank 1 / 2 / 3. Pin one with --pin <slot>=<item>~<infusion>[/<rating>][!].
 ```
 
 ### `bench rarity`
@@ -937,26 +1223,43 @@ RARITY     FLAGS                  iLVL  MAX UPG  drop 1-10  drop 11-30  drop 31-
 Common     -                         -        -          -           -           -         -
 Uncommon   AllowRandomWeaponDrop    +0        2        40%         30%         15%         0
 Rare       AllowRandomWeaponDrop   +10        3        60%         50%         59%       60%
-Epic       AllowRandomWeaponDrop   +30        4          0         19%         25%       35%
-Legendary  AllowRandomWeaponDrop   +50        5          0          1%          1%        5%
+Epic       AllowRandomWeaponDrop   +50        4          0         19%         25%       35%
+Legendary  AllowRandomWeaponDrop   +70        5          0          1%          1%        5%
 
 CEILING PER SLOT   at level 25
 SLOT           KIND    CEILING    REACHABLE HERE                   DERIVED FROM
 Weapon1        weapon  Legendary  Uncommon, Rare, Epic, Legendary  highest rarity flagged AllowRandomWeaponDrop
 ...
-Head           gear    Rare       Uncommon, Rare, Epic*            highest rarity authored on a stat-bearing item for this slot
-Neck           gear    Rare       Uncommon, Rare                   highest rarity authored on a stat-bearing item for this slot
+Head           gear    Epic       Uncommon, Rare, Epic             highest rarity AUTHORED on a stat-bearing item for this slot - gear keeps its row's rarity and never rolls one
+Neck           gear    Rare       Uncommon, Rare                   highest rarity AUTHORED on a stat-bearing item for this slot - gear keeps its row's rarity and never rolls one
 ...
-Trinket        gear    Rare       Rare                             highest rarity authored on a stat-bearing item for this slot
+Trinket        gear    Epic       Rare, Epic                       highest rarity AUTHORED on a stat-bearing item for this slot - gear keeps its row's rarity and never rolls one
 ...
 
 WHAT THE DATA DOES NOT SAY
-  No column anywhere declares a rarity ceiling. ... So the ceiling is a
-  content decision in code, and the two rules above stand in for it.
+  11 columns are typed on `rarity`:
+  ...
+
+  Two of them bound a roll: item@props@gainItem@rarity.min and
+  item@props@gainItem@rarity.max - a CONTAINER's own floor and ceiling,
+  copied onto every loot entry it opens
+  (st.skill.GainItem.onStartStep@32109) and rolled inside
+  (ent.Hero.makeLootItem@7953). One row authors it: Hero Weapon Cache
+  (HM_Weapon_Cache_25) - floor Epic, no ceiling.
+
+  Beyond that, no column declares a ceiling for a slot or for an item row.
+  ...
+  GEAR does not roll at all (the same function skips everything that is
+  not a Weapon): its "ceiling" is only the highest rarity AUTHORED on a
+  stat-bearing row this install hands out, and a piece keeps its row's.
 ```
 
-`--no-rarity-roll` pins every item to the rarity the CDB authors it at;
-`--rarity-cap <r>` lowers the ceiling by hand.
+**A weapon rolls its rarity; gear never does.** A weapon's row is a floor and
+a drop can come out above it, so the search treats each attainable rarity as
+its own candidate, with its share. A chest, a ring or a trinket is the rarity
+its row says, and the Epic tier the September 30 update added is a set of
+separate rows. `--no-rarity-roll` pins every weapon to the rarity the CDB
+authors it at; `--rarity-cap <r>` lowers the weapon ceiling by hand.
 
 ### `bench audit`
 
@@ -966,48 +1269,206 @@ Every assumption and gap in the model.
 bench audit
 ```
 
-Each of the 39 entries carries a WHY that is a paragraph long — the bytecode
-function it was read out of, or the measurement that settled it. Only the KIND
-and WHAT columns fit here:
-
+Each entry carries a WHY that is a paragraph long - the bytecode function it
+was read out of, the measurement that settled it, or the one reading in game
+that would. There are 121 of them on build 25959898 as this sample was taken
+(44 verified, 66 assumption, 8 unmodelled, 3 info); only the KIND and WHAT
+columns fit here:
 ```
-ASSUMPTIONS AND GAPS (39) - read these before trusting a number
-  KIND        WHAT                                                                                                                       WHY
-  info        aptitude Fighter: authored Armor start 261 implies armorReduction 0.350, props.armorReduction says 0.4                     ...
-  verified    Fervor and the matching mastery share ONE additive bracket, on everything except Raw damage and status ticks               ...
-  verified    WeaponPower = 0.4 x the SUM of the item's aptitude primary budgets at the item's level, plus the MEAN of those attributes  ...
-  verified    an item pays every aptitude it names, each divided by how many it names                                                    ...
-  verified    a damage-over-time ticks once per stack, and the count is live                                                             ...
-  assumption  an UNCAPPED stacking dot is held at one stack, and named                                                                   ...
-  unmodelled  a stat buff is still counted at its cap, not at a tracked count                                                            ...
-  unmodelled  skill scripts, beyond the links and guards read out of them                                                                ...
-  assumption  a pool DoT is credited as the share of what fed it, paid out tick by tick                                                  ...
-  verified    a chain link swings at its authored duration - there is no floor                                                           ...
-  assumption  throughput is a 200-second fight, not a steady state                                                                       ...
-  assumption  the target stands at FULL health, so every execute clause in the game is off                                               ...
-  assumption  an area effect is priced against 1 target                                                                                  ...
-  assumption  a fight starts COLD: no banked stacks, no food, no pre-cast, nothing carried in from a previous pull                       ...
-  verified    the arsenal gives two skills and 40% of its stats, and nothing else                                                        ...
+ASSUMPTIONS AND GAPS (121) - read these before trusting a number
+  KIND        WHAT
+  info        aptitude Fighter: authored Armor start 261 implies armorReduction 0.350, props.armorReduction says 0.4
+  assumption  a heroic target is the unit's heroic stat rows at MaxLevel - read from the client, not yet measured in game
+  unmodelled  heroic dungeon trash - the server rescales it, and the client does not say how
+  verified    a unit's armour is ONE row - its own, else the nearest inherited - and not a sum over its parents
+  assumption  a target stands at its unit row's level; Veteran, Heroic and dynamic scaling are things you say
+  verified    the training dummy is not a zero-mitigation target - it lets 89.9% through at level 25, read and measured on this build
+  assumption  crowd-control immunity is read off the unit's flags, and on an archetype it is a census
+  assumption  a target that is not crowd-control immune can still refuse a stun - `stunImmune` is read off the unit row, and on an archetype it is a census
+  verified    Fervor and the matching mastery share ONE additive bracket, on everything except Raw damage
+  verified    a base attack scales on R x MEAN over the weapon's aptitudes of (0.4 x budget + 0.6 x attribute) - read on build 25782799 and measured on its dummy
+  verified    a weapon skill's attribute scaling is 60% attribute + 40% of that attribute's own budget curve - from either hand
+  verified    an item pays every aptitude it names, each divided by how many it names
   ...
+  verified    a summon's hit reaches its owner's scripts through the proxy hooks, once per damage event
+  ...
+  assumption  Domination: a stun arms a certain-crit weapon skill (measured), and its rank-3 bonus is paid at the controlled SHARE of the fight (an average)
+  ...
+  verified    Cooldown Reduction is read when a cooldown STARTS and held for that cooldown - so a timed status that carries it shortens the cooldowns begun under it
+  assumption  a status a script hands to the caster's whole party is the caster's - Mystic Empowerment is priced, and placed by the order, not chosen
+  ...
+  verified    displayed damage is the ceiling of the raw float; health loses the float
+  verified    an augment socketed in the ARSENAL weapon grants no skill - its enchant does nothing
+  verified    a cooldown-gated passive can carry a finisher bonus and a cooldown its swings shorten - Worldsplitter's does
+  verified    a passive that runs its own cooldown as a clock: Queen's Decree adds to the next magic skill's damage-ratio bracket, and strikes on your critical hits while the cooldown runs
+  assumption  the Raclette Pan's stacks are priced as +0.5 CritChance each - and the capture did not see them
+  ...
+  assumption  RATE against the capture, like for like: the Rogue's own rotation reads +4.5% a second on the dummy it fought - its hits -4.1% in size, +9.0% in number
+  ...
+  verified    a WEAPON and a piece of WORN ARMOUR are generated - each stands at the drop's level, its row's level being a floor - and only a weapon rolls its rarity
+  assumption  jewellery is priced at the level its row authors - and the capture logged two necklaces ABOVE theirs
+  ...
+  assumption  Hidden Power: a cast armed by walking into what a passive drops is priced with every drop collected - an input (--pickups), not a measurement
+  ...
+  info        13 of 15 infusions can be learned on this build; Resine Armor, Honorable Defender cannot
+  assumption  gear nothing in this install hands out is withheld from the search
+  assumption  a DemonSigil is taken because a free talent beats an empty socket, not because it scored
 
 See docs/MODEL.md for where each formula came from.
 ```
 
 `verified` was read out of the bytecode or measured in the running game;
-`assumption` is a stated convention; `unmodelled` is named rather than
-approximated; `info` is a fact about the data worth knowing. The list is
+`assumption` is a stated convention, a rule that was READ on the new build
+and has not been measured there, or one the 2026-10-13 capture measured only
+in part - the entry says which, and they are the largest group, 66 of the
+121; `unmodelled` is named rather than approximated; `info` is a fact about
+the data worth knowing. An assumption that was read and not measured is
+still SCORED: the entry says which single reading in game would move it to
+verified or correct it. Where the read and the capture disagree and the
+cause was not found, the read stands and the entry carries both numbers (the
+Raclette Pan's crit chance is one: priced at its row, 62 critical hits of
+385 at ten stacks in the rows, 16.1% where the price says 21.7%). Most of
+the row counts an entry quotes are counted off your installed sheet when the
+list is printed, so they follow a patch; a measurement it quotes is of the
+build it was taken on, and every capture so far is of build 25782799. The
+list is
 printed with every `sheet` and `rank` result too, because a number without its
 caveats is the thing this tool is trying not to be.
 
 ### Two more commands
 
-`bench update` is the patch-day pipeline: it diffs the install against the
-committed fingerprint — every sheet row, every script, every bytecode citation
-— and prints the work list, split into what needs an in-game log, what the
-sheet check can confirm, and what is a model re-read. `bench verify` holds the
-model against a recorded capture and prints the per-skill difference, signed;
-it is the only command that can report the model wrong without a person
-deciding that it is.
+**`bench update` is the patch-day pipeline.** It diffs the install against
+the committed fingerprint — every sheet row, every script and the hooks it
+declares, every enum and custom-type case the readers decode by name, the
+talent trees, every bytecode citation — and prints the work list, split into
+what needs an in-game log, what the sheet check can confirm, and what is a
+model re-read. Added ids that share a word across sheets are grouped as a
+possible new system, and added items are counted by rarity and type.
+
+```bash
+bench update                          # the report
+bench update --reanchor               # which citations merely moved, and which need a person
+bench update --reanchor --write       # rewrite the ones that merely moved
+bench update --row skill:GA_Craft_Passive --against <an older data.cdb>
+bench update --accept                 # record the new build, once the work is done
+```
+
+A citation is opened, not just located, so the report gives five different
+answers where it used to give one. **MOVED**: the function is at another
+number, and `--reanchor --write` fixes it mechanically. **CHANGED**: it is
+where it was and its body is not what was recorded. **STUB**: the client no
+longer carries the body at all — the September 30 build ships 202 server-side
+functions as a bare `throw` — so the sentence that cites it can no longer be
+re-read and has to say which build it was read on. **MISSING** and **ANON**:
+no function has that name, or nothing but a number identifies it. Only the
+first is ever rewritten for you; a fresh number on a sentence nobody re-read
+would be a forged re-read.
+
+`--accept` records the new build and is refused while any citation is stale;
+`--with-stale-citations` defers them, on the record — every later run lists
+what is still owed. Without `--accept` nothing is recorded,
+a missing fingerprint included. `--against <data.cdb or install dir>` diffs
+the data against an older copy instead of the fingerprint (the code half is
+still diffed against the fingerprint), and `--row <sheet>:<id>` prints what
+changed inside one row, a skill's script among its columns. A bytecode the
+reader cannot parse does not hide the data half: the citations are reported
+as unchecked and the rest still prints. The CAPTURE line says whether
+anything has been recorded in game on this build — it reads the probe's own
+session rows, which name the `hlboot.dat` they ran against, and counts every
+session recorded on the installed one, so a last launch that wrote nothing
+does not read as a build nobody measured — and a copy
+downloaded from Releases, which ships the accepted-build stamp but no
+fingerprint, says whether the game was patched since and records nothing.
+
+**`bench verify` holds the model against a recorded capture** and prints the
+per-skill difference, signed; it is the only command that can report the
+model wrong without a person deciding that it is.
+
+```bash
+bench verify --character Emsai --target Dummy
+bench verify --character Emsey --target Dummy --snapshots
+bench verify --character Emsai --target Dummy --since 1791844203301 --until 1791844271325 --split
+bench verify --character Emsay --target Dummy --window 1791846350797..1791846411249 --replay --split
+bench verify --character Emsai --target Ratsar --price-as Ratsar@heroic
+bench verify --character Emsai --capture bench-probe.2026-08-02_2026-08-29.build-2026-07-29.csv
+```
+
+**Read a ledger on one block of play, not on a whole capture.** The bare
+command reads the span of the richest snapshot the probe wrote of that
+character, and a span is rarely one fight: on the 2026-10-13 capture the
+Warrior's is eleven stretches of play, five that press something and six
+that do not, and the ledger says so above its table (`THIS WINDOW IS NOT ONE
+FIGHT`). The model plays ONE fight that presses everything the window
+pressed anywhere, so `PER-HIT` there mixes states - a swing inside a buff
+and one outside it, a held skill's three charge levels, an armed press and a
+plain one. That ledger reads Rampage +41.9% and the base attacks +8 to +12%;
+the same rows one block at a time read 852.5 against a logged 853 and 112.3
+against 113.2 / 111.4 / 108.3. The first number is the mix, the second is
+the formula.
+
+- `--since <ms>` / `--until <ms>` give a window by its ends, `--window
+  <from>..<to>` gives one too and repeats; the times are the log's own
+  `ts_ms`. A given window with no row of the character is refused with where
+  its rows are. It is priced with the snapshot STANDING when it opens;
+  `--snapshot <n>` names the build, and `--snapshots` lists every snapshot
+  with what each changed (a talent point, a piece, a rune).
+- `--split` compares ordinary hits with ordinary hits and critical with
+  critical, with counts and ranges, and prints the crit rate of both sides.
+  On a few presses this is the comparison to read: the blended `PER-HIT` is
+  mostly which hits happened to crit.
+- `--replay` plays one window's recorded presses at their own times instead
+  of the model's rotation. It is what holds a register on a cooldown to the
+  presses that really found it ready, and it needs the window's start. The
+  swings between the presses stay the model's, on the model's clock, so a
+  replay is not the referee of a RATE.
+- `--fight <s>` sets the model fight's length. Where something ramps from
+  nothing (a stack counter, a bank of doses) give it the window's own length.
+- `--behind-fraction <0..1>` says which side of the target a window was
+  fought from, for a build whose weapon upgrade pays only from behind; the
+  ledger names the perk when the build holds one. The model bills such a perk
+  on 41% of swings by default, an assumption, and nothing in a log marks the
+  side.
+- `--target <unit>` holds each row to the INSTANCE being fought at that
+  moment (three yard dummies are three targets) and counts what landed on
+  the others as left out; `--target <unit>#<n>` names one, `--all-instances`
+  reads them all.
+- `--skills <pool>=<a,b,...>` names what the snapshot could not read (the
+  Mage's conduit slots); without it they are filled from the rows and the
+  ledger says how.
+
+A row's status is `BOTH`, `MISSING` (the game did it and the model has no
+line), `PHANTOM` (the model claims it and the game never logged it),
+`NOT-PRESSED`, or `CARRIED-IN`: in a window that pressed nothing, damage of
+a skill pressed or a status applied before it opened, which is left out of
+the coverage and named with what the log shows standing at the opening. The
+`RATE` column and the line above the table compare how often things land,
+model against the capture's time in play; that is like for like only on a
+window that is one fight on one target. A pool other hits pay into prints
+`pool` for its per-hit figure and is judged on its share. The ledger's
+closing paragraph says what a per-hit disagreement can be - the formula, a
+state the window holds in another mix than the model's fight, or over a few
+hits the die - and names the states the build is known to hold.
+
+A direct hit is logged as a whole number, the CEILING of what the formula
+gives, so a whole-number stream is compared with the model's figure lifted
+by a half; `--json` carries the unlifted one as `perHitRaw`.
+
+The ledger opens by saying which build its window was recorded on (the probe
+starts a new log with each build; `--capture <file>` reads another one, and a
+bare name is looked up in `hlx/logs`) and what the target was priced as. On
+build 25959898 every ledger read from the 2026-10-13 capture says it is
+another build's - the probe's session rows name the `hlboot.dat` of
+25782799 - and a disagreement can then also be whatever the hotfixes
+changed; of what they changed only Shred's 10s reaches a line of it, the
+Rogue's.
+`--target <unit>` is the FILTER — the capture rows on that unit — and the
+model is priced on it at the level the capture logged; `--price-as <target>`
+prices the model on something else, a mode or `none`. Two cases it will not
+decide for you and says so: a dummy window recorded before the September 30
+build is priced on `none`, because the dummy had no armour then; and a boss
+logged at the level cap stood in Veteran or in Heroic, the capture does not
+say which, and where Heroic reads other armour rows the ledger warns with
+the size of the difference. `--json` writes the whole ledger.
 
 ### Importing a build from questlog.gg
 
@@ -1050,6 +1511,14 @@ build offers no slot for**, named individually; and the **class-skill bar**,
 which questlog does not store at all — so the bench still searches that choice,
 and an imported build is not quite fully pinned.
 
+Two more since the September 30 update. A rarity override on a piece of
+**gear** is ignored with a warning that says which rarity the row is,
+because only a weapon rolls one and gear keeps its row's. And an entry's **infusion** fields, where a
+link carries them, become the `~` part of the pin. No builder link seen so
+far carries one, so what the site calls those fields is unknown: the game's
+own names are accepted, and any key on an entry that the translation does
+not read is named rather than dropped.
+
 ---
 
 ## How it knows anything
@@ -1057,18 +1526,26 @@ and an imported build is not quite fully pinned.
 Farever runs on Shiro's own stack — Haxe → HashLink → Heaps.io — and ships two
 things that make this tool possible:
 
-1. **`data.cdb`**, a CastleDB with the whole stat system in it: 78 attributes
-   *with their formulas*, per-class stat budgets, per-slot budget shares, 962
-   skills with timed damage effects, and 93 augments with explicit affixes.
-2. **`hlboot.dat`**, HashLink bytecode v4 **with full debug info** — source
-   filenames and per-opcode line numbers across 47342 functions. The repo
-   ships its own reader for it (`node bin/hl.mjs find/disasm/grep-str`), so
-   the composition rules are read out of the compiled game rather than
-   guessed, and every citation below reproduces from your install.
+1. **`data.cdb`**, a CastleDB with the whole stat system in it: 80 attributes
+   *with their formulas*, per-class stat budgets, per-slot budget shares,
+   1,098 skill rows with timed damage effects, and 93 augments with explicit
+   affixes (counted on the September 30 build).
+2. **`hlboot.dat`**, HashLink bytecode **with full debug info** — version 6
+   since that build, with source filenames and per-opcode line numbers across
+   48,047 functions. The repo ships its own reader for it
+   (`node bin/hl.mjs find/disasm/grep-str`), so the composition rules are read
+   out of the compiled game rather than guessed, and every citation
+   reproduces from your install.
 
-Seven formulas carry the whole model. All seven were read from the bytecode —
-the last three with the repo's own reader, after live measurements found them
-first — and each is cited to its function index and source line in
+One thing the September 30 build took away: the client no longer carries its
+server half. 202 functions — `applyDamage`, `addStatus`, the status refresh,
+the loot drop among them — are a bare `throw` now. What they did was read on
+the previous build and cannot be re-read on this one; the shared code that
+prices a hit, builds a unit's armour and rolls a weapon is still there, and
+that is what the rules below are read from.
+
+Seven formulas carry the whole model. All seven were read from the bytecode
+and each is cited to its function index and source line in
 [docs/MODEL.md](docs/MODEL.md):
 
 ```
@@ -1076,15 +1553,34 @@ budget(L, min, max) = min * (max/min)^((L-1)/(EarlyMaxLevel-1))     one curve, e
 rating contribution = (rating / budget(L, min, max)) * target        `scale` is NOT read
 armor budget        = red * (385 + 100L) / (1 - red)                 authored columns are dead
 attribute           = (stored + scaling + flat) * modAdd * modMul
-weaponPower         = 0.4 * SUM(aptitude budgets at item level)      + MEAN of those attributes per swing
+base-attack term    = ratio * MEAN over the weapon's aptitudes of (0.4*budget + 0.6*attribute)
 weapon-skill term   = ratio * (0.6*attribute + 0.4*its own curve)    either hand; class skills pure
 one hit             = (amount + adds) * dmgMult * crit               * (1+fervor+mastery) * (1-reduction) * taken
 ```
 
+The fifth line is the one the update changed. Until it, a base attack scaled
+on 0.4 × the SUM of the weapon's aptitude budgets plus the whole attribute,
+and every dummy reading of that build fits that. The new rule was read on the
+new build and prices a swing 24% to 47% lower. MEASURED 2026-10-13 on four
+weapons, ordinary hits against ordinary hits, each weapon in its own chain
+block of about a minute: Judgement 112.3 priced against 113.2 / 111.4 /
+108.3 logged by link (17 swings each), Beefury 14.6 against 15.0 / 15.1 /
+15.1 (28 / 25 / 29), Silhouette of Almaz 28.8 against 28.6 / 27.5 / 28.9
+(14 / 13 / 15), Nibsham's Liberators 18.1 against 18.5 / 19.1 / 18.4 / 18.7
+from behind and 14.4 against 14.6 / 15.2 / 15.1 / 15.1 from the front. The
+log writes the ceiling of a hit, so a 15-damage swing carries up to 3% of
+rounding. That excludes the old rule. It is not the last word on the new
+one: the Warrior's third link and the Mage's second read 4 to 7% under the
+model on 17 and 13 swings, the staff's swing is two states (26.5 against a
+logged 27.1 without the finisher's buff, 28.9 against 29.0 with it), and
+critical swings are too few in any one block to hold a crit multiplier to.
+The first whole-capture ledgers read these same swings 3 to 12% high; that
+was the window, not the rule (see `bench verify`).
+
 Four consequences worth knowing as a player, none of them visible in game:
 
 - **Rating is linear, and it depreciates.** At level 25 one point of
-  CritChanceRating is +0.0527 percentage points of crit, and every point loses
+  CritChanceRating is +0.0526 percentage points of crit, and every point loses
   **3.8% of its value per character level you gain**.
 - **Faction decides your secondary stat.** The same Manfish chest gives a
   Priest Fervor and a Warrior ArmorPenetration, out of one data row. Gear with
@@ -1125,7 +1621,20 @@ is worth the same whether you burst inside it or outside it.
                      # (default 100), for the script clauses that ask
 --lookahead 8        # seconds of rollout when choosing a cast; 0 for a plain
                      # first-available priority list
+--behind-fraction 0.41  # the share of base attacks that land from behind the
+                     # target (default 0.41), for a weapon perk that pays only
+                     # there; where you stand is not in the game data
+--pickups 1          # the share of a weapon passive's ground drops you walk
+                     # into (default 1), for a cast armed by collecting them
 ```
+
+The last two are inputs, not measurements, and a build that leans on one
+says so beside its number: the default Priest build prints `priced on an
+input: Hidden Power is 43.3 dps (9 casts) on walking into every cloud its
+passive drops`. With every cloud collected the Censer of Wool Hollow build
+reads 579.1 and the best Flame of Argol build the search finds 548.5; the
+same Censer build keeps the lead down to three casts of the nine (550.2 at
+`--pickups` 0.35) and loses it at two (545.4 at 0.3).
 
 **On the rotation.** SimulationCraft answers dependency order with a
 human-authored Action Priority List and does no search — its wiki says outright
@@ -1136,21 +1645,59 @@ worth up to +97% on a rotation built to reward it. It is a heuristic and it can
 lose to plain priority order, so the fight is played **both ways and the better
 kept**, and the output says which won.
 
-**`--target-health` is stated, not derived.** Eight script clauses across seven
-weapons compare the **target's** health against a threshold, and the comparison
+One kind of press is also played out of that order: a press that lands on
+its own caster, in a build holding a status such a landing puts up (the
+Priest's Faithful Winds under Sunlight). What it buys is the status's
+window, which the ranking does not see, so the fight is also played with
+that press LAST in the order and WITHOUT it - every combination while there
+are at most 8, one press at a time past that - and the best is kept. A
+releaser that is in the rotation for nothing but a release that lands on its
+caster (Judgment with a heal as its only prayer, in a dps fight) gets the
+same choice. The sheet's ROTATION block lists each order with what it came
+to, and a press left out is named under the cause `not pressed` with both
+numbers. These are orders the simulator can play, not a rule of the game,
+and they cost time: a full Priest search takes about two and a half times
+as long as it did without them.
+
+**What the order still gets wrong, said in `bench audit`.** A cast that puts
+a status up is kept for it whatever the status carries, so a defensive or a
+movement buff is pressed on cooldown in a dps fight and costs the swings it
+takes; and a press that deals damage and displaces more than it deals is
+pressed whenever it is ready (on the tree before the hotfixes, Zealous Spins
+in the arsenal of that day's default Warrior build read 812.1 where the same
+build with the slot empty read 846.3; the search does not pick it, a pin is
+priced with it pressed). The
+rule that would settle both - keep a press only where the fight with it
+beats the fight without it, for every cast - is one more fight per press per
+evaluation and was not taken.
+
+**`--target-health` is stated, not derived.** Ten script clauses in nine rows
+of the September 30 sheet compare the **target's** health against a threshold
+(`bench audit` counts them off your install), and the comparison
 is answered **exactly** — no assumption that the fight ends in a kill, none
 that damage is even, none that some share of the clock is spent below the line.
 Because one stated number carries no more precision than that, `<` and `<=`
 differ only exactly *at* the boundary, and the tool does not pretend otherwise.
-**Three of the eight are priced today**: Execution's `+25% damage under 35%
-health` on Raging Smash, and Demonic Bite and Scatterbloom, which are the same
-shape. The other five ask something else *as well* as the health and stay
-refused on that other guard, named individually in the audit. Hiveborn Blossom
-is the one that runs the other way (`+200%` **above** 80%) and it is among the
-refused, so the default of 100 turns every execute clause **off** and leaves
-nothing else to turn on — and the output names each rider that switched off, so
-a rune you slotted never reads as worthless when what actually happened is that
-the tool was never told about the execute phase.
+Priced today, each checked by stating a health on a build that holds the row:
+Execution's `+25% damage under 35% health` on Raging Smash; Demonic Bite and
+Scatterbloom, which are the same shape; Nectar-infused Blade's ×1.3 on its
+own hits; Bullying the Weak's bonus on weapon skills; the crit chance Thrill
+of the Hunter adds to the finisher that spends its mark; Spark Shot's extra
+hit, a step its script plays under 35% and, from weapon rank 3, above 80%;
+and Hiveborn Blossom's `+200%` above 80%. The last two run the other way, so
+the default of 100 switches every execute clause **off** and those two **on**
+— a large number, and it is what the rows say. The one clause left, Blind
+Breakthrough's, asks something else *as well* as the health and stays refused
+on that other guard, named on its own line. Seven more clauses read the
+OWNER's health and stay refused: your health over a fight is not simulated.
+And the output names each rider that switched off, under
+`off at this target health`, so a rune you slotted never reads as worthless
+when what actually happened is that the tool was never told about the
+execute phase.
+
+`--targets` works the same way for the clauses that ask how many enemies a
+cast hit: read, answered at the number you stated, and listed under
+`off at this target count` when the answer is no.
 
 Your **own** health is not an input, because the fight does not model it: six
 more clauses read `owner.healthRatio` and those stay refused and named.
@@ -1197,11 +1744,14 @@ that only wins where it was tuned is a rotation for that corner.
 **Does a stat repartition change the rotation?** `--across-search` asks the
 stronger version: search a **fresh** rotation at every corner with the kit held
 fixed — so the only thing that moved is the stats — then cross-evaluate every
-rotation at every corner. **Barely.** Three of the six corners converge on the
-*same* four-line list, and carrying any one of them everywhere costs at most
-**0.63%**. Whether a distinct list per stat spread is worth writing down is
-then a decision with a number attached rather than a guess, and the number says
-no.
+rotation at every corner. On the build this was last run on (August 2026) the
+answer was **barely**: three of the six corners converged on the *same*
+four-line list, and carrying any one of them everywhere cost at most
+**0.63%**. It has not been re-run since the September 30 update, where a
+searched list is worth more than it was (see the `bench rotation` sample
+above), so treat that figure as the previous build's. Whether a distinct list
+per stat spread is worth writing down is a decision with a number attached
+rather than a guess; run it for your weapon.
 
 ### Comparing weapons without the gear in the way
 
@@ -1234,10 +1784,11 @@ a real character the rig sits.
 
 `--across` answers the question the decomposition rests on, and on this data
 the answer is encouraging: above the bare corner the **weapon ranking barely
-moves** (mean shift 0.3–0.6 places out of 13) and the **skill choice does not
-move at all**. Talents and runes do — three or four different sets across six
-corners — which is exactly what you would expect from nodes that trade crit
-against penetration. So a weapon and its two skills are one decision that can
+moves** (mean shift 0.6–0.9 places out of 14, on
+`bench weapons --class Warrior --across zero,mid,crit,armorpen,fervor,strength`)
+and the **skill choice does not move at all**. Talents and runes do — two to
+four different sets across six corners — which is exactly what you would
+expect from nodes that trade crit against penetration. So a weapon and its two skills are one decision that can
 be made once; the tree and the runes are re-decided per corner, which is cheap.
 
 A profile also probes corners gear cannot reach — a Warrior in Faith gear — and
@@ -1252,15 +1803,18 @@ game's own constants — `UnlockLevel_WeaponSkillSlots`, `UnlockLevel_Arsenal`,
 `Priest_Prayer_Slot_Unlocks`, `Mage_Conduit_Levels` — so a level-12 character
 correctly gets two main-hand skills and only one arsenal skill.
 
-The chain's **length** is authored, in `moveSet.comboLength`, and two weapons'
-item rows are shorter than it says: `Scepter_Flamie` lists 2 links where the
-scepter moveSet declares 4, and `DM_Multispin` lists 4 where DualMaces declares
-5. The missing links all exist as rows — `DM_Base_Attack4` is the only
-chain-link row in the sheet no weapon references — so they are filled from the
-weapon type and the fill is printed. It matters because the combo finisher is
-what charges prayers and what every proc guard rolls against: a 2-link chain
-fires them twice as often, which was worth +44% on a Priest holding that
-scepter.
+The base-attack chain is **the weapon's own rows**: the swings its item row
+lists, then its finisher, and nothing pads it. Two weapons list fewer links
+than their weapon class declares in `moveSet.comboLength` — Flame of Argol 2
+where the scepter class says 4, Twin Pillars of Justice 4 where dual maces
+say 5 — and until the September 30 update the game filled the difference by
+repeating the weapon's last swing (the capture shows it: the same swing three
+times, then the finisher). On the new build nothing reads that length any
+more, so those two weapons play exactly what they list. It matters because
+the combo finisher is what every proc guard rolls against: a 2-link chain
+fires them twice as often. That is read from the bytecode and not yet watched
+in game, it is the flattering direction, and the output says so on the
+weapon's own line.
 
 Only the **main-hand** weapon's base-attack chain is used. Confirmed in game:
 you do not swap to the arsenal, so it contributes no chain and no combo, and
@@ -1290,115 +1844,178 @@ using stat weights, because the objective is not linear in the stats — see
 Stated plainly, because a tool that hides its gaps is worse than no tool.
 `bench audit` prints this list with every result.
 
-- **The composition order is READ now.** `ent.Unit.computeDamage` and
-  `applyDamage` are disassembled (`node bin/hl.mjs disasm 4841`): one folded
-  multiplier `(amount + adds) × dmgMult × crit × (1 − reduction) × taken`,
-  Fervor and the matching Mastery additive inside one bracket, Raw damage
-  bypassing all of it, and `WeaponPower` = 0.4 × the summed aptitude budgets.
-  Every formula was ALSO verified against live dummy readings before the code
-  was read, and the audit tracks the few places the two disagree.
+- **Much of the September 30 build is read, not yet measured.** The update
+  changed how a base attack scales, whose stats a damage-over-time tick
+  takes, how a unit's armour is resolved, the Rogue's poison, the Warrior's
+  Domination, and added a whole gear system. Each of those rules was read
+  from the new build's data and compiled code, is scored, and sits in the
+  audit with the one reading in game that would settle it. The first capture
+  on the new build (2026-10-13, four level-25 characters on the training
+  dummies, two driven sessions, build 25782799) was then held against the
+  model block by block. What it SETTLED: the dummy's armour, the new base-attack rule on
+  four weapons, Domination's register, the dose gate of Lethal Poison and
+  most of the Rogue's poison tree one talent point at a time, whose stats a
+  tick takes (on one poison), and the log's rounding (it writes the
+  ceiling). What it showed WRONG, now fixed: Queen's Decree was unpriced
+  (the three Mage spells the first ledgers read 22 to 36% low), an enchant
+  in the arsenal weapon does nothing, a trinket's status scales through its
+  item, a tick reads the target as it lands, an aura that follows its wearer
+  has no hit at spawn, Combo Points pay a skill different from the last one
+  that paid. What turned out to be PROTOCOL and not a formula: a window that
+  mixes states - Rampage's +42% (three charge levels and armed crits in one
+  window), Surging Force's +21% (statuses only a swing applies), most of the
+  3 to 12% on base attacks (buffs the chain block never pressed, the crit
+  die, the ceiling). What is still OPEN, each in `bench audit` with both
+  numbers: the Raclette
+  Pan's crit chance (62 critical of 385 where the price expects 21.7%), the
+  Rogue's rate (the model's own rotation lands +4.5% a second, and Urge to
+  Kill is in no number), the Finisher below a full bar, buffs priced at their
+  fight average, and the level of a dropped necklace. Nothing about bosses,
+  heroic targets or crowd-control immunity has been measured at all, and of
+  Infusion only when three sets fire, on other players' rows. Nothing at all
+  has been measured on the two hotfix builds that followed (25933712,
+  25959898): the capture predates them, and every ledger read from it says
+  so. [docs/GROUND-TRUTH.md](docs/GROUND-TRUTH.md) has the record and
+  [docs/TODO.md](docs/TODO.md) what is open.
+- **The composition order is READ.** `ent.Unit.computeDamage` is disassembled
+  (`node bin/hl.mjs disasm ent.Unit.computeDamage`): one folded multiplier
+  `(amount + adds) × dmgMult × crit × (1 − reduction) × taken`, Fervor and the
+  matching Mastery additive inside one bracket, Raw damage bypassing all of
+  it. The receiving half — `applyDamage` and its neighbours — was read on the
+  previous build and is not in this client any more; where a rule rests on
+  it, the audit says so.
 - **How many enemies you are hitting is an input, not an answer.** Most of a
   build's damage comes from area steps, and the geometry is fully authored —
   shape, range, height, an expanding radius — but *nothing anywhere says how
   many enemies stand inside it*. `--targets` defaults to 1, so the headline
   figure is single-target and an open-world pull reads higher.
-- **Partial skill scripts.** 427 of 962 skills carry hscript bodies this build
-  does not execute. What is read out of them, because the data records it
-  nowhere else: the status a skill applies (`addStatus`, through a local alias
-  if it uses one), the *event* that applies it, the roll that guards it, the
-  proc rate `vars.chance`, and the rest of the guard — a `rank >= 2` rider, a
-  `hasTalent` or `hasMastery` check, all of which the build can answer. A
-  magnitude passed as a third `addStatus` argument or a `setDynVal` injection
-  is not, and neither is a guard that asks about live state (`hasStatus`,
-  `getStatusCount`, `.stacks >= getMaxStacks()`). Those keep their rate
-  **refused and named** rather than approximated: `DA_Water_Combo_PassiveRank3`
-  rolls 0.35 a swing but only once its own buff is max-stacked, and crediting
-  the bare 0.35 is a proc rate the skill does not have.
-- **A guard is read, not assumed.** A script's `rank >= 2`, `hasTalent`,
-  `hasMastery` and `critical` are all things the build can answer, so they are
-  evaluated: a rank-1 character no longer gets rank-2 riders, a rune-gated
-  bonus applies only when you slot it, and a proc on a critical strike is
-  priced at your crit rate. A guard that asks about live state — `hasStatus`,
-  `getStatusCount`, your **own** health — keeps its rate **refused and named**
-  instead of approximated. The **target's** health used to sit in that list and
-  no longer does: it is not something the tool has to guess, it is something
-  you state with `--target-health`, exactly as you state `--targets`. See
-  [docs/MODEL.md §14](docs/MODEL.md) for the full list of shapes.
-- **Talents and runes are structure more than value.** The trees are allocated
-  and validated against the real rules, but most of the 88 nodes and most of
-  the 84 runes declare nothing a data-driven model can read. `bench talents`
-  counts what is readable, live. A Demon sigil grants a tier-4 talent outright;
-  the search takes one because free beats empty, and says the pick is not
-  scoreable.
-
-  **The Warrior is the exception, because it was walked node by node.** All
-  sixteen points land on something the model values: two pool bleeds, six
-  scoped modifiers, penetration against a bleeding target, Rage income per
-  critical strike, cooldown earned back per bleed tick, and a proc rolled
-  against each of those ticks. What is left is named with its reason. The other
-  three classes have the shared readers and have not been audited that way, so
-  their exposure is under-reading rather than over-reading.
-
-  **A node can depend on another node, and it says so in script.** Hold the
-  Line is +6% damage *while Rage Shield is up*, and Rage Shield is a different
-  branch you may not have taken. Four nodes across three trees have that shape
-  and all four were being credited unconditionally; they are resolved against
-  the allocation now, and a build that cannot arm one is told which one it is
-  missing.
-- **Resources: Rage yes, Spark no, ComboPoints halfway.** A resource is a
-  second kind of cooldown — you wait for income instead of a timer — and for
-  the Warrior both halves are authored. `MaxRage` is 20 and `NoAutoFill` says
-  you start a fight at zero; `Warrior_Rage`'s script generates 1 from every
-  attack, combo finisher and weapon skill (and explicitly *not* from a
-  signature skill, so it cannot fund itself); `Warrior_InfiniteRage` adds 1
-  every 3s in combat; `Warrior_Rage_Strike` spends 10. So it casts every ~7s on
-  a real build, and it is worth **+14%** on the Warrior.
-
-  The Mage and Rogue pools were unreadable from data and are now read from the
-  bytecode: `Skill.getSparkCost` prices a weapon skill at
-  `round(max(5, cooldown × 1.0))` Spark, refunded by Ray of Spark's authored
-  18% of MaxSpark per cast, and `Rogue_ComboPoints` grants one point per
-  distinct weapon skill or finisher with the signature spending all of them at
-  +30% damage each. Both gates run in the fight now; what is still simplified
-  is named in the audit.
-- **Coverage is reported by cause, not as one number.** The tool names every
-  skill it could not score and groups them: `utility`, `rune`, `resource`,
-  `no rate` (the amount is in the data, the schedule is not), `status`,
-  `script magnitude`, `script`, and `nothing declared`. Five to eight per
-  class, and each group says what would settle it.
+- **Which difficulty you are in is an input too.** A unit id is priced at its
+  row's level, which is Normal. Veteran and Heroic stand everything at the
+  level cap and Heroic reads the heroic rows of the ten bosses whose Heroic
+  is released; a rift rebuilds
+  a foe's armour at your level. The tool reads all of that and cannot see
+  which one you are standing in, so you say it (`@veteran`, `@heroic`,
+  `@scaled`). Heroic *trash* is rescaled by server code the client no longer
+  carries, and is unmodelled beyond its armour.
+- **Partial skill scripts.** 508 of the 1,101 skill rows carry hscript bodies
+  this tool does not execute. What is read out of them, because the data
+  records it nowhere else: the status a skill applies, the *event* that
+  applies it, the roll that guards it, the rest of the guard — a rank, a
+  talent, a rune, a critical strike, the target's health, the number of
+  targets, whether the target is crowd-controlled — and a growing list of
+  shapes the fight then plays: a pool that banks a share of a hit, cooldown
+  handed to another skill, a register the next cast spends, a mark or a bank
+  the finisher spends, a counter that arms a cast. A guard that asks about
+  live state the fight does not hold keeps its rate **refused and named**
+  rather than approximated — Tide Warlord is held up only while your own
+  health is under a threshold, and your health over a fight is a trajectory
+  this model does not simulate. See [docs/MODEL.md §14](docs/MODEL.md) for the
+  shapes.
+- **A zero is not always a gap.** The unscored list is grouped by cause, and
+  the causes are different kinds of statement: `off at this target health`,
+  `off against this target`, `off at this target count` and
+  `off in this build` are clauses the tool READ and answered no for the fight
+  you described, each with what would switch it on; `not pressed` is a
+  slotted skill the fight was played with and without and was better
+  without, with both numbers; `lands on an ally` is a status a script hands
+  to an ally or a summon and not to you or your target; `conditional`,
+  `no rate`, `script magnitude`, `script` and `status` are things it could
+  not price; `foe is passive` and `crowd control` are worth nothing because
+  the simulated foe does not act; `utility`, `rune` and `nothing declared`
+  say what they say.
 
   **A rune can turn any of them into something else, so the choice is
   printed.** A teleport is not inherently worth zero — `Rogue_Shadowstep` with
   *Combo Step* generates 2 ComboPoints, `Mage_Blink` with *Phase Strike*
   amplifies your next weapon skill, `Warrior_Charge` with *Juggernaut*
-  generates 5 Rage. The search leaves those sockets empty precisely *because*
-  it cannot price them, so the options are listed under the skill with their
-  numbers filled in from the data.
+  generates 5 Rage. Where the search cannot price an option it leaves the
+  socket to a tie and says so, and the options are listed under the skill
+  with their numbers filled in from the data.
+- **Talents and runes are structure more than value.** The trees are allocated
+  and validated against the real rules; `bench talents` counts what is
+  readable, live — 62 of the 88 nodes and 31 of the 84 runes on this build. A
+  Demon sigil grants a tier-4 talent outright; the search takes one because
+  free beats empty, and says so when the pick is not scoreable.
+
+  **Two trees were walked node by node.** On the Warrior all sixteen points
+  land on something the model values: two pool bleeds, six scoped modifiers,
+  penetration against a bleeding target, Rage income per critical strike,
+  cooldown earned back per bleed tick, and a proc rolled against each of
+  those ticks. The Rogue's tree was rebuilt by the September 30 update, re-read
+  off its scripts, and then stepped through in game one point at a time.
+  The Mage and the Priest have the shared readers and have not been audited
+  that way, so their exposure is under-reading rather than over-reading.
+
+  **A node can depend on another node, and it says so in script.** Hold the
+  Line is +6% damage *while Rage Shield is up*, and Rage Shield is a different
+  branch you may not have taken. Such nodes are resolved against the
+  allocation, and a build that cannot arm one is told which one it is
+  missing.
+- **Resources are a second kind of cooldown** — you wait for income instead of
+  a timer — and all three are played in the fight. For the Warrior both
+  halves are authored: `MaxRage` is 20 and `NoAutoFill` says you start a fight
+  at zero; `Warrior_Rage`'s script generates 1 from every attack, combo
+  finisher and weapon skill (and explicitly *not* from a signature skill, so
+  it cannot fund itself); `Warrior_InfiniteRage` adds 1 every 3s in combat;
+  Raging Smash spends 10. The Mage and Rogue pools were unreadable from data
+  and are read from the bytecode: `Skill.getSparkCost` prices a weapon skill
+  at `round(max(5, cooldown × 1.0))` Spark, and `Rogue_ComboPoints` pays a
+  point to a weapon skill or a final attack that is a different skill from
+  the last one it paid. The Finisher needs no point: it is pressed whenever
+  it is ready, spends what the pool holds and is priced there, +30% a point
+  (179 logged at none and 448 at five on the 2026-10-13 dummy). Spark is
+  spent and never required: a press short of Spark goes off. What is still
+  simplified is named in the audit - Urge to Kill above all: the captured
+  Rogue's Finishers held 4.07 points each where the model's own rotation
+  finds 2.12, and that skill is in no number.
+- **Infusion is half a search and half an assumption.** The tool reads which
+  pieces can carry an infusion, counts the set rank, prices the stat rows and
+  eight of the fifteen scripted effects, and refuses the rest by name. Two
+  things it cannot know: what a piece nobody owns rolled as its bonus stat
+  (priced at zero unless you say), and whether one infused piece below the
+  first cap already switches the set on (assumed not).
+- **What your install hands out is the client's answer.** Rows are withheld
+  when no loot table, level file, merchant, recipe or compiled function in
+  your install names them, and two infusions when the Heroic that drops
+  them is marked unreleased in the level files (four before build 25959898
+  opened two Heroics). A server that opened those
+  dungeons anyway would make the list too short; `--include-all` and
+  `--infusions all` offer everything.
 - **A thin player model.** The fight is simulated, but the priority is derived
   — press the ready skill with the highest damage per second of commitment —
   not authored. There is no movement, no target switching, no interrupt, and
-  the foe does not act, so crowd control and mitigation-through-avoidance are
-  worth nothing here.
-- **The model has been checked against the running game, extensively.** A
-  naked level-25 character sheet reproduces to the decimal; two weapons were
-  measured live on a 0-armor dummy (swings, crits, bleed ticks, charge
-  timings) and every formula reproduces the displayed integers; six expanded
-  tooltips render the weapon-skill mix the model implements; a character-sheet
-  reading settled how aptitudes pay; and the composition order itself is now
-  disassembled from `hlboot.dat` rather than assumed (`node bin/hl.mjs disasm
-  4841`). See [docs/MODEL.md](docs/MODEL.md). What remains unmeasured is
-  behavioral, not numeric — movement, target switching, a foe that acts — and
-  the audit names it.
+  the foe does not act, so a control is worth nothing *as a control* and
+  mitigation-through-avoidance is worth nothing at all. A control is still
+  read as a state other effects ask about, and the target's immunity to it is
+  read off its unit row. Position is not modelled either: the rear-hit
+  bonuses are billed at a stated share of swings (41% by default,
+  `--behind-fraction`). The 2026-10-13 capture measured what that share
+  stands for: the Rogue's base attacks land about ×1.27 harder from behind
+  one dummy than from its front, which is her two daggers' upgrade perks
+  read off their rows (+12% and +14%, ×1.26).
+- **The model was calibrated on the previous build, extensively, and that
+  calibration is history now.** A naked level-25 character sheet reproduces
+  to the decimal; in August two weapons were measured live on a dummy that
+  then had no armour (swings, crits, bleed ticks, charge timings) and every
+  formula reproduced the displayed integers; six expanded tooltips rendered
+  the weapon-skill mix; a 1.8 GB event capture closed every class's ledger to
+  full coverage. Those readings are still the record of how each rule was
+  found, and the sheet arithmetic they settled still holds — the new capture
+  matches it within 1% on all 40 attributes it checks across the four
+  characters, the Mage's Block once the arsenal's was found to hand out
+  nothing. What they no longer do is vouch
+  for a number on the new build. See [docs/MODEL.md](docs/MODEL.md).
 
 ---
 
 ## Relation to farever-mods
 
-`src/lib/pak.mjs` and `src/lib/game.mjs` are copied from
-[farever-mods](https://github.com/Blaakan/farever-mods) — the `.pak` reader and
-the Steam-library install finder — same MIT licence, copied rather than
-depended on so this repo clones and runs on its own. `game.mjs`'s cache path is
-the only change.
+`src/lib/pak.mjs`, `src/lib/game.mjs` and `src/lib/hbson.mjs` are copied from
+[farever-mods](https://github.com/Blaakan/farever-mods) — the `.pak` reader,
+the Steam-library install finder, and the reader for the prefab container the
+level files ship in — same MIT licence, copied rather than depended on so this
+repo clones and runs on its own. `game.mjs`'s cache path is the only change,
+and of `hbson.mjs` only the reader was taken.
 
 Everything else is new.
 

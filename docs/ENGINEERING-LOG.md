@@ -13,6 +13,702 @@ an entry says a rule was refuted, the alternative it beat is named, because a
 model that only records its conclusions cannot be checked.
 
 ---
+## 2026-10-17 - Two hotfixes: the numbers held, and one reader went quiet
+
+Two Steam builds followed the September 30 update, 25933712 on the 14th
+and 25959898 on the 15th, and the second is the one installed. The new
+hlboot.dat is 14,797,138 bytes against 14,789,204, 48,068 functions
+against 48,047, and the same 202 server-only stubs. Nothing on it has
+been measured; the capture of the 13th is of the build before.
+
+The bytecode half was bookkeeping, and the right kind. `bench update`
+read 414 citations as moved and 4 as where they were;
+`--reanchor` proposed 1,121 rewrites (998 in the code and the suite, 122
+in the two living documents, 1 in TODO.md) and listed 40 for a person
+(16 stubs, 2 suspect picks, 22 anonymous numbers). The stored
+fingerprint predates body hashes, so it had nothing to say about what
+was inside a moved function. That comparison was done by hand, against
+the old hlboot.dat kept beside the install: 315 distinct moves, each
+landing on a function with the same qualified name on both builds, and
+each body equal to its old self but for type, string and line indexes -
+except two, whose behaviour moved. `SkillStep.hitEntity` skips a hit
+whose effect is missing, and `GameObject.doUseSkill` no longer puts the
+hero in the Skill state for a press flagged NonInterupting (it already
+did not stop the running skill for one). Two rows carry the flag,
+Bubble Bullet and the consumable use, and the fight reads it off them
+now. That comparison is the body verdict the pipeline was built to give,
+from the next accept on.
+
+The data half moved little - about twenty skills, six units, five
+scripts and one new column (`overlapTolerance`, which no reader takes) -
+and three of those changes went under a reader. Expulse's recast counts
+its orbs through a helper of its own script now, `getOrbCount()`, a
+one-line return of the same expression; the shape reader stopped
+matching it and priced one orb a press with or without the spheres the
+recast pulls in, and said nothing. That is the failure worth writing
+down: not a wrong number with a sentence, but a reader that went quiet.
+Every zero-argument helper whose body is one return is put back in
+place of its calls before a shape is matched. Acidic Splatter reads the
+Combo Points in `onUseSkill`, before the Finisher spends them, and rolls
+on the Finisher's first hit or on its projectile's - the patch notes'
+fix for the ranged Finisher. The reader lost the chance per point (a
+flat 20%) and filed the armour break as unreadable; the hotfix's form
+of "the first hit" is read as the gate it is. And four bosses gained a
+heroic loot table, two of whose dungeons - Cheese Station, Crimson
+Barracks - had their Heroic released in the level files, while
+Chakram's Chapel and Honeyzabeth's Hivetrunk still mark Development and
+their bosses carry no heroic stat row. "Authors a heroic loot table"
+stopped meaning "is a heroic boss"; the release is read where the loot
+side reads it, and the withheld list fell from 26 rows and four
+infusions to 13 and two with no change of code.
+
+That release flip is invisible to `bench update`: it lives in a level
+prefab, which the fingerprint does not record. It showed only in what
+the search offered.
+
+The suite on the re-anchored tree read 4,278 passed and 19 failed, 15 of
+them the hotfix. Some were the three readers. The rest were the suite's
+own fault: a withheld count of 26, a list of four unobtainable
+infusions, a function number inside a regex - literals that pinned a
+fact of 25782799 a hotfix may legally change. Each became the
+relationship it stood for (a withheld row sits only in tables nothing
+names or a shut Heroic names; a released Heroic's table withholds
+nothing; a cited function is asked by name). The second run read 4,302
+passed and the three citation gates red.
+
+The numbers: Warrior 846.3 to 841.7, Rogue 1,068.9 to 1,082.3, Mage
+718.8 unchanged, Priest 575.2 to 579.1. Two of those are not about the
+model. The Warrior's previous optimum still prices 846.3 on the new
+rows; Balance of Justice came into the pool with Robin Hoof's Heroic and
+the search, at three restarts and again at six, settles on a four-piece
+Balance of Justice build that reads less. The Priest's is a re-searched
+build with the same set. The Rogue's is all Shred, Knives Tempest's
+armour break, whose row went from 3 to 10 seconds: with that one row
+put back to 3, the same build reads 1,068.9, and every ledger of the
+capture prints what it printed on 25782799, line for line. With the
+installed row, the ledgers move only on the Rogue's two rotation blocks.
+Each ledger now opens by saying the capture is another build's.
+
+## 2026-10-14 - The first measured night, read again one block at a time
+
+The entry below is the night as its first ledgers read it, and most of
+what it calls a contradiction was the window, not the model. Each of
+those ledgers held a whole snapshot span - for the Warrior eleven
+stretches of play, five that pressed something and six that pressed
+nothing - against one model fight that pressed everything the span
+pressed anywhere. Cut by the driver's journal into its blocks, the same
+rows said something else.
+
+What the blocks confirmed. The dummy's armour is the level-1 pool of its
+row, to the integer: through a Warrior's 48.3% penetration 0.9453 of a
+hit gets in, and Rampage at full charge prices 852.5 against a logged
+853, nine presses of nine; Charge 231.9 against 232. The new base-attack
+rule holds on four weapons, each in a chain block of its own, ordinary
+hits against ordinary hits: Judgement 112.3 priced against 113.2 /
+111.4 / 108.3 logged by link, Beefury 14.6 against 15.0 / 15.1 / 15.1,
+the Silhouette of Almaz 28.8 against 28.6 / 27.5 / 28.9, Nibsham's
+Liberators 18.1 against 18.5 / 19.1 / 18.4 / 18.7 from behind. The armed
+Shockwave's x1.722 that looked short of x1.767 is the same rule in a
+fuller bracket - Shockwave stuns, so its own hit carries Domination's
++0.25 and the register's +0.15 sums with it: (1 + 0.25 + 0.15) / (1 +
+0.25) x 1.5366 = 1.721. A Lethal Poison tick takes the applier's Fervor
+and mastery (68.95 priced, 69 logged), and a foe-worn poison of another
+class, Swarm, logged 25.5 where the applier's side prices 25.3 and the
+wearer's 21.7.
+
+What was protocol. Rampage's +41.8% was three charge levels and the
+armed crits in one window. Surging Force's +21% was the statuses only a
+swing applies: pressed a few seconds after a chain it logged 178, alone
+154. The base attacks' 3 to 12% was buffs the chain blocks never
+pressed, the model's 21.7% crit share against the 10 to 15% a minute of
+swings happened to roll, and the ceiling - on a 15-damage swing the
+log's rounding alone is 3%. The Rogue's -4.7 to -7.3% was a window that
+held both sides of the dummy.
+
+What was the model, and is fixed, each found because a block disagreed
+and each read off a row or the bytecode before it was changed. Queen's
+Decree had been refused; it adds 1 inside the next magic skill's damage
+bracket - x1.930 on that sheet, not x2 - and that was most of the three
+spells read 21 to 36% low (Static Nova 450.0 priced, 451 logged). An
+enchant in the arsenal weapon grants nothing: `Gear.getSkills` skips
+the arsenal's slot and `Weapon.canGiveSlotSkills` answers false for the
+secondary weapon, and the Rogue with Devote in her arsenal daggers
+logged not one stack of it in 15,489 damage rows, while the default
+Warrior had worn a second enchant there and been paid for it. A trinket's status scales
+through the trinket alone: 36.25 a tick where the bench said 45, 37
+logged. A tick reads the target as it lands - 69 and 71 inside one
+application as an armour break came and went. An aura that follows its
+wearer has no hit at spawn (Hive Swarm's first row 0.95 seconds after
+the press). A status step a swing plays is not an attack: Purging
+Strikes crit on 9.9% of 302 hits where the swings that played it crit
+on 17.6%. Combo Points pay a skill different from the last one that
+paid, which gives the logged count on 157 to 160 of 181 Finishers where
+paying every skill gives it on 100 to 107. Gash pays over four ticks,
+not four and a half, and counts the Chaos Mark and not the hidden dose
+marker. What a status on the target adds sums with the attacker's
+riders (Death Mark: 456 to 484 logged where a product gives 524).
+Beefury's "attack twice" is a second hit, not 7% on the first. Brutal
+Frenzy's second strike rolls again on its own hit: 42 strikes after 112
+finishers, 0.375 a finisher, where the model had priced a quarter; it
+prices p / (1 - p) now, 0.333. The x1.27 between the two sides of a
+dummy was never a new effect: it is the Rogue's two daggers' upgrade
+perks, 0.12 and 0.14, which the model already billed at a share of
+swings.
+
+Three rules came out of it, and a comparison rests on them now. The log
+writes the CEILING of a hit: five lines that do not vary log 230 for
+229.3, 145 for 144.3, 353 for 352.4, 299 for 298.1 and 188 for 187.6,
+which rounding misses four times and flooring five, so a whole-number
+stream is compared with the model plus a half. A window must match what
+was pressed: one block, priced with the build standing in it, played as
+it was pressed or for as long as it lasted, from the side it was fought
+from - and a window that pressed nothing still holds what was pressed
+before it. And a rate is comparable only like for like: one fight on
+one target instance over its time in play. The yard's three dummies are
+three targets - 36.5 a second of the Rogue's damage fell on the two she
+was not fighting - and a replay's swings stay on the model's clock. Like
+for like, the Rogue's own rotation lands 4.5% more a second than the
+capture over sixteen talent steps, its hits 4.1% smaller and 9.0% more
+numerous.
+
+The tool had to learn the same rules before it could show them. `bench
+verify` had no end to a window, no split of ordinary from critical hits,
+no hold on the instance being fought and no word for damage a window
+inherited; a replay of a build that took a second pass printed the
+discarded pass's count over an all-MISSING ledger; and its default
+window, a snapshot's span, ran for the Mage 25,632 seconds into a third
+session nobody had journaled. Each of those is a flag or a line of the
+ledger now, and the ledger says above its table when a window is not
+one fight.
+
+A review of the whole change before it was accepted then re-derived
+what had been fixed and found more in the same rows. Cooldown Reduction
+is latched when a cooldown starts: a 20-second clock begun under Mystic
+Empowerment, which ended 4.9 seconds in, took 13.03. The arsenal weapon
+hands out no Block either, which took the Mage's sheet check from 11 of
+12 to 12 of 12 - the 39 of 40 the night reported is 40 of 40. Other
+players in the same yard wear infusions: 9,657 rows from 33 of them say
+when Seals of Atonement, Hive Venom and Fermentation fire, and none says
+how much. The default optima moved through all of it from 852.2 /
+1,036.4 / 677.7 / 571.4 to 846.3 / 1,068.9 / 718.8 / 575.2.
+
+What stays open is in the audit with both numbers, and the read stands
+beside each: the Finisher's points (4.07 held a press in the capture,
+2.12 in the model's rotation, because Urge to Kill is cast by nobody in
+the fight), Domination's rank-3 bonus paid at a share of the fight
+(+5.5% and +4.9% on two lines of their own block), the Raclette Pan's
+crit chance (62 critical of 385 where its price expects 21.7%), Chaos
+Bolts' reset rolled once a finisher where the game rolls it per bolt
+(47 in 268), and two link readings wider than the rest (+4.1% and +6.6%
+on 17 and 13 swings). The lesson of the night is the first rule above
+in another form: a ledger over a whole span is a mix of states before it
+is a verdict, and the entry below quoted it as one.
+
+## 2026-10-13 - The first measured night: the register held to the digit, and three spells did not
+
+For five days every rule the model carried on the new build was a
+reading. The capture chain was dead where the September entry left it:
+the HLX loader's vendored HashLink stopped at bytecode v5 and the build
+ships v6. The loader and the probe were rebuilt - bench-probe v10, 15 of
+15 hooks installed - and two driven sessions were recorded on the
+training dummies in Tyrna with four level-25 characters. Each session
+row carries the size and time of the hlboot.dat it ran against
+(14789204 bytes), which is what makes a row evidence about this build
+rather than about a log that happened to be lying there.
+
+What the night confirmed, it confirmed to the digit. Domination's
+register: Rampage at full charge reads 853 with no spread and 1310 on a
+natural crit; after a Charge it reads 1507, ten times in ten, and 1507 /
+853 is x1.767 against a natural x1.536 - the forced crit and x1.150 on
+top, at all three charge levels (628 / 356, 1005 / 569, 1507 / 853).
+Tear Reality, the other weapon's skill, spends it too (571 for 324);
+basic attacks do not (35 rows passed under it); it did not time out in
+82.9 seconds; and the target need not still be stunned - Charge's one
+second had ended 2.6 seconds earlier. That is the script, line for
+line. Rampage's three charge levels come out in the authored 2.5 : 4 : 6
+(356 / 569 / 853). The Rogue's dose gate is four marker statuses and a
+counter; the third kind applies Lethal Poison in the same millisecond;
+a third dose on a poisoned dummy is a Physical row of 272 under the
+same skill id and the twenty seconds start again. Powerful Toxins is
+x1.10 and x1.20 on tick and direct hit alike. Deadly Poison at two
+points crits 73 direct hits of 140. Brutal Frenzy's second strike lands
+93 to 102ms after its finisher at 0.63 of it - 145 after 230, 188 after
+299 - which is the row's 0.9 over its 1.43.
+
+What it contradicted is the more useful half. Three Mage spells read 21
+to 36% LOW per hit - Demonic Discharge -25.0%, Spark Beam -21.4%, Static
+Nova -35.8% on six hits - and two lines the model does not have at all:
+the imps' own swing (56 hits of 39.7), which the new probe logs under
+the owner's name where the old one logged a summon source, and Queen's
+Decree (41 hits of 28.1). The Rogue's Finisher is +24.7%, the burn of
+her daggers' passive +61.3%, her trinket's tick +23.5%. Surging Force is
++21.0% on six hits. And base attacks are over-claimed on three of four
+weapons by 3 to 12% - which settles the direction of the WeaponPower
+rule (the previous one is excluded by a factor) and leaves its size
+open. None of that is gear: the sheet check is within 1% on 39 of 40
+attributes.
+
+Two things it found that nobody had asked. Opportunity Strike does
+nothing visible: 93 Envenom rows on 187 basic hits after the point was
+spent, 272 on 526 before, no doubled row, no new id. And Brutal Frenzy's
+second strike can roll another - one finisher of 265 is followed by
+four strikes of 167, a hundred milliseconds apart - which the model
+prices as a floor. The Rogue's base attacks also hit about x1.27 harder
+from one side of a dummy than from the other, with no status row to
+mark it. (Both are settled in the entry above: the strike's re-roll is
+priced, and the x1.27 is her daggers' upgrade perks, 0.12 and 0.14,
+which the model already billed at a share of swings.)
+
+The Warrior's +41.8% on Rampage is not in the list above on purpose. The
+window mixes three charge levels and the armed crits, and the model
+prices every cast at full charge: it is a protocol artefact until it is
+sliced, and reporting it beside the others would be the same mistake as
+the August meter's "the base chain matches absolutely". (Sliced, the
+full-charge presses read 852.5 priced against 853 logged, nine of nine.)
+
+What a dummy cannot say stays a reading: a boss, an immune target, a
+heroic row, an infusion, a talent nobody had spent. The reconciliation
+of the open lines is under way as this is written (its result is the
+entry of 2026-10-14 above), on one rule: a
+change must be the game's rule AND agree with the rows, and where the
+read and the rows disagree with no cause found, the read stays and both
+numbers go in the audit.
+
+## 2026-10-12 - The client no longer carries its server half
+
+The September entry ended on the citation gate: every one of the 102
+citations had moved and none was missing. On the live build that was
+true and it hid the real loss. Six of the functions the model cites
+resolve to a body three ops long: load a constant string, wrap it in an
+exception, throw. The string is "!isServer". The previous build kept
+those bodies behind a runtime guard - `if (!simulatingServer &&
+!Config.server) throw` and then a hundred and fifty ops of applyDamage;
+this one ships the throw alone, 202 times. applyDamage, receiveDamage,
+applyEffect, addStatus, Status.refresh, applyAffixes, playStep,
+dropLoot: the functions half of the August reads were taken from.
+
+So "MOVED" was the wrong word for them, and the dangerous one, because
+re-anchoring a moved citation is mechanical. A fresh number on a
+sentence that says "applyDamage does X" would have been a forged
+re-read: the number resolves, the sentence looks checked, and nothing
+on this client can check it. The pipeline has a state for that now -
+STUB - and the rule that goes with it: the number is never rewritten
+for you; the sentence has to say which build the read dates from. The
+other 121 functions that only throw say "TODO" or "Not implemented" and
+were never bodies to lose; only the one constant means the client
+dropped something.
+
+What is left to read is the shared code, and it is more than it sounds:
+the scaler that turns a ratio and an attribute into a number, the
+context a hit is priced in, the unit merge, the loot roll, every
+script. What is gone is the consumer of each. The tick's bracket is
+read; that the server multiplies a tick by it is the August body. The
+hook Domination arms on is named in the script; its dispatcher was in
+addStatus. Each such rule is scored, sits in the audit as an
+assumption, and names the one reading in game that would settle it,
+which is why the audit stands at 92 entries and 60 of them are
+assumptions (121 and 66 by 2026-10-17, 44 of them verified).
+
+## 2026-10-12 - The rule that moved under an unchanged function
+
+Base attacks priced x1.3 to x1.9 too high on the new build and nothing
+in the report said why. The function everyone reads first for a scaling
+entry, getStepEffectScaling, had moved and nothing else. The swing rows
+hashed as they did - 57 base-attack rows unchanged, GreatSword down from
+0.95 to 0.7, the Halos swings retuned - so the data had not compensated
+for anything.
+
+The rule had moved in two places a diff of that function cannot show.
+The closure that prices the WeaponPower flat gained ONE op: its last
+multiply uses the 1 / count factor its predecessor unpacked and never
+used - a pre-patch dump of the function differs from today's in exactly
+that op. And the WeaponPower attribute row gained the ItemScaling flag,
+so the attribute half keeps 1 - 0.4 of its ratio like any weapon
+skill's: the row's accepted hash is reproduced only by today's row with
+its flags set back to zero. Together: R x the mean over the weapon's
+aptitudes of (0.4 x budget + 0.6 x attribute), where the measured rule
+was R x (0.4 x the SUM of the budgets + the whole attribute). A
+dual-aptitude swing is worth about 0.53 of what it was, a
+single-aptitude one about 0.76.
+
+Refuted on the way: the handedness factor the August dummy readings had
+suggested (none exists anywhere in the damage path), and the first
+draft's pool-tick bracket,
+which read as a double count of DamageModifier and was removed, then
+put back - the copy inside the banked hit is the hit's own and the
+tick's context is a second one.
+
+It cost the Warrior 8.6% of its default optimum on its own (603.6 to
+551.4), Judgement's three swings going from 158.9 dps to 95.3. It was
+scored at once as an assumption, with the tooltip that would check the
+client's reading and the swing-against-class-skill ratio that would
+check the server's, 1.89x apart between the two rules on a
+dual-aptitude one-hander. The capture has since done the second: the
+old rule is excluded and the new one sits 3 to 12% high on three
+weapons. Close is not exact, and the gap is open. (That was the
+whole-span ledgers of the night. Block by block, ordinary hit against
+ordinary hit, fifteen of seventeen link readings come within 3%: the
+entry of 2026-10-14.)
+
+The lesson is about the pipeline and has its own entry below: a
+citation that MOVED says where a function is and nothing about what is
+in it.
+
+## 2026-10-12 - The dummy grew armour, and the ladder lost a sum
+
+Every "0-armour dummy" calibration in this log stood on a row that
+really was zero. On the new build the Dummy unit authors 0.40 / 0.40.
+It carries no level, the five spawners that place it name none, and a
+level-less unit nothing summons is made at level 1 - the level all
+5,013 pre-patch hits on it that logged a level were logged at (47,001
+more logged none) - so its pool is 323, built
+at level 1 and divided at the striker's: a level-25 character gets
+89.9% through. `none` is the zero-mitigation target now, and `dummy` is
+the unit.
+
+Pulling on that thread took the armour law of 2026-08-11 with it. That
+law made a unit's pool the SUM of every reduction row in its
+inheritance closure, and it was fitted - two fitters and a judge - to
+boss windows. The client's unit merge keeps one row per attribute and
+throws if two survive. And the pre-patch capture had the evidence all
+along, one level down from where it was looked for: for one hero and
+one skill, a unit with its own 0.25 row under an inherited 0.30 takes
+MORE than a plain 0.30 unit at the same logged level in 186 of 201
+pairs, median 1.073, where one row predicts 1.071 and a sum 0.811. The
+sum read small mobs at 43% for an authored 25%, big ones at 49% for
+35%, elites and the inheriting bosses at 52% for 40%.
+
+The fitted spawn levels went with it - rift 6.9, arena 7.9, dungeon 12
+- because 296 of the 300 unit archetypes the capture logged a level for
+were only ever at their row's level, their summoners' or at 25. What
+the boss windows had really shown, a boss taking more than either
+reading allows, is put down to party armour shreds, and that is
+inferred: the target's live armour was never logged.
+
+One refutation inside the fix is worth keeping. A level-less summoned
+row was first stood at level 1 like the dummy; the capture had logged
+Chaotic Portals at 25 (2,853 rows) and 24 (327), never at 1. Every
+summon path hands the constructor its summoner's level. And "equal
+physical and magical reduction on every real foe" was false by one
+unit nobody had listed: Snack of Ratsar authors an Armor value of 0
+under a parent with 0.30, and the merge keeps a row that has a value.
+
+The default optimum moved by a tenth of a dps (603.6 to 603.7) - the
+boss is still 0.40 at your level, 1,923.33 rounded to 1,923 as the game
+rounds it - and every other target moved a great deal.
+Ratsar went from 1,177 at a fitted level 6.9 to 923 at his row's level
+10. Heroic is read the same way: 27 stat rows on 9 units apply only
+there, and 8 heroic bosses resolve to 0.40 at the level cap.
+
+## 2026-10-12 - Gear never rolled, and twenty-six rows nobody hands out
+
+The suite's rarity-ceiling tests failed in September with the message
+they were written to fail with, and the obvious repair - let gear reach
+Epic - was wrong in a way the tests could not say. The update's Epic
+armour is not a roll of the Rare piece: it is another row, with other
+stats. The rarity draw is in makeLootItem and its first test skips
+anything that is not a Weapon. So the optimizer had been pricing a Rare
+chest "as Epic" beside the real Epic chest, a phantom with the wrong
+budget, and the fix was to stop rolling gear at all. A weapon's share
+is normalised over the rarities at or above its row's: 71.4 / 27.1 /
+1.43 for a Rare-authored weapon at level 25.
+
+Then the Epic rows themselves. Fifteen per armour slot; 26 of them sit
+only in four loot tables that nothing names. "Nothing" needed three
+readers before it could be said: the cdb rows, the prefabs inside the
+paks - the element, activity and spawner sheets are empty in data.cdb
+because their rows live in 4,597 level files - and string literals in
+compiled code, because eight loot tables are named nowhere else. The
+first version of the sentence was false in both directions: it called a
+table dead that a prefab kept alive, and counted a shop line behind a
+Development flag as a source. A gate is judged by name now or not at
+all, an unjudged source withholds nothing, and the reason is printed.
+
+It also found that the default `--exclude ^GM_`, kept since the first
+version to hide developer rows, had been hiding Pocket Hive, a real
+weapon. The exclusion is gone.
+
+Withholding the 26 cost the Rogue, the Mage and the Priest about 2%
+each (626.1 to 615.4, 467.3 to 456.2, 498.2 to 489.7); the Warrior wore
+none of them.
+
+## 2026-10-12 - Infusion: counted per id, fought beside the rotation, measured by nobody
+
+The September entry read the new system off the row counts and got one
+number wrong: the bonus rating is not "a quarter of a normal secondary
+gain". The ratio is 0.4 of the InfusionBonus aptitude's own budget at
+the piece's item level, not divided by the piece's aptitude count: +14
+on a chest at the level cap, 89 rating over eight lit pieces.
+
+The structure is all in the client and reads cleanly. Epic armour with
+a faction can carry one of 15 set passives; the rank is how many of the
+caps 2 / 4 / 6 the count of pieces carrying the SAME infusion reaches;
+the game titles the ranks with those caps. A third rank namespace,
+after weapon mastery and talent points, and the suite now fails by name
+on a fourth. One thing is not in the client: the line that attaches the
+passive. That it exists only from the first cap is inferred from the
+titles, and one infused piece and a character-sheet read would settle
+it.
+
+Two things came out of the search that nobody proposed. Sets are
+counted per infusion id, so two DIFFERENT Nightling infusions that each
+grant +4 Fervor at four pieces beat any six-piece set on priced stats:
+until the scripts were priced all four classes ended on four pieces of
+Gift Beyond Realities and four of Blood Oath. And 11 of the 15 can be learned at all - eight
+from a Heroic boss, three sold by one merchant; the other four drop in
+Heroics the level files mark Development.
+
+Then the scripts. The first design pushed a set passive through the
+rotation like any triggered skill and was refuted before it ran: it
+lost rows on four sets, double-counted one, and left twenty readers
+asking the weapon's rank about a set. So a set fights BESIDE the
+rotation - the cached rotation is the same object with and without four
+sets - as one of five shapes: a status an event puts up, a debuff an
+event stacks on the foe, a step played on an event, a cast a counter
+arms, two statuses a timer swaps. Eight of the fifteen have a part of
+that kind. Pricing them moved every optimum off the two Nightling sets
+and onto mixed ones, and the Mage changed main hand to carry a rider
+that pays per base-attack damage instance.
+
+It is the largest unmeasured block in the tool. No captured character
+wears an infusion; Seals of Atonement firing per damage instance and
+Wet stacking on a control the target refuses are the two readings the
+numbers lean on hardest. (Both were measured later on other players'
+rows in the 2026-10-13 log - 529 of 529, and 4 of 4 on a NoStun unit -
+which say when a set fires and not how much it deals.) One measured consequence of the composition:
+with Thornlace and six pieces of Overwhelming Tides the same set is
+worth +12.5% or +38.3% depending on how often the weapon's bonus hit
+fires (61 against 525), because every fire is an attempt and every
+attempt a stack.
+
+## 2026-10-12 - The poison counts doses now, and the bank was read from the wrong hook
+
+The update rebuilt Lethal Poison and the Rogue's tree with it, and the
+model priced the whole mechanic at zero: its optimum spent its points
+on Footwork, Adrenaline and Toxic Miasmas. Read off the script: one
+hidden dose per skill category the first time a cast of that category
+hits - weapon skill, class skill, the chain's finisher, the signature -
+three doses convert into the poison, and applying it to a target that
+already wears it plays a 1.5 x Dexterity Physical hit. With it priced a
+build nobody chose for the mechanic went from 535.3 to 744.5, and the
+search then re-cut the tree around it.
+
+The ticks were a trap of their own. The row authors 4 x Dexterity and a
+loop flagged SpreadEffects, so that is the total over ten ticks; read
+per tick it is ten times too rich, and the suite pins it.
+
+Three things were first read wrong and are worth the record. Improved
+Mixture's income was cited to ops that raise the RECEIVER's hooks, not
+the one the talent listens on: its script hears onInflictStatus, which
+is raised only when a status starts, so a cast of a category already
+dosed banks nothing - one stack per new dose, not per application.
+"canApply is true" was taken for "the fight applies it", which credited
+Adrenaline for a poison the build never laid. And Recovery Toxins made
+Gash count a status its own wearer carries.
+
+The capture has since walked the tree one point at a time and the gate,
+the direct hit and the bracket hold. It also showed that Improved
+Mixture's stacks cap at 3 and then 5 by rank and follow the talent's
+text - spent by the final combo - where the glossary under the node
+says the signature.
+
+One cost, stated: the Rogue's default search is about 2.3 times slower
+(243 seconds against 104 on a shared machine). The profile points at
+shared code - the rollout and a string-keyed pricing cache - not at the
+poison. (A cache keyed on interned state identity was built since and
+measured slower; the cause is still open.)
+
+## 2026-10-12 - Domination was read, listed as scored, and applied to no cast
+
+The August model read Domination's +25% against a stunned target,
+printed it under what it scored, and applied it to nothing: the rider
+sits in the passive's own damage hook, and a passive lands no hit. It
+took the update rewriting the script to find that, because the rewrite
+crashed the suite. The new passive is two mechanisms. A stun you apply
+arms a status on you, and the next weapon-skill use is a certain crit
+with +10%, or +15% from weapon rank 2. And at rank 3 every hit you land
+on a crowd-controlled target takes +25% - the owner's rider, which is
+the routing the old one needed too.
+
+The register turned out to be worth far more than its first estimate
+of 7 to 8%: +9.6% on the unchanged optimum (587.6 to 644.0), because
+every forced crit also feeds Hemorrhage, and +33% once the search built
+around it and took Twin Pillars of Justice for a ten-second stun.
+
+Then the target answered back. The default boss is immune to crowd
+control, so the rank-3 rider is worth zero on it - the same command
+printed 854.5 while targets carried no immunity and 804.3 once they
+did. And immune is not the whole of it: 76 units carry a NoStun flag
+and 69 of them are not immune at all, so a root or a slow lands and a
+stun does not. A target carries both answers now. Crowd control got
+one reader on the way, and it found that Eruption had been read as
+stunning at weapon rank 1, where its script only plays the stun step
+from rank 3.
+
+Whether a stun the target REFUSES still arms the register is not in
+the client - the hook's dispatcher was in addStatus - and the default
+Warrior leans on it. The dummy measured everything else about the
+register on 2026-10-13 and cannot measure that.
+
+Found beside it: the Mage's "720.4 with one regex fixed" was a doubled
+chain. The build held High Voltage as a talent point and from a sigil,
+and each occurrence armed a register; one register prices that build at
+567.4 and the real optimum at 590.7. The September entry's guess that
+the register was "armed through a new onMageChainCast hook" was wrong
+too: the hook is old, and what changed is the accessor the consumer
+reads.
+
+## 2026-10-12 - What the pipeline could not see, the second time
+
+September fixed four things the alarm was deaf to. The live build found
+the rest, and the common shape is that the report said where a thing
+was and not what it was.
+
+A citation that resolves is not a citation that holds. Every cited
+function is now opened: its body is hashed by shape, names resolved, so
+a function that merely moved reads SAME and one whose contents moved
+reads CHANGED. That check would have caught the WeaponPower closure.
+It could not catch it this time - the August fingerprint predates body
+hashes, so every body reads "not comparable" until the next accept -
+which is the honest state and is printed as such.
+
+An anonymous function has no name to track. 6,274 functions are
+unnamed and 1,100 of them have a same-shape twin nearby; two twin pairs
+the model cites are each created by one function, so "the enclosing
+function" does not tell them apart. What is recorded is the owner at
+the top of the closure's maker chain and which of that owner's
+same-shape closures it is. "Nearest to the prediction" is no longer a
+rule anywhere: it was how a guess became a recorded fact, when a
+deferred SUSPECT pick was written into the table and came back the
+next run as the name the fingerprint recorded.
+
+A row that changed is not a number that changed. A renumbered enum
+re-hashed every row that used it; rows are decoded by name before
+hashing, and a third hash that ignores flags separates "a flag moved"
+from "a number moved". Of 85 changed skills, 47 changed in the script
+alone.
+
+And the capture line read a version byte. It reads evidence now:
+whether a probe log holds rows after a session row that names this
+hlboot.dat. Until the first session of 2026-10-13 it said nothing had
+been recorded on this build, and 160 in-game and 170 sheet-check items
+in the work list had nothing to be checked against.
+
+Still invisible, stated: a fact that lives only in a level prefab - a
+Heroic's release status, a shop line - which the source reader depends
+on and the fingerprint does not record; and whether a body shape
+survives a recompile at all, which only a second real build can show.
+If the next patch reads CHANGED on nearly everything, a normalisation
+is missing.
+---
+## 2026-09-10 - The first real patch day: the alarm rang, and it was half deaf
+
+The September 30 update reached the public test branch and went through
+`bench update` end to end - the first time the pipeline met a build it was
+not written against. It failed on the first line: the new hlboot.dat is
+HashLink bytecode VERSION 6 and the reader stopped at 5. Upstream code.c
+says v6 changes exactly one thing, a third index per debug `assign`. With
+it read, the 14.6MB file parses to exactly EOF, names resolve, debug lines
+attach. What the index MEANS the data said, not the source: for a
+function-scope local it equals the function's op count and for a block local
+its block's last op, so it is where the local's scope ends - the first guess,
+"the register it lives in", put 60,693 of 67,215 locals out of register range
+and the suite caught it. The reader takes v2-v6 now.
+
+What the run then said: 48748 functions (was 47342), every one of the 102
+citations MOVED, none missing; 46 skills, 143 items, 7 units, 3 item types,
+1 aptitude and 2 affinities added; 92 skill rows and 43 scripts changed.
+Read as a sentence rather than a list: a new gear system called Infusion
+(an `InfusionPassive` skill type, an `InfusionPattern` item type, an
+`InfusionBonus` aptitude scaling secondary ratings 150->1000 gear-only,
+constants capping it at 2/4/6 and pricing it at a quarter of a normal
+secondary gain), heroic dungeons (a `heroic` flag on skill effects, step
+conditions and unit stats - bosses at Vitality x50, FoePower x1.5 - on 29
+foe skills and 6 units, no player skill), an Epic tier of armour for every
+slot plus Epic trinkets, and emotes. The suite's rarity-ceiling tests failed
+with the message they were written to fail with: "if a patch authored Epic
+gear this is the expected change".
+
+Four things the pipeline could not see, all fixed:
+
+1. It aborted whole when the bytecode was unreadable, so the data drift was
+   hidden behind a reader bug. The halves are independent now; an unreadable
+   bytecode reports its citations as UNCHECKED and refuses --accept.
+2. It re-anchored a bare citation name to whichever same-named function came
+   first: `reset@7990` to a cursor class. 28 of the 102 names were
+   ambiguous. The first fix, nearest to the cached findex, was refuted by
+   reading all 28 picks against the disassembly: five were still wrong
+   (`evalCost@44627`, `onStop@44624`, `onStacksChange@44356` to interpreter
+   trampolines, `updateInf@8174` to a one-op stub, `isBaseAttack@6046` to a
+   step wrapper), because a patch moves each class block by its own amount -
+   +55, +74, +1192 on this build - and a same-named stub sat between the old
+   findex and the new one. Resolution now measures the shift from the nearest
+   unambiguous citation and takes the candidate nearest cached + shift; all
+   five land exactly. A pick still off the prediction is SUSPECT and blocks
+   --accept until the citation is qualified in src/, and the fingerprint
+   records the qualified name so a name is ambiguous at most once.
+3. `moveSet` (the CHAIN column) and `craft` were read but never
+   fingerprinted; `slot` was fingerprinted but is not a sheet; and the UI
+   server reads `gameTerm`, `color` and `icon` - the icon sheet gained 40
+   rows on this patch and the report said nothing. All fixed, and the suite
+   now lints the sheet list against every literal sheet name read through a
+   cdb in src/, bin/, tools/ and ui/.
+4. Row hashes cannot see a new enum case, column or custom-type case - the
+   readers decode those by name, so the one change they are blind to is the
+   one the fingerprint did not record. The schema is fingerprinted now, and
+   `--against <old data.cdb>` diffs it when the stored fingerprint predates
+   the feature: against the July copy in the modkit's output, 69 column
+   changes across 35 sheets and 2 custom types, `skill.type` gaining
+   `InfusionPassive` among them.
+
+The work list also grew two summaries - added ids sharing a word across
+sheets ("infusion: skill 5, item 2, itemType 1, constant 4, aptitude 1") and
+added items by rarity and type ("15 Epic Legs") - and calls out rows that
+read like a developer's scratch: `test`, a Common sword with no aptitude
+that the weapons table now ranks as a second Light Practice Sword.
+
+A regression pass over the command on copies of the repo - baseline,
+no-drift, drift, --accept, --json, an unreadable bytecode - found the
+flows intact and one older fault: `bench update --game X` never used X.
+The flag was parsed and then dropped, and the locator fell through to the
+cached path, so on a machine with two installs the report described
+whichever one was remembered. Fixed, with a refused --accept now exiting 1
+so a script can tell it from an accepted one.
+
+Two more things the same reading turned up. Opcode 101, carried since the
+first bytecode reader as a fork-only opcode of unknown purpose, is upstream
+HashLink's `OCatch` (one global per caught exception type, after OTrap):
+its 105 occurrences all resolve to exception classes. And the stat merge
+would have attached a parent curve to a heroic row when that row came first
+for its attribute; heroic rows are skipped now, and the audit says heroic
+dungeons are unmodelled.
+
+A completeness pass over the documented patch-day steps named what the
+report could not see, and the cheap half of it is closed: the fingerprint
+now records each script's hook names (the PTR declares nine the readers
+have never met, `onMageChainCast` among them), the player classes' talent
+trees (a moved talent used to surface as "unit Warrior changed"), a second
+row hash with texts and visuals stripped (19 of the 44 changed items only
+changed their name), and a hash per sheet the bench does not read; the
+citations are scanned in the commands, the tools, the UI server and the two
+living documents, not just src/; every header says when the install is not
+the accepted build; and `bench update` prints a CAPTURE line, which on this
+install reads: loader and probe are HLB v4 against a v6 boot, last probe
+log August 28. The in-game half is dead until farever-hlx is rebuilt for v6
+- its vendored hashlink stops at 5 - and the report now says so instead of
+routing a hundred items to a login that cannot happen.
+
+Not done, on purpose: the fingerprint is not accepted, no citation in src/
+is re-anchored, no model work is started. The suite's remaining failures are
+the work list in test form - Epic gear ceilings, the Mage HighVoltage
+register now armed through a new `onMageChainCast` hook, a fourth base
+attack on the Water Uppercut fists, the `test` sword. The in-game half is
+blocked in the other repo: the HLX loader vendors a hashlink whose
+`max_version` is 5. 1049 green, 16 red, and every red is the
+patch: nine slots that now reach Epic, a Rare chest that rolls Epic, five
+rank gates on a skill type the suite never met, the HighVoltage register,
+the `test` sword, the citation gate, the Uppercut bank.
+---
 ## 2026-08-12 - A bug net is not a greataxe, whatever the rig says
 
 CaptureNet inherits GreatAxe for the animation rig - its own type row is skills: [], moveSet: Staff, setup: Weapon_2H_GreatAxe.prefab - and the model read that cosmetic inherit as a mechanical one. Through it a bug-catching net collected two augment sockets, a block ability, and the first <Type>_Upgrade in the chain: GreatAxe_Upgrade, +2 CritChance, which lifted every line of the build about 1% and was the whole of the net's +4 dps over an empty arsenal slot. It is the same confusion that once handed this same net a Legendary greatsword's WeaponPower, and it is fixed the same way: by the item's own aptitudes. Net_Basic is the only aptitude-less item among the 37 that fit a weapon slot, so nothing a character fights with moves - Staff_Censer keeps its two sockets and Staff_Upgrade. An arsenal net now prices at exactly an empty slot, to six decimals, and the tripwire pins that end to end.
@@ -43,7 +739,7 @@ Conduit: Power's refusal predated the conduit economy: the model's stream once f
 
 ## 2026-08-11 - Replay: the capture's own fingers on the model's keyboard
 
-verify --replay replaces the sim's chooser with the recorded press timeline - each press fires at its recorded offset if the model agrees it was possible, the fight runs the window's own length, and every disagreement is counted and printed rather than absorbed: N replayed, N refused as not ready, N outside the model's rotation, N landed late. Cadence residuals collapse into formula verification - the Mage's conduit share reads -0.2pp and the Ultimate -0.1pp at her real sequence - and the refusals themselves are findings: utility casts the model does not press still advance the live chain counter, which is the next refinement this mode exposed on its first run. 918 green.
+verify --replay replaces the sim's chooser with the recorded press timeline - each press fires at its recorded offset if the model agrees it was possible, the fight runs the window's own length, and every disagreement is counted and printed rather than absorbed: N replayed, N refused as not ready, N outside the model's rotation, N landed late. Cadence residuals collapse into formula verification - the Mage's conduit share reads -0.2pp and the Ultimate -0.1pp at her real sequence - and the refusals themselves are findings: utility casts the model does not press still advance the live chain counter, which is the next refinement this mode exposed on its first run. 918 green. (2026-10: the swings between the presses stay the model's, on the model's clock, so a replay is a referee of the presses and not of a rate; the fight runs the window's own length only since 2026-10-13, when a replay of a build taking a second pass was also found printing the discarded pass's count over an all-MISSING ledger; and a replay refuses a window with no start.)
 
 ## 2026-08-11 - The Mage was three economies short, and the chain was never a crit rider
 
@@ -679,7 +1375,10 @@ demon trinket: `!hasStatus(dmg.target, X)` is the no-reapply gate with
 the recipient named instead of the owner, and a ROLL with no predicate
 on an inflict hook is floored to the swing-and-finisher clock - three
 percent per damage instance is a rate, and refusing a rate is not the
-discipline. The Swarm's rank-3 poison rides the same floor.
+discipline. The Swarm's rank-3 poison rides the same floor. (2026-10: still
+true of a buff or a debuff rolled that way; a DAMAGING status rolled in a
+damage hook is rolled on every damage instance now - the Finger of
+Sukuna'Maatata's curse.)
 
 The floor is for rolls only, and the hour it briefly was not proved
 why: an unconditional application floored to once per swing read
@@ -2413,6 +3112,9 @@ what it claims and nothing else.
 
 --swing-floor 0.7 restores the old reading. The residual 5% between 1810ms
 authored and 1903ms measured is unexplained and named rather than fitted.
+(2026-10: on build 25782799 it is a Free state of 10 to 17ms before every
+link - five links and five such gaps are the round to the millisecond - and
+still not priced.)
 
 Suite 664 green.
 

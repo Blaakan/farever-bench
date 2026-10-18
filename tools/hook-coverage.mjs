@@ -5,7 +5,8 @@
 //
 //   node tools/hook-coverage.mjs [--source <name>] [--since <ms>] [--top <n>]
 //
-// 427 of the game's 962 skill rows carry a `script` column of live Haxe, and
+// Close to half of the game's skill rows carry a `script` column of live Haxe
+// (427 of 962 in August 2026, 508 of 1098 after the October patch), and
 // the bench reads four things out of that text with regexes: addStatus, the
 // event predicate, checkProba, and vars.chance. Everything else in those
 // scripts is not executed. The open question has always been whether that

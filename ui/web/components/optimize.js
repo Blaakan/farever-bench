@@ -96,6 +96,10 @@ const ui = {
   below: null,        // .opt-below (meter + unmodelled), Profile only
 };
 
+// `pins.infusions` is sent ALWAYS, empty included: it is how the server tells
+// "the user stated these slots' infusions" from an older client that never
+// says, for which every pinned piece keeps the infusion it states. The two
+// infusion search options ride `options` with the rest.
 const collectRequest = () => ({
   loadout: App.state.loadout,
   pins: {
@@ -104,6 +108,7 @@ const collectRequest = () => ({
     skills: [...App.state.pins.skills],
     runes: [...App.state.pins.runes],
     talents: App.state.pins.talents,
+    infusions: [...App.state.pins.infusions],
   },
   options: { ...App.state.options, lookahead: 8, restarts: 3, allowEmpty: true },
 });
@@ -195,7 +200,7 @@ function subscribe(job) {
       renderErrorCard('the optimizer sent an unreadable result');
       return;
     }
-    App.result = { envelope: d.envelope, view: d.view, score: d.score };
+    App.result = { envelope: d.envelope, view: d.view, score: d.score, search: d.search ?? null };
     ui.tab = 'profile';           // a new answer always opens on the sheet
     ui.more = false;
     renderResult();
@@ -335,7 +340,7 @@ function selectTab(id) {
 }
 
 function renderTabBody() {
-  const { envelope, view } = App.result ?? {};
+  const { envelope, view, search } = App.result ?? {};
   const loadout = envelope?.build ?? null;
   if (!ui.body) return;
   ui.body.replaceChildren();
@@ -348,15 +353,17 @@ function renderTabBody() {
   if (ui.tab === 'talents') { renderTalentsTab(ui.body, loadout, view); return; }
   if (ui.tab === 'runes') { renderRunesTab(ui.body, loadout, view); return; }
 
-  renderProfileTab(ui.body, loadout, view);
+  renderProfileTab(ui.body, loadout, view, search);
   ui.below.appendChild(renderMeter(view, envelope, false));
   const un = renderUnmodelled(view);
   if (un) ui.below.appendChild(un);
+  const held = renderWithheld(search);
+  if (held) ui.below.appendChild(held);
 }
 
 // -------------------------------------------------------------- profile tab
 
-function renderProfileTab(host, loadout, view) {
+function renderProfileTab(host, loadout, view, search) {
   if (typeof window.SheetView?.renderBuild !== 'function') {
     renderFallbackSheet(host, loadout, view, 'the sheet renderer is not loaded');
     return;
@@ -365,6 +372,9 @@ function renderProfileTab(host, loadout, view) {
     window.SheetView.renderBuild(host, {
       loadout, view: statView(view, ui.more), boot: App.boot,
       catalog: App.catalog, title: 'Optimized', readOnly: true,
+      // what the search was allowed to do - the sheet's Infusions block
+      // prints the infusion half of it under the sets it found
+      search,
     });
   } catch (e) {
     host.replaceChildren();
@@ -665,6 +675,39 @@ function renderUnmodelled(view) {
   for (const u of list) {
     ul.appendChild(el('li', null,
       `${u?.name ?? '?'}${u?.why ? ` — ${u.why}` : ''}`));
+  }
+  det.appendChild(ul);
+  return det;
+}
+
+// The gear rows the search was NOT offered, and on what evidence. The catalog
+// withholds a row nothing in the install hands out and a row whose every copy
+// exists above the character's level; a filter nobody can see is a filter
+// nobody can check, so the answer names each one with the source reader's own
+// sentence. With a store the reader could not open nothing is withheld at all,
+// and that is said instead.
+function renderWithheld(search) {
+  const g = search?.gear;
+  if (!g) return null;
+  const list = Array.isArray(g.withheld) ? g.withheld : [];
+  if (!list.length && !g.unread) return null;
+  const det = el('details', 'opt-unmodelled opt-withheld');
+  if (!list.length) {
+    det.appendChild(el('summary', null, 'not offered to the search: nothing'));
+    det.appendChild(el('div', 'opt-note',
+      `${g.unread}, so no row could be shown to be unobtainable`));
+    return det;
+  }
+  const gone = list.filter((w) => w.kind === 'unreleased').length;
+  const high = list.length - gone;
+  const bits = [];
+  if (gone) bits.push(`${gone} nothing in this install hands out`);
+  if (high) bits.push(`${high} that only exist above this level`);
+  det.appendChild(el('summary', null,
+    `not offered to the search: ${list.length} gear ${list.length === 1 ? 'row' : 'rows'} (${bits.join(', ')})`));
+  const ul = el('ul');
+  for (const w of list) {
+    ul.appendChild(el('li', null, `${w.name ?? w.id} - ${w.why}`));
   }
   det.appendChild(ul);
   return det;

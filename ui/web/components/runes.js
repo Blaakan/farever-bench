@@ -46,10 +46,14 @@ const UNMOD_TIP = '<div class="tname tgold">Not modelled</div>' +
 const tipCache = new Map();          // 'skill|rank|rune|build' -> Promise<html>
 
 // Cheap identity for a loadout: what a tooltip's numbers actually depend on.
+// The three infusion fields are part of it - a set's stat rows and a lit bonus
+// line move the sheet a tooltip is priced against, and a key without them
+// served the pre-infusion number from the cache.
 const buildKey = (l) => !l ? '-' : [
   l.class, l.level,
   Object.entries(l.gear || {}).map(([k, v]) =>
-    `${k}:${v?.item}@${v?.rarity ?? ''}*${v?.stars ?? 0}^${v?.level ?? ''}`).join(','),
+    `${k}:${v?.item}@${v?.rarity ?? ''}*${v?.stars ?? 0}^${v?.level ?? ''}`
+    + `~${v?.infusion ?? ''}/${v?.infusionStat ?? ''}${v?.prismatic ? '!' : ''}`).join(','),
   Object.entries(l.augments || {}).map(([k, v]) => `${k}=${v}`).join(','),
   Object.entries(l.talents || {}).map(([k, v]) => `${k}=${v}`).join(','),
 ].join('|');

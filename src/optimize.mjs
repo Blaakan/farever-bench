@@ -29,6 +29,14 @@
 //     (an armour piece's faction decides which rating it can carry, and the
 //     Demon augments convert one rating into another), so the search restarts
 //     from several seeds and keeps the best. `--restarts` controls how many.
+//
+//   * An infusion is not a per-slot coordinate. A set pays at 2, 4 and 6
+//     pieces of the SAME infusion and nothing in between, so walking one slot
+//     at a time never sees a threshold: the first piece of a set is worth
+//     nothing and so is the third. Infusions are therefore assigned as a PLAN
+//     over the armour the build is wearing - see `infusionPass` - and a piece
+//     swapped by the gear pass keeps its slot's infusion, so a set is not
+//     broken just by trying a different chest.
 // ---------------------------------------------------------------------------
 
 import { socketsOf, pruneIllegal, illegalReason } from './loadout.mjs';
@@ -57,6 +65,86 @@ function shuffled(arr, rand) {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+/**
+ * Hand each planned infusion set its pieces: {infusion -> count} over the
+ * slots given, as {slot -> infusion}.
+ *
+ * WHICH pieces a set takes changes nothing about the set - any `count` pieces
+ * reach the cap - and everything about the bonus lines: a piece is paid its
+ * line only under an infusion of its own faction
+ * (st.item.Gear.isInfusionBonusActive@9766), so a set that fills up with a
+ * piece ANOTHER planned set matches leaves that set to fill up with one it
+ * does not, and a line stays dark for nothing. Handing the sets their pieces
+ * one set at a time did exactly that: with Hive Venom and Chain Heal at four
+ * pieces each on a Mage, the Bee set took the Manfish head as its filler, the
+ * Manfish set was left the Kobold legs, and the build read 479.9 where the
+ * same two sets, swapped by hand, read 482.7.
+ *
+ * So the assignment is solved whole: of every way to give each set exactly
+ * its count, the one that lights the most RATING - a chest's line is worth
+ * twice a cloak's, so the piece that has to go dark is the one that pays
+ * least. There are at most eight armour slots and as many sets as the
+ * smallest cap divides them into, so the table is a few hundred states.
+ * Ties go to the earlier slot and the larger set, which keeps the answer the
+ * same from run to run.
+ *
+ * NOT weighed: what the rating a piece can roll is worth to the class. Two
+ * assignments that light the same rating can differ there, and only the
+ * fight could tell them apart.
+ *
+ * @param slots  slot ids, in slot order
+ * @param plan   Map(infusion id -> pieces) or [[id, pieces]]
+ * @param fits   (slot, infusion) -> is the piece's bonus line lit under it
+ * @param worth  (slot) -> the rating a lit line pays on that piece
+ * @param fill   (slot) -> the infusion a piece NO set takes is handed, or
+ *               null; omitted, such a piece is left bare
+ */
+export function assignInfusionSlots(slots, plan, { fits, worth, fill = null }) {
+  const sets = [...plan].filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  // A plan asking for more pieces than there are is cut short from its
+  // smallest set - the callers never build one, and this must not loop.
+  let room = slots.length;
+  const need = sets.map(([, n]) => { const c = Math.min(n, room); room -= c; return c; });
+  const pays = slots.map((s) => Math.max(0, worth(s) ?? 0));
+  const spare = slots.map((s) => (fill ? fill(s) ?? null : null));
+  const spareLit = spare.map((id, i) => id != null && fits(slots[i], id));
+
+  const memo = new Map();
+  // The most rating slots[i..] can light with `left[j]` pieces still owed to
+  // set j, and the choice at i that gets it (-1: no set takes the piece).
+  const best = (i, left) => {
+    if (i === slots.length) return { value: 0, pick: -1 };
+    const key = `${i}:${left.join(',')}`;
+    let hit = memo.get(key);
+    if (hit) return hit;
+    for (let j = 0; j < sets.length; j++) {
+      if (!left[j]) continue;
+      left[j]--;
+      const value = best(i + 1, left).value + (fits(slots[i], sets[j][0]) ? pays[i] : 0);
+      left[j]++;
+      if (!hit || value > hit.value + 1e-9) hit = { value, pick: j };
+    }
+    // The piece can be left to no set only while the rest still cover what
+    // the sets are owed.
+    if (slots.length - i > left.reduce((a, b) => a + b, 0)) {
+      const value = best(i + 1, left).value + (spareLit[i] ? pays[i] : 0);
+      if (!hit || value > hit.value + 1e-9) hit = { value, pick: -1 };
+    }
+    memo.set(key, hit);
+    return hit;
+  };
+
+  const out = new Map();
+  const left = need.slice();
+  for (let i = 0; i < slots.length; i++) {
+    const { pick } = best(i, left);
+    if (pick >= 0) { out.set(slots[i], sets[pick][0]); left[pick]--; }
+    else if (spare[i]) out.set(slots[i], spare[i]);
+  }
+  return out;
 }
 
 /**
@@ -92,6 +180,29 @@ export function optimize(engine, spec) {
   // Skill pools the user chose by hand.
   const pinnedSkills = spec.pinnedSkills ?? new Set();
   const pinnedRunes = spec.pinnedRunes ?? new Set();
+  // Slots whose INFUSION is fixed as the seed states it - none stated means
+  // not infused. Left unsaid, that is every pinned slot: a caller that holds a
+  // piece fixed holds all of it. The CLI narrows it to the pins that carry a
+  // `~` part, so pinning a chest there leaves its infusion searchable the
+  // same way it leaves its sockets searchable.
+  const pinnedInfusion = spec.pinnedInfusion ?? pinnedGear;
+  // Which infusions the search may hand out. The default is every one this
+  // install does not show to be unobtainable - a pattern whose only source is
+  // a Heroic the client refuses to open is withheld, one whose source could
+  // not be judged is not. `[]` turns the pass off.
+  //
+  // Both this and the stat policy below fall back to the ENGINE's options
+  // before their own defaults: they describe the run, and bench has a dozen
+  // optimize() call sites that would each have to remember to pass them.
+  const infusionIds = (spec.infusions ?? engine.opts?.infusions
+    ?? [...cat.infusions.keys()].filter((id) => cat.infusionSource(id)?.state !== 'unreleased'))
+    .filter((id) => cat.infusions.has(id));
+  // What an infused piece nobody owns is taken to have rolled. `none` prices
+  // no bonus line at all - a floor, and the default, because the roll is the
+  // game's and not a choice. `best` and a named rating are for asking what a
+  // set COULD be worth; they only ever light a faction-matched piece, never a
+  // Prismatic one.
+  const statPolicy = spec.infusionStat ?? engine.opts?.infusionStat ?? 'none';
 
   // The objective the FIGHT maximises. A single goal is handed through so the
   // derived rotation plays for it; a blend keeps the fight's everything-counts
@@ -128,6 +239,7 @@ export function optimize(engine, spec) {
     const list = cat.candidates(slotId, {
       aptitude: cls.aptitude, charLevel: spec.loadout.level,
       rarities, exclude: spec.exclude, rarityRoll: spec.rarityRoll, rarityCap: spec.rarityCap,
+      includeUnreleased: spec.includeUnreleased ?? null,
     }).map((c) => ({
       item: c.item.id,
       rarity: c.rarity,
@@ -154,7 +266,7 @@ export function optimize(engine, spec) {
   function augOptions(type) {
     let l = augCandidates.get(type);
     if (!l) {
-      l = cat.augmentCandidates(type, { exclude: spec.exclude })
+      l = cat.augmentCandidates(type, { exclude: spec.exclude, includeUnreleased: spec.includeUnreleased ?? null })
         // A sigil grants a talent, and a talent belongs to exactly one class.
         // All twelve fit the socket; only this class's three are legal to wear
         // meaningfully, and offering the rest let the search pin a Warrior
@@ -277,7 +389,10 @@ export function optimize(engine, spec) {
     // Only the decisions matter, so key on them rather than the whole object.
     const key = cat.combatSlots().map((s) => {
       const g = loadout.gear[s.id];
-      return g ? `${s.id}=${g.item}/${g.rarity ?? ''}:${g.stars ?? 0}${g.flawless ? 'f' : ''}~${g.generic ?? ''}` : '';
+      // ...and what the piece is infused with. Without it the first plan the
+      // infusion pass scored would be served back for every other one.
+      return g ? `${s.id}=${g.item}/${g.rarity ?? ''}:${g.stars ?? 0}${g.flawless ? 'f' : ''}~${g.generic ?? ''}`
+        + `^${g.infusion ?? ''}/${g.infusionStat ?? ''}${g.prismatic ? '!' : ''}` : '';
     }).join('|')
       + '#' + Object.entries(loadout.augments).filter(([, v]) => v).sort().map(([k, v]) => k + '=' + v).join('|')
       + '$' + Object.entries(loadout.skills ?? {}).sort().map(([k, v]) => k + '=' + v.join('+')).join('|')
@@ -309,7 +424,12 @@ export function optimize(engine, spec) {
       const grants = Object.entries(loadout.augments ?? {})
         .filter(([k, v2]) => v2 && k.endsWith('/AugmentDemonSigil'))
         .reduce((n, [, v2]) => n + (cat.itemById.get(v2)?.skills ?? []).filter((s) => treeNodes.has(s)).length, 0);
-      v = { score: scorer.scoreFrom(ev), tie, grants };
+      // Fourth rung, same argument: a set rank whose scripted effect this model
+      // does not score is still never worse than not having it. Where six
+      // pieces of one infusion and four of it come to the same number, the six
+      // also light the branch behind `rank >= 3`.
+      const sets = (ev.infusions?.sets ?? []).reduce((n, s) => n + s.rank, 0);
+      v = { score: scorer.scoreFrom(ev), tie, grants, sets };
       evalCache.set(key, v);
       counter++;
       if (onProgress && counter % 500 === 0) onProgress(counter);
@@ -317,15 +437,188 @@ export function optimize(engine, spec) {
     return v;
   }
 
-  // Lexicographic: objective, then stat magnitude, then free talents.
+  // Lexicographic: objective, then stat magnitude, then free talents, then
+  // infusion set ranks.
   const EPS = 1e-9;
   const better = (a, b) => {
     if (a.score > b.score + EPS) return true;
     if (a.score < b.score - EPS) return false;
     if (a.tie > b.tie + EPS) return true;
     if (a.tie < b.tie - EPS) return false;
-    return (a.grants ?? 0) > (b.grants ?? 0);
+    if ((a.grants ?? 0) !== (b.grants ?? 0)) return (a.grants ?? 0) > (b.grants ?? 0);
+    return (a.sets ?? 0) > (b.sets ?? 0);
   };
+
+  // --- infusion ---------------------------------------------------------------
+  /**
+   * A gear entry with its infusion fields set to `infusionId` (or cleared).
+   * The bonus stat follows `statPolicy`, and only where the piece would be
+   * paid it: a rating the piece can roll, on a piece of the infusion's own
+   * faction.
+   */
+  function dress(entry, infusionId, stat = null) {
+    if (!entry) return entry;
+    const { infusion, infusionStat, prismatic, ...bare } = entry;
+    const item = cat.itemById.get(entry.item);
+    if (!infusionId || !item || !cat.canInfuse(item)) return bare;
+    const out = { ...bare, infusion: infusionId };
+    if (statPolicy === 'none') return out;
+    const pool = cat.infusionBonusPool(item);
+    const want = stat ?? (statPolicy === 'best' ? (pool.includes(infusionStat) ? infusionStat : pool[0]) : statPolicy);
+    if (want && pool.includes(want) && cat.infusionBonusActive(item, { infusion: infusionId, infusionStat: want })) {
+      out.infusionStat = want;
+    }
+    return out;
+  }
+
+  /** The armour this build wears that can carry an infusion the search may choose. */
+  const freeInfusable = (l) => cat.combatSlots().map((s) => s.id).filter((id) => {
+    const g = l.gear[id];
+    return g?.item && !pinnedInfusion.has(id) && cat.canInfuse(cat.itemById.get(g.item));
+  });
+
+  /**
+   * Assign infusions to the armour as a PLAN, and keep it if it wins.
+   *
+   * A plan is a multiset of (infusion, pieces) where each piece count lands
+   * exactly on a cap - pieces between two caps add nothing to the set, so no
+   * plan spends them there. Every (infusion, cap) is scored alone first, which
+   * is three evaluations per infusion; every plan that fits the armour worn is
+   * then ranked by the SUM of those single values, and only the best few are
+   * evaluated for real. The sum is an estimate (penetration has increasing
+   * returns, a stat row can saturate a cap) and is used only to choose what to
+   * evaluate - the plan kept is the one whose real score is best.
+   *
+   * Pieces a set does not need are handed an infusion of their own faction when
+   * a bonus stat is being priced, because one matched piece lights its bonus
+   * line whatever the set's rank.
+   */
+  const INFUSION_SHORTLIST = 8;
+  // The largest share of a build's score any plan has added so far in this
+  // run. The gear pass uses it to decide whether a piece that ADDS an
+  // infusable slot is worth re-planning for - see there.
+  let planGainSeen = 0;
+  function infusionPass(cur, best) {
+    if (!infusionIds.length) return null;
+    const slots = freeInfusable(cur);
+    if (!slots.length) return null;
+    const caps = cat.infusionCaps;
+    const itemOf = (slotId) => cat.itemById.get(cur.gear[slotId].item);
+    // Pieces the user infused by pin still count towards their own set.
+    const fixed = new Map();
+    for (const id of pinnedInfusion) {
+      const inf = cur.gear[id]?.infusion;
+      if (inf) fixed.set(inf, (fixed.get(inf) ?? 0) + 1);
+    }
+    const matched = (slotId, infId) => cat.infusions.get(infId)?.faction === cat.factionOrigin(itemOf(slotId));
+
+    // What a lit line pays on the piece in this slot - the rating the policy
+    // asks about, or the best the piece can roll when it asks about none in
+    // particular. With `--infusion-stat none` nothing of it is priced, and it
+    // still decides which pieces a set takes: the build printed is the one a
+    // player would infuse, and its "reads LOW by up to" line counts them.
+    const lineWorth = new Map();
+    const worth = (slotId) => {
+      let w = lineWorth.get(slotId);
+      if (w === undefined) {
+        const g = cur.gear[slotId];
+        const item = itemOf(slotId);
+        const rarity = cat.instanceRarity(item, g);
+        const levelOpts = {
+          charLevel: cur.level, stars: Math.min(g.stars ?? 0, cat.maxStars(item, rarity)), rarity,
+          flawless: !!g.flawless, level: g.level ?? null,
+          socketed: cat.socketsFor(item).map((t) => cur.augments?.[`${slotId}/${t}`]).filter(Boolean),
+        };
+        const pool = cat.infusionBonusPool(item);
+        const asked = statPolicy === 'none' || statPolicy === 'best' ? pool : pool.filter((st) => st === statPolicy);
+        w = Math.max(0, ...asked.map((st) => cat.infusionBonus(item, st, levelOpts)));
+        lineWorth.set(slotId, w);
+      }
+      return w;
+    };
+
+    // Turn {infusion -> pieces} into {slot -> infusion}, lighting as much
+    // rating as that plan can - see assignInfusionSlots. With `fill`, the
+    // pieces no set needs are handed an infusion of their own faction - only
+    // ever asked for when a bonus stat is being priced.
+    const assign = (plan, { fill = false } = {}) => assignInfusionSlots(slots, plan, {
+      fits: matched, worth,
+      fill: fill ? (slotId) => infusionIds.find((id) => matched(slotId, id)) ?? null : null,
+    });
+    const filling = statPolicy !== 'none';
+    const build = (byslot) => {
+      const trial = clone(cur);
+      for (const slotId of slots) trial.gear[slotId] = dress(cur.gear[slotId], byslot.get(slotId) ?? null);
+      return trial;
+    };
+    const tryScore = (trial) => { try { return scoreOf(trial); } catch { return null; } };
+
+    // 1. each (infusion, cap) alone - and alone means WITHOUT the fill. The
+    //    fill is worth roughly the same whatever the sets are, so scoring it
+    //    inside every single made each one claim it, and the sum then ranked
+    //    four two-piece sets (four claims) above the plan that actually wins.
+    const none = tryScore(build(new Map()));
+    if (!none) return null;
+    // What one filled piece is worth, for the estimate only.
+    const filled = filling ? tryScore(build(assign(new Map(), { fill: true }))) : null;
+    const perFill = filled ? Math.max(0, filled.score - none.score) / slots.length : 0;
+    const options = [];           // {id, n, value}
+    for (const infId of infusionIds) {
+      for (const cap of caps) {
+        const n = cap - (fixed.get(infId) ?? 0);
+        if (n <= 0 || n > slots.length) continue;
+        const got = tryScore(build(assign(new Map([[infId, n]]))));
+        if (got) options.push({ id: infId, n, value: got.score - none.score, rank: caps.filter((c) => c <= cap).length });
+      }
+    }
+    // 2. every plan that fits, by the sum of its parts.
+    const byId = new Map();
+    for (const o of options) { if (!byId.has(o.id)) byId.set(o.id, []); byId.get(o.id).push(o); }
+    const idList = [...byId.keys()];
+    const plans = [];
+    const walk = (i, used, acc, value, ranks) => {
+      if (i === idList.length) {
+        plans.push({ plan: new Map(acc), value: value + perFill * (slots.length - used), ranks });
+        return;
+      }
+      walk(i + 1, used, acc, value, ranks);
+      for (const o of byId.get(idList[i])) {
+        if (used + o.n > slots.length) continue;
+        acc.push([o.id, o.n]);
+        walk(i + 1, used + o.n, acc, value + o.value, ranks + o.rank);
+        acc.pop();
+      }
+    };
+    walk(0, 0, [], 0, 0);
+    plans.sort((a, b) => b.value - a.value || b.ranks - a.ranks);
+
+    // 3. the shortlist, for real.
+    let win = null;
+    for (const p of plans.slice(0, INFUSION_SHORTLIST)) {
+      const trial = build(assign(p.plan, { fill: filling }));
+      const got = tryScore(trial);
+      if (got && (!win || better(got, win.score))) win = { loadout: trial, score: got };
+    }
+    if (!win) return null;
+
+    // 4. which rating each lit piece rolled, when the caller asked for the
+    //    best one: the pool is three or four ratings per piece.
+    if (statPolicy === 'best') {
+      for (const slotId of slots) {
+        const g = win.loadout.gear[slotId];
+        if (!g?.infusionStat) continue;
+        for (const stat of cat.infusionBonusPool(itemOf(slotId))) {
+          if (stat === g.infusionStat) continue;
+          const trial = clone(win.loadout);
+          trial.gear[slotId] = dress(g, g.infusion, stat);
+          const got = tryScore(trial);
+          if (got && better(got, win.score)) win = { loadout: trial, score: got };
+        }
+      }
+    }
+    if (none.score > 0) planGainSeen = Math.max(planGainSeen, win.score.score / none.score - 1);
+    return better(win.score, best) ? win : null;
+  }
 
   /**
    * Slots whose contents make no difference to the goal - emptying them scores
@@ -419,16 +712,43 @@ export function optimize(engine, spec) {
       for (const slotId of shuffled(freeSlots, rand)) {
         let bestPick = cur.gear[slotId] ?? null;
         let bestScore = best;
+        // THE SLOT KEEPS ITS INFUSION through a swap. A set is a count of
+        // pieces, and a trial that put a bare chest where an infused one stood
+        // would be charged the whole set rank for it - every alternative would
+        // lose to the piece that happened to be there first. The rolled bonus
+        // stat does NOT carry: it belongs to the old piece.
+        const carried = pinnedInfusion.has(slotId) ? null : (cur.gear[slotId]?.infusion ?? null);
+        const wear = (pick) => dress({ item: pick.item, rarity: pick.rarity, stars: pick.stars, generic: pick.generic }, carried);
+        // ...AND A PIECE THAT ADDS AN INFUSABLE SLOT IS JUDGED WITH THE PLAN IT
+        // MAKES POSSIBLE. Seven infusable pieces carry one rank-2 set; the
+        // eighth makes room for a second, and that second set is the whole
+        // value of the swap - which a trial priced as "a bare Epic piece
+        // against the Rare one it replaces" never sees. The Rogue is the live
+        // case: its best Rare legs beat every Epic pair by 7 dps bare, and
+        // lose to them by 10 once the armour is re-planned as four and four.
+        // Re-planning costs about forty fights, so it is only asked of a trial
+        // that could plausibly win: one within the largest gain a plan has
+        // been seen to add in this run.
+        const here = cur.gear[slotId]?.item ? cat.itemById.get(cur.gear[slotId].item) : null;
+        const addsSlot = (pick) => !!pick && infusionIds.length > 0 && !pinnedInfusion.has(slotId)
+          && !(here && cat.canInfuse(here)) && cat.canInfuse(cat.itemById.get(pick.item));
+        let bestLoadout = null;
         for (const pick of candidates.get(slotId)) {
-          const trial = clone(cur);
-          if (pick) trial.gear[slotId] = { item: pick.item, rarity: pick.rarity, stars: pick.stars, generic: pick.generic };
+          let trial = clone(cur);
+          if (pick) trial.gear[slotId] = wear(pick);
           else delete trial.gear[slotId];
           pruneAugments(trial);
-          const s = scoreOf(trial);
-          if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
+          let s = scoreOf(trial);
+          let planned = false;
+          if (addsSlot(pick) && planGainSeen > 0 && s.score * (1 + planGainSeen) > bestScore.score) {
+            const got = infusionPass(trial, s);
+            if (got) { trial = got.loadout; s = got.score; planned = true; }
+          }
+          if (better(s, bestScore)) { bestScore = s; bestPick = pick; bestLoadout = planned ? trial : null; }
         }
         if (better(bestScore, best)) {
-          if (bestPick) cur.gear[slotId] = { item: bestPick.item, rarity: bestPick.rarity, stars: bestPick.stars, generic: bestPick.generic };
+          if (bestLoadout) cur = bestLoadout;
+          else if (bestPick) cur.gear[slotId] = wear(bestPick);
           else delete cur.gear[slotId];
           pruneAugments(cur);
           best = bestScore;
@@ -445,14 +765,41 @@ export function optimize(engine, spec) {
         if (opts.length < 2) continue;
         let bestPick = cur.skills[pool.key];
         let bestScore = best;
+        let bestRunes = null;
+        // A SKILL NEWLY SLOTTED IS JUDGED WITH ITS BEST RUNE. The rune step
+        // below only ever sees the skills already on the bar, and this step
+        // used to score a newcomer with whatever its socket happened to hold
+        // - nothing, for a skill the search had never slotted. A skill whose
+        // worth IS its rune therefore never got onto the bar for the rune
+        // step to find: with Flame of Argol pinned, Faithful Winds deals
+        // nothing rune-less, ties with leaving the slot to something else,
+        // and the strict `better` keeps whichever stood - so the search
+        // answered 3 dps under the same build with Faithful Winds and the
+        // rune that gives it a hit. Only the newcomers are re-runed here, and
+        // a pinned rune stays pinned.
+        const held = new Set(cur.skills[pool.key] ?? []);
         for (const pick of opts) {
-          const trial = clone(cur);
+          let trial = clone(cur);
           trial.skills[pool.key] = pick;
-          const s = scoreOf(trial);
-          if (better(s, bestScore)) { bestScore = s; bestPick = pick; }
+          let s = scoreOf(trial);
+          const fresh = [...new Set(pick)].filter((id) => !held.has(id) && !pinnedRunes.has(id));
+          if (fresh.length) {
+            const runed = new Map(engine.talents.runePools(trial).map((p) => [p.skill, p]));
+            for (const id of fresh) {
+              for (const rune of [...(runed.get(id)?.options ?? []).map((r) => r.id), null]) {
+                if ((trial.runes[id] ?? null) === rune) continue;
+                const withRune = clone(trial);
+                if (rune) withRune.runes[id] = rune; else delete withRune.runes[id];
+                const got = scoreOf(withRune);
+                if (better(got, s)) { trial = withRune; s = got; }
+              }
+            }
+          }
+          if (better(s, bestScore)) { bestScore = s; bestPick = pick; bestRunes = trial.runes; }
         }
         if (better(bestScore, best)) {
           cur.skills[pool.key] = bestPick.slice();
+          if (bestRunes) cur.runes = { ...bestRunes };
           best = bestScore;
           improved = true;
         }
@@ -527,6 +874,22 @@ export function optimize(engine, spec) {
             for (const g of grantedTalents(cur)) cur.talents[g] = 1;
           }
           best = bestScore;
+          improved = true;
+        }
+      }
+
+      // Then the infusions, against the armour and the stats that now exist.
+      // EVERY pass, not once at convergence: planning only after the gear had
+      // settled was tried and was both slower and worse - the armour had
+      // already been chosen for a build with no set, and each late plan
+      // re-opened the whole loop (Mage 471.3 against 485.3, in half again the
+      // time). A plan costs about forty fights and most are served from cache
+      // once the armour stops moving.
+      {
+        const got = infusionPass(cur, best);
+        if (got) {
+          cur = got.loadout;
+          best = got.score;
           improved = true;
         }
       }
@@ -725,6 +1088,78 @@ export function optimize(engine, spec) {
     winner = cur;
   }
 
+  // POINTS THAT BOUGHT NOTHING ARE HANDED BACK. The walk buys a point in a
+  // node nothing reads on a PROMISE - the readable value left above it in
+  // its branch (talents.mjs `suggest`) - before it knows whether the budget
+  // reaches that value, and the ascents after it only ever MOVE a point to
+  // where the objective is better. Where the promise is not kept the point
+  // stayed: the default Mage of build 25782799 held Life Current 2/2,
+  // "nothing readable", under a tier-4 conduit sixteen points do not reach,
+  // and printed "16 of 16 points spent" - where `bench talents` says the
+  // optimiser does not spend on nodes it cannot tell apart. So, from the
+  // ranks actually kept: a point in a node that reads as nothing at the rank
+  // it holds is taken back when the allocation is still one a character
+  // could have without it (nothing kept stands on it) and the build scores
+  // the same on every rung of `better`. One point at a time, to a fixpoint:
+  // a gate can stand on another, and one point of a two-point node can be
+  // the one a threshold needs. The bookkeeping below reports them unspent.
+  if (winner.talentAlloc && !spec.pinnedTalents) {
+    const granted = grantedTalents(winner.loadout);
+    const points = engine.talents.pointsAt(winner.loadout.level, spec.talentPoints ?? null);
+    const same = (a, b) => !better(a, b) && !better(b, a);
+    for (let again = true; again;) {
+      again = false;
+      for (const [id, held] of Object.entries(winner.loadout.talents ?? {})) {
+        if (granted.has(id) || engine.talents.readableValue(id, held).readable) continue;
+        const trial = { ...winner.loadout.talents };
+        if (held <= 1) delete trial[id]; else trial[id] = held - 1;
+        if (engine.talents.illegalAllocation(winner.loadout.class, trial, {
+          level: winner.loadout.level, points, granted,
+        })) continue;
+        const probe = clone(winner.loadout);
+        probe.talents = trial;
+        let got;
+        try { got = scoreOf(probe); } catch { continue; }
+        if (!same(got, winner.score)) continue;
+        winner.loadout.talents = trial;
+        again = true;
+      }
+    }
+  }
+
+  // THE ALLOCATION'S BOOKKEEPING, FROM THE RANKS ACTUALLY KEPT. `talentAlloc`
+  // is the descriptor of whichever `allocateTalents` call last WON, and the
+  // ranks do not always come from that call: the point-moving ascent rewrites
+  // them, and a polish round that re-enters the gear loop brings back a
+  // loadout whose tree was cut by an allocation nobody kept the descriptor
+  // of. The header then printed "13 of 16 points spent, 3 unspent" above a
+  // table of sixteen. Counted here, off the loadout, so the header is the
+  // table's own arithmetic; `picked` and `blind` are re-derived with it.
+  if (winner.talentAlloc && !spec.pinnedTalents) {
+    const granted = grantedTalents(winner.loadout);
+    const ranks = winner.loadout.talents ?? {};
+    const budget = engine.talents.pointsAt(winner.loadout.level, spec.talentPoints ?? null);
+    const spent = Object.entries(ranks).filter(([id]) => !granted.has(id)).reduce((n, [, r]) => n + r, 0);
+    winner.talentAlloc = {
+      ...winner.talentAlloc,
+      picked: Object.keys(ranks), ranks: { ...ranks }, spent, budget, unspent: Math.max(0, budget - spent),
+      // GATE POINTS: the nodes that read as nothing at the rank they hold
+      // and that the allocation cannot lose a point of - a tier taken above
+      // stands on them. (What else is left of such nodes after the hand-back
+      // above is one the fight scores through a reader of its own; that is
+      // no gate, and the table prints what the fight makes of it.)
+      blind: Object.keys(ranks).filter((id) => {
+        if (granted.has(id) || engine.talents.readableValue(id, ranks[id]).readable) return false;
+        const trial = { ...ranks };
+        if (ranks[id] <= 1) delete trial[id]; else trial[id] = ranks[id] - 1;
+        return !!engine.talents.illegalAllocation(winner.loadout.class, trial, {
+          level: winner.loadout.level, points: budget, granted,
+        });
+      }),
+      granted: [...granted],
+    };
+  }
+
   const finalEval = engine.evaluate(winner.loadout, { target, rank, mix, policy, goal: simGoal });
 
   return {
@@ -754,6 +1189,16 @@ export function optimize(engine, spec) {
     evaluations: counter,
     trace,
     goal, weights,
+    // What the infusion search was allowed to do, for the report: which
+    // infusions it could hand out, which it withheld and why, and what it took
+    // an unowned piece's bonus roll to be.
+    infusion: {
+      offered: infusionIds,
+      withheld: (spec.infusions ?? engine.opts?.infusions) ? [] : [...cat.infusions.keys()]
+        .map((id) => ({ id, ...cat.infusionSource(id) })).filter((s) => s.state === 'unreleased'),
+      statPolicy,
+      pinned: [...pinnedInfusion],
+    },
   };
 }
 
@@ -775,13 +1220,28 @@ export function rankSlot(engine, loadout, slotId, spec = {}) {
   const cands = cat.candidates(slotId, {
     aptitude: cls.aptitude, charLevel: loadout.level, rarities,
     exclude: spec.exclude, rarityRoll: spec.rarityRoll, rarityCap: spec.rarityCap,
+    includeUnreleased: spec.includeUnreleased ?? null,
   });
+  // The slot's infusion goes with whatever is tried in it, as in the search:
+  // a player who swaps an infused chest infuses the new one. The piece worn
+  // keeps its whole entry (its rolled bonus stat is its own); any other
+  // candidate that can be infused takes the infusion and no stat, and one that
+  // cannot loses it - which is then a real cost of that candidate.
+  const worn = loadout.gear[slotId] ?? null;
   for (const cand of cands) {
     const it = cand.item;
     const st = stars === 'max' ? cat.maxStars(it, cand.rarity) : Math.min(stars, cat.maxStars(it, cand.rarity));
+    const entry = { item: it.id, rarity: cand.rarity, stars: st, generic: cand.generic ?? null };
+    if (worn?.infusion && cat.canInfuse(it)) {
+      entry.infusion = worn.infusion;
+      if (worn.item === it.id) {
+        if (worn.infusionStat) entry.infusionStat = worn.infusionStat;
+        if (worn.prismatic) entry.prismatic = true;
+      }
+    }
     const trial = {
       ...loadout,
-      gear: { ...loadout.gear, [slotId]: { item: it.id, rarity: cand.rarity, stars: st, generic: cand.generic ?? null } },
+      gear: { ...loadout.gear, [slotId]: entry },
       augments: { ...loadout.augments },
     };
     // A different host item may not host the same augments, and a different

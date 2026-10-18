@@ -15,25 +15,38 @@
 // as if you had typed them.
 // ---------------------------------------------------------------------------
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { createEngine, GOALS, FERVOR_SCOPES } from '../src/engine.mjs';
+import { createEngine, GOALS, FERVOR_SCOPES, TICK_SOURCES } from '../src/engine.mjs';
 import { emptyLoadout, classOf } from '../src/loadout.mjs';
 import { optimize, rankSlot } from '../src/optimize.mjs';
 import {
   makePolicy, derivedApl, repairApl, searchApl, vocabularyFor, condLabel,
 } from '../src/rotation.mjs';
 import { slugOf, endpoints, normalize, translate } from '../src/questlog.mjs';
-import { aggregate, sessions, snapshots, streamCapture } from '../src/capture.mjs';
-import { compare } from '../src/verify.mjs';
+import {
+  aggregate, sessions, snapshots, streamCapture, resolveCapture, captureEra, bootFacts,
+  describeMissingCapture, describeOtherCaptures, buildDiff, snapshotAt, mechanicEvidence, poolAt, openingState, stretches, parseExtra,
+} from '../src/capture.mjs';
+import {
+  compare, eraWarning, modelTarget, parseWindows, chooseSnapshot, INTEGER_STREAM, fillFromEvidence, replaySchedule,
+} from '../src/verify.mjs';
 import { readDump, toLoadout, listCharacters, fromSnapshot } from '../src/inventory.mjs';
 import { requireGame, requireBoot } from '../src/lib/game.mjs';
 import { readHlb } from '../src/lib/hl.mjs';
-import { loadCdb } from '../src/cdb.mjs';
-import { buildFingerprint, diffFingerprints, resolveCitations, workList, loadFingerprint, fingerprintPath } from '../src/drift.mjs';
+import { loadCdb, Cdb } from '../src/cdb.mjs';
+import {
+  buildFingerprint, diffFingerprints, resolveCitations, workList, loadFingerprint, fingerprintPath,
+  clusters, addedItemsByKind, citationRoots, captureChain,
+  captureLine, acceptGate, fingerprintGaps, planReanchor, applyReanchor, anonWhy, rowDiff,
+  acceptedBuild, acceptedStampPath, loadAcceptedStamp, syncAcceptedStamp,
+  acceptedRowsPath, saveAcceptedRows, loadAcceptedRows,
+  deferredCitations, rowLines, fingerprintAgainst,
+} from '../src/drift.mjs';
 import { fileURLToPath } from 'node:url';
 import * as f from '../src/format.mjs';
+import { FLAGS, REPEATABLE, nearestFlags } from '../src/flags.mjs';
 
 // Out of package.json, not a constant here. tools/release.mjs moves that one
 // number and ui/api.mjs reads the same file, so a bump cannot leave the CLI
@@ -47,13 +60,22 @@ export const VERSION = JSON.parse(
 
 function parseArgs(argv) {
   const out = { _: [], flags: {}, repeated: {} };
-  const REPEATABLE = new Set(['pin', 'no-augment', 'weight', 'skills', 'rune', 'talent']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('-')) { out._.push(a); continue; }
     const eq = a.indexOf('=');
     let key = (eq >= 0 ? a.slice(0, eq) : a).replace(/^--?/, '');
     let val = eq >= 0 ? a.slice(eq + 1) : null;
+    // A NAME NOBODY READS IS REFUSED (src/flags.mjs has the table and why): it
+    // used to be stored and never looked at, so `--target-lvl 3` was the
+    // default run with exit 0. Said with the nearest names there are, or with
+    // none when nothing is close.
+    if (!Object.hasOwn(FLAGS, key)) {
+      const near = nearestFlags(key);
+      die(`unknown flag ${a.startsWith('--') ? '--' : '-'}${key}`
+        + (near.length ? ` - did you mean ${near.map((n) => `--${n}`).join(' or ')}?` : '')
+        + '\nbench --help lists every flag.');
+    }
     if (val === null) {
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith('--')) { val = next; i++; } else { val = true; }
@@ -90,6 +112,12 @@ function resolve(input, ids, what) {
 //
 //   --pin chest=Chest_RManfish_Cle        an item
 //   --pin weapon1=Sword_Swarm*3           an item with 3 upgrade stars
+//   --pin weapon1=Spear_Eruption@Epic     a weapon at the rarity it rolled
+//   --pin chest=Chest_EBee_Fig~Infusion_Bee_DPS/CritChance
+//                                         a piece infused with Hive Venom whose
+//                                         bonus stat rolled CritChanceRating;
+//                                         a trailing ! marks it Prismatic, and
+//                                         ~none pins it NOT infused
 //   --pin trinket=none                    force the slot empty
 //   --pin weapon1/enchantweapon=none      force that socket empty
 //   --pin feet/enchantfeet=FormulaFeetCritical_Z2
@@ -109,12 +137,42 @@ function bestRarityFor(cat, item, slotId, charLevel) {
   return best;
 }
 
+// An infusion as a person types it: the skill id, the id without its
+// `Infusion_` prefix, or the name the game shows ("Hive Venom", spaces
+// optional). The name comes off the skill row, never off the id.
+function resolveInfusion(cat, input) {
+  const ids = [...cat.infusions.keys()];
+  if (!ids.length) die('this build of the game has no infusions');
+  const squash = (x) => String(x).toLowerCase().replace(/[\s_'-]+/g, '');
+  const byName = ids.filter((id) => squash(cat.infusions.get(id).name) === squash(input));
+  if (byName.length === 1) return byName[0];
+  const bySuffix = ids.filter((id) => squash(id.replace(/^Infusion_/, '')) === squash(input));
+  if (bySuffix.length === 1) return bySuffix[0];
+  // The same forgiving match `resolve` makes on the ids - the whole id in any
+  // case, or a part of exactly one - with a refusal of its own: handed to
+  // `resolve` as a label, the catalogue was printed twice (every id with its
+  // name inside the label, every id again after "Known:") and what had been
+  // typed came after the first fifteen. What was typed comes first, and each
+  // infusion is listed once, by its id and the name the game shows.
+  const lower = String(input).toLowerCase();
+  const exact = ids.find((id) => id.toLowerCase() === lower);
+  if (exact) return exact;
+  const partial = ids.filter((id) => id.toLowerCase().includes(lower));
+  if (partial.length === 1) return partial[0];
+  const listed = (list) => list.map((id) => `${id} "${cat.infusions.get(id).name}"`).join(', ');
+  if (partial.length > 1) die(`ambiguous infusion "${input}" - could be: ${listed(partial)}`);
+  die(`unknown infusion "${input}".\nKnown: ${listed(ids)}`);
+}
+
 function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
   const { cat } = engine;
   const slotIds = cat.combatSlots().map((s) => s.id);
   const augTypeIds = cat.augmentTypes.map((a) => a.id);
   const pinnedGear = new Set();
   const pinnedAug = new Set();
+  // Slots whose infusion the user stated - `~something` or `~none`. A pin
+  // without a `~` part fixes the item and leaves its infusion to the search.
+  const pinnedInfusion = new Set();
   const augPins = [];
 
   // A saved envelope records what was held fixed. Re-reading it re-pins the
@@ -126,6 +184,7 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
   if (savedPins && !(args.repeated.pin ?? []).length) {
     for (const slot of savedPins.gear ?? []) if (slotIds.includes(slot)) pinnedGear.add(slot);
     for (const key of savedPins.augments ?? []) pinnedAug.add(key);
+    for (const slot of savedPins.infusions ?? []) if (slotIds.includes(slot)) pinnedInfusion.add(slot);
   }
   const savedSkillPins = savedPins && !(args.repeated.skills ?? []).length ? (savedPins.skills ?? []) : [];
 
@@ -148,17 +207,34 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
     pinnedGear.add(slot);
     if (/^(none|empty|-)$/i.test(rhs)) { delete loadout.gear[slot]; continue; }
 
-    // item [ ^instanceLevel ] [ @rarity ] [ *stars ] [ +generic ]
-    const m = /^([^@*^+]+)(?:\^(\d+))?(?:@([^*^+]+))?(?:\*(\d+))?(?:\+([A-Za-z]+))?$/.exec(rhs);
-    if (!m) die(`--pin "${spec}": cannot read the item part "${rhs}"`);
+    // item [ ^instanceLevel ] [ @rarity ] [ *stars ] [ +generic ] [ ~infusion[/stat][!] ]
+    // The infusion part is split off first: the item group below takes
+    // everything up to the next separator, and `~` is not one of its.
+    const tilde = rhs.indexOf('~');
+    const itemPart = tilde < 0 ? rhs : rhs.slice(0, tilde);
+    const infPart = tilde < 0 ? null : rhs.slice(tilde + 1);
+    const m = /^([^@*^+]+)(?:\^(\d+))?(?:@([^*^+]+))?(?:\*(\d+))?(?:\+([A-Za-z]+))?$/.exec(itemPart);
+    if (!m) die(`--pin "${spec}": cannot read the item part "${itemPart}"`);
     const itemId = resolve(m[1], cat.items.filter((i) => i.slots.includes(slot)).map((i) => i.id), `item for ${f.short(slot)}`);
     const item = cat.itemById.get(itemId);
     const cls = classOf(cat, loadout);
     if (!cat.usableBy(item, cls.aptitude)) {
       die(`${cls.unit} cannot use ${itemId} - it needs aptitude ${item.aptitudes.join(' or ')}`);
     }
-    if (item.level != null && item.level > loadout.level) {
-      die(`${itemId} needs level ${item.level}, the build is level ${loadout.level}`);
+    // `minLevel` is the row's level or, for a head or shoulder piece that
+    // authors none, its type's defaultMinLevel - see catalog.mjs.
+    if (item.minLevel != null && item.minLevel > loadout.level) {
+      die(`${itemId} needs level ${item.minLevel}, the build is level ${loadout.level}`);
+    }
+    // A pin always may; it is told what it is pinning.
+    const rel = cat.release(item);
+    if (rel.state === 'unreleased') {
+      console.error(f.warn(`note: nothing in this install hands out ${item.name} (${itemId}): ${rel.why}`));
+    }
+    const floor = cat.minInstanceLevel(item);
+    if (floor != null && floor > loadout.level && m[2] == null) {
+      console.error(f.warn(`note: ${item.name} (${itemId}) only exists at level ${floor} - every source of it makes it `
+        + `there - so it is priced at ${floor}, above the build's ${loadout.level}`));
     }
 
     // The instance level - what your copy actually dropped at. The authored
@@ -175,6 +251,19 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
     const rarity = m[3]
       ? resolve(m[3], cat.cdb.lines('rarity').map((r) => r.id), 'rarity')
       : (rarityRoll ? bestRarityFor(cat, item, slot, loadout.level) : item.rarity);
+    // ONLY A WEAPON HAS A RARITY OF ITS OWN (ent.Hero.makeLootItem@7953 ops
+    // 126-129; `rarity` is a field of st.item.Weapon and of nothing else). An
+    // Epic chest is a different ROW, so `chest=<a Rare row>@Epic` names an item
+    // that cannot exist - say which row the Epic one is.
+    if (m[3] && !cat.isWeaponType(item.type) && rarity !== item.rarity) {
+      const twin = cat.items.find((x) => x.type === item.type && x.rarity === rarity && !x.isAugment
+        && cat.factionOrigin(x) === cat.factionOrigin(item)
+        && x.aptitudes.length === item.aptitudes.length && x.aptitudes.every((a) => item.aptitudes.includes(a)));
+      die(`--pin "${spec}": ${item.name} (${itemId}) is ${item.rarity}, and only a weapon rolls its rarity - `
+        + `armour and jewellery keep their row's. `
+        + (twin ? `The ${rarity} row of this piece is ${twin.id} (${twin.name}).`
+          : `No ${rarity} row of this piece exists.`));
+    }
 
     const cap = cat.maxStars(item, rarity);
     const want = m[4] != null ? Number(m[4]) : (stars === 'max' ? cap : Math.min(stars, cap));
@@ -195,7 +284,42 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
     } else if (m[5]) {
       die(`--pin "${spec}": ${itemId} names no generic aptitudes to choose between`);
     }
-    loadout.gear[slot] = { item: itemId, rarity, stars: capped, level: instanceLevel, generic };
+    // The infusion: which set passive the piece carries, what its bonus line
+    // rolled, and whether the piece is Prismatic. Refused here only for what
+    // the GAME refuses (a piece that cannot be infused) and for a stat the
+    // piece cannot have rolled - a typed pin is a claim, unlike a dump.
+    const inf = {};
+    if (infPart != null) {
+      pinnedInfusion.add(slot);
+      if (!/^(none|empty|-)$/i.test(infPart)) {
+        const im = /^([^/!]+)(?:\/([A-Za-z]+))?(!)?$/.exec(infPart);
+        if (!im) die(`--pin "${spec}": cannot read the infusion part "~${infPart}" - the form is ~<infusion>[/<rating>][!]`);
+        const why = cat.whyNotInfusable(item);
+        if (why) die(`--pin "${spec}": ${why}`);
+        inf.infusion = resolveInfusion(cat, im[1]);
+        if (im[3]) inf.prismatic = true;
+        const pool = cat.infusionBonusPool(item);
+        if (im[2]) {
+          const all = [...new Set((cat.cdb.byId('aptitude').get('InfusionBonus')?.atbScaling ?? []).map((e) => e.endAtb))];
+          // "Crit" is what a person types and "CritChanceRating" what the row
+          // says, so the name is matched without its suffix.
+          const stat = resolve(im[2].replace(/Rating$/i, ''), all.map((a) => a.replace(/Rating$/, '')),
+            'infusion bonus rating') + 'Rating';
+          if (!pool.includes(stat)) {
+            die(`--pin "${spec}": ${item.name} (${itemId}) cannot have rolled ${stat} as its infusion bonus - it already `
+              + `pays that rating, and the roll is taken from the ones it does not (${pool.join(', ')})`);
+          }
+          inf.infusionStat = stat;
+          if (!cat.infusionBonusActive(item, inf)) {
+            const of = cat.infusions.get(inf.infusion);
+            console.error(f.warn(`note: ${of.name} is a ${of.faction ?? '?'} infusion and ${item.name} is a `
+              + `${cat.factionOrigin(item)} piece, so its bonus line stays dark - only a piece of the infusion's own `
+              + 'faction, or a Prismatic one (a trailing !), is paid it'));
+          }
+        }
+      }
+    }
+    loadout.gear[slot] = { item: itemId, rarity, stars: capped, level: instanceLevel, generic, ...inf };
   }
 
   // --no-augment <slot> pins every socket that slot can have to empty. Applied
@@ -213,7 +337,7 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
     pinnedAug.add(p.key);
     if (p.value == null) { delete loadout.augments[p.key]; continue; }
     const [, type] = p.key.split('/');
-    const choices = cat.augmentCandidates(type).map((a) => a.id);
+    const choices = cat.augmentCandidates(type, { includeUnreleased: true }).map((a) => a.id);
     if (!choices.length) die(`no augments exist for socket ${type}`);
     const chosen = resolve(p.value, choices, `augment for ${type}`);
     // A DemonSigil grants a talent, and a talent belongs to exactly one class.
@@ -226,6 +350,44 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
       }
     }
     loadout.augments[p.key] = chosen;
+  }
+
+  // --- talents --------------------------------------------------------------
+  // `--talent <node>=<rank>`. Naming ANY node fixes the WHOLE allocation: the
+  // tree has tier thresholds, so a half-pinned allocation is not a constraint
+  // the greedy can satisfy without re-deciding which branches are even
+  // reachable. Say so rather than silently searching around the pin.
+  //
+  // BEFORE --skills AND --rune, which are resolved against what the build
+  // OFFERS - and a talent is part of what it offers: Conduit: Spark Explosion
+  // is a conduit the Mage's talent of that name puts in the pool, and a skill
+  // a talent grants can carry a rune slot. Read after them, `--talent
+  // Mage_Talent_ConduitSparkExplosion=1 --skills conduits=...` printed the
+  // conduit under "not taken" and refused its name as unknown in the same
+  // command. The tree needs nothing those two set, so it goes first; the
+  // prune below then also drops what a saved selection holds of a tree this
+  // command replaced.
+  let pinnedTalents = false;
+  const talentSpecs = args.repeated.talent ?? [];
+  if (talentSpecs.length) {
+    const tree = engine.talents.treeFor(loadout.class);
+    const ids = tree.nodes.map((n) => n.skill);
+    loadout.talents = {};
+    for (const spec of talentSpecs) {
+      if (spec === true) die('--talent needs a value, e.g. --talent Warrior_Hemorrhage=1');
+      const eq = String(spec).indexOf('=');
+      const node = resolve(eq < 0 ? spec : spec.slice(0, eq), ids, `talent in the ${loadout.class} tree`);
+      const rank = eq < 0 ? 1 : Number(spec.slice(eq + 1));
+      if (!Number.isFinite(rank) || rank < 1) die(`--talent "${spec}": rank must be a positive number`);
+      loadout.talents[node] = rank;
+    }
+    const bad = engine.talents.illegalAllocation(loadout.class, loadout.talents, {
+      level: loadout.level,
+      points: engine.talents.pointsAt(loadout.level, null),
+      granted: new Set(),
+    });
+    if (bad) die(`--talent: ${bad}`);
+    pinnedTalents = true;
   }
 
   // --skills weapon1=Sword_Swarm_Skill1,Sword_Swarm_Passive
@@ -285,35 +447,7 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
     pinnedRunes.add(skill);
   }
 
-  // --- talents --------------------------------------------------------------
-  // `--talent <node>=<rank>`. Naming ANY node fixes the WHOLE allocation: the
-  // tree has tier thresholds, so a half-pinned allocation is not a constraint
-  // the greedy can satisfy without re-deciding which branches are even
-  // reachable. Say so rather than silently searching around the pin.
-  let pinnedTalents = false;
-  const talentSpecs = args.repeated.talent ?? [];
-  if (talentSpecs.length) {
-    const tree = engine.talents.treeFor(loadout.class);
-    const ids = tree.nodes.map((n) => n.skill);
-    loadout.talents = {};
-    for (const spec of talentSpecs) {
-      if (spec === true) die('--talent needs a value, e.g. --talent Warrior_Hemorrhage=1');
-      const eq = String(spec).indexOf('=');
-      const node = resolve(eq < 0 ? spec : spec.slice(0, eq), ids, `talent in the ${loadout.class} tree`);
-      const rank = eq < 0 ? 1 : Number(spec.slice(eq + 1));
-      if (!Number.isFinite(rank) || rank < 1) die(`--talent "${spec}": rank must be a positive number`);
-      loadout.talents[node] = rank;
-    }
-    const bad = engine.talents.illegalAllocation(loadout.class, loadout.talents, {
-      level: loadout.level,
-      points: engine.talents.pointsAt(loadout.level, null),
-      granted: new Set(),
-    });
-    if (bad) die(`--talent: ${bad}`);
-    pinnedTalents = true;
-  }
-
-  return { pinnedGear, pinnedAug, pinnedSkills, pinnedRunes, pinnedTalents };
+  return { pinnedGear, pinnedAug, pinnedSkills, pinnedRunes, pinnedTalents, pinnedInfusion };
 }
 
 function parseWeights(args) {
@@ -335,10 +469,14 @@ function simGoalOf(s) {
   return (s.weights && Object.keys(s.weights).length) || s.goal === 'mixed' ? 'mixed' : s.goal;
 }
 
-// Dev-only items are in the same sheet as everything else with no flag to tell
-// them apart, so the one heuristic is their id prefix. Visible and overridable
-// rather than silent: a filter you cannot see is a filter you cannot check.
-const DEFAULT_EXCLUDE = '^GM_';
+// No id is excluded by default. This used to be `^GM_`, on the belief that
+// the prefix marked dev-only items - and the only row it has ever matched is
+// GM_MassGrab, "Pocket Hive", the game's one Great Mace (type GreatMace,
+// dropped by Queen Honeyzabeth's table), which the default then hid from
+// every class that can wield it. No dev or test item row exists in the sheet.
+// What a run withholds now is decided by what the install hands out - see
+// sources.mjs - and --exclude remains for whatever a user wants gone.
+const DEFAULT_EXCLUDE = null;
 
 // How far the rotation looks ahead before choosing a cast, in seconds. Set
 // from measurement rather than taste: below ~6s a setup cast that only pays off
@@ -357,7 +495,7 @@ const DEFAULT_LOOKAHEAD = 8;
 //
 // Everything the envelope recorded becomes a DEFAULT, so re-reading a file
 // reproduces the run it came from, and any flag you pass still wins.
-export const ENVELOPE_KEYS = ['goal', 'weights', 'target', 'fervorScope', 'stars', 'rank', 'level', 'mix'];
+export const ENVELOPE_KEYS = ['goal', 'weights', 'target', 'fervorScope', 'tickSource', 'stars', 'rank', 'level', 'mix'];
 
 function readBuildFile(args) {
   if (typeof args.flags.build !== 'string') return null;
@@ -391,6 +529,13 @@ function commonSetup(args) {
   if (args.flags['no-fervor-damage']) assume.fervorScope = 'none';
   if (!FERVOR_SCOPES.includes(assume.fervorScope ?? 'all')) die(`--fervor-scope must be one of ${FERVOR_SCOPES.join(', ')}`);
   if (args.flags['no-mastery']) assume.mastery = false;
+  // Whose sheet a status tick is priced off. The default is this build's read
+  // (the unit that applied the status); 'carrier' is the accepted build's rule.
+  // Saved with the build like the fervor scope, so a file written under one
+  // rule is not silently re-read under the other.
+  if (env.tickSource) assume.tickSource = env.tickSource;
+  if (args.flags['tick-source'] != null) assume.tickSource = args.flags['tick-source'];
+  if (!TICK_SOURCES.includes(assume.tickSource ?? TICK_SOURCES[0])) die(`--tick-source must be one of ${TICK_SOURCES.join(', ')}`);
   // Reported from play: a skill cast interrupts the base-attack chain, so the
   // fight restarts it at link 1 after every cast. This flag restores the old
   // reading - the chain holding its place through anything - for sensitivity.
@@ -405,11 +550,20 @@ function commonSetup(args) {
   // The measured floor on a chain link's swing period (0 to trust the
   // authored durations alone).
   // How often basic attacks land from behind, for the upgrade perks that pay
-  // there. Default 1 (the Shadowstep claim); the measured drifting-melee dummy
-  // fraction was 0.68-0.85.
+  // there. Default 0.41, the share a player's sessions measured (engine.mjs
+  // DEFAULT_ASSUME); 1 is the Shadowstep claim, and a capture block fought
+  // from one side of a dummy is 1 or 0.
   if (args.flags['behind-fraction'] != null && args.flags['behind-fraction'] !== true) {
     assume.behindFraction = Number(args.flags['behind-fraction']);
     if (!(assume.behindFraction >= 0 && assume.behindFraction <= 1)) die('--behind-fraction needs 0..1');
+  }
+  // The share of a passive's ground drops the hero walks into, for a cast
+  // armed by collecting them (the Censer's clouds). Default 1 - every drop,
+  // the moment it lands - which is the read with nothing subtracted and is
+  // not a measurement (engine.mjs DEFAULT_ASSUME; `bench audit`).
+  if (args.flags.pickups != null) {
+    assume.pickupShare = args.flags.pickups === true ? NaN : Number(args.flags.pickups);
+    if (!(assume.pickupShare >= 0 && assume.pickupShare <= 1)) die('--pickups needs 0..1 (the share of the drops you walk into)');
   }
   if (args.flags['swing-floor'] != null && args.flags['swing-floor'] !== true) {
     assume.swingFloor = Number(args.flags['swing-floor']);
@@ -492,22 +646,24 @@ function commonSetup(args) {
   // Default to a boss rather than to `Armor_ExpectedReduction`: the authored
   // boss intent is 0.40 against that constant's 0.25, which understates
   // penetration against the content anyone actually gears for. The boss also
-  // spawns at YOUR level - it used to be Ratsar, whose fitted rift level of
-  // 6.9 froze the pool at 1,177 and left the default mitigating less than
+  // stands at YOUR level - it used to be Ratsar under a fitted level of 6.9,
+  // which froze the pool at 1,177 and left the default mitigating less than
   // world trash. See `bench targets`.
   //
-  // An envelope written by this version records the target NAME. One written
-  // by an older version recorded only the label ("named boss (Ratsar: 0.4/0.4)"),
-  // so the unit id is recovered from the parentheses rather than failing.
+  // An envelope written by this version records the target NAME, with its
+  // mode when it has one ("Ratsar@heroic"). One written by an older version
+  // recorded only the label ("named boss (Ratsar: 0.4/0.4)"), so the unit id
+  // is recovered from the parentheses rather than failing.
   const savedTarget = typeof env.target === 'string'
-    ? (/^[A-Za-z0-9_]+$/.test(env.target) ? env.target : (/\(([A-Za-z0-9_]+):/.exec(env.target)?.[1] ?? null))
+    ? (/^[A-Za-z0-9_]+(?:@[a-z]+)?$/.test(env.target) ? env.target : (/\(([A-Za-z0-9_]+):/.exec(env.target)?.[1] ?? null))
     : null;
   const targetName = String(args.flags.target ?? savedTarget ?? 'boss');
-  // The level the target SPAWNED at, when it differs from yours. The resist
-  // pool is built at the target's level and the divisor at the striker's -
-  // two dials, and "authored 0.40" is only 40% when they agree. Default is
-  // parity, which matches every calibration to date and what world bosses
-  // actually do (they spawn at zone level, whatever their unit row claims).
+  // The level the target STANDS at, when it is not the one the target name
+  // already implies. The resist pool is built at the target's level and the
+  // divisor at the striker's - two dials, and "authored 0.40" is only 40%
+  // when they agree. Left unset, a shortcut stands at your level, a unit id
+  // at its row's, and `@veteran` / `@heroic` / `@scaled` where those put it
+  // (combat.foe has the reads).
   const targetLevel = args.flags['target-level'] != null && args.flags['target-level'] !== true
     ? Number(args.flags['target-level']) : null;
   if (targetLevel !== null && !(Number.isFinite(targetLevel) && targetLevel > 0)) {
@@ -520,6 +676,43 @@ function commonSetup(args) {
   let exclude = null;
   if (exPattern) {
     try { exclude = new RegExp(exPattern); } catch (e) { die(`--exclude is not a valid regex: ${e.message}`); }
+  }
+  // --include-all also re-admits the rows nothing in this install hands out
+  // (sources.mjs). Set once on the catalog, so every candidate list agrees.
+  engine.cat.setIncludeUnreleased(!!args.flags['include-all']);
+  // Which infusions a search may hand out, and what the bonus roll of a piece
+  // nobody owns is taken to be. Both describe the RUN, so they sit on the
+  // engine's options beside the fight - optimize() reads them from there -
+  // and an envelope's recorded choice is the default, like every other
+  // setting.
+  {
+    const savedSearch = env.infusionSearch ?? null;
+    const flag = args.flags.infusions;
+    if (flag === true) die('--infusions needs a value: learnable, all, none, or a comma-separated list of infusions');
+    if (flag != null) {
+      const v = String(flag);
+      if (/^all$/i.test(v)) engine.opts.infusions = [...engine.cat.infusions.keys()];
+      else if (/^none$/i.test(v)) engine.opts.infusions = [];
+      else if (!/^learnable$/i.test(v)) {
+        engine.opts.infusions = v.split(',').map((x) => resolveInfusion(engine.cat, x.trim()));
+      }
+    } else if (Array.isArray(savedSearch?.offered)) {
+      engine.opts.infusions = savedSearch.offered.filter((id) => engine.cat.infusions.has(id));
+    }
+    const st = args.flags['infusion-stat'];
+    if (st === true) die('--infusion-stat needs a value: none, best, or a rating (CritChance, Fervor, ArmorPenetration, SpellPenetration)');
+    if (st != null) {
+      const v = String(st);
+      if (/^(none|best)$/i.test(v)) engine.opts.infusionStat = v.toLowerCase();
+      else {
+        const all = [...new Set((engine.cdb.byId('aptitude').get('InfusionBonus')?.atbScaling ?? []).map((e) => e.endAtb))];
+        if (!all.length) die('--infusion-stat: this build of the game has no infusion bonus ratings');
+        engine.opts.infusionStat = resolve(v.replace(/Rating$/i, ''), all.map((a) => a.replace(/Rating$/, '')),
+          'infusion bonus rating') + 'Rating';
+      }
+    } else if (typeof savedSearch?.stat === 'string') {
+      engine.opts.infusionStat = savedSearch.stat;
+    }
   }
   let talentPoints = null;
   if (args.flags[`talent-points`] != null && args.flags[`talent-points`] !== true) {
@@ -553,36 +746,58 @@ function commonSetup(args) {
   // {entries: [{skill, cond}], excluded} - or, hand-written, a bare array of
   // skill ids / {skill} objects, which becomes a plain priority list. Skills
   // not on the list are never pressed; that is what "authored" means.
-  let policy = null;
+  //
+  // WHERE THE FILE KEEPS IT. `bench rotation --json` writes an envelope - the
+  // kit under `build`, the rotation under `rotation` - and this reader took
+  // `raw.apl ?? raw`, so the one file the help names ("the file bench rotation
+  // --json writes") was refused as "not a rotation". Both keys are read.
+  const asApl = (x) => {
+    let apl = x;
+    if (Array.isArray(apl)) {
+      apl = {
+        entries: apl.map((e) => (typeof e === 'string' ? { skill: e, cond: { kind: 'always' } }
+          : { skill: e?.skill, cond: e?.cond ?? { kind: 'always' } })),
+        excluded: [],
+      };
+    }
+    return Array.isArray(apl?.entries) && apl.entries.every((e) => typeof e?.skill === 'string') ? apl : null;
+  };
+  const said = (apl) => `${apl.entries.length} line${apl.entries.length === 1 ? '' : 's'}, walked top to bottom and the first that is ready pressed; `
+    + 'a skill with no line is never pressed';
+  let policy = null, policyNote = null;
   if (typeof args.flags['rotation-file'] === 'string') {
     let raw;
     try { raw = JSON.parse(readFileSync(args.flags['rotation-file'], 'utf8')); } catch (e) {
       die(`${args.flags['rotation-file']}: ${e.message}`);
     }
-    let apl = raw?.apl ?? raw;
-    if (Array.isArray(apl)) {
-      apl = {
-        entries: apl.map((e) => (typeof e === 'string' ? { skill: e, cond: { kind: 'always' } }
-          : { skill: e.skill, cond: e.cond ?? { kind: 'always' } })),
-        excluded: [],
-      };
-    }
-    if (!Array.isArray(apl?.entries) || !apl.entries.every((e) => typeof e?.skill === 'string')) {
-      die(`${args.flags['rotation-file']}: not a rotation - expected {entries:[{skill,...}]} or ["Skill_A", ...]`);
+    const apl = asApl(raw?.apl ?? raw?.rotation ?? raw);
+    if (!apl) {
+      die(`${args.flags['rotation-file']}: not a rotation - expected the file bench rotation --json writes, {entries:[{skill,...}]} or ["Skill_A", ...]`);
     }
     policy = makePolicy(apl);
+    policyNote = `authored: the rotation in ${args.flags['rotation-file']} - ${said(apl)}`;
   }
+  // THE ROTATION SAVED WITH A BUILD. The envelope `bench rotation --json`
+  // writes says what its kit scored UNDER ITS ROTATION (metrics.dps), and
+  // `sheet --build` of that file priced the kit under the derived order
+  // instead - 210.5 for an envelope that says 225.4 - with nothing said.
+  // Handed on here for the one command that re-prices a saved build as it
+  // stands (`sheet`); a search is NOT handed it, because an authored list
+  // ("a skill with no line is never pressed") changes what a search scores.
+  const savedApl = !policy && saved?.envelope ? asApl(saved.envelope.rotation ?? null) : null;
   return {
-    engine, stars, rarities, goal, targetName, targetLevel, rank, mix, exclude, rarityCap, talentPoints, policy,
+    engine, stars, rarities, goal, targetName, targetLevel, rank, mix, exclude, rarityCap, talentPoints, policy, policyNote,
+    savedRotation: savedApl?.entries.length ? { apl: savedApl, path: saved.path, said: said(savedApl) } : null,
     saved, fight, numFlag, profile, profileValues,
     // A bare loadout carries its own level, and the foe, the rating->percent
     // conversions and the candidate list all have to agree with it. Reporting a
     // level-10 character against a level-25 foe mixed two levels in one page.
     level: (args.flags.level == null && env.level == null && saved?.loadout?.level > 0)
       ? saved.loadout.level : level,
-    // On by default: rarity is rolled at drop, so a Rare-authored chest that can
-    // land Epic or Legendary should be on the table. --no-rarity-roll pins every
-    // item to the rarity the CDB authors it at. It round-trips like everything
+    // On by default: a WEAPON's rarity is rolled at drop, so a Rare-authored
+    // sword that can land Epic or Legendary should be on the table (gear never
+    // rolls one - see catalog.attainableRarities). --no-rarity-roll pins every
+    // weapon to the rarity the CDB authors it at. It round-trips like everything
     // else: an envelope written with --no-rarity-roll re-reads that way.
     rarityRoll: args.flags['no-rarity-roll'] ? false : (env.rarityRoll ?? true),
     // A saved blend must not outrank a typed --goal. It used to: re-reading an
@@ -996,6 +1211,9 @@ const commands = {
     const url = `http://${shown.includes(':') ? `[${shown}]` : shown}:${live.port}/`;
     console.log(`farever-bench ${VERSION} ui on ${url}`);
     console.log(f.dim(`  reading ${game}`));
+    // The line every other command prints under its header; this one has no
+    // header, and the page it serves carries the same sentence.
+    if (live.notice) console.log(f.warn(`  ${live.notice}`));
     // On the BOUND address, not the printed one: a wildcard bind prints as
     // loopback and is precisely the case worth warning about.
     if (!['127.0.0.1', '::1', 'localhost'].includes(host)) {
@@ -1022,15 +1240,24 @@ const commands = {
   slots(args) {
     const { engine } = commonSetup(args);
     console.log(f.header(engine, VERSION) + '\n');
-    console.log(f.table(['SLOT', 'CATEGORY', 'STAT FACTOR', 'HOSTS AUGMENT'],
+    console.log(f.table(['SLOT', 'CATEGORY', 'STAT FACTOR', 'HOSTS AUGMENT', 'INFUSION'],
       engine.cat.combatSlots().map((s) => {
-        const types = engine.cat.items
-          .filter((i) => i.slots.includes(s.id) && !i.isAugment)
-          .flatMap((i) => engine.cat.socketsFor(i));
+        const here = engine.cat.items.filter((i) => i.slots.includes(s.id) && !i.isAugment);
+        const types = here.flatMap((i) => engine.cat.socketsFor(i));
+        // How many of the slot's rows can carry an infusion - counted, so the
+        // column follows whatever tier and type the next patch opens it to.
+        const infusable = here.filter((i) => engine.cat.canInfuse(i)).length;
         return [f.short(s.id), s.category, s.affixFactor === 1 ? '' : f.warn('x' + s.affixFactor),
-          [...new Set(types)].map((t) => t.replace(/^Augment/, '')).join(', ') || f.dim('-')];
+          [...new Set(types)].map((t) => t.replace(/^Augment/, '')).join(', ') || f.dim('-'),
+          infusable ? `${infusable} of ${here.length} rows` : f.dim('-')];
       })));
     console.log('\n' + f.dim('Slot factor: Slot_Weapon2 (the arsenal weapon) contributes 40% of its stats.'));
+    if (engine.cat.infusions.size) {
+      const c = engine.cat;
+      console.log(f.dim(`Infusion: ${c.infusionMinRarity} armour with a faction can carry one of ${c.infusions.size} set passives; `
+        + `${c.infusionCaps.join(' / ')} pieces of the SAME one are its rank ${c.infusionCaps.map((_, i) => i + 1).join(' / ')}. `
+        + 'Pin one with --pin <slot>=<item>~<infusion>[/<rating>][!].'));
+    }
   },
 
   items(args) {
@@ -1040,24 +1267,60 @@ const commands = {
     const slotIds = s.engine.cat.combatSlots().map((x) => x.id);
     if (typeof args.flags.slot !== 'string') die(`--slot is required. One of: ${slotIds.map(f.short).join(', ')}`);
     const slot = resolve(args.flags.slot, slotIds, 'slot');
+    // EVERY row, the withheld ones included and marked: this command is where
+    // a player looks an item up, and one that silently is not there reads as a
+    // bug. The search does not offer the marked rows unless --include-all.
     const list = s.engine.cat.candidates(slot, {
       aptitude: cls.aptitude, charLevel: s.level,
       rarities: s.rarities, exclude: s.exclude, rarityRoll: s.rarityRoll, rarityCap: s.rarityCap,
-      talentPoints: s.talentPoints,
+      talentPoints: s.talentPoints, includeUnreleased: true,
     });
+    const { cat } = s.engine;
+    const gone = new Map(list.filter((c) => cat.release(c.item).state === 'unreleased').map((c) => [c.item.id, cat.release(c.item)]));
+    const anyInfusable = list.some((c) => cat.canInfuse(c.item));
+    const pricedAt = (item) => cat.instanceLevel(item, { charLevel: s.level });
+    const anyRaised = list.some((c) => c.item.level != null && pricedAt(c.item) !== c.item.level);
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`${cls.unit} ${s.level} - ${f.short(slot)} - ${list.length} legal ` +
       `${s.rarityRoll ? '(item, rarity) pairs' : 'items'}\n`);
-    console.log(f.table(['ITEM', 'NAME', 'RAR', 'ROLL', 'MAX UPG', 'LVL', 'FACTION', 'GIVES', 'SKILLS'],
+    console.log(f.table(['ITEM', 'NAME', 'RAR', 'ROLL', 'MAX UPG', 'LVL', 'FACTION', 'GIVES', 'SKILLS',
+      ...(anyInfusable ? ['INFUSE'] : []), ...(gone.size ? ['SOURCE'] : [])],
       list.map((c) => [
         c.item.id, c.item.name === c.item.id ? '' : c.item.name, c.rarity,
-        c.chance != null && !c.authored ? f.pct(c.chance, 0) : '',
-        s.engine.cat.maxStars(c.item, c.rarity),
-        c.item.level ?? f.dim('(scales)'),
+        // A share of the rarities this row can roll, its own included - the
+        // three of a Rare weapon sum to 100%. Gear does not roll and shows none.
+        c.chance != null ? f.pct(c.chance, 0) : '',
+        cat.maxStars(c.item, c.rarity),
+        // The level an unpinned piece of this row is PRICED at, with the
+        // row's own beside it where the two differ: a weapon's or a worn
+        // armour piece's authored level is a floor, not a pin
+        // (catalog.mjs effectiveLevel), and the column used to print the
+        // floor - `1` for the 48 Demon armour rows a level-25 build wears at
+        // 25, `18` for breeches priced at 250.
+        c.item.level == null ? f.dim('(scales)')
+          : pricedAt(c.item) !== c.item.level ? `${pricedAt(c.item)} ${f.dim(`(row ${c.item.level})`)}` : c.item.level,
         c.item.faction ?? (c.generic ? f.warn(c.generic) : f.dim("-")),
-        f.ratingGiven(s.engine.cat, c.item, cls.aptitude, c.rarity, c.generic) ?? f.dim('-'),
+        f.ratingGiven(cat, c.item, cls.aptitude, c.rarity, c.generic) ?? f.dim('-'),
         c.item.skills.length ? f.warn(String(c.item.skills.length)) : '',
+        ...(anyInfusable ? [cat.canInfuse(c.item)
+          ? cat.infusionBonusPool(c.item).map((p) => p.replace(/Rating$/, '')).join('/') : f.dim('-')] : []),
+        ...(gone.size ? [gone.has(c.item.id) ? f.warn('not obtainable') : ''] : []),
       ]), { align: [null, null, null, 'r', 'r', 'r'] }));
+    if (anyRaised) {
+      console.log(f.dim('\nLVL: the level an unpinned piece is priced at. "N (row n)": the row authors level n and the piece is priced at N - a weapon '
+        + 'or worn armour as a drop at yours, its row level being a floor, or a piece every source of which makes it higher '
+        + '(--drops authored prices a drop at n; --pin <slot>=<item>^n names one instance).'));
+    }
+    if (anyInfusable) {
+      console.log(f.dim('\nINFUSE: the ratings the piece\'s infusion bonus can roll (the ones it does not already pay).'));
+    }
+    if (gone.size) {
+      console.log(f.warn(`\n${gone.size} row${gone.size === 1 ? '' : 's'} above cannot be obtained on this build, and the search does not `
+        + 'offer them (--include-all does):'));
+      const byWhy = new Map();
+      for (const [id, r] of gone) { if (!byWhy.has(r.why)) byWhy.set(r.why, []); byWhy.get(r.why).push(id); }
+      for (const [why, ids] of byWhy) console.log(f.dim(`  ${ids.join(', ')}: ${why}`));
+    }
   },
 
   sheet(args) {
@@ -1066,10 +1329,34 @@ const commands = {
     const pins = applyProfile(s, loadout,
       applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved }));
     const target = s.engine.combat.foe(s.targetName, s.level, s.targetLevel);
-    const ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s), policy: s.policy ?? null });
+    let ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s), policy: s.policy ?? null });
+    // A build saved with its rotation is priced under that rotation
+    // (commonSetup, `savedRotation`) - while the kit is still the one it was
+    // written for. A --pin or a --skills that takes a listed skill off the
+    // bar leaves a list that would skip that line in silence and never press
+    // what replaced it; then the derived order is played, and said.
+    let authored = s.policyNote ?? null, rotationGone = null;
+    if (!s.policy && s.savedRotation) {
+      const held = new Set(ev.rotation.active.map((a) => a.prof.id));
+      const gone = [...new Set(s.savedRotation.apl.entries.map((e) => e.skill))].filter((id) => !held.has(id));
+      if (gone.length) {
+        const nameOf = (id) => s.engine.cdb.byId('skill').get(id)?.texts?.name ?? id;
+        rotationGone = `the rotation saved in ${s.savedRotation.path} is NOT played: it presses ${gone.map(nameOf).join(', ')}, `
+          + `which this build does not hold (a --pin or a --skills changed the kit it was written for). The derived order is played instead; `
+          + `--rotation-file ${s.savedRotation.path} plays the saved list as it is, skipping those lines.`;
+      } else {
+        ev = s.engine.evaluate(loadout, { target, rank: s.rank, mix: s.mix, goal: simGoalOf(s), policy: makePolicy(s.savedRotation.apl) });
+        authored = `saved: the rotation ${s.savedRotation.path} was written with - ${s.savedRotation.said} (--rotation-file <json> plays another)`;
+      }
+    }
     console.log(f.header(s.engine, VERSION) + '\n');
     if (ev.profile) console.log(f.profileBlock(ev.profile) + '\n');
     console.log(f.gearBlock(s.engine, loadout) + '\n');
+    {
+      const ib = (ev.infusions?.sets.length || ev.infusions?.pieces.length)
+        ? f.infusionBlock(s.engine, loadout, ev, { verbose: true }) : null;
+      if (ib) console.log(f.bold('INFUSION') + '\n' + ib + '\n');
+    }
     if (s.engine.socketsOf(loadout).length) {
       console.log(f.bold('AUGMENTS'));
       console.log(f.augmentBlock(s.engine, loadout) + '\n');
@@ -1080,7 +1367,8 @@ const commands = {
       console.log(f.skillsBlock(s.engine, loadout, ev, { pinnedSkills: pins.pinnedSkills }) + '\n');
     }
     console.log(f.sheetBlock(s.engine, ev, { level: s.level }));
-    console.log(f.throughputBlock(s.engine, ev, { goal: s.goal }) + '\n');
+    if (rotationGone) console.log(f.warn(rotationGone) + '\n');
+    console.log(f.throughputBlock(s.engine, ev, { goal: s.goal, authored }) + '\n');
     console.log(f.auditBlock(s.engine));
   },
 
@@ -1151,7 +1439,20 @@ const commands = {
       (s.exclude ? `   excluding /${s.exclude.source}/` : '')));
     if (pins.pinnedGear.size || pins.pinnedAug.size) {
       console.log(f.dim(`pinned: ${[...pins.pinnedGear].map(f.short).join(', ') || '-'}` +
-        (pins.pinnedAug.size ? `   sockets: ${[...pins.pinnedAug].map((k) => k.replace(/Slot_|Augment/g, '')).join(', ')}` : '')));
+        (pins.pinnedAug.size ? `   sockets: ${[...pins.pinnedAug].map((k) => k.replace(/Slot_|Augment/g, '')).join(', ')}` : '') +
+        (pins.pinnedInfusion.size ? `   infusions: ${[...pins.pinnedInfusion].map(f.short).join(', ')}` : '')));
+    }
+    // What the candidate lists left out, and on what evidence - a filter you
+    // cannot see is a filter you cannot check.
+    if (!args.flags['include-all']) {
+      const src = s.engine.cat.sources();
+      const gone = s.engine.cat.unreleasedItems().filter((x) => !x.item.isAugment);
+      if (gone.length) {
+        console.log(f.dim(`withheld: ${gone.length} stat-bearing rows nothing in this install hands out `
+          + '(--include-all offers them; `bench audit` says how that was read)'));
+      } else if (!src.prefabs.read || !src.code.read) {
+        console.log(f.dim(`withheld: nothing - ${src.prefabs.why ?? src.code.why}, so no row could be shown to be unobtainable`));
+      }
     }
     // The seeds are not all random. After `--restarts` random ones, the search
     // starts once from each secondary rating the class can wear, with every
@@ -1179,6 +1480,10 @@ const commands = {
         '  cannot tell one from another, or from none at all.'));
     }
     console.log('');
+    {
+      const ib = f.infusionBlock(s.engine, res.loadout, res.evaluation, { search: res.infusion, verbose });
+      if (ib) console.log(f.bold('INFUSION') + '\n' + ib + '\n');
+    }
     console.log(f.bold('AUGMENTS'));
     console.log(f.augmentBlock(s.engine, res.loadout, { pinnedAug: pins.pinnedAug }) + '\n');
     if (res.talentAlloc) {
@@ -1193,7 +1498,7 @@ const commands = {
     console.log(f.sheetBlock(s.engine, res.evaluation, { level: s.level }));
     console.log(f.damageBlock(res.evaluation) + '\n');
     if (verbose) {
-      console.log(f.throughputBlock(s.engine, res.evaluation, { goal: s.goal }) + '\n');
+      console.log(f.throughputBlock(s.engine, res.evaluation, { goal: s.goal, authored: s.policyNote ?? null }) + '\n');
       // What the search bought over the seed, when the seed had anything in it.
       const seedScore = s.engine.makeScorer({ ...s, target, ref: res.reference }).scoreFrom(res.reference);
       if (seedScore > 0) {
@@ -1214,13 +1519,25 @@ const commands = {
         goal: s.goal, weights: s.weights,
         target: s.targetName, targetLabel: target.name,
         fervorScope: s.engine.opts.assume.fervorScope,
+        tickSource: s.engine.opts.assume.tickSource,
         stars: s.stars, rank: s.rank, level: s.level, mix: s.mix,
         rarityRoll: s.rarityRoll,
         fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
         targetHealth: s.fight.targetHealth,
         lookahead: s.fight.lookahead,
-        pinned: { gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills] },
+        pinned: {
+          gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills],
+          infusions: [...pins.pinnedInfusion],
+        },
+        // What the infusion search was allowed to do, so --build reproduces it.
+        infusionSearch: { offered: res.infusion.offered, stat: res.infusion.statPolicy },
         build: res.loadout,
+        // The sets the build wears and each piece's bonus line, as the engine
+        // attached them: {sets: [{id, name, pieces, slots, rank, title,
+        // priced[], fought[], unpriced[]}], pieces: [{slot, item, infusion,
+        // stat, value, lit, prismatic, pool[]}]} - `priced` is what of the set
+        // is in the number, `fought` what each part came to in this fight.
+        infusions: res.evaluation.infusions,
         metrics: {
           dps: res.evaluation.throughput.dps,
           hps: res.evaluation.throughput.hps,
@@ -1270,87 +1587,280 @@ const commands = {
           f.dim(c.why)];
       })));
 
+    // WHICH COLUMNS SPEAK OF RARITY is read off the schema, every run. This
+    // paragraph used to be typed: "no column anywhere declares a rarity
+    // ceiling, the seven columns typed on rarity are ..." - and went on saying
+    // so on a build with eleven, two of which are exactly a floor and a
+    // ceiling. st.skill.GainItem.onStartStep@32109 ops 99-110 copies a
+    // container's `gainItem.rarity.min` / `.max` onto every loot entry it
+    // opens, and ent.Hero.makeLootItem@7953 ops 140-167 rolls inside them.
+    const cdb = s.engine.cdb;
+    const rarityCols = [];
+    for (const [name, sh] of cdb.sheets) {
+      for (const c of sh.columns ?? []) if (c.typeStr === '6:rarity') rarityCols.push(`${name}.${c.name}`);
+    }
+    const BOUNDS = ['item@props@gainItem@rarity.min', 'item@props@gainItem@rarity.max'];
+    const bounds = BOUNDS.filter((c) => rarityCols.includes(c));
+    const boxes = cdb.lines('item').filter((i) => i.props?.gainItem?.rarity?.min != null || i.props?.gainItem?.rarity?.max != null);
+    const lootTableCols = rarityCols.filter((c) => /^lootTable(@|\.)/.test(c));
+    const rarityTypes = [...cdb.customTypes.keys()].filter((k) => /rarity/i.test(k));
+    // What a constant holds, as the kinds of its leaves - `range`, `float`...
+    const leafKinds = (v, out = new Set()) => {
+      if (Array.isArray(v)) for (const x of v) leafKinds(x, out);
+      else if (v && typeof v === 'object') {
+        for (const [k, x] of Object.entries(v)) {
+          if (k === 'group') leafKinds(x, out);
+          else if (k === 'v') leafKinds(x, out);
+          else if (k !== 'id' && k !== 'desc') out.add(k);
+        }
+      }
+      return out;
+    };
+    const stub = cdb.has('constant', 'WeaponRarityChances_Low') ? cdb.row('constant', 'WeaponRarityChances_Low') : null;
+    const stubKinds = stub ? [...leafKinds(stub.v)] : [];
+    const wrap = (text) => {
+      const lines = [];
+      let line = ' ';
+      for (const word of text.split(/\s+/).filter(Boolean)) {
+        if (line.length + 1 + word.length > 76 && line.trim()) { lines.push(line); line = ' '; }
+        line += ' ' + word;
+      }
+      if (line.trim()) lines.push(line);
+      return lines.join('\n');
+    };
+    const para = [];
+    para.push(`${rarityCols.length} columns are typed on \`rarity\`: ${rarityCols.join(', ')}.`);
+    if (bounds.length) {
+      para.push(`${bounds.length === 2 ? 'Two' : 'One'} of them bound${bounds.length === 2 ? '' : 's'} a roll: ${bounds.join(' and ')} - `
+        + 'a CONTAINER\'s own floor and ceiling, copied onto every loot entry it opens '
+        + '(st.skill.GainItem.onStartStep@32109) and rolled inside (ent.Hero.makeLootItem@7953). '
+        + (boxes.length
+          ? `${boxes.length === 1 ? 'One row authors' : `${boxes.length} rows author`} it: `
+            + boxes.map((i) => `${i.texts?.name ?? i.id} (${i.id}) - `
+              + `${i.props.gainItem.rarity.min != null ? `floor ${i.props.gainItem.rarity.min}` : 'no floor'}, `
+              + `${i.props.gainItem.rarity.max != null ? `ceiling ${i.props.gainItem.rarity.max}` : 'no ceiling'}`).join('; ') + '.'
+          : 'No row authors either on this build.'));
+    }
+    para.push(`${bounds.length ? 'Beyond that, no' : 'No'} column declares a ceiling for a slot or for an item row. `
+      + (lootTableCols.length ? `\`lootTable\` does carry rarity (${lootTableCols.join(', ')}), which this bench does not read. `
+        : '`lootTable` carries no rarity column at all. ')
+      + (rarityTypes.length ? `There is a custom type named for it (${rarityTypes.join(', ')}), also unread. `
+        : 'There is no rarity custom type. ')
+      + (stub
+        ? `\`WeaponRarityChances_Low\` exists as a constant and holds ${stubKinds.length ? `only ${stubKinds.join(' and ')} leaves` : 'nothing'}`
+          + `${stubKinds.some((k) => /float|int|chance/i.test(k)) ? ' - it may no longer be the stub it was; read it' : ' - a level range and no chance'}.`
+        : ''));
     console.log('\n' + f.warn('WHAT THE DATA DOES NOT SAY'));
+    console.log(para.map(wrap).join('\n\n'));
     console.log([
-      '  No column anywhere declares a rarity ceiling. The seven columns typed on',
-      '  `rarity` are: item.rarity, aptitude@atbScaling.conds.minRarity,',
-      '  itemType@props@rarities.rarity, itemType@defaultIcons.rarity,',
-      '  job@recipeModels.rarity, and two constant sub-columns for enchant',
-      '  materials and scrap quantities. `lootTable` carries no rarity at all, and',
-      '  there is no RarityKind custom type. `WeaponRarityChances_Low` exists as a',
-      '  constant but is an empty stub with only a 0-10 level range in it.',
       '',
-      '  So the ceiling is a content decision in code, and the two rules above',
-      '  stand in for it. Both move on their own: the weapon ceiling follows the',
-      '  AllowRandomWeaponDrop flag, and the gear ceiling rises by itself the day',
-      '  a patch authors an Epic chest. Override either with --rarity-cap.',
+      '  So a WEAPON\'s ceiling is set where its loot entry is made - by its',
+      '  container\'s bounds where it has one, in code everywhere else - and',
+      '  ent.Hero.makeLootItem@7953 rolls inside whatever the entry carries. The',
+      '  AllowRandomWeaponDrop flag stands in for that ceiling; --rarity-cap',
+      '  overrides it. A weapon\'s ROLL share is its level band\'s chance over the',
+      '  sum of the rarities at or above its row\'s, the way the game draws it.',
+      '  GEAR does not roll at all (the same function skips everything that is',
+      '  not a Weapon): its "ceiling" is only the highest rarity AUTHORED on a',
+      '  stat-bearing row this install hands out, and a piece keeps its row\'s.',
     ].join('\n'));
   },
 
   targets(args) {
     const s = commonSetup(args);
-    const { combat } = s.engine;
+    const { combat, cdb } = s.engine;
     const [a, b] = s.engine.ctx.consts.resistFormula;
+    const maxLevel = Math.round(s.engine.ctx.consts.maxLevel);
     // Damage that gets through, at a given penetration.
     const through = (armor, pen) => {
       const r = armor * (1 - pen / 100);
       return 1 - r / (r + a + b * s.level);
     };
+    const unitName = (id) => cdb.byId('unit').get(id)?.texts?.name ?? null;
+    // Two answers in one column: `immune` is isCCImmune (nothing lands),
+    // `no stun` a unit that is not immune and still refuses a stun, `lands`
+    // neither. An archetype's is a census of its heirs, not a flag it carries.
+    const cc = (t) => (t.ccImmune ? 'immune' : t.stunImmune ? 'no stun' : 'lands')
+      + (/^assumed/.test(t.ccImmune ? t.ccImmuneWhy : t.stunImmuneWhy) ? '*' : '');
 
     console.log(f.header(s.engine, VERSION) + '\n');
     console.log(`What the world resists at level ${s.level}, and what penetration buys against it.\n`);
     console.log(f.table(
-      ['TARGET', 'UNIT', 'PHYS', 'MAG', 'ARMOUR', 'NO PEN', '25% PEN', '50% PEN', 'GAIN @50%'],
+      ['TARGET', 'WHAT', 'PHYS', 'MAG', 'LEVEL', 'ARMOUR', 'NO PEN', '25% PEN', '50% PEN', 'GAIN @50%', 'CC'],
       combat.foes.map((n) => {
         const t = combat.foe(n, s.level);
+        const named = combat.namedTargets[n];
         const base = through(t.armor, 0);
         return [
-          n, t.name.replace(/^[^(]*\(|\)$/g, ''),
-          f.pct(t.physReduction, 0), f.pct(t.magicReduction, 0), f.num(t.armor, 0),
+          n, t.unit ? `${named.label} (${t.unit})` : named.label,
+          f.pct(t.physReduction, 0), f.pct(t.magicReduction, 0),
+          f.num(t.spawnLevel, Number.isInteger(t.spawnLevel) ? 0 : 1), f.num(t.armor, 0),
           f.pct(base), f.pct(through(t.armor, 25)), f.pct(through(t.armor, 50)),
           t.armor > 0 ? f.signedPct(through(t.armor, 50) / base - 1, 1) : f.dim('-'),
+          cc(t),
         ];
-      }), { align: [null, null, 'r', 'r', 'r', 'r', 'r', 'r', 'r'] }));
+      }), { align: [null, null, 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', null] }));
+    console.log(f.dim([
+      '  PHYS / MAG is what the unit row authors: the reduction it would be at its own level.',
+      '  ARMOUR is the pool the game builds from it at LEVEL, and the PEN columns are what gets',
+      `  through to a level-${s.level} striker. CC: \`immune\` refuses every crowd control (the unit`,
+      '  flags a skill reads as isCCImmune); `no stun` is not immune - a root or a slow lands -',
+      '  and still refuses a stun (unit flag NoStun); `lands` takes all of it. * is assumed from',
+      '  the units built on that archetype, not read off a unit (bench audit has the counts).',
+    ].join('\n')));
+
+    // The heroic bosses, each as the unit its row says in Normal and as its
+    // heroic rows at MaxLevel - the two things `--target <id>` and
+    // `--target <id>@heroic` price.
+    if (combat.heroicBosses.length) {
+      console.log('\n' + f.bold('HEROIC') + f.dim(`  the ${combat.heroicBosses.length} bosses that author a heroic loot table in a dungeon whose Heroic is released:`
+        + `\n  the unit row in Normal, the heroic rows at level ${maxLevel} in Heroic`));
+      const side = (t) => [
+        `${f.pct(t.physReduction, 0)}${t.magicReduction !== t.physReduction ? ' / ' + f.pct(t.magicReduction, 0) : ''}`,
+        f.num(t.spawnLevel, Number.isInteger(t.spawnLevel) ? 0 : 1), f.num(t.armor, 0), f.pct(through(t.armor, 0)),
+      ];
+      console.log(f.table(
+        ['UNIT', 'NAME', 'NORMAL', 'LVL', 'ARMOUR', 'NO PEN', 'HEROIC', 'LVL', 'ARMOUR', 'NO PEN'],
+        combat.heroicBosses.map((id) => [
+          id, unitName(id) ?? f.dim('(no name)'),
+          ...side(combat.foe(id, s.level)), ...side(combat.foe(`${id}@heroic`, s.level)),
+        ]), { align: [null, null, 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r'] }));
+      const named = combat.heroicNamed;
+      console.log(f.dim(`  \`--target heroic\` is the Heroic column: ${named.share} of ${named.of} resolve the same row`
+        + (named.share === named.of ? '.' : `, and the shortcut stands on ${named.unit}.`)
+        + ' `--target <unit>@heroic` names one.'));
+      // Authored ahead of the mode: the loot table is wired, the dungeon's
+      // level file keeps Heroic shut - not a target anyone meets yet.
+      for (const x of combat.heroicAhead ?? []) {
+        console.log(f.dim(`  not listed: ${x.id} (${unitName(x.id) ?? 'no name'}) authors a heroic loot table, and ${x.why}`));
+      }
+      for (const x of combat.heroicUnjudged ?? []) {
+        console.log(f.dim(`  listed although unread: ${x.id} - ${x.why}`));
+      }
+    }
 
     console.log(f.dim(`\n  ${combat.targetsByUnit.size} units resolve an armour intent through inheritance, ` +
       'so --target also\n  accepts any unit id directly.'));
+
+    // Every count below is taken off the rows as the sentence is printed.
+    const units = cdb.lines('unit');
+    const isArmourRow = (st) => st.specScaling?.armorReduction != null || st.specScaling?.magicReduction != null;
+    const declarers = units.filter((u) => (u.stats ?? []).some((st) => st.heroic !== true && isArmourRow(st)));
+    const heroicOnly = units.filter((u) => !declarers.includes(u)
+      && (u.stats ?? []).some((st) => st.heroic === true && isArmourRow(st)));
+    const bossOwn = declarers.filter((u) => combat.unitFlags(u.id).includes('Boss')).map((u) => u.id);
+    // Who splits physical from magical, and why - the model's own list, so the
+    // prose and the audit cannot disagree about what a golem is.
+    const golems = combat.armourSplits.byStub.map((id) => [id, combat.targetsByUnit.get(id)]);
+    const splitOther = combat.armourSplits.authored.map((id) => [id, combat.targetsByUnit.get(id)]);
+    const wrap = (parts, sep, width, indent) => {
+      const lines = [];
+      let cur = '';
+      for (const part of parts) {
+        const next = cur ? `${cur}${sep}${part}` : part;
+        if (next.length > width && cur) { lines.push(cur); cur = part; } else cur = next;
+      }
+      if (cur) lines.push(cur);
+      // A list breaks after its comma; a comparison carries its sign down.
+      const list = sep.trim() === ',';
+      return lines.map((l, i) => indent + (i && !list ? `  ${sep.trim()}  ` : '') + l
+        + (list && i < lines.length - 1 ? ',' : '')).join('\n');
+    };
+    // The archetype ladder, off the rows: every row that authors a reduction
+    // and that other units are built from, by what it authors.
+    const isParent = new Set(units.flatMap((u) => (u.inherit ?? [])
+      .filter((i) => !i?.textOnly && i?.ref).map((i) => i.ref)));
+    const ownRed = (u) => (u.stats ?? [])
+      .find((st) => st.heroic !== true && st.specScaling?.armorReduction != null)?.specScaling.armorReduction ?? null;
+    const tiers = new Map();
+    for (const u of declarers) {
+      const r = ownRed(u);
+      if (r == null || u.lvl != null || !isParent.has(u.id)) continue;
+      if (!tiers.has(r)) tiers.set(r, []);
+      tiers.get(r).push(u.id);
+    }
+    const ladder = [...tiers].sort((x, y) => x[0] - y[0]).map(([r, ids]) => `${ids.join(' / ')} ${r.toFixed(2)}`);
+    const bossReds = [...new Set(bossOwn.map((id) => ownRed(cdb.byId('unit').get(id))))].sort();
+    // The row whose Armor is a bare multiplier, and the units it lands on.
+    const { stubOwners } = combat.armourSplits;
+    // A boss whose row stands below the character, to show what a unit id prices.
+    const low = bossOwn.map((id) => combat.foe(id, s.level)).find((t) => t.spawnLevel < s.level);
+    const dummy = combat.foe('dummy', s.level);
+    // A level-less row that some unit summons, found by shape, to show where
+    // a summon stands.
+    const summon = [...combat.targetsByUnit.keys()]
+      .filter((id) => cdb.byId('unit').get(id).lvl == null && combat.summonersOf(id).length)
+      .map((id) => combat.foe(id, s.level))
+      .find((t) => /^summoned: /.test(t.levelWhy));
+    const ref = combat.foe('reference', s.level);
+    const boss = combat.foe('boss', s.level);
+    const gain = (t) => f.signedPct(through(t.armor, 50) / through(t.armor, 0) - 1, 1);
 
     console.log('\n' + f.bold('WHERE THESE COME FROM'));
     console.log([
       '  `unit.stats[].specScaling.armorReduction` and `.magicReduction`. Foes',
       '  express armour as a target damage REDUCTION, exactly the way the four',
-      '  classes do, and resistForReduction turns that intent into a number. 27',
-      '  units declare one and the rest inherit it, so nothing here is invented.',
+      `  classes do, and the game turns that intent into a pool at the unit's level.`,
+      `  ${declarers.length} units author one` + (heroicOnly.length ? ` (${heroicOnly.length} more only in Heroic)` : '')
+        + ' and the rest inherit it,',
+      '  so nothing here is invented.',
       '',
-      '  The ladder the world is built on:',
+      '  A unit resolves ONE armour row: its own when it authors one, the nearest',
+      '  inherited otherwise - a child\'s row replaces its parent\'s, it does not add',
+      '  to it. So the ladder the world is built on is the ladder the table shows:',
       '',
-      '    W_Assassin 0.20  <  W_Base_Small / D_Base_Small 0.25  <  W_Base 0.30',
-      '      <  W_Base_Big / W_Base_Unique / D_Base_Big 0.35  <  W_Base_Elite 0.40',
-      '      =  every named boss (Ratsar, Mokshi, Crabgantua, Phrixes, Cleodora,',
-      '         MunsterChuck, Ulserous, DemonSuperElite)',
+      wrap(ladder, '  <  ', 66, '    '),
       '',
-      f.bold('  Two things follow, and both matter for gearing:'),
+      `  and ${bossOwn.length} bosses author a row of their own, at ${bossReds.map((r) => r.toFixed(2)).join(' / ')}:`,
+      wrap(bossOwn, ', ', 66, '    '),
       '',
-      '  * Physical and magical reduction are EQUAL on every real foe. Only the',
-      '    dev punching bags split them (PunchingBagArmor 0.5/0, PunchingBagMagicRes',
-      '    0/0.5). So ArmorPenetration and SpellPenetration are worth the same',
-      '    against everything currently in the game - which one you want is decided',
-      '    by your class and your gear\'s faction, never by the fight.',
+      f.bold('  What follows, and matters for gearing:'),
       '',
-      `  * Armor_ExpectedReduction (${s.engine.cdb.constant('Armor_ExpectedReduction')}) is well below what you actually fight, so`,
-      '    it understates penetration against a boss - +14.3% against +25.0% at',
+      `  * Physical and magical reduction are EQUAL on every foe but the ${golems.length} units`,
+      `    that inherit ${stubOwners.join(' / ') || '(none)'} - an Armor multiplier with no MagicArmor twin, so a`,
+      '    golem is harder to hit than to burn' + (golems.length
+        ? ` (${golems[0][0]}: ${f.pct(golems[0][1].phys, 0)} / ${f.pct(golems[0][1].mag, 0)}).` : '.'),
+      ...(splitOther.length ? [
+        '    The only other rows that split them author it outright:',
+        wrap(splitOther.map(([id, i]) => `${id}${unitName(id) ? ` ("${unitName(id)}")` : ''} ${f.pct(i.phys, 0)} / ${f.pct(i.mag, 0)}`),
+          ', ', 64, '      ') + '.',
+      ] : []),
+      '    Against everything else ArmorPenetration and SpellPenetration are worth',
+      '    the same, and which one you want is decided by your class and your',
+      '    gear\'s faction, not by the fight.',
+      '',
+      `  * Armor_ExpectedReduction (${cdb.constant('Armor_ExpectedReduction')}) is well below what you actually fight, so`,
+      `    it understates penetration against a boss - ${gain(ref)} against ${gain(boss)} at`,
       '    50% penetration. That is why the default target is a boss and not that',
       '    constant.',
       '',
-      '  * A foe\'s pool is built at ITS level and divided at YOURS, so a boss that',
-      '    spawns below you mitigates far less than its intent says. `boss` is a',
-      '    world boss at your own level; Ratsar and Phrixes carry measured rift and',
-      '    arena levels and are softer than 0.40 when you name them directly.',
-      '    `--target-level <n>` sets the spawn level on any of them.',
+      '  * A foe\'s pool is built at ITS level and divided at YOURS, so a foe below',
+      '    you mitigates less than its row says. The archetype shortcuts (trash to',
+      '    dungeon) stand at your own level; `dummy` and `heroic` stand where the',
+      '    table says. A unit id stands where its row puts it in Normal',
+      '    difficulty' + (low
+        ? `: \`--target ${low.unit}\` is level ${low.spawnLevel}, ${f.pct(1 - through(low.armor, 0))} to you.` : '.'),
+      `    \`<target>@veteran\` and \`<target>@heroic\` stand it at level ${maxLevel}, where those`,
+      '    difficulties spawn everything (Heroic also reads the heroic rows);',
+      '    `<target>@scaled` builds the pool at your level, which is what a rift does',
+      '    to whatever stands in it. `--target-level <n>` overrides any of them.',
       '',
+      `  * The training dummy is not a zero any more. Its row authors ${f.pct(dummy.physReduction, 0)} / ${f.pct(dummy.magicReduction, 0)}`,
+      `    and it stands at level ${dummy.spawnLevel}, so a level-${s.level} character loses ${f.pct(1 - through(dummy.armor, 0))} on it.`,
+      '    `none` is the target that mitigates nothing.',
+      '',
+      ...(summon ? [
+        '  * A unit with no level on its row that something SUMMONS stands at its',
+        '    summoner\'s level, not at 1:',
+        `    \`--target ${summon.unit}\` is level ${f.num(summon.spawnLevel, Number.isInteger(summon.spawnLevel) ? 0 : 1)}, summoned by`,
+        wrap(combat.summonersOf(summon.unit), ', ', 64, '    ') + '.',
+        '',
+      ] : []),
+      f.dim('  Not read: which activity a unit stands in, and the few spawners that name a'),
+      f.dim('  level - both ship in the level prefabs, not in data.cdb. A summoned row that'),
+      f.dim('  authors a level of its own is priced at that row (bench audit names them).'),
       f.dim('  Not modelled: unitType.props.resistance is an affinity-level resistance'),
-      f.dim('  hook and only Bee uses it (Honey), so it is inert. Foe level is taken'),
-      f.dim('  from --level; zone rows carry levels 1..25 if you want a specific one.'),
+      f.dim('  hook and only Bee uses it (Honey), so it is inert.'),
     ].join('\n'));
   },
 
@@ -1398,7 +1908,10 @@ const commands = {
             + (v.affixes.length ? f.affixSummary(v.affixes)
               : v.buffs.length ? v.buffs.map((x) => x.name + " x" + x.stacks).join(", ")
                 : v.effects.length ? v.effects.map((x) => x.kind).join(", ")
-                  : f.dim("no affix, no effect, no status"))];
+                  // A node read off its SCRIPT declares none of the three, and
+                  // the column must not say "nothing" beside what it reads as.
+                  : f.dim(v.readable ? "its script - no affix, effect or Status step in the row"
+                    : "no affix, no effect, no status"))];
         })));
       console.log("");
     }
@@ -1417,21 +1930,30 @@ const commands = {
     console.log("\n" + f.warn("WHY THIS IS MOSTLY STRUCTURE"));
     const all = s.engine.cat.classes.flatMap((c) => T.treeFor(c.unit).nodes);
     const rd = all.filter((n) => T.readableValue(n.skill).readable);
+    // Counted at print time, like the rune figures below. The sentence this
+    // replaced carried a hand count ("72 of them DO ship an hscript body")
+    // that had come to exceed the number it was a part of.
+    const unreadScripted = all.filter((n) => !T.readableValue(n.skill).readable
+      && T.readableValue(n.skill).hasScript).length;
     console.log([
-      "  " + rd.length + " of " + all.length + " talent nodes declare something a data-driven model can",
-      "  read - a stat affix, a self-buff status, or a damage effect. The other",
-      "  " + (all.length - rd.length) + " declare no affix, no effect and no status - but 72 of them DO",
-      "  ship an hscript body, and between them those scripts call only 63",
-      "  distinct names - about 39 real host functions once the entry hooks and",
-      "  built-ins are removed. So the talent layer is blocked on the same small",
-      "  script kernel the rest of the skill work needs, not on absent data. Every",
-      "  one of the 88 nodes also carries a texts.desc to check an implementation",
-      "  against.",
+      "  " + rd.length + " of " + all.length + " talent nodes declare something this model reads - a stat affix,",
+      "  a self-buff status, a damage effect, or one of the script shapes the fight",
+      "  plays (a scoped modifier, a pool, a status on a named event, a rider on a",
+      "  status's own hits, cooldown handed to a named skill). The other " + (all.length - rd.length) + " read as",
+      "  nothing here: " + unreadScripted + " of them ship an hscript body the readers behind this",
+      "  table do not take (the fight scores a few of those through readers of",
+      "  its own - a next-cast register, the Mage's chain), and the rest declare",
+      "  nothing at all. So what is left of the talent layer is blocked on script",
+      "  shapes, not on absent data. Every one of the " + all.length + " nodes also carries a",
+      "  texts.desc to check an implementation against.",
       "",
       "  So the optimiser allocates points over the readable nodes and STOPS. It",
       "  does not spend the remainder on nodes it cannot tell apart, because a",
       "  build assembled that way would look authoritative and be arbitrary. The",
-      "  unspent points are reported rather than quietly filled.",
+      "  one point it does put in such a node is a GATE POINT: a tier it takes",
+      "  something from stands on it, and the table tags it. A point bought",
+      "  toward a tier the budget then does not reach is taken back. The unspent",
+      "  points are reported rather than quietly filled.",
       "",
     ].join("\n"));
 
@@ -1549,6 +2071,7 @@ const commands = {
       version: VERSION, cdbSha: s.engine.meta.cdbSha, bootSha: s.engine.meta.bootSha,
       goal: s.goal, weights: s.weights, target: s.targetName, targetLabel: target.name,
       fervorScope: s.engine.opts.assume.fervorScope,
+      tickSource: s.engine.opts.assume.tickSource,
       stars: s.stars, rank: s.rank, level: s.level, mix: s.mix,
       rarityRoll: s.rarityRoll,
       fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
@@ -1698,7 +2221,7 @@ const commands = {
       console.log(f.bold('SKILLS'));
       console.log(f.skillsBlock(s.engine, k.res.loadout, k.res.evaluation, { pinnedSkills: new Set() }) + '\n');
       console.log(f.runeBlock(s.engine, k.res.loadout, k.res.evaluation) + '\n');
-      console.log(f.throughputBlock(s.engine, k.res.evaluation, { goal: s.goal }));
+      console.log(f.throughputBlock(s.engine, k.res.evaluation, { goal: s.goal, authored: s.policyNote ?? null }));
     }
     console.log('\n' + f.dim(`every layout is in ${outDir}/ - index.json ranks them, and any pair file `
       + 'loads back with --build'));
@@ -1751,6 +2274,9 @@ const commands = {
     // every other command stops.
     let kit = kitSearch(null);
     let derivedScore = kit.score;
+    // The orders the derived fight played for a press that lands on its
+    // caster (sim.mjs `simulate`), for the sentence about the baseline below.
+    const placed = kit.evaluation?.throughput?.rotationSearched?.landers ?? null;
     let apl = null, aplScore = derivedScore, best = { kit, apl: null, score: derivedScore };
     const log = [];
 
@@ -1852,6 +2378,14 @@ const commands = {
         + '\n  and a rollout is not something a priority list can express - it re-simulates the next\n'
         + '  few seconds before every cast. Where the rollout wins, an APL starts behind and may\n'
         + '  not catch up. --lookahead 0 compares against plain priority order instead.'));
+      // ...and, for a build with a press that lands on its caster for a
+      // status that waits for a landing, of every order that places that
+      // press (sim.mjs `simulate`) - with or without a lookahead.
+      if (placed?.played?.length > 1) {
+        console.log(f.dim(`  In this build each of those was also played ${placed.exhaustive ? 'every way' : 'several ways'} `
+          + `${placed.of.map((l) => l.name).join(' and ')} can be placed (${placed.played.length} orders: as ranked, last, left out),\n`
+          + '  and the baseline is the best of them - with --lookahead 0 too. bench sheet --verbose lists them.'));
+      }
     }
     console.log(f.table(['  ROUND', 'SEARCHED', s.goal.toUpperCase(), 'FIGHTS'],
       log.map((l) => ['  ' + l.round, l.what, l.score.toFixed(1), l.fights ? String(l.fights) : ''])
@@ -2043,6 +2577,7 @@ const commands = {
         version: VERSION, cdbSha: s.engine.meta.cdbSha, bootSha: s.engine.meta.bootSha,
         goal: s.goal, weights: s.weights, target: s.targetName, targetLabel: target.name,
         fervorScope: s.engine.opts.assume.fervorScope,
+        tickSource: s.engine.opts.assume.tickSource,
         stars: s.stars, rank: s.rank, level: s.level, mix: s.mix, rarityRoll: s.rarityRoll,
         fight: s.fight.seconds, fights: s.fight.count, targets: s.fight.targets,
         targetHealth: s.fight.targetHealth,
@@ -2247,74 +2782,435 @@ const commands = {
   },
 
   // The patch-day pipeline. `bench update` diffs the install against the
-  // committed fingerprint and prints the work list; --accept records the new
-  // state once the work is done (or consciously deferred).
+  // committed fingerprint and prints the work list; --reanchor rewrites the
+  // citations whose function merely moved; --accept records the new state
+  // once the work is done (or consciously deferred). The two halves are
+  // independent on purpose: a bytecode the reader cannot parse (a new HLB
+  // version, a new opcode) must not hide the data drift, so the cdb half runs
+  // regardless and the citations are reported as UNCHECKED.
   async update(args) {
-    const game = requireGame(args._);
+    // --game lands in flags, so hand it back to the locator or it falls
+    // through to the cached path - and with a live and a PTR install side by
+    // side that is a report about the wrong build.
+    const gameArgv = typeof args.flags.game === 'string' ? ['--game', args.flags.game, ...args._] : args._;
+    const game = requireGame(gameArgv);
     const cdb = loadCdb({ game, quiet: true });
-    const code = readHlb(requireBoot(args._));
     const srcDir = fileURLToPath(new URL('../src', import.meta.url));
     const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+    const withStale = !!args.flags['with-stale-citations'];
 
-    const stored = loadFingerprint(repoRoot);
-    const current = buildFingerprint(cdb, { code, srcDir });
-    const cites = resolveCitations(code, srcDir);
+    // Refused before anything is computed: nothing below may tempt a write.
+    if (args.flags.accept && args.flags.against) {
+      console.log(f.warn(`Not accepted: ${acceptGate({ against: true }).reason}.`));
+      process.exitCode = 1;
+      return;
+    }
+
+    let code = null, codeError = null;
+    try { code = readHlb(requireBoot(gameArgv)); } catch (e) { codeError = e.message; }
+
+    // --against <path>: diff against an older copy of the data instead of the
+    // committed fingerprint - a data.cdb pulled out of an old depot, or a whole
+    // install folder. The schema diff can only speak from a real old build,
+    // and the fingerprint carries one only from the first --accept after
+    // schemas were tracked. Old ROWS are what lets a changed row say what
+    // changed in it: --against has them, and so does the copy --accept leaves
+    // in .cache/ on the machine that accepted.
+    const committed = loadFingerprint(repoRoot);
+    let stored = committed, oldCdb = null;
+    if (args.flags.against) {
+      if (typeof args.flags.against !== 'string') throw new Error('--against needs a path: a data.cdb file or an install folder');
+      const p = args.flags.against;
+      if (!existsSync(p)) throw new Error(`--against: ${p} does not exist`);
+      oldCdb = statSync(p).isDirectory()
+        ? loadCdb({ game: p, quiet: true })
+        : new Cdb(JSON.parse(readFileSync(p, 'utf8')), { game: p, cdbSha: null, bootSha: null });
+      // The data of the old copy, and the code half of the committed
+      // fingerprint: an old data.cdb has no bytecode beside it.
+      stored = fingerprintAgainst(oldCdb, committed, `${p} (--against)`);
+    } else if (committed) {
+      const raw = loadAcceptedRows(repoRoot, committed.cdbSha);
+      if (raw) oldCdb = new Cdb(raw, { game: acceptedRowsPath(repoRoot), cdbSha: raw.cdbSha, bootSha: null });
+    }
+    // The qualified names, body shapes and stub annotations a previous
+    // --accept recorded. They describe the bytecode, not the data, so they
+    // are consulted whatever the data is being diffed against.
+    const known = committed?.citations ?? null;
+    // Citations are scanned wherever they are stated as current fact: the
+    // model, the commands, the tools, the UI server, the living docs, and the
+    // comment lines of the suite.
+    const roots = citationRoots(repoRoot);
+    const current = buildFingerprint(cdb, { code, srcDir: roots, known, prev: committed });
+    // ...and with them what the last acceptance deferred: where each of
+    // those citations was estimated to be when it was let through.
+    const deferredList = committed?.staleCitations ?? null;
+    const cites = code ? resolveCitations(code, roots, { known, deferred: deferredList }) : { resolved: {}, report: [], sites: [] };
+    const gate = acceptGate({ report: cites.report, codeError, withStale });
+    // What the last acceptance deferred, against what the source says today.
+    const deferred = code ? deferredCitations(committed, cites.report) : [];
+
+    // --reanchor: the mechanical half, on its own. A dry run unless --write.
+    if (args.flags.reanchor) {
+      if (!code) {
+        console.log(f.warn(`Cannot re-anchor: the bytecode is unreadable (${codeError}).`));
+        process.exitCode = 1;
+        return;
+      }
+      const only = typeof args.flags.only === 'string' ? args.flags.only : null;
+      const plan = planReanchor(code, roots, { known, only, deferred: deferredList });
+      console.log(f.bold(`RE-ANCHOR  ${plan.edits.length} citation${plan.edits.length === 1 ? '' : 's'} can be rewritten mechanically, ${plan.manual.length} need a person`)
+        + f.dim(only ? `  (only files matching ${only})` : ''));
+      for (const e of plan.edits) {
+        console.log(`  ${`${e.file}:${e.line}`.padEnd(24)} ${e.from} -> ${e.to}  ${f.dim(e.why)}`
+          + (e.body === 'CHANGED' ? f.warn('  BODY CHANGED since the accepted build - the number moves, the sentence still needs a re-read') : '')
+          + (e.printed ? f.warn('  [printed to the user]') : ''));
+      }
+      if (plan.manual.length) {
+        console.log('');
+        console.log(f.bold(`MANUAL     ${plan.manual.length}`) + f.dim('  never rewritten: a fresh number on a sentence nobody re-read would be a forged re-read'));
+        for (const m of plan.manual) {
+          console.log(`  ${m.state.padEnd(8)} ${m.label ?? m.key}  ${f.dim(m.at.join(', '))}${m.printed ? f.warn('  [printed to the user]') : ''}\n${f.dim('           ' + m.why)}`);
+        }
+      }
+      if (args.flags.json) {
+        const out = typeof args.flags.json === 'string' ? args.flags.json : 'bench-reanchor.json';
+        writeFileSync(out, JSON.stringify({ edits: plan.edits, manual: plan.manual }, null, 1));
+        console.log(f.dim(`\nfull plan -> ${out}`));
+      }
+      if (args.flags.write) {
+        const done = applyReanchor(plan);
+        console.log('');
+        for (const w of done.written) console.log(`  wrote ${w.edits} edit${w.edits === 1 ? '' : 's'} to ${w.path}`);
+        for (const s of done.skipped) console.log(f.warn(`  SKIPPED ${s}: it changed since it was scanned - nothing written there, run again`));
+        if (!done.written.length && !done.skipped.length) console.log(f.dim('  nothing to write'));
+      } else {
+        console.log(f.dim('\nDry run: nothing was written. --reanchor --write rewrites the files; --only <path> narrows it to the files whose path contains it.'));
+      }
+      return;
+    }
+
+    // --row <sheet>:<id>: everything that changed inside one row.
+    if (args.flags.row) {
+      const [sheet, ...rest] = String(args.flags.row).split(':');
+      const id = rest.join(':');
+      if (!sheet || !id) die('--row needs <sheet>:<id>, e.g. --row rarity:Epic');
+      if (!oldCdb) {
+        die('--row needs the old rows, and the fingerprint keeps hashes only. Either pass --against <an older data.cdb or install folder>,\n'
+          + `or run it on the machine that ran the last --accept (it keeps the accepted rows in ${acceptedRowsPath(repoRoot)}; there is no such file for the accepted build here).`);
+      }
+      const paths = rowDiff(oldCdb, cdb, sheet, id);
+      if (paths == null) die(`--row: ${sheet}:${id} is not a row on both sides (old side: ${stored.at}) - an added or a removed row has nothing to diff`);
+      console.log(f.bold(`${sheet} ${id}`) + f.dim(`  ${stored.at} -> this install; texts and visuals left out, enums by name${sheet === 'skill' ? ', the script on a line of its own' : ''}`));
+      const out = rowLines(sheet, paths);
+      for (const l of out) console.log(paths.length ? `  ${l}` : f.dim(`  ${l}`));
+      return;
+    }
 
     if (!stored) {
+      // A packaged copy carries the accepted build's two hashes and not the
+      // fingerprint: it can say whether the game moved, and nothing more.
+      const stamp = loadAcceptedStamp(repoRoot);
+      if (stamp) {
+        const acc = acceptedBuild(repoRoot, cdb.meta);
+        console.log(`This copy carries no model/fingerprint.json - a download ships the accepted build's hashes only (${acceptedStampPath(repoRoot)}).`);
+        console.log(`  the model was accepted on ${String(stamp.at).slice(0, 10)}: cdb ${String(stamp.cdbSha).slice(0, 12)}  boot ${String(stamp.bootSha ?? '').slice(0, 12) || 'n/a'}`);
+        console.log(`  this install:                       cdb ${cdb.meta.cdbSha.slice(0, 12)}  boot ${cdb.meta.bootSha?.slice(0, 12) ?? 'n/a'}`);
+        console.log(acc?.same
+          ? '  The same build: every number is computed on the data the model was accepted on.'
+          : f.warn('  NOT the same build: the game was patched after this copy was released. What changed can only be listed from a clone of the repository (it holds the fingerprint) - or wait for a release accepted on the new build.'));
+        console.log(f.dim('Nothing was recorded.'));
+        return;
+      }
+      if (!args.flags.accept) {
+        console.log('No fingerprint exists, so there is nothing to diff against.');
+        console.log(f.dim(`Recording this build as the baseline is an acceptance like any other: re-run with --accept. ${gate.ok ? 'The citation gate is open.' : `It would be refused now: ${gate.reason}.`}`));
+        return;
+      }
+      if (!gate.ok) {
+        console.log(f.warn(`No fingerprint existed, and this build cannot be recorded as the baseline: ${gate.reason}.`));
+        process.exitCode = 1;
+        return;
+      }
+      if (gate.stale.length) current.staleCitations = gate.stale;
       mkdirSync(join(repoRoot, 'model'), { recursive: true });
       writeFileSync(fingerprintPath(repoRoot), JSON.stringify(current, null, 1));
+      syncAcceptedStamp(repoRoot, current);
+      saveAcceptedRows(repoRoot, cdb);
       console.log(`No fingerprint existed. Recorded the current build as the baseline:`);
       console.log(`  cdb ${current.cdbSha.slice(0, 12)}  boot ${current.bootSha?.slice(0, 12)}`);
       console.log(`  ${Object.keys(current.sheets).length} sheets, ${Object.keys(current.scripts).length} scripts, ${Object.keys(current.citations ?? {}).length} citations`);
-      console.log(f.dim('Commit model/fingerprint.json. Future runs diff against it.'));
+      console.log(f.dim('Commit model/fingerprint.json and model/accepted-build.json. Future runs diff against them.'));
       return;
     }
 
     // Citations first - they are free to check and they gate everything else.
-    const moved = cites.report.filter((c) => c.state === 'MOVED');
-    const missing = cites.report.filter((c) => c.state === 'MISSING');
-    console.log(f.bold(`CITATIONS  ${cites.report.filter((c) => c.state === 'OK').length} ok, ${moved.length} moved, ${missing.length} missing`));
-    for (const c of moved.slice(0, 20)) console.log(`  MOVED    ${c.name}  @${c.cached} -> @${c.now}  (name is the identity; update the cache)`);
-    for (const c of missing) console.log(f.warn(`  MISSING  ${c.name}@${c.cached} - the cited function no longer exists; the formula it anchored is UNVERIFIED`));
+    const chain = captureChain(game, code?.version ?? null, { functions: code?.functions.length ?? null });
+    if (code) {
+      const rep = cites.report;
+      const of = (st) => rep.filter((c) => c.state === st);
+      const moved = of('MOVED'), missing = of('MISSING'), stubs = of('STUB'), anon = of('ANON');
+      const ambiguous = moved.filter((c) => c.ambiguous);
+      const suspect = rep.filter((c) => c.suspect);
+      const changed = rep.filter((c) => c.body === 'CHANGED' && c.state !== 'STUB');
+      const unhashed = rep.filter((c) => c.body === 'UNHASHED').length;
+      console.log(f.bold(`BYTECODE   HLB v${code.version}, ${code.functions.length} functions, ${code.natives.length} natives`));
+      // The in-game half, from what the install itself recorded: did the
+      // loader run on this boot, and was anything captured against it.
+      const cap = captureLine(chain);
+      console.log((cap.level === 'warn' ? f.warn : f.dim)(`CAPTURE    ${cap.text}`));
+      const staleAnon = anon.filter((c) => c.stale);
+      console.log(f.bold(`CITATIONS  ${of('OK').length} ok, ${moved.length} moved, ${stubs.length} on a server-only stub, ${missing.length} missing`
+        + (anon.length ? `, ${anon.length} anonymous${staleAnon.length ? ` (${staleAnon.length} stale)` : ''}` : ''))
+        + (ambiguous.length ? f.dim(`  (${ambiguous.length} of the moved names match several functions - each placed by the shift its nearest unambiguous neighbour measured`) + (suspect.length ? f.warn(`, ${suspect.length} SUSPECT`) : '') + f.dim(')') : ''));
+      // What a findex cannot say: whether the function under the name is still
+      // the function the sentence read.
+      console.log(f.dim(`  bodies   ${rep.filter((c) => c.body === 'SAME').length} same as accepted, ${changed.length} CHANGED, ${rep.filter((c) => c.body === 'STRIPPED').length} STRIPPED to a stub`
+        + (unhashed ? `, ${unhashed} not comparable - the stored fingerprint predates body hashes, so MOVED says where a function is and nothing about what is in it; recorded on --accept` : '')));
+      for (const c of moved.filter((x) => !x.suspect).slice(0, 20)) {
+        console.log(`  MOVED    ${c.name}  @${c.cached} -> @${c.now}  ${f.dim(c.qualified ?? '')}`
+          + (c.ambiguous || c.via ? f.dim(`  via ${c.via}`) : '')
+          + (c.body === 'CHANGED' ? f.warn(`  BODY CHANGED (${c.opsWas ?? '?'} -> ${c.ops} ops)`) : ''));
+      }
+      if (moved.length > 20) console.log(f.dim(`  ...and ${moved.length - 20} more moved (all in --json)`));
+      for (const c of changed) {
+        console.log(f.warn(`  CHANGED  ${c.name}@${c.cached}${c.now != null ? ` -> @${c.now}` : ''} ${c.qualified}: the body is not the one the fingerprint recorded (${c.opsWas ?? '?'} -> ${c.ops} ops) - re-read the formula at ${(c.at ?? c.in ?? []).slice(0, 4).join(', ')}`));
+      }
+      for (const c of stubs) {
+        const at = (c.at ?? c.in ?? []).slice(0, 4).join(', ');
+        const head = `  STUB     ${c.name}@${c.cached}${c.stale ? ` -> @${c.now}` : ''} ${c.qualified}: ${c.ops} ops, throws "${c.stub.thrown}"`;
+        if (c.stub.recorded) console.log(f.dim(`${head} - annotated since ${String(c.stub.since).slice(0, 10)}; the formula it anchored cannot be re-read on this client`) + (c.stale ? f.warn('  (the number is stale)') : ''));
+        else console.log(f.warn(`${head} - the client no longer carries this body, so the formula it anchored cannot be re-read on this build${c.body === 'STRIPPED' ? ` (the accepted build recorded ${c.opsWas ?? 'a body of unknown'} ops there)` : ''}. Say so where it is cited: ${at}${c.printed ? ' [printed to the user]' : ''}`
+          // Accepted stale: the stub got its date, the sentence stayed as it was.
+          + (c.stub.acceptedStale ? `. Accepted STALE${c.stub.since ? ` on ${String(c.stub.since).slice(0, 10)}` : ''} (--with-stale-citations): the sentence was not reworded then and still states @${c.cached}` : '')));
+      }
+      // Intact itself, and calling something that is not.
+      for (const c of rep.filter((x) => x.leans?.length && x.state !== 'STUB')) {
+        console.log(f.dim(`  LEANS    ${c.name}@${c.cached} ${c.qualified} has its body, and calls ${c.leans.length === 1 ? 'a server-only stub' : 'server-only stubs'}: ${c.leans.join(', ')} - what happens in there cannot be re-read on this client (${(c.at ?? []).slice(0, 3).join(', ')})`));
+      }
+      for (const c of suspect) {
+        console.log(f.warn(`  SUSPECT  ${c.name}@${c.cached} -> @${c.now} ${c.qualified}: ${c.off ?? '?'} slots off ${c.via}; the alternatives: ${(c.candidates ?? []).filter((x) => !x.endsWith('@' + c.now)).join(', ')} - qualify the citation in ${(c.in ?? []).join(', ')} as Class.method@findex`));
+      }
+      for (const c of missing) {
+        // "No longer exists" is a claim about the game; say it only when no
+        // reading of the spelling finds anything.
+        console.log(f.warn(`  MISSING  ${c.name}@${c.cached} in ${(c.at ?? c.in ?? []).slice(0, 4).join(', ')} - ${c.hint?.text ?? 'no function of that name on this build; the formula it anchored is UNVERIFIED until the new code is read'}`));
+      }
+      for (const c of staleAnon.slice(0, 20)) {
+        console.log(f.warn(`  ANON     ${c.closure ? 'fn' : ''}@${c.cached} in ${(c.at ?? []).slice(0, 4).join(', ')} - ${anonWhy(c)}`));
+      }
+      if (staleAnon.length > 20) console.log(f.dim(`  ...and ${staleAnon.length - 20} more anonymous (all in --json)`));
+      const quiet = anon.length - staleAnon.length;
+      if (quiet) console.log(f.dim(`  ANON     ${quiet} more land on an unnamed function - nothing but the number identifies them until --accept records the body`));
+      // A recorded closure with a twin and no owner to tell them apart: the
+      // number is taken at its word, and that is said.
+      for (const c of rep.filter((x) => x.name === 'fn' && x.state === 'OK' && x.twins?.length)) {
+        console.log(f.dim(`  ANON     fn@${c.cached} lands on the body the fingerprint recorded - and so ${c.twins.length === 1 ? 'does' : 'do'} ${c.twins.map((x) => `fn@${x}`).join(', ')}, with no owner recorded to tell them apart; the written number is taken at its word (${(c.at ?? []).slice(0, 3).join(', ')})`));
+      }
+      const printed = rep.filter((c) => c.printed && (c.state !== 'OK' || c.body === 'CHANGED'));
+      if (printed.length) console.log(f.warn(`  ${printed.length} of these sit in strings the bench PRINTS (an audit's why:), so a user is being told it: ${printed.map((c) => `${c.name}@${c.cached}`).join(', ')}`));
+      // A deferral is put on the record so that it stays in view: what the
+      // last --accept --with-stale-citations let through, and which of those
+      // are still owed.
+      if (deferred.length) {
+        const open = deferred.filter((d) => d.open);
+        console.log((open.length ? f.warn : f.dim)(`  DEFERRED ${deferred.length} citation${deferred.length === 1 ? ' was' : 's were'} accepted stale on ${String(committed?.at).slice(0, 10)} (--with-stale-citations); `
+          + (open.length ? `${open.length} still ${open.length === 1 ? 'is' : 'are'}: ${open.map((d) => `${d.label} ${d.state}${d.at.length ? ` ${d.at[0]}` : ''}`).join(', ')}` : 'none still is')
+          + (open.length < deferred.length ? ` - ${deferred.length - open.length} ${open.length ? 'more' : 'of them'} ${deferred.length - open.length === 1 ? 'was' : 'were'} rewritten since, and the next --accept shortens the list` : '')));
+      }
+      if (gate.stale.length) console.log(f.dim(`  \`bench update --reanchor\` lists what can be rewritten mechanically (--write does it) and what needs a person.`));
+    } else {
+      console.log(f.warn(`BYTECODE   unreadable: ${codeError}`));
+      const cap = captureLine(chain);
+      console.log((cap.level === 'warn' ? f.warn : f.dim)(`CAPTURE    ${cap.text}`));
+      console.log(f.warn('CITATIONS  UNCHECKED - every formula anchored in the bytecode is unverified until the reader parses this build'));
+    }
 
     const diff = diffFingerprints(stored, current);
+    const writeJson = (extra) => {
+      if (!args.flags.json) return;
+      const out = typeof args.flags.json === 'string' ? args.flags.json : 'bench-drift.json';
+      writeFileSync(out, JSON.stringify({
+        stored: stored.at, bytecode: code ? { version: code.version, functions: code.functions.length } : { error: codeError },
+        capture: chain, diff, citations: cites.report, accept: gate, deferred, ...extra,
+      }, null, 1));
+      console.log(f.dim(`\nfull report -> ${out}`));
+    };
+    // The one place a fingerprint is written. Gated: see acceptGate.
+    const accept = (what) => {
+      if (!gate.ok) {
+        console.log(f.warn(`\nNot accepted: ${gate.reason}.`));
+        process.exitCode = 1;
+        return;
+      }
+      if (gate.stale.length) current.staleCitations = gate.stale;
+      writeFileSync(fingerprintPath(repoRoot), JSON.stringify(current, null, 1));
+      syncAcceptedStamp(repoRoot, current);
+      const kept = saveAcceptedRows(repoRoot, cdb);
+      const stubbed = Object.values(current.citations ?? {}).filter((r) => r.stub).length;
+      console.log(f.bold(`\nAccepted: ${what}`)
+        + f.dim(` Commit model/fingerprint.json and model/accepted-build.json with the work that justified accepting.`));
+      console.log(f.dim(`  recorded ${Object.keys(current.citations ?? {}).length} citations with their body shapes, ${stubbed} of them annotated as server-only stubs`
+        + (gate.stale.length ? `, and ${gate.stale.length} accepted STALE (--with-stale-citations): ${gate.stale.map((x) => x.key).join(', ')}` : '')));
+      console.log(f.dim(`  the accepted rows are kept in ${kept} (this machine only, never committed) so the next report can say what changed inside a row`));
+    };
     if (diff.same) {
       console.log(`\nNo drift: the install matches the fingerprint from ${stored.at}.`);
+      // The same build can still leave --accept something to record: a table
+      // written before hooks, talents, schemas or body shapes existed, or
+      // citations added to the source since.
+      const gaps = fingerprintGaps(stored, current, { report: code ? cites.report : null });
+      if (gaps.length) console.log(f.dim(`The stored fingerprint is not what this version would write for this build (${gaps.join(', ')}) - --accept rewrites it on this same build.`));
+      writeJson({ clusters: [], itemsAdded: [], work: [], gaps });
+      if (args.flags.accept) {
+        if (gaps.length) accept(`the fingerprint is rewritten for this build (${gaps.join(', ')}).`);
+        else console.log(f.dim('\nNothing to accept: the fingerprint already records everything this version tracks for this build.'));
+      }
       return;
     }
     console.log('');
     console.log(f.bold(`DRIFT since ${stored.at}`)
-      + f.dim(`  cdb ${diff.cdbChanged ? 'CHANGED' : 'same'}, boot ${diff.bootChanged ? 'CHANGED' : 'same'}`));
+      + f.dim(`  cdb ${diff.cdbChanged ? 'CHANGED' : 'same'}, boot ${stored.bootSha == null ? 'n/a' : diff.bootChanged ? 'CHANGED' : 'same'}`));
+    // A skill row's script has its own hash and its own line, so a row that
+    // changed in its script alone is neither "changed in substance" nor
+    // "cosmetic": it is counted with the scripts.
+    const scriptMoved = new Set([...diff.scripts.changed, ...diff.scripts.removed]);
     for (const [sheet, d] of Object.entries(diff.sheets)) {
-      console.log(`  ${sheet.padEnd(12)} +${d.added.length} added  -${d.removed.length} removed  ~${d.changed.length} changed`);
+      if (d.newlyTracked) { console.log(`  ${sheet.padEnd(12)} ${d.added.length} rows, tracked for the first time`); continue; }
+      const scriptOnly = sheet === 'skill' ? (d.cosmeticOnly ?? []).filter((id) => scriptMoved.has(id)).length : 0;
+      const cosmetic = (d.cosmeticOnly?.length ?? 0) - scriptOnly;
+      const notes = [cosmetic ? `${cosmetic} in texts, visuals or an enum's numbering only` : '', scriptOnly ? `${scriptOnly} in the script alone` : ''].filter(Boolean).join(', ');
+      console.log(`  ${sheet.padEnd(12)} +${d.added.length} added  -${d.removed.length} removed  ~${d.changed.length} changed${notes ? f.dim(` (${notes})`) : ''}`);
     }
     if (diff.scripts.changed.length || diff.scripts.added.length || diff.scripts.removed.length) {
       console.log(`  ${'scripts'.padEnd(12)} +${diff.scripts.added.length}  -${diff.scripts.removed.length}  ~${diff.scripts.changed.length}`);
     }
+    if (diff.scripts.hooksUnknown) {
+      console.log(f.dim(`  ${'hooks'.padEnd(12)} not in the stored fingerprint - recorded on --accept, diffed from then on`));
+    } else if (diff.scripts.newHookNames.length) {
+      console.log(`  ${'hooks'.padEnd(12)} ${diff.scripts.newHookNames.length} names no script declared before: ${diff.scripts.newHookNames.join(', ')}`);
+    }
+    if (diff.talentsUnknown) {
+      console.log(f.dim(`  ${'talents'.padEnd(12)} not in the stored fingerprint - recorded on --accept, diffed from then on (a moved talent is invisible in this report)`));
+    }
+    for (const [u, d] of Object.entries(diff.talents ?? {})) {
+      console.log(`  ${('talents '.padEnd(12))} ${u}: +${d.added.length} -${d.removed.length} ~${d.changed.length} moved`);
+    }
+    if (diff.othersUnknown) {
+      console.log(f.dim(`  ${'unread'.padEnd(12)} sheets nothing reads are not in the stored fingerprint - recorded on --accept`));
+    } else if (diff.othersChanged.length) {
+      console.log(`  ${'unread'.padEnd(12)} sheets nothing in the bench reads changed: ${diff.othersChanged.join(', ')}`);
+    }
+    // Schema: what the row hashes cannot see - a column or an enum case that
+    // appeared. The readers decode those by name, so a new case is silent.
+    const sch = diff.schema;
+    if (sch.unknown) {
+      console.log(f.dim(`  ${'schema'.padEnd(12)} not in the stored fingerprint - recorded on --accept, diffed from then on`));
+    } else {
+      const sheetChanges = Object.entries(sch.sheets);
+      const typeChanges = Object.entries(sch.customTypes);
+      if (sheetChanges.length || typeChanges.length) {
+        const cols = sheetChanges.reduce((n, [, d]) => n + d.added.length + d.removed.length + d.changed.length, 0);
+        console.log(`  ${'schema'.padEnd(12)} ${cols} column changes across ${sheetChanges.length} sheets, ${typeChanges.length} custom types`);
+        for (const [sheet, d] of sheetChanges.slice(0, 40)) {
+          if (d.newSheet) { console.log(`    + ${sheet}  (${d.added.join(', ')})`); continue; }
+          if (d.goneSheet) { console.log(`    - ${sheet}`); continue; }
+          for (const c of d.added) console.log(`    + ${sheet}.${c}`);
+          for (const c of d.removed) console.log(`    - ${sheet}.${c}`);
+          for (const c of d.changed) {
+            console.log(c.casesAdded
+              ? `    ~ ${sheet}.${c.col}  ${c.casesAdded.length ? 'gained ' + c.casesAdded.join(', ') : ''}${c.casesRemoved.length ? ' lost ' + c.casesRemoved.join(', ') : ''}${c.reordered ? ' REORDERED' : ''}`
+                + (!c.reordered && c.shifted?.length ? f.warn(`  INDEX SHIFT ${c.shifted.join(', ')} - only a by-name decode survives`) : '')
+              : `    ~ ${sheet}.${c.col}  ${c.from} -> ${c.to}`);
+          }
+        }
+        if (sheetChanges.length > 40) console.log(f.dim(`    ...and ${sheetChanges.length - 40} more sheets (all in --json)`));
+        for (const [t, d] of typeChanges) {
+          console.log(d.newType ? `    + customType ${t}  (${d.added.join(', ')})` : d.goneType ? `    - customType ${t}`
+            : `    ~ customType ${t}  ${d.added.length ? 'gained ' + d.added.join(', ') : ''}${d.removed.length ? ' lost ' + d.removed.join(', ') : ''}`);
+        }
+      }
+    }
 
-    const work = workList(diff, cdb);
+    // New code: the classes that arrived in the packages the model cites, and
+    // the cited classes whose method set moved.
+    const cd = diff.code;
+    // Always against the committed fingerprint: --against changes what the
+    // DATA is diffed against, and an old data.cdb says nothing about code.
+    const codeSince = args.flags.against ? `  since the accepted build (${String(committed?.at).slice(0, 10)}) - the code is diffed against the committed fingerprint whatever --against names` : '';
+    if (code && cd.unknown) {
+      console.log(f.dim(`  ${'code'.padEnd(12)} classes are not in the committed fingerprint - recorded on --accept; this report cannot name a class the patch added`));
+    } else if (code && (cd.added.length || cd.removed.length || cd.changed.length)) {
+      console.log('');
+      console.log(f.bold(`NEW CODE   ${cd.added.length} classes added, ${cd.removed.length} removed, ${cd.changed.length} with another method set`)
+        + f.dim(`  in the packages the model cites (${(current.code?.packages ?? []).map((p) => p || '(top level)').join(', ')})${codeSince}`));
+      if (cd.added.length) console.log(`  + ${cd.added.slice(0, 24).join(', ')}${cd.added.length > 24 ? f.dim(`, ...and ${cd.added.length - 24} more`) : ''}`);
+      if (cd.removed.length) console.log(`  - ${cd.removed.slice(0, 24).join(', ')}${cd.removed.length > 24 ? f.dim(`, ...and ${cd.removed.length - 24} more`) : ''}`);
+      for (const c of cd.changed.filter((x) => x.cited)) {
+        console.log(`  ~ ${c.cls}  ${c.from} -> ${c.to} methods${c.methodsAdded?.length ? `, gained ${c.methodsAdded.join(', ')}` : ''}${c.methodsRemoved?.length ? `, lost ${c.methodsRemoved.join(', ')}` : ''}`);
+      }
+      const uncited = cd.changed.filter((x) => !x.cited).length;
+      if (uncited) console.log(f.dim(`  ~ ${uncited} more classes nothing cites changed their method set (all in --json)`));
+    }
+
+    // The two summaries that turn hundreds of ids into a sentence.
+    const groups = clusters(diff);
+    if (groups.length) {
+      console.log('');
+      console.log(f.bold('NEW SYSTEMS?') + f.dim('  ids added in the same patch sharing a word across sheets, largest first, each id counted once - a heuristic, read the rows'));
+      for (const g of groups.slice(0, 10)) {
+        console.log(`  ${g.token.padEnd(12)} ${Object.entries(g.sheets).map(([s, ids]) => `${s} ${ids.length}`).join(', ')}`
+          + f.dim(`  e.g. ${Object.values(g.sheets).flat().slice(0, 4).join(', ')}`));
+      }
+      if (groups.length > 10) console.log(f.dim(`  ...and ${groups.length - 10} smaller ones: ${groups.slice(10).map((g) => g.token).join(', ')}`));
+    }
+    const kinds = addedItemsByKind(diff, cdb);
+    if (kinds.length) {
+      console.log('');
+      console.log(f.bold(`ITEMS ADDED  ${diff.sheets.item.added.length}`));
+      for (const k of kinds.slice(0, 12)) console.log(`  ${String(k.ids.length).padStart(4)}  ${k.kind.padEnd(28)} ${f.dim(k.ids.slice(0, 3).join(', ') + (k.ids.length > 3 ? ', ...' : ''))}`);
+      if (kinds.length > 12) console.log(f.dim(`  ...and ${kinds.length - 12} more kinds`));
+    }
+
+    const work = workList(diff, cdb, { srcDir, roots, oldCdb });
     const needsGame = work.filter((w) => w.needs === 'in-game');
     const needsSheet = work.filter((w) => w.needs === 'sheet');
     const needsModel = work.filter((w) => w.needs === 'model');
+    const notes = work.filter((w) => w.needs === 'none');
     console.log('');
-    console.log(f.bold(`WORK LIST  ${work.length} items: ${needsGame.length} need an in-game log, ${needsSheet.length} a SHEET check, ${needsModel.length} a model re-read`));
-    const show = (list, cap = 25) => {
-      for (const w of list.slice(0, cap)) console.log(`  [${w.needs}] ${w.kind.padEnd(18)} ${w.id}\n${f.dim('           ' + w.why)}`);
-      if (list.length > cap) console.log(f.dim(`  ...and ${list.length - cap} more`));
-    };
-    show(needsGame); show(needsSheet, 10); show(needsModel, 10);
-
-    if (args.flags.json) {
-      const out = typeof args.flags.json === 'string' ? args.flags.json : 'bench-drift.json';
-      writeFileSync(out, JSON.stringify({ stored: stored.at, diff, citations: cites.report, work }, null, 1));
-      console.log(f.dim(`\nfull report -> ${out}`));
+    console.log(f.bold(`WORK LIST  ${work.length - notes.length} items: ${needsGame.length} need an in-game log, ${needsSheet.length} a SHEET check, ${needsModel.length} a model re-read`)
+      + f.dim(`  (+${notes.length} notes needing nothing)`));
+    // Both evidence buckets stand on a capture of THIS build. Say whether
+    // there is one before listing what needs it.
+    if (chain.present && !chain.capturedOnThisBoot && (needsGame.length || needsSheet.length)) {
+      console.log(f.warn(`  nothing has been captured in combat on this build yet (see CAPTURE): the in-game and SHEET buckets have no evidence to be checked against${chain.bakedOnThisBoot ? ' - except the item bakes, which tools/bake-diff.mjs holds against the model' : ''}. A snapshot or log from before the patch is evidence about the old build.`));
     }
-    if (args.flags.accept) {
-      writeFileSync(fingerprintPath(repoRoot), JSON.stringify(current, null, 1));
-      console.log(f.bold('\nAccepted: the fingerprint now records this build.')
-        + f.dim(' Commit model/fingerprint.json with the work that justified accepting.'));
-    } else {
-      console.log(f.dim('\nThe fingerprint is unchanged; re-run with --accept once the work list is addressed.'));
+    if (!oldCdb) {
+      console.log(f.dim(`  a changed row is named, not described: the fingerprint keeps hashes. --against <an older data.cdb> (or the rows a previous --accept kept on this machine) lets each item say what changed; --row <sheet>:<id> prints one row in full.`));
+    }
+    const show = (list, cap = 25) => {
+      for (const w of list.slice(0, cap)) console.log(`  [${w.needs}] ${w.kind.padEnd(22)} ${w.id}\n${f.dim('           ' + w.why)}`);
+      if (list.length > cap) console.log(f.dim(`  ...and ${list.length - cap} more (all in --json)`));
+    };
+    // The SHEET bucket in the order a sheet is built: the tables every item
+    // goes through first (a rarity row prices every item of that rarity),
+    // then the items themselves.
+    const SHEET_ORDER = ['rarity', 'attribute', 'aptitude', 'affix', 'constant', 'item'];
+    const rank = (w) => { const i = SHEET_ORDER.indexOf(w.kind.split('-')[0]); return i < 0 ? SHEET_ORDER.length : i; };
+    const sheetOrdered = [...needsSheet].sort((a, b) => rank(a) - rank(b));
+    // Schema items first among the model re-reads: they are few, and each one
+    // is a whole kind of thing the readers cannot see yet.
+    const modelOrdered = [...needsModel.filter((w) => w.kind.startsWith('schema-')), ...needsModel.filter((w) => !w.kind.startsWith('schema-'))];
+    show(needsGame); show(sheetOrdered, 10); show(modelOrdered, 20);
+    const dev = work.filter((w) => / dev\/test row/.test(w.why));
+    if (dev.length) console.log(f.warn(`  ${dev.length} rows read like dev/test rows: ${dev.map((w) => w.id).join(', ')}`));
+    const todo = work.filter((w) => /named TODO_/.test(w.why));
+    if (todo.length) console.log(f.dim(`  ${todo.length} rows are named TODO_: ${todo.map((w) => w.id).join(', ')}`));
+
+    writeJson({ clusters: groups, itemsAdded: kinds, work });
+    if (args.flags.accept) accept('the fingerprint now records this build.');
+    else {
+      console.log(f.dim('\nThe fingerprint is unchanged; re-run with --accept once the work list is addressed.'
+        + (gate.ok ? '' : ` It would be refused now: ${gate.reason}.`)));
     }
   },
 
@@ -2330,11 +3226,13 @@ const commands = {
   // game actually did, per skill, signed.
   async verify(args) {
     // `rank` is weapon mastery, and it is not decoration: a script that opens
-    // `if (rank >= 3)` is invisible below it. Daggers_DuplicatePoison_Skill1's
-    // whole bonus-damage hook is behind that gate, and evaluating at the
-    // default rank of 1 silently priced a quarter of the build's damage at
-    // zero. Every other command takes this from commonSetup; so does this one.
-    const { engine, rank, mix, targetLevel, policy: authoredPolicy } = commonSetup(args);
+    // `if (rank >= 3)` is invisible below it. On the accepted build
+    // Daggers_DuplicatePoison_Skill1's whole bonus-damage hook sat behind that
+    // gate, and evaluating at the default rank of 1 silently priced a quarter
+    // of the build's damage at zero. (Build 25782799 emptied that row's script;
+    // 109 others in the sheet still test `rank >= 3`.) Every other command
+    // takes this from commonSetup; so does this one.
+    const { engine, rank, mix, targetLevel, policy: authoredPolicy, fight: fightSetup } = commonSetup(args);
     const game = requireGame(args._);
     const character = args.flags.character ?? args.flags.char;
     if (typeof character !== 'string') {
@@ -2342,9 +3240,19 @@ const commands = {
         + `Known in this install: ${listCharacters(game).join(', ') || '(none)'}`);
     }
 
-    const capturePath = typeof args.flags.capture === 'string'
-      ? args.flags.capture
-      : join(game, 'hlx', 'logs', 'bench-probe.csv');
+    // Which log. The probe's file is rotated when the game is patched - the
+    // old one renamed beside it, a new one started at the next boot - so the
+    // default path may not exist yet, and an older log beside it is another
+    // build's. Reading that one is a decision (--capture <file>), never a
+    // fallback: the ledger below would wear the patch as a model error.
+    const captureFile = resolveCapture(game, typeof args.flags.capture === 'string' ? args.flags.capture : null);
+    const capturePath = captureFile.path;
+    const otherLogs = () => describeOtherCaptures(captureFile)
+      + (captureFile.others.length ? ' verify says which build its window was recorded on.' : '');
+    if (!captureFile.exists) {
+      die(describeMissingCapture(captureFile)
+        + (captureFile.others.length ? ' verify says which build its window was recorded on.' : ''));
+    }
 
     const wantLevel = args.flags.level != null && args.flags.level !== true ? Number(args.flags.level) : null;
     const wantClass = typeof args.flags.class === 'string' ? args.flags.class : null;
@@ -2394,15 +3302,120 @@ const commands = {
     // events ON that target: a dummy calibration followed by a rift leaves
     // the newest snapshot rich in everything except dummy hits, and a
     // target-blind pick chose it - the whole ledger came back PHANTOM.
-    const wantArchetype = typeof args.flags.target === 'string' ? args.flags.target : null;
+    //
+    // `--target` is the capture FILTER: hits on that unit. A capture names
+    // its targets by unit id, so a shortcut is read through to the unit
+    // behind it (`dummy` is Dummy) and a mode suffix is the model's business
+    // only (`Ratsar@heroic` filters on Ratsar). What the model is priced
+    // against is a second question - see modelTarget below - and `--price-as`
+    // answers it separately when the two must differ.
+    //
+    // ...and a unit id is not ONE target either. `--target Dummy#2180` names an
+    // INSTANCE as the capture writes it: the rows are that instance's alone
+    // and the model stands on the unit. Without one, a read on a unit is held
+    // to the instance the character was fighting at each moment (see where
+    // the capture is read, below).
+    const rawTarget = typeof args.flags.target === 'string' ? args.flags.target : null;
+    const instanceOf = rawTarget ? /^([^#@]+)#(-?\d+)(@[a-z]+)?$/.exec(rawTarget) : null;
+    const wantTarget = instanceOf ? instanceOf[1] + (instanceOf[3] ?? '') : rawTarget;
+    const wantPriceAs = typeof args.flags['price-as'] === 'string' ? args.flags['price-as'] : null;
+    let wantArchetype = null;
+    if (wantTarget) {
+      let asFoe = null;
+      try { asFoe = engine.combat.foe(wantTarget, engine.ctx.consts.maxLevel); } catch (e) {
+        // Not something the model can stand on. As a pure filter that is
+        // fine - any archetype in the log can be read - provided the model
+        // is told what to stand on instead.
+        if (!wantPriceAs) die(e.message);
+      }
+      if (asFoe && !asFoe.unit) {
+        die(`--target ${wantTarget} is not a unit, so no capture row is a hit on it.\n`
+          + `Filter the capture with --target <unit id> and price the model with --price-as ${wantTarget}.`);
+      }
+      // A shortcut that carries a MODE is not one either. `heroic` stands on
+      // whichever heroic boss the sheet lists first and speaks for all of
+      // them: as a filter it would read the hits on that one boss - at any
+      // difficulty, the capture cannot tell - drop the other bosses', and
+      // price what it kept on heroic rows.
+      const shortcut = engine.combat.namedTargets[wantTarget.replace(/@[a-z]+$/, '')];
+      if (asFoe && shortcut?.mode) {
+        const stoodOn = engine.combat.heroicBosses.includes(asFoe.unit) ? engine.combat.heroicBosses : [asFoe.unit];
+        die(`--target ${wantTarget} is not one unit: it is what ${stoodOn.length} units resolve to in ${shortcut.mode} mode `
+          + `(${stoodOn.join(', ')}), so it cannot say which capture rows to read.\n`
+          + `Filter the capture with --target <unit id> and price the model with --price-as ${wantTarget}, `
+          + `or say both at once with --target <unit id>@${shortcut.mode}.`);
+      }
+      wantArchetype = asFoe?.unit ?? wantTarget.replace(/@[a-z]+$/, '');
+    }
+    // The instance as the capture spells it: the unit's own id and the number.
+    const wantInstance = instanceOf ? `${wantArchetype}#${instanceOf[2]}` : null;
+    if (wantPriceAs) {
+      try { engine.combat.foe(wantPriceAs, engine.ctx.consts.maxLevel); } catch (e) { die(`--price-as: ${e.message}`); }
+    }
     const evidence = (x) => (wantArchetype ? (x.targets?.[wantArchetype] ?? 0) : x.events);
+    // WHICH PIECE OF THE CAPTURE, when the caller says: --since / --until are
+    // one range, each --window <from>..<to> another, all in the capture's own
+    // epoch milliseconds (verify.mjs parseWindows). A given window is priced
+    // with the snapshot STANDING when it opens - not with whichever snapshot
+    // saw the most damage - and --snapshot names the build outright
+    // (verify.mjs chooseSnapshot). Left alone, the choice below stands as it
+    // always has: the richest snapshot with evidence on the target, and its
+    // own span as the window.
+    const asked = parseWindows({
+      since: args.flags.since ?? null, until: args.flags.until ?? null, windows: args.repeated?.window ?? [],
+    });
+    if (asked.error) die(asked.error);
+    const isEquipment = (kind) => (engine.cat.itemById.get(kind)?.slots ?? []).some((x) => combatSlots.has(x));
+    const differ = (a, b) => buildDiff(a, b, { relevant: isEquipment });
+    const stamp = (ms) => (ms == null ? 'open' : `${new Date(ms).toISOString().replace('T', ' ').slice(0, 19)}Z (${ms})`);
+    // --snapshots: the character's snapshots, one line each, and what each
+    // changed. A capture recorded for a purpose is walked one build at a time
+    // (the 2026-10-13 Rogue: eighteen snapshots, one talent point apart), and
+    // this is the list a window and a --snapshot number are read off.
+    if (args.flags.snapshots) {
+      const all = snaps.snapshots;
+      if (args.flags.json) {
+        console.log(JSON.stringify(all.map((x, i) => ({
+          index: x.index, ts: x.ts, until: x.until, events: x.events, onTarget: evidence(x),
+          usable: describes(x) >= 5, talents: x.talents, changed: i ? differ(all[i - 1], x) : null,
+        })), null, 2));
+        return;
+      }
+      console.log(f.bold(`${character} - ${all.length} snapshot(s) in ${capturePath}`));
+      if (!all.length) console.log(f.dim('  none: the probe wrote no build for this character in this log.'));
+      for (const [i, x] of all.entries()) {
+        const changed = i ? differ(all[i - 1], x) : null;
+        console.log(`  #${String(x.index).padEnd(3)} ${stamp(x.ts)}  until ${x.until == null ? 'the end of the log' : stamp(x.until)}`);
+        console.log(f.dim(`       ${x.events.toLocaleString()} damage rows under it`
+          + (wantArchetype ? `, ${evidence(x).toLocaleString()} on ${wantArchetype}` : '')
+          + `; ${describes(x)} worn pieces, ${x.talents.length} talent rows`
+          + (describes(x) >= 5 ? '' : ' - too little gear to price a build')));
+        if (changed) {
+          console.log(f.dim(changed.length
+            ? `       against #${all[i - 1].index}: ${changed.join('; ')}`
+            : `       the same build as #${all[i - 1].index} (a snapshot is also written at every login)`));
+        }
+      }
+      console.log(f.dim('\nPrice a window with one of them: --snapshot <n>, with --since / --until or --window <from>..<to> '
+        + 'for the rows.\nLeft out, a given window is priced with the snapshot standing when it opens.'));
+      return;
+    }
+    const usableSet = new Set(usable.map((c) => c.s));
+    const chosen = chooseSnapshot({
+      snaps: snaps.snapshots.map((x) => Object.assign(x, { usable: usableSet.has(x) })),
+      windows: asked.windows,
+      want: args.flags.snapshot != null && args.flags.snapshot !== true ? String(args.flags.snapshot)
+        : args.flags.snapshot === true ? '' : null,
+      differ,
+    });
+    if (chosen.error) die(chosen.error);
     // A snapshot with NOTHING recorded on the verified target cannot win on
     // richness: a login-and-out snapshot carries the newest probe fields and
     // zero combat, and it once out-ranked a two-thousand-event window on the
     // strength of its empty rune list.
     const withEvidence = usable.filter((c) => evidence(c.s) > 0);
     const pickFrom = withEvidence.length ? withEvidence : usable;
-    const snap = pickFrom.length
+    const snap = chosen.snap ?? (pickFrom.length
       ? pickFrom.reduce((best, c) => {
         if (c.slots !== best.slots) return c.slots > best.slots ? c : best;
         const cr = richness(c.s);
@@ -2410,7 +3423,7 @@ const commands = {
         if (cr !== br) return cr > br ? c : best;
         return evidence(c.s) > evidence(best.s) ? c : best;
       }).s
-      : null;
+      : null);
     // Falling back is fine; falling back QUIETLY is not. A capture that holds
     // snapshots for this character which none of them can be used is a probe
     // problem, and the run must not read as though no snapshot was ever taken.
@@ -2492,6 +3505,94 @@ const commands = {
       built = toLoadout(engine.cat, readDump(game, character), { level: wantLevel, unit: wantClass });
     }
 
+    // THE MECHANIC SLOTS (conduits, prayers), when nothing carried them. A
+    // snapshot writes what they hold where the probe can read it; where it
+    // cannot (probe v10 on build 25782799: `snap_err conduit`), the model
+    // would fill a pool that allows repeats with its options in turn, and
+    // price conduits the character does not slot. So such a pool is filled
+    // from what the character's own rows show under the snapshot
+    // (verify.mjs fillFromEvidence), `--skills <pool>=<a,b,...>` names it
+    // outright - the spelling the build commands use - and the ledger says
+    // which of the three it is standing on.
+    const poolFacts = [];
+    {
+      let pools = [];
+      try { pools = engine.plan.pools(built.loadout); } catch { pools = []; }
+      const nameOf = (id) => engine.cdb.byId('skill').get(id)?.texts?.name ?? id;
+      const count = (ids) => [...new Set(ids)].map((id) => {
+        const n = ids.filter((x) => x === id).length;
+        return `${nameOf(id)}${n > 1 ? ` x${n}` : ''}`;
+      }).join(', ');
+      built.loadout.skills ??= {};
+      for (const spec of args.repeated?.skills ?? []) {
+        if (spec === true) die('--skills needs a value, e.g. --skills conduits=Mage_Conduit_Power,Mage_Conduit_Power');
+        const eq = String(spec).indexOf('=');
+        if (eq < 0) die(`--skills "${spec}" needs the form pool=skill,skill`);
+        const alias = new Map(pools.flatMap((p) => [
+          [p.key.toLowerCase(), p], [f.short(p.key).toLowerCase(), p],
+          [p.label.replace(/\s+/g, '').toLowerCase(), p], [(p.mechanic ?? '').toLowerCase(), p],
+        ].filter(([k]) => k)));
+        const pool = alias.get(spec.slice(0, eq).trim().toLowerCase());
+        if (!pool) {
+          die(`--skills: ${character} has no skill pool "${spec.slice(0, eq)}" `
+            + `(one of ${pools.map((p) => p.label.replace(/\s+/g, '')).join(', ') || 'none'})`);
+        }
+        const picks = spec.slice(eq + 1).split(',').map((x) => x.trim()).filter(Boolean);
+        for (const id of picks) {
+          if (!pool.options.includes(id)) die(`--skills: ${id} is not one of the ${pool.label} (${pool.options.join(', ')})`);
+        }
+        if (picks.length > pool.slots) {
+          die(`${pool.label}: only ${pool.slots} slot${pool.slots === 1 ? '' : 's'} at level ${built.level}, but ${picks.length} were named`);
+        }
+        if (!pool.repeats && new Set(picks).size !== picks.length) die(`${pool.label}: an option fills one slot only`);
+        built.loadout.skills[pool.key] = picks;
+        poolFacts.push({
+          key: pool.key, label: pool.label, how: 'named', fill: picks,
+          note: `${pool.label}: ${count(picks)} - named with --skills`,
+        });
+      }
+      if (snap) {
+        const runes = new Set(Object.values(built.loadout.runes ?? {}).flat().filter(Boolean));
+        for (const p of pools) {
+          if (p.kind !== 'mechanic' || !p.repeats || built.loadout.skills[p.key]?.length) continue;
+          const options = p.options.map((id) => {
+            let statuses = [];
+            try { statuses = engine.plan.statusesOf(id, { rank, runes }).self.map((b) => b.status); } catch { statuses = []; }
+            return { id, statuses };
+          });
+          const evidence = await mechanicEvidence(capturePath, {
+            source: character, since: snap.ts, until: snap.until ?? null,
+            skills: p.options, statuses: options.flatMap((o) => o.statuses),
+          });
+          const got = fillFromEvidence({ slots: p.slots, options, evidence });
+          const defaulted = engine.plan.defaultSelection(built.loadout)[p.key] ?? [];
+          const saw = got.seen.map((s) => `${nameOf(s.id)}: `
+            + [s.hits ? `${s.hits.toLocaleString()} hits` : null,
+              s.applied ? `its status applied ${s.applied.toLocaleString()} times`
+                + (s.perEvent ? `, ${s.perEvent} stack${s.perEvent > 1 ? 's' : ''} at a time` : '') : null]
+              .filter(Boolean).join(', ')).join('; ');
+          const unseen = p.options.filter((id) => !got.seen.some((s) => s.id === id)).map(nameOf);
+          if (got.fill) {
+            built.loadout.skills[p.key] = got.fill;
+            poolFacts.push({
+              key: p.key, label: p.label, how: 'rows', fill: got.fill, exact: got.exact, seen: got.seen,
+              note: `${p.label}: the snapshot does not say what the ${p.slots} slots hold; filled from ${character}'s own rows under it - `
+                + `${count(got.fill)} (${saw}${unseen.length ? `; no row of ${unseen.join(', ')}` : ''})`
+                + (got.exact ? '' : '. How many slots each holds is not in the rows: they take turns')
+                + `. --skills ${p.label}=<a,b,...> names them outright.`,
+            });
+          } else {
+            poolFacts.push({
+              key: p.key, label: p.label, how: 'default', fill: defaulted, seen: got.seen,
+              note: `${p.label}: the snapshot does not say what the ${p.slots} slots hold, and ${character}'s rows under it do not settle it `
+                + `(${saw || 'no hit and no status of any option'}). The model fills them in turn - ${count(defaulted)} - `
+                + `and a line of one the character did not slot is not this ledger's evidence. --skills ${p.label}=<a,b,...> names them.`,
+            });
+          }
+        }
+      }
+    }
+
     // A capture is many hours across many builds; the dump is one instant. The
     // default window is the character's last few play sessions, because that is
     // the stretch most likely to have been played in the gear they are wearing
@@ -2499,14 +3600,19 @@ const commands = {
     // of weapons as missing coverage - the first run of this command did.
     const wantSessions = args.flags.sessions != null && args.flags.sessions !== true
       ? Number(args.flags.sessions) : 3;
-    let since = args.flags.since != null && args.flags.since !== true ? Number(args.flags.since) : null;
-    let until = null;
-    let window = null;
+    // A GIVEN window stands as given: its rows are whatever falls in the
+    // ranges, and `since` / `until` below are its outer ends (what the build
+    // check and a replay read).
+    let windows = asked.windows;
+    let since = windows ? windows[0].from : null;
+    let until = windows ? windows.reduce((m, w) => (w.to == null || m == null ? null : Math.max(m, w.to)), -Infinity) : null;
+    if (until === -Infinity) until = null;
+    let window = windows ? { given: true, ranges: windows } : null;
     // A snapshot IS the window: the build it describes stands from the moment it
     // was written until the next one. That is a far better boundary than "the
     // last few sessions", which was only ever a guess at when the gear last
     // changed.
-    if (since === null && snap) {
+    if (!windows && snap) {
       since = snap.ts;
       until = snap.until;
       window = {
@@ -2515,33 +3621,139 @@ const commands = {
         seconds: until ? (until - snap.ts) / 1000 : null,
       };
     }
-    if (since === null) {
+    if (!windows && since === null) {
       const s = await sessions(capturePath, { source: character, gapMs: 120_000 });
       const real = s.sessions.filter((x) => x.seconds >= 30);
       if (!real.length) {
         die(`${character} has no recorded damage in ${capturePath}.\n`
-          + 'Either the probe never saw this character, or the name is wrong.');
+          + 'Either the probe never saw this character, or the name is wrong'
+          + (captureFile.defaulted ? ', or this log was started after the last patch\nand the play is in an older one.\n' : '.\n')
+          + otherLogs());
       }
       const take = real.slice(-Math.max(1, wantSessions));
       since = take[0].startTs;
       window = { count: take.length, of: real.length, seconds: take.reduce((a, x) => a + x.seconds, 0) };
     }
 
+    // One list of ranges from here on, whichever way the window was arrived at.
+    windows ??= [{ from: since, to: until }];
+    const inWindow = (ts) => windows.some((w) => ts >= (w.from ?? -Infinity) && ts <= (w.to ?? Infinity));
+    // WHICH INSTANCE of the unit. The model fights one target; three yard
+    // dummies are three, and what a rotation lands on the two it is not
+    // fighting (Acidic Splatter spreads to the enemies around the one hit,
+    // and the trinket's curse then rolls on those ticks) is damage the model
+    // has no line for. Read together, the 2026-10-13 Rogue's 15-point
+    // rotation was 57,304 on three dummies against a single-target model,
+    // and from the sixth talent on the two totals agreed only because of the
+    // neighbours. So a read on a unit is held to the instance being fought
+    // at each moment (capture.mjs aggregate, `follow`: the target of the
+    // latest press, or where the latest base attack landed), or to the one
+    // `--target <unit>#<n>` names; what that leaves out is counted and
+    // said. `--all-instances` reads the unit's every instance, as this
+    // command always used to - and so does a model asked to fight several
+    // targets (--targets), which has lines for them.
+    const followInstance = wantArchetype != null && !wantInstance && !args.flags['all-instances'] && fightSetup.targets === 1;
     const cap = await aggregate(capturePath, {
       source: character,
-      target: typeof args.flags.target === 'string' ? args.flags.target : null,
+      target: wantArchetype,
       groupBy: 'skill',
-      since,
-      until,
+      windows,
+      instance: wantInstance,
+      follow: followInstance ? { isBaseAttack: engine.plan.isBaseAttack } : null,
+    });
+    // A GIVEN WINDOW WITH NOTHING IN IT IS NOT A LEDGER. It used to print one:
+    // `--since 1 --until 2` dated the window from the numbers that were typed
+    // (1970, so "written before this boot was installed", so the Dummy priced
+    // with no armour), fell back to the snapshot with the most damage under
+    // it, and listed ten lines of a 395 dps model as NOT-PRESSED beside zero
+    // capture rows, with exit code 0. A window the caller gave is a claim
+    // about where the rows are; when there are none it is said, with where
+    // they are - before the build is dated and before anything is priced.
+    if (asked.windows && cap.matched === 0) {
+      const said = windows.map((w) => `${stamp(w.from)} .. ${stamp(w.to)}`).join(', ');
+      if (wantInstance && cap.leftOut.hits > 0) {
+        die(`${character} dealt ${cap.leftOut.hits.toLocaleString()} damage row${cap.leftOut.hits === 1 ? '' : 's'} on ${wantArchetype} in the given window (${said}), `
+          + `none of them on ${wantInstance}.\n`
+          + `They are on ${cap.leftOut.instances.slice(0, 6).map((x) => `${x.target} (${x.hits.toLocaleString()})`).join(', ')}`
+          + `${cap.leftOut.instances.length > 6 ? `, and ${cap.leftOut.instances.length - 6} more` : ''}.`);
+      }
+      const inWindow0 = wantArchetype ? await aggregate(capturePath, { source: character, groupBy: 'target', windows }) : cap;
+      if (inWindow0.matched > 0) {
+        die(`${character} dealt ${inWindow0.matched.toLocaleString()} damage row${inWindow0.matched === 1 ? '' : 's'} in the given window (${said}), `
+          + `none of them on ${wantArchetype}.\n`
+          + `They are on ${inWindow0.groups.slice(0, 6).map((g) => `${g.key} (${g.hits.toLocaleString()})`).join(', ')}`
+          + `${inWindow0.groups.length > 6 ? `, and ${inWindow0.groups.length - 6} more` : ''}.`);
+      }
+      const whole = await aggregate(capturePath, { source: character, groupBy: 'target' });
+      if (!whole.matched) {
+        die(`${character} has no recorded damage in ${capturePath}.\n`
+          + 'Either the probe never saw this character, or the name is wrong'
+          + (captureFile.defaulted ? ', or this log was started after the last patch\nand the play is in an older one.\n' : '.\n')
+          + otherLogs());
+      }
+      die(`${character} has no damage row in the given window (${said}).\n`
+        + `Its ${whole.matched.toLocaleString()} damage rows in ${capturePath} run from ${stamp(whole.firstTs)} to ${stamp(whole.lastTs)}.\n`
+        + 'Times are epoch milliseconds, the log\'s own ts_ms; --snapshots lists the character\'s builds and when each was written.');
+    }
+    // WHICH BUILD the window was recorded on, off the capture's own session
+    // rows and the installed bytecode - before anything is priced, because the
+    // answer decides what a disagreement below can mean. A given window is
+    // dated by its ROWS and never by the bounds that were typed (it holds
+    // rows, or the run stopped above).
+    const era = captureEra({
+      sessionRows: cap.sessionRows,
+      from: cap.firstTs ?? (asked.windows ? null : since),
+      to: cap.lastTs ?? (asked.windows ? null : until ?? since),
+      boot: bootFacts(game),
     });
     // PRICE AGAINST WHAT WAS HIT. `--target Dummy` filtered the capture to
     // dummy hits and then priced the model against the default reference foe
     // (0.25/0.25 mitigation) - so every skill read 15-25% low against a target
     // that mitigates nothing, across three classes, and the deficit wore the
-    // costume of a formula error. The model's target is now the same one the
-    // capture was filtered to.
-    const verifyTarget = typeof args.flags.target === 'string'
-      ? engine.combat.foe(args.flags.target, built.level, targetLevel)
+    // costume of a formula error. The model's target is the one the capture
+    // was filtered to - AS THAT UNIT WAS when the capture was recorded: the
+    // Dummy authors 0.40 / 0.40 since the 2026-10 build and authored nothing
+    // before it, so a pre-patch dummy window priced on today's row reads
+    // every row 10% low for a reason that is the patch's and not the model's
+    // (verify.mjs modelTarget). --price-as names the model's target outright.
+    //
+    // And AT THE LEVEL IT STOOD AT: a unit id alone is its row's level in
+    // Normal, and the capture logs where each target actually stood (tlvl).
+    // --target-level still wins over both.
+    //
+    // And the DIFFICULTY, which the logged level only half says: at MaxLevel
+    // a unit stood in Veteran or in Heroic, and for a boss with heroic armour
+    // rows those are two targets (verify.mjs modelTarget). What each would
+    // make of the filtered unit is worked out here, where the engine is.
+    const difficulty = (() => {
+      if (!wantArchetype || !engine.cdb.byId('unit').has(wantArchetype)) return null;
+      const maxLevel = Math.round(engine.ctx.consts.maxLevel);
+      let veteran;
+      let heroic;
+      try {
+        veteran = engine.combat.foe(`${wantArchetype}@veteran`, built.level);
+        heroic = engine.combat.foe(`${wantArchetype}@heroic`, built.level);
+      } catch { return { maxLevel }; }
+      const [ra, rb] = engine.ctx.consts.resistFormula;
+      const through = (pool) => 1 - pool / (pool + ra + rb * built.level);
+      const short = (t) => `S ${(t.physReduction / (1 - t.physReduction)).toFixed(2)}/${(t.magicReduction / (1 - t.magicReduction)).toFixed(2)}, `
+        + `${f.pct(1 - through(t.armor), 0)} to a level-${built.level} striker`;
+      const span = engine.combat.normalLevelSpan(wantArchetype);
+      return {
+        maxLevel,
+        normalTop: span ? span.hi : null,
+        heroicDiffers: veteran.armor !== heroic.armor || veteran.magicArmor !== heroic.magicArmor,
+        veteranLabel: short(veteran), heroicLabel: short(heroic),
+        // What pricing a Heroic window as Veteran overreads by, per hit.
+        overread: through(veteran.armor) / through(heroic.armor) - 1,
+      };
+    })();
+    const priced = modelTarget({
+      filter: wantTarget, priceAs: wantPriceAs, unit: wantArchetype, era,
+      logged: cap.targetLevels, heroLevel: built.level, difficulty,
+    });
+    const verifyTarget = priced.name
+      ? engine.combat.foe(priced.name, built.level, targetLevel ?? priced.level)
       : undefined;
     // What the player actually pressed in this window - BEFORE the model runs,
     // because the model is held to it. Left to its own rotation the sim
@@ -2554,73 +3766,97 @@ const commands = {
     // via chain; with no press rows at all (an old capture), the model keeps
     // its own rotation.
     const pressAgg = await aggregate(capturePath, {
-      source: character, event: 'press', groupBy: 'skill', since, until,
+      source: character, event: 'press', groupBy: 'skill', windows,
     });
     const pressed = new Set(pressAgg.groups.map((g) => g.key));
+    // NO PRESS ROW IS AN ANSWER TOO, where the log writes them. A window
+    // opened by a session row was written by probe v10 or later, which logs
+    // every press - and a held basic chain writes none (2026-10-13: sixty
+    // seconds of left mouse button, 76 damage rows, no press row). So such a
+    // window with no press in it is a window in which nothing was pressed,
+    // and the model is held to that: the chain alone. Before this, an empty
+    // set fell through to "an old capture, keep the model's own rotation",
+    // and a basic-attack block was priced against a fight that pressed every
+    // cooldown the build owns - Battle Shout's crit chance and Berserk's
+    // damage on swings that had neither.
+    const nothingPressed = !pressed.size && era.sessions.length > 0 && cap.matched > 0;
     let policy = null;
     let fightLen = null;
     let chainFeeds = null;
     let divergence = null;
+    let replayOpens = null;
     // --replay: hold the model to the capture's own PRESS SEQUENCE, not just
     // its press SET. The sim's chooser is replaced by the recorded timeline -
     // each press fires at its recorded offset if the model agrees it is
-    // ready - and the fight runs the window's own length, so every cadence
-    // residual (register arming order, conduit spend sequence, charge banks)
-    // collapses into pure formula verification. Where the model DISAGREES
+    // ready - so WHICH press finds a register armed, a conduit spent or a
+    // charge banked is the capture's own order. The fight is as long as a
+    // GIVEN window, or as --fight says; only a window left open at its end
+    // runs to fifteen seconds past the last press. (It used to run there
+    // always: a 30.5 s window was replayed over 40 s whatever --fight said,
+    // the last ten of them bare chain the capture holds no row of, and the
+    // ledger's dps and SHARE were that longer fight's.) Where the model DISAGREES
     // that a recorded press was possible, that is counted and reported, not
     // silently absorbed: a divergence is a finding about the model's
     // cooldown/resource state, which is exactly what this mode exists to
     // expose.
+    if (args.flags.replay && windows.length > 1) {
+      die('--replay plays ONE recorded press sequence as one fight; give it one window (--since / --until), not several.');
+    }
+    // ...and a fight has a first second. A press is replayed at its offset
+    // from where the window opens, so a window with no opening (--until
+    // alone, --window ..<to>) has no clock to put the presses on: the
+    // offsets came out as epoch seconds, the fight as fifty-seven years, and
+    // the command never returned. Taking the origin from the rows instead
+    // would replay the log's first sitting against a ledger of every row up
+    // to --until, which is two different windows; so it is asked for.
+    if (args.flags.replay && asked.windows && windows[0].from == null) {
+      die('--replay needs where the fight starts: give --since or --window <from>..');
+    }
     if (args.flags.replay && pressed.size) {
-      const seq = [];
+      const presses = [];
+      // ...and where the recorded sitting OPENS: the character's first skill
+      // state inside the window (a `go_state` row to Skill - a swing or a
+      // cast), which is where the model's fight starts moving too
+      // (verify.mjs replaySchedule, `opens`).
+      let opensTs = null;
       await streamCapture(capturePath, (r) => {
+        if (!inWindow(r.ts)) return;
+        if (opensTs === null && r.event === 'go_state' && r.target === character && parseExtra(r.extra).state === 'Skill') opensTs = r.ts;
         if (r.source !== character || r.event !== 'press') return;
-        if (r.ts < since || (until && r.ts > until)) return;
-        seq.push({ t: (r.ts - since) / 1000, id: r.skill });
+        presses.push({ t: (r.ts - since) / 1000, id: r.skill });
       });
-      seq.sort((a, b) => a.t - b.t);
-      // An open-ended window can span several sittings; a replay is ONE
-      // fight, so the sequence is cut at the first two-minute silence and
-      // the fight runs that block's span.
-      let cut = seq.length;
-      for (let i = 1; i < seq.length; i++) {
-        if (seq[i].t - seq[i - 1].t > 120) { cut = i; break; }
-      }
-      seq.length = cut;
-      fightLen = seq.length ? seq[seq.length - 1].t + 15 : null;
+      // The schedule itself - the cut at a two-minute silence, the fight's
+      // length, the policy and what it counts - is verify.mjs replaySchedule.
+      const schedule = replaySchedule(presses, {
+        fight: args.flags.fight !== undefined ? fightSetup.seconds
+          : asked.windows && windows[0].to != null ? (windows[0].to - windows[0].from) / 1000 : null,
+        opens: opensTs === null ? null : (opensTs - since) / 1000,
+      });
+      replayOpens = opensTs === null ? null : (opensTs - since) / 1000;
+      const seq = schedule.seq;
+      fightLen = schedule.fight;
       // Presses the model holds no active for still advance the game's chain
-      // counter when their type is active-ish (isActiveSkill@6049: weapon,
-      // class and signature skills) - Blink and MysticEmpowerment fed the
-      // live Mage chain while the model's counter never saw them, which is
-      // why replay refused chain-reset presses the player demonstrably made.
+      // counter when their type is active-ish (BaseSkill.isActiveSkill@6156: weapon,
+      // class and signature skills - types 7, 9 and 17, and NOT the
+      // WeaponSubSkill that BaseSkill.isWeaponSkill@6161 now admits) - Blink and
+      // MysticEmpowerment fed the live Mage chain while the model's counter
+      // never saw them, which is why replay refused chain-reset presses the
+      // player demonstrably made.
       try {
         const rotR = engine.plan.resolve(built.loadout, rank);
         const knownIds = new Set([
           ...(rotR.active ?? []).map((a) => a.prof.id),
           ...(rotR.active ?? []).map((a) => a.via).filter(Boolean),
         ]);
-        const activeish = new Set(['WeaponSkill', 'ClassSkill', 'SignatureSkill', 'WeaponSubSkill']);
+        const activeish = new Set(['WeaponSkill', 'ClassSkill', 'SignatureSkill']);
         chainFeeds = seq
           .filter((p) => !knownIds.has(p.id) && activeish.has(engine.plan.typeOf(p.id)))
           .map((p) => p.t);
       } catch { /* no feeds - replay still runs */ }
-      divergence = { pressedLate: 0, notReady: 0, unknown: 0, replayed: 0, total: seq.length };
-      let cursor = 0;
-      policy = ({ ready, actives, t }) => {
-        while (cursor < seq.length && seq[cursor].t <= t + 0.05) {
-          const want = seq[cursor].id;
-          // A via-granted active (the orb status rides its S1 cast) is
-          // pressed under its PRESSER's id in the live log.
-          const i = actives.findIndex((a) => a.prof.id === want || a.via === want);
-          if (i < 0) { cursor++; divergence.unknown++; continue; }
-          if (!ready.includes(i)) { cursor++; divergence.notReady++; continue; }
-          cursor++;
-          divergence.replayed++;
-          if (t - seq[cursor - 1].t > 1) divergence.pressedLate++;
-          return i;
-        }
-        return -1;
-      };
+      // The tally is the schedule's own and is the RETURNED fight's: it starts
+      // over with every fight the evaluation plays.
+      divergence = schedule.tally;
+      policy = schedule.policy;
     } else if (pressed.size) {
       const allowed = new Set(pressed);
       try {
@@ -2633,14 +3869,390 @@ const commands = {
         for (const i of ready) if (allowed.has(actives[i].prof.id)) return i;
         return -1;
       };
+    } else if (nothingPressed) {
+      policy = () => -1;
     }
-    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy: authoredPolicy ?? policy, fight: fightLen, chainFeeds });
-    const cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed });
+    // THE CHAIN, when the window never swung it. A block of isolated presses
+    // holds no base attack at all, and a model that fills the gaps with its
+    // chain prices those presses inside Brutal Frenzy, Devote and whatever
+    // else only a swing puts up. So a window that pressed something and
+    // holds not one hit of the build's own chain is played with the chain
+    // held - and with every timed status on the character that is not a
+    // pressed skill's own priced as down, which reaches past a swing's
+    // statuses to a proc's and a conduit's (engine.mjs, the held-chain rule;
+    // the ledger names what was priced down). (A window with no press row
+    // in a log that writes none says nothing about how it was played, and
+    // keeps the model's own fight.)
+    let holdChain = false;
+    // ...AND WHEN IT NEVER PRESSED EITHER. Nothing pressed and not one swing:
+    // the window holds nothing the model can play, and what its rows hold
+    // was dealt by something that happened before it opened or is something
+    // the model has no line for (the 2026-10-13 Warrior's second login: 3.5
+    // seconds, one Rampage hit, its press half a second before the window).
+    // Swinging the chain there printed four
+    // NOT-PRESSED lines of 66 to 88 model hits beside a window with no swing
+    // in it. So the chain is held here too, and the ledger says the fight is
+    // empty.
+    let nothingToPlay = false;
+    if (cap.matched > 0 && (pressed.size > 0 || nothingPressed)) {
+      try {
+        const chainIds = new Set((engine.plan.resolve(built.loadout, rank).filler ?? []).map((x) => x.prof.id));
+        const swung = cap.groups.some((g) => chainIds.has(g.key));
+        if (pressed.size > 0) holdChain = chainIds.size > 0 && !swung;
+        else nothingToPlay = !swung && !authoredPolicy;
+      } catch { /* the rotation still resolves inside evaluate */ }
+    }
+    // THE GAUGE AT THE OPENING of a given window. The Mage's conduits fire
+    // only on a Spark spend from above the gauge, so where the pool stands
+    // when the window opens decides whether they fire in it at all: the
+    // 2026-10-13 chain block opened at 35.8 of 100 and logged no conduit row
+    // in seventy seconds, where a fight opened on a full pool fires five. The
+    // log says (every press and state row carries it), and the model's fight
+    // opens there.
+    let poolStart = null;
+    let poolNote = null;
+    if (asked.windows && windows[0].from != null) {
+      let gaugeAtb = null;
+      try { gaugeAtb = engine.plan.resolve(built.loadout, rank).sparkGauge?.atb ?? null; } catch { gaugeAtb = null; }
+      if (gaugeAtb === 'Spark') {
+        const open = await poolAt(capturePath, { source: character, since: windows[0].from, until: windows[0].to, key: 'spark' });
+        if (open) {
+          poolStart = { [gaugeAtb]: open.value };
+          poolNote = `${gaugeAtb}: ${open.value} when the window opens (the first row that says, `
+            + `${((open.ts - windows[0].from) / 1000).toFixed(1)}s in) - the model's fight opens there`;
+        }
+      }
+    }
+    const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy: authoredPolicy ?? policy, fight: fightLen, chainFeeds, holdChain: holdChain || nothingToPlay, poolStart });
+    // Both clocks, for the RATE: the model's fight as it was played, and the
+    // capture's time in play over the rows read.
+    const clocks = { modelSeconds: ev.throughput.fight ?? fightLen ?? fightSetup.seconds, liveSeconds: cap.activeMs > 0 ? cap.activeMs / 1000 : null };
+    let cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed, ...clocks });
+    // WHAT WAS CARRIED INTO A WINDOW THAT PRESSED NOTHING. Such a window is
+    // played with the chain alone, and that is right: nothing WAS pressed in
+    // it. But a window cut out of a sitting does not open on nothing. The
+    // 2026-10-13 Rogue's sixteen "basics" blocks each open one to seven
+    // seconds after a rotation with Lethal Poison still on the dummy: its
+    // ticks, and Envenom - a base-attack rider gated on that poison, which
+    // refreshes it - run for the whole block, and both were printed MISSING,
+    // "damage the game did and the bench cannot see", for a model that has
+    // both lines whenever it presses. So a row the chain-alone fight has no
+    // line for is asked of the build's own unrestricted fight: with a line
+    // there it was CARRIED IN - filed as that, out of MISSING and out of
+    // coverage (verify.mjs compare) - and the ledger says what stood when
+    // the window opened (capture.mjs openingState). MISSING stays for a row
+    // neither fight has a line for.
+    //
+    // This is the FILING, and it is not the whole answer: the model's fight
+    // still opens with nothing standing, so a carried-in line is not priced
+    // and the window's own lines are priced without what stood (bench audit,
+    // "a fight starts COLD").
+    let carriedNote = null;
+    let opening = null;
+    if (nothingPressed && !authoredPolicy && cmp.totals.missing > 0) {
+      let free = null;
+      try { free = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, poolStart }); } catch { free = null; }
+      if (free) {
+        const has = new Set(compare({ modelLines: free.throughput.lines, captureGroups: cap.groups }).rows
+          .filter((r) => r.status === 'BOTH').map((r) => r.skill ?? r.id));
+        cmp = compare({ modelLines: ev.throughput.lines, captureGroups: cap.groups, pressed, carried: has, ...clocks });
+      }
+      const rowsIn = cmp.rows.filter((r) => r.status === 'CARRIED-IN');
+      if (rowsIn.length && windows[0].from != null) {
+        const nameOf = (id) => engine.cdb.byId('skill').get(id)?.texts?.name ?? id;
+        const state = await openingState(capturePath, { source: character, at: windows[0].from, wearers: cap.instances });
+        const ago = (ts) => `${((windows[0].from - ts) / 1000).toFixed(1)}s`;
+        opening = {
+          lastPress: state.lastPress ? { skill: state.lastPress.skill, name: nameOf(state.lastPress.skill), ts: state.lastPress.ts } : null,
+          standing: state.standing.map((e) => ({
+            status: e.status, name: nameOf(e.status), on: e.self ? 'self' : 'target', wearer: e.wearer,
+            since: e.since, lastAt: e.lastAt, stacks: e.stacks, expires: e.expires,
+          })),
+        };
+        // Each carried-in line, with what the log holds behind it: the line
+        // is a status standing when the window opens, or a rider the build
+        // plays only while such a status stands (`rule.whileStatus`, read off
+        // its script's guard), or a skill pressed before the window.
+        let riders = [];
+        try { riders = engine.plan.resolve(built.loadout, rank).triggered ?? []; } catch { riders = []; }
+        for (const r of rowsIn) {
+          const skill = r.skill ?? r.id;
+          const own = state.standing.find((e) => e.status === skill);
+          const gate = own ? null : riders.filter((g) => String(g.prof?.id ?? '').split('#')[0] === skill && g.rule?.whileStatus)
+            .map((g) => state.standing.find((e) => e.status === g.rule.whileStatus)).find(Boolean) ?? null;
+          r.carriedBy = own ? { standing: skill, since: own.since }
+            : gate ? { whileStanding: gate.status, since: gate.since }
+              : state.pressed[skill] != null ? { pressed: skill, ts: state.pressed[skill] } : null;
+        }
+        const what = rowsIn.map((r) => {
+          const by = r.carriedBy;
+          return nameOf(r.skill ?? r.id) + (by?.standing ? ` (standing, applied ${ago(by.since)} before it)`
+            : by?.whileStanding ? ` (plays while ${nameOf(by.whileStanding)} stands)`
+              : by?.pressed ? ` (pressed ${ago(by.ts)} before it)`
+                // Nothing in the log behind it: carried in by elimination -
+                // the build has the line when it presses, and nothing was.
+                : ' (the log before the window does not show what)');
+        }).join(', ');
+        const standing = opening.standing.slice(0, 6).map((e) => `${e.name} on ${e.on === 'self' ? character : 'the target'}`).join(', ')
+          + (opening.standing.length > 6 ? `, and ${opening.standing.length - 6} more` : '');
+        const hitsIn = rowsIn.reduce((n, r) => n + r.liveHits, 0);
+        carriedNote = `carried in: ${rowsIn.length} line${rowsIn.length > 1 ? 's' : ''}, `
+          + `${hitsIn.toLocaleString()} hit${hitsIn === 1 ? '' : 's'}, dealt in this window by what was pressed or applied before it - ${what}.\n`
+          + `  The last press before the window: ${opening.lastPress ? `${opening.lastPress.name}, ${ago(opening.lastPress.ts)} earlier` : 'none in this session of the log'}. `
+          + `Standing when it opens: ${standing || 'no status of this character\'s'}.\n`
+          + '  The model\'s fight opens with nothing standing: the carried-in lines are not priced (they are out of MISSING and out of\n'
+          + '  coverage), and the lines that are priced are priced without whatever stood.';
+      } else if (rowsIn.length) {
+        carriedNote = `carried in: ${rowsIn.length} line${rowsIn.length > 1 ? 's' : ''} of skills this window did not press and the build has a line for when it does. `
+          + 'They are out of MISSING and out of coverage.';
+      }
+    }
 
+    // What the model stood on, in words. With no --target the capture is
+    // every hit the character landed and the model keeps the engine's own
+    // default target, exactly as before.
+    const pricedLabel = ev.target?.name ?? verifyTarget?.name ?? null;
+    // What the held chain priced as down (engine.mjs marks each row).
+    const heldDown = (ev.buffs ?? []).filter((b) => b.heldDown)
+      .map((b) => ({ status: b.status, name: b.name ?? engine.cdb.byId('skill').get(b.status)?.texts?.name ?? b.status, from: b.from }));
+    // WHAT THIS BUILD HOLDS THAT A HIT CAN FIND IN TWO STATES, as far as the
+    // model itself knows - for the closing paragraph, which used to call a
+    // per-hit disagreement "a formula error and nothing else" over a Mage
+    // ledger whose three misses were states: Static Nova 450.0 against 451
+    // with Queen's Decree and 233 without, block by block, and -28.9% over a
+    // span that mixes the two. Three kinds are known from the evaluation:
+    //   a USE RIDER (throughput.useRiders): the next press that can spend it
+    //   takes its amount and its cooldown starts, so each spender's line is
+    //   a mix of presses that found it ready and presses that did not - by
+    //   the model's clock in the model's fight, by the recorded one in the
+    //   capture;
+    //   a RAMPED BUFF priced at its mean stack count (conduitRamps);
+    //   a PERK THAT PAYS FROM ONE SIDE of the target (sidePerks): a base
+    //   attack from behind takes the daggers' upgrade amount, the model bills
+    //   it on --behind-fraction of the swings, and a window fought from one
+    //   side is all or none of them. The 2026-10-13 Rogue's ordinary swings
+    //   read 18.4-19.1 from behind (100 of them) and 14.6-15.2 from the
+    //   front (69), where the model's are 18.1 at --behind-fraction 1, 14.4
+    //   at 0 and 15.9 at the default - and the flag was in no help text.
+    // Only what the ledger has a row for is named.
+    const stateMixes = [];
+    {
+      const nameOf = (id) => engine.cdb.byId('skill').get(id)?.texts?.name ?? id;
+      const inLedger = new Set(cmp.rows.filter((r) => (r.liveHits ?? 0) > 0).map((r) => r.id));
+      const linesOf = (id) => (ev.throughput?.lines ?? []).filter((l) => l.id === id || String(l.id).startsWith(`${id}#`));
+      for (const u of ev.throughput?.useRiders ?? []) {
+        const spec = (ev.rotation?.useRiders ?? []).find((x) => x.from === u.from);
+        const spenders = (u.spenders ?? []).filter((id) => inLedger.has(id));
+        if (!spenders.length) continue;
+        stateMixes.push({
+          kind: 'use rider', id: u.from, name: u.name ?? nameOf(u.from), amount: spec?.amount ?? null,
+          spenders: spenders.map((id) => ({ id, name: nameOf(id) })),
+          // In the model's fight: the presses that spent it, of those that could.
+          spent: u.fires, presses: (u.spenders ?? []).reduce((n, id) => n + linesOf(id).reduce((m, l) => m + (l.casts ?? 0), 0), 0),
+        });
+      }
+      for (const g of ev.conduitRamps ?? []) {
+        stateMixes.push({ kind: 'ramp', id: g.id, name: nameOf(g.id), mean: g.mean, cap: g.cap });
+      }
+      // The side perks, when the window holds a base attack for them to ride
+      // (BaseSkill.isBasicAttack@6152: skill types Attack..Attack4).
+      const skillTypes = engine.cdb.enumValues('skill', 'type');
+      const isBasic = (id) => /^Attack[234]?$/.test(skillTypes[engine.cdb.byId('skill').get(id)?.type] ?? '');
+      const side = ev.sidePerks;
+      if (side?.perks?.length && [...inLedger].some(isBasic)) {
+        stateMixes.push({
+          kind: 'side', amount: side.perks.reduce((n, p) => n + p.damage, 0), fraction: side.fraction,
+          weapons: side.perks.map((p) => {
+            const item = engine.cat.itemById.get(built.loadout.gear[p.slot]?.item);
+            return { slot: p.slot, id: item?.id ?? null, name: item?.name ?? item?.id ?? p.slot, amount: p.damage };
+          }),
+        });
+      }
+    }
+    // The difficulty warning is about which ROWS a window at MaxLevel reads, so
+    // it stands while the model is priced at the logged level - also when a
+    // --target-level says that same level, which answers where and not which.
+    const undecidedNote = priced.difficulty && (targetLevel == null || targetLevel === priced.level) ? priced.note : null;
+    // WHICH BUILD THE WINDOW WAS PRICED WITH, and whether the window is one
+    // build. `chosen.mixed` is every other snapshot that stands somewhere in
+    // a GIVEN window and differs; on the default path the window is the
+    // chosen snapshot's own span and nothing else can stand in it.
+    const snapFacts = snap ? {
+      index: snap.index ?? null, of: snaps.snapshots.length, ts: snap.ts, until: snap.until ?? null,
+      how: chosen.how ?? 'most evidence', note: chosen.note ?? null,
+      // The build standing when the window opens, when that is not the one
+      // priced (a --snapshot that names another).
+      standing: (() => {
+        if (!asked.windows || windows[0].from == null) return null;
+        const at = snapshotAt(snaps.snapshots, windows[0].from);
+        return at && at !== snap ? { index: at.index, ts: at.ts, differs: differ(snap, at) } : null;
+      })(),
+    } : null;
+    const mixed = chosen.mixed ?? [];
+    const mixedNote = mixed.length
+      ? 'THIS WINDOW MIXES BUILDS. It is priced with snapshot #' + snap.index + '; inside it the character also stood as:\n'
+        + mixed.map((m) => `  #${m.index}, ${m.until != null && m.ts <= (windows[0].from ?? -Infinity) ? 'until' : 'from'} `
+          + `${stamp(m.until != null && m.ts <= (windows[0].from ?? -Infinity) ? m.until : m.ts)}: ${m.differs.join('; ')}`).join('\n')
+        + '\nEvery row dealt under another build is evidence about that build, not about this ledger\'s model. '
+        + 'Narrow the window (--since / --until) to one of them, or name the build with --snapshot.'
+      : null;
+    // WHETHER THE WINDOW IS ONE FIGHT. The ledger with no window flag reads a
+    // snapshot's whole span, and on a capture recorded block by block that
+    // span is many things at once: the 2026-10-13 Warrior's is 6,716 seconds
+    // of chain-only blocks, lone presses, a held skill at three charge
+    // levels and a rotation, and its ledger printed Rampage +41.9%, Surging
+    // Force +21.3% and the base attacks +8..12% with nothing saying why.
+    // Block by block the same model reads Rampage at full charge 852.5
+    // against a logged 853, Surging Force pressed alone 155.5 against 154,
+    // an ordinary swing of the chain 112.3 against 108-113. The model plays
+    // ONE fight that presses, whenever it is ready, everything the window
+    // pressed anywhere; a swing dealt in a block that pressed nothing is
+    // then compared with a swing priced inside Battle Shout.
+    //
+    // So the window's stretches of play are counted (capture.mjs stretches)
+    // and the ledger says when they were not played alike: some press and
+    // some do not, or a pressed skill whose own cast puts a timed status on
+    // the character was pressed in fewer than half of the stretches that
+    // pressed anything. It is a count off the press rows, said with its
+    // numbers; it does not try to find the blocks, which no silence marks
+    // (the Rogue's basics blocks open four seconds after a rotation).
+    let spanFacts = null;
+    let spanNote = null;
+    {
+      const GAP_MS = 30_000;
+      let parts = [];
+      try { parts = (await stretches(capturePath, { source: character, target: wantArchetype, windows, gapMs: GAP_MS })).stretches; } catch { parts = []; }
+      const pressing = parts.filter((x) => Object.keys(x.pressed).length);
+      if (parts.length > 1 && pressing.length) {
+        const nameOf = (id) => engine.cdb.byId('skill').get(id)?.texts?.name ?? id;
+        const buffCasts = new Set((ev.buffs ?? []).filter((b) => b.duration > 0 && b.trigger?.on === 'cast').map((b) => b.from));
+        const partial = [...pressed].filter((id) => buffCasts.has(id))
+          .map((id) => ({ skill: id, name: nameOf(id), stretches: pressing.filter((x) => x.pressed[id]).length }))
+          .filter((x) => x.stretches * 2 < pressing.length);
+        const silent = parts.length - pressing.length;
+        spanFacts = { stretches: parts.length, pressing: pressing.length, silent, gapMs: GAP_MS, partial, mixed: silent > 0 || partial.length > 0 };
+        if (spanFacts.mixed) {
+          spanNote = `THIS WINDOW IS NOT ONE FIGHT. It holds ${parts.length} stretches of play (split at ${GAP_MS / 1000}s without a hit or a press): `
+            + `${pressing.length} press something${silent ? `, ${silent} press nothing` : ''}`
+            + (partial.length ? `; ${partial.map((x) => `${x.name} was pressed in ${x.stretches} of the ${pressing.length}`).join(', ')}` : '') + '.\n'
+            + (authoredPolicy ? 'The model plays one fight, by the rotation it was given.'
+              : divergence ? 'The model replays one recorded sequence, as one fight.'
+                : 'The model plays one fight that presses, whenever it is ready, everything the window pressed anywhere.')
+            + ' PER-HIT below\n'
+            + 'therefore mixes states - such as a swing inside a buff and one outside it, a held skill\'s charge levels, an armed\n'
+            + 'press and a plain one - and a delta there is the mix before it is a formula. Take one stretch with --since / --until\n'
+            + 'or --window (--snapshots lists the builds and their spans), and read it with --split.';
+        }
+      }
+    }
+    // THE SAME BUILD, WRITTEN AGAIN. The probe writes a snapshot at every
+    // login as well as at every change, so the span of the snapshot chosen
+    // above can stop where the same build goes on: the Warrior's second
+    // session is snapshot #2, "the same build as #1", and its 178 rows were
+    // in no ledger that did not ask for them. The window is not widened -
+    // what a snapshot's span means stays one thing - but the ledger says
+    // which neighbours are the same build, what they hold, and how to read
+    // them together.
+    let sameBuild = [];
+    if (snap && window?.fromSnapshot) {
+      const all = snaps.snapshots;
+      const at = all.indexOf(snap);
+      for (let i = at + 1; i < all.length && differ(snap, all[i]).length === 0; i++) sameBuild.push(all[i]);
+      for (let i = at - 1; i >= 0 && differ(snap, all[i]).length === 0; i--) sameBuild.unshift(all[i]);
+      sameBuild = sameBuild.map((x) => ({ index: x.index, ts: x.ts, until: x.until ?? null, events: x.events, onTarget: evidence(x) }));
+    }
+    // Other players on the same target instances, inside the window.
+    const foreign = cap.foreign ?? [];
+    const foreignNote = foreign.length
+      ? `${foreign.reduce((n, x) => n + x.hits, 0).toLocaleString()} hits by ${foreign.length} other player${foreign.length > 1 ? 's' : ''} `
+        + `landed on the same target${wantArchetype ? '' : 's'} inside this window (`
+        + foreign.slice(0, 4).map((x) => `${x.source} ${x.hits}`).join(', ') + (foreign.length > 4 ? ', ...' : '')
+        + '). Their rows are not in the ledger; whatever they put on the target was there for these hits.'
+      : null;
     if (args.flags.json) {
       console.log(JSON.stringify({
         character, unit: built.unit, level: built.level,
-        capture: capturePath, since, window, gaps: built.gaps,
+        capture: capturePath, since, until, windows, window, gaps: built.gaps,
+        // The window's stretches of play, and whether they were played alike
+        // (`mixed`: some press and some do not, or a buff was pressed in
+        // fewer than half of those that press - PER-HIT then mixes states).
+        // Null when the window is one stretch, or the log holds no press.
+        span: spanFacts,
+        // Neighbouring snapshots that are the same build as the one whose
+        // span is the window, with the rows each holds: not in this ledger.
+        sameBuild,
+        // The build the window was priced with, how it was chosen, and every
+        // other build standing inside a given window (empty: it is one build).
+        snapshot: snapFacts, mixedBuilds: mixed,
+        // The mechanic pools the snapshot did not carry: how each was filled
+        // ('named' with --skills, from the 'rows', or the model's 'default').
+        pools: poolFacts.map(({ note, ...rest }) => rest),
+        // Other players' hits on the same target instances inside the window.
+        foreign,
+        // What was pressed in the window; `nothingPressed` when the log writes
+        // presses and the window holds none (the model then plays the chain alone).
+        pressed: [...pressed], nothingPressed,
+        // ...and no base attack either: there is nothing in the window for
+        // the model to play, and its fight is empty.
+        nothingToPlay,
+        // What stood when a no-press window opened, when rows in it were
+        // CARRIED IN from before (null otherwise): the character's last
+        // press, and the statuses it had applied that were still up.
+        opening,
+        // No hit of the build's base-attack chain in the window: the model
+        // stood still between presses.
+        holdChain: holdChain || nothingToPlay,
+        // ...and what was priced as down for it: every timed status on the
+        // character that is not a pressed skill's own - a swing's, and also
+        // a proc's or a conduit's (bench audit, "with the chain held").
+        heldDown,
+        // What the build holds that a hit can find in two states, as far as
+        // the model knows: a use rider with the ledger's lines that can spend
+        // it (`spent` of `presses` in the model's own fight), a buff priced
+        // at its mean stack count. A PER-HIT delta on such a line is the mix
+        // before it is a formula.
+        stateMixes,
+        // --replay: the recorded presses as the RETURNED fight played them
+        // (verify.mjs replaySchedule) - how many of `total` it `replayed`,
+        // refused as `notReady`, did not know, pressed more than a second
+        // late - over a fight of `fight` seconds, the last of `fights` the
+        // evaluation played. Null without the flag, or with nothing pressed.
+        // `opens`: the second the recorded sitting's first skill state opened,
+        // until which the replayed fight stands still (null: the log does not
+        // say, and it moves from its first second).
+        replay: divergence ? { ...divergence, fight: fightLen, opens: replayOpens } : null,
+        // The gauge pool at the opening of a given window, where the log says.
+        poolStart,
+        // Which build the window was recorded on: true, false, or null when
+        // it cannot be told - and the sentence that says why.
+        captureEra: {
+          onThisBuild: era.onThisBuild, reason: era.reason, from: era.from, to: era.to,
+          probe: era.probe, sessions: era.sessions, boot: era.boot,
+        },
+        // What the rows are hits on, what the model stood on and at which
+        // level - with the levels the capture itself logged for those rows.
+        target: {
+          filter: wantArchetype, pricedAs: priced.name, pricedLabel, note: priced.difficulty ? undecidedNote : priced.note,
+          // Which INSTANCES of the unit the rows are on: the one named
+          // (`--target <unit>#<n>`: 'named'), the one being fought at each
+          // moment ('followed'), or every one ('all': --all-instances, a
+          // model of several targets, or no unit asked for) - and the rows
+          // of the character's on the unit's other instances that this left
+          // out of every figure in the ledger, per instance.
+          instances: wantInstance ? 'named' : followInstance ? 'followed' : 'all',
+          read: cap.instances, leftOut: cap.leftOut,
+          // 'veteran-or-heroic' when the window stood at MaxLevel, the two
+          // difficulties are different targets for this unit and nothing
+          // says which it was (the note says what each costs); else null.
+          difficulty: undecidedNote ? priced.difficulty : null,
+          level: verifyTarget?.spawnLevel ?? null,
+          levelNote: targetLevel == null ? priced.levelNote : null,
+          loggedLevels: cap.targetLevels,
+        },
+        // The fight the model played, in seconds, and what it dealt a second.
+        // The capture's side of that - its damage per second over its time
+        // in play, and the model's over the capture's - is `totals.rate`.
+        modelSeconds: clocks.modelSeconds,
         modelDps: ev.throughput.dps, ...cmp,
       }, null, 2));
       return;
@@ -2649,49 +4261,192 @@ const commands = {
     console.log(f.header(engine, VERSION) + '\n');
     console.log(f.bold(`${character} - ${built.unit} ${built.level}`) + f.dim(
       `  ${built.placed.length} slots from ${snap ? 'the capture\'s own snapshot' : 'the modkit dump'}`));
+    const eraNote = eraWarning(era);
+    if (eraNote) console.log(f.warn(eraNote));
+    else console.log(f.dim(`capture: ${era.reason}`));
+    if (priced.note && (!priced.difficulty || undecidedNote)) console.log(f.warn(priced.note));
+    console.log(f.dim(`target: capture rows on ${wantInstance ?? wantArchetype ?? 'every target'}`
+      + (followInstance ? `, held to the instance being fought${cap.instances.length ? ` (${cap.instances.slice(0, 4).join(', ')}${cap.instances.length > 4 ? ', ...' : ''})` : ''}` : '')
+      + `; model priced against ${pricedLabel ?? '(none)'}`));
+    if (cap.leftOut.hits > 0) {
+      const lo = cap.leftOut;
+      console.log(f.warn(`  left out: ${lo.hits.toLocaleString()} hit${lo.hits === 1 ? '' : 's'}, ${Math.round(lo.total).toLocaleString()} damage, that ${character} landed on `
+        + `${lo.instances.length} other instance${lo.instances.length === 1 ? '' : 's'} of ${wantArchetype} `
+        + `(${lo.instances.slice(0, 4).map((x) => `${x.target} ${x.hits.toLocaleString()} / ${Math.round(x.total).toLocaleString()}`).join(', ')}${lo.instances.length > 4 ? ', ...' : ''})`
+        + (wantInstance ? '.' : ' while it was fighting another: a spread, an area.')
+        + `\n  The model fights one target and has no line for them; they are in no figure below. --all-instances reads them`
+        + (wantInstance ? '.' : `, --target ${wantArchetype}#<n> names one instance outright.`)));
+    } else if (wantArchetype && !followInstance && !wantInstance && cap.instances.length > 1) {
+      console.log(f.dim(`  the rows are on ${cap.instances.length} instances of ${wantArchetype}, all read`
+        + (args.flags['all-instances'] ? ' (--all-instances)' : ` (the model fights ${fightSetup.targets} targets)`)
+        + '; a model of one target has a line for one of them.'));
+    }
+    if (priced.levelNote && targetLevel == null) console.log(f.dim(`  ${priced.levelNote}`));
     if (snapNote) console.log(f.warn(snapNote));
     if (runeNote) console.log(f.warn(runeNote));
+    for (const pf of poolFacts) console.log(pf.how === 'default' ? f.warn(pf.note) : f.dim(pf.note));
     if (divergence) {
-      console.log(f.dim(`replay: ${divergence.replayed}/${divergence.total} presses replayed over ${Math.round(fightLen ?? 0)}s`
+      console.log(f.dim(`replay: ${divergence.replayed}/${divergence.total} presses replayed over ${(fightLen ?? 0).toFixed(1).replace(/\.0$/, '')}s`
+        + (replayOpens > 0 ? `, opening ${replayOpens.toFixed(2)}s in where the log's first skill state does` : '')
+        + (divergence.beyond ? ` (${divergence.beyond} more were pressed after the fight's end)` : '')
+        + (divergence.cut && divergence.cut.kept + divergence.cut.voided > 0
+          ? `, ${divergence.cut.kept + divergence.cut.voided} swing${divergence.cut.kept + divergence.cut.voided === 1 ? '' : 's'} cut short by a press that interrupts - ${divergence.cut.voided} before the hit (nothing landed), ${divergence.cut.kept} after it` : '')
         + (divergence.notReady ? `, ${divergence.notReady} the model refused as not ready` : '')
         + (divergence.unknown ? `, ${divergence.unknown} outside the model's rotation` : '')
         + (divergence.pressedLate ? `, ${divergence.pressedLate} landed >1s late` : '')));
     }
+    if (mixedNote) console.log(f.warn(mixedNote));
+    if (window?.given) {
+      for (const w of window.ranges) console.log(f.dim(`window: ${stamp(w.from)} .. ${stamp(w.to)}`
+        + (w.from != null && w.to != null ? `, ${((w.to - w.from) / 1000).toFixed(1)}s` : '') + ' (given)'));
+    }
+    if (snapFacts && (window?.given || chosen.how === 'asked')) {
+      console.log(f.dim(`build: snapshot #${snapFacts.index} of ${snapFacts.of}, written ${stamp(snapFacts.ts)} - `
+        + (snapFacts.how === 'asked' ? 'named with --snapshot'
+          : snapFacts.how === 'standing' ? 'the one standing when the window opens'
+            : snapFacts.how === 'next' ? 'the first one inside the window'
+              : snapFacts.how === 'nearest' ? 'the nearest one that describes a build, none standing in the window' : 'the one with the most evidence')));
+      if (snapFacts.note) console.log(f.warn(snapFacts.note));
+      if (snapFacts.standing) {
+        console.log(f.warn(`the build standing when the window opens is snapshot #${snapFacts.standing.index}, not the one priced: `
+          + (snapFacts.standing.differs.length ? snapFacts.standing.differs.join('; ') : 'the same build, written again')));
+      }
+    }
+    if (foreignNote) console.log(f.warn(foreignNote));
+    if (nothingToPlay) {
+      console.log(f.warn('presses: none in this window, in a log that writes them, and no base attack either - there is nothing in it for the model to play.\n'
+        + '  Its fight is empty. A row below was dealt by something pressed or applied before the window opens (CARRIED-IN),\n'
+        + '  or is one no fight of this build has a line for (MISSING).'));
+    } else if (nothingPressed) {
+      console.log(f.dim('presses: none in this window, in a log that writes them - the model plays the base-attack chain alone'));
+    }
+    if (carriedNote) console.log(f.warn(carriedNote));
+    if (poolNote) console.log(f.dim(poolNote));
+    if (holdChain) {
+      const names = [...new Set(heldDown.map((b) => b.name))];
+      console.log(f.dim('chain: no base attack in this window - the model stands still between presses, and every timed status of the\n'
+        + '  character\'s that is not a pressed skill\'s own is priced as down'
+        + (names.length
+          ? `: ${names.join(', ')}.\n  What only a swing applies is rightly down. One that a proc on any damage, a conduit or a passive raises off a press is\n`
+            + '  down with it, and may stand in the rows (bench audit, "with the chain held").'
+          : ' (this build has none).')));
+    }
     if (window?.fromSnapshot) {
       console.log(f.dim(`window: the snapshot's own span - ${window.events.toLocaleString()} events`
         + (window.seconds ? ` over ${Math.round(window.seconds)}s` : ', open-ended')));
-    } else if (window) {
+      const more = sameBuild.reduce((n, x) => n + x.onTarget, 0);
+      if (more > 0) {
+        const first = Math.min(snap.ts, ...sameBuild.map((x) => x.ts));
+        const lastUntil = [snap, ...sameBuild].some((x) => x.until == null) ? null : Math.max(snap.until, ...sameBuild.map((x) => x.until));
+        console.log(f.warn(`  snapshot${sameBuild.length > 1 ? 's' : ''} ${sameBuild.map((x) => `#${x.index}`).join(', ')} `
+          + `${sameBuild.length > 1 ? 'are' : 'is'} the same build, written again (one is written at every login): `
+          + `${more.toLocaleString()} more row${more === 1 ? '' : 's'}${wantArchetype ? ` on ${wantArchetype}` : ''} that this window does not read.\n`
+          + `  --since ${first}${lastUntil == null ? '' : ` --until ${lastUntil}`} reads them together.`));
+      }
+    } else if (window && !window.given) {
       console.log(f.dim(`window: last ${window.count} of ${window.of} sessions, `
         + `${Math.round(window.seconds)}s of recorded combat`));
     }
+    // THE RATE, beside the model's. A ledger that printed `model: 613.3 dps`
+    // and nothing for the capture left the one number a reader came for to
+    // be worked out by hand - and it was worked out against three dummies.
+    const rate = cmp.totals.rate;
     console.log(f.dim(`capture: ${cap.matched.toLocaleString()} events over ${cap.groups.length} skills`
-      + `   model: ${ev.throughput.dps.toFixed(1)} dps`));
+      + (rate ? `, ${rate.liveDps.toFixed(1)} damage a second over the ${rate.liveSeconds.toFixed(1)}s it was in play` : '')
+      + `   model: ${ev.throughput.dps.toFixed(1)} dps${rate ? ` over a ${rate.modelSeconds.toFixed(1).replace(/\.0$/, '')}s fight` : ''}`));
+    // ...and the two compared - where they can be. A window that is several
+    // stretches of play not played alike (lone presses with pauses between
+    // them, a chain-only block, a rotation) has a "time in play" that is all
+    // of those, and its rate against ONE fight that presses everything
+    // whenever it is ready is no comparison: the 2026-10-13 Mage's whole span
+    // reads 88 a second against a model of 228. So there the line says that
+    // instead of a percentage.
+    if (rate && cmp.totals.matched > 0) {
+      const pc = (x) => `${x > 0 ? '+' : ''}${(100 * x).toFixed(1)}%`;
+      if (spanFacts?.mixed) {
+        console.log(f.warn(`rate: not like for like on this window - it is ${spanFacts.stretches} stretches of play that were not played alike (above the table), `
+          + `and the capture's ${rate.liveDps.toFixed(1)} a second is over all of them, pauses of up to ${spanFacts.gapMs / 1000}s between presses included. `
+          + 'Take one stretch (--since / --until, --window) before reading a rate, or RATE below.'));
+      } else {
+        console.log(f.dim(`rate: the model's lines deal ${rate.modelDps.toFixed(1)} a second against the capture's ${rate.liveDps.toFixed(1)}: ${pc(rate.delta)}`
+          + (rate.perHitPart != null ? `, of which ${pc(rate.perHitPart)} is the size of the hits (the capture's own hit counts at the model's mean hit) and the rest how often they land (RATE below)` : '')
+          + '.'));
+      }
+    }
     console.log('');
 
     const t = cmp.totals;
+    const poolRows = t.pools.match + t.pools.close + t.pools.miss;
     const pctOf = (x) => (x === null ? '-' : `${(100 * x).toFixed(1)}%`);
-    console.log(f.bold(`coverage ${pctOf(t.coverage)}`) + f.dim(
-      `  of the damage the game recorded, the model has a line for.`));
+    console.log(f.bold(`coverage ${pctOf(t.coverage)}`) + f.dim(t.coverage === null && t.carriedIn
+      ? '  every row of this window was carried into it: there is nothing here for the model to cover.'
+      : t.carriedIn
+        ? '  of the damage the game recorded that was not carried into the window, the model has a line for.'
+        : '  of the damage the game recorded, the model has a line for.'));
     console.log(`  matched ${t.matched}   MISSING ${t.missing}   PHANTOM ${t.phantom}`
+      + (t.carriedIn ? `   carried-in ${t.carriedIn}` : '')
       + (t.notPressed ? `   not-pressed ${t.notPressed}` : '')
-      + `   per-hit: ${t.verdicts.match} match / ${t.verdicts.close} close / ${t.verdicts.miss} miss`);
+      + `   per-hit: ${t.verdicts.match} match / ${t.verdicts.close} close / ${t.verdicts.miss} miss`
+      // A pool has no per-hit claim (verify.mjs `globalPool`): counted apart,
+      // by the SHARE it is held to.
+      + (poolRows ? `   pool${poolRows > 1 ? 's' : ''} by share: ${t.pools.match} match / ${t.pools.close} close / ${t.pools.miss} miss` : ''));
     console.log('');
 
     const n = (x, d = 1) => (x === null || x === undefined ? '-' : x.toFixed(d));
     const sd = (x) => (x === null || x === undefined ? '-' : `${x > 0 ? '+' : ''}${(100 * x).toFixed(1)}%`);
+    if (spanNote) console.log(f.warn(spanNote) + '\n');
     console.log(
-      f.dim('SKILL'.padEnd(38) + 'STATUS'.padEnd(9) + 'MODEL'.padStart(8) + 'LIVE'.padStart(8)
-        + 'PER-HIT'.padStart(9) + 'SHARE'.padStart(8) + 'HITS'.padStart(8) + 'CRIT'.padStart(7))
+f.dim('SKILL'.padEnd(38) + 'STATUS'.padEnd(9) + 'MODEL'.padStart(8) + 'LIVE'.padStart(8)
+        + 'PER-HIT'.padStart(9) + 'SHARE'.padStart(8) + 'RATE'.padStart(8) + 'HITS'.padStart(8) + 'CRIT'.padStart(7))
     );
+    // A row that is ONE AFFINITY of a skill (verify.mjs compare: the capture
+    // logs the skill under several and the model prices them as separate
+    // hits) says which in its name, and the cut to the column's width must
+    // not be what removes it: the skill's id is shortened instead.
+    const shown = (r, w) => {
+      if (!r.affinity) return r.id.slice(0, w);
+      const tail = ` (${r.affinity})`;
+      return (r.skill.length + tail.length <= w ? r.skill : r.skill.slice(0, Math.max(1, w - tail.length - 1)) + '~') + tail;
+    };
     for (const r of cmp.rows) {
-      const line = r.id.slice(0, 37).padEnd(38) + r.status.padEnd(9)
-        + n(r.modelMean).padStart(8) + n(r.liveMean).padStart(8)
-        + sd(r.perHitDelta).padStart(9) + sd(r.shareDelta).padStart(8)
+      // A status wider than its column (NOT-PRESSED, CARRIED-IN) takes the
+      // room from the MODEL column beside it, which such a row leaves empty,
+      // so LIVE and everything after it stay under their headers.
+      const over = Math.max(0, r.status.length + 1 - 9);
+      const line = shown(r, 37).padEnd(38) + r.status.padEnd(9)
+        + n(r.modelMean).padStart(Math.max(2, 8 - over)) + n(r.liveMean).padStart(8)
+        // A pool other hits feed ticks at a rate, not a per-event amount: it
+        // is held to SHARE and prints no per-hit figure (the footer says so).
+        + (r.globalPool ? 'pool' : sd(r.perHitDelta)).padStart(9) + sd(r.shareDelta).padStart(8) + sd(r.rateDelta).padStart(8)
         + String(Math.round(r.liveHits || r.modelHits)).padStart(8)
         + (r.liveCrit === undefined ? '-' : pctOf(r.liveCrit)).padStart(7);
       if (r.status === 'MISSING' || r.status === 'PHANTOM') console.log(f.warn(line));
-      else if (r.status === 'NOT-PRESSED') console.log(f.dim(line));
+      else if (r.status === 'NOT-PRESSED' || r.status === 'CARRIED-IN') console.log(f.dim(line));
       else console.log(line);
+    }
+
+    // THE TWO HALVES OF THE DIE (--split). PER-HIT above is a mean over
+    // whatever the window happened to roll; here the ordinary hits are held
+    // to the model's ordinary hit and the critical ones to its critical one,
+    // with how many of each the window holds and the range they span - a
+    // line that reads one integer every time says so by itself.
+    if (args.flags.split) {
+      const rng = (lo, hi) => (lo === null || lo === undefined ? '' : lo === hi ? `=${n(lo, 0)}` : `${n(lo, 0)}-${n(hi, 0)}`);
+      console.log('');
+      console.log(f.bold('ORDINARY AND CRITICAL HITS APART') + f.dim('  model / live (hits, range) / delta; crit rate model vs live'));
+      console.log(f.dim('SKILL'.padEnd(34) + 'ORDINARY'.padStart(9) + 'LIVE'.padStart(8) + ' '.repeat(15) + 'DELTA'.padStart(8)
+        + 'CRITICAL'.padStart(10) + 'LIVE'.padStart(8) + ' '.repeat(15) + 'DELTA'.padStart(8) + 'RATE'.padStart(13)));
+      for (const r of cmp.rows) {
+        if (r.status !== 'BOTH' && r.status !== 'MISSING') continue;
+        const half = (model, live, hits, lo, hi, delta) => n(model).padStart(9) + n(live).padStart(8)
+          + (hits ? ` (${hits}, ${rng(lo, hi)})` : '').padEnd(15).slice(0, 15) + sd(delta).padStart(8);
+        console.log(shown(r, 33).padEnd(34)
+          + half(r.modelNonCrit, r.liveNonCrit, r.liveNonCritHits, r.liveNonCritMin, r.liveNonCritMax, r.nonCritDelta)
+          + ' ' + half(r.modelCrit, r.liveCritMean, r.liveCritHits, r.liveCritMin, r.liveCritMax, r.critHitDelta)
+          + `${r.modelCritRate == null ? '-' : pctOf(r.modelCritRate)} / ${pctOf(r.liveCrit ?? 0)}`.padStart(15));
+      }
+      console.log(f.dim('A row with no model figure is one the fight kept no decomposition for (a pool, a\n'
+        + 'counter priced after the fight). A half with no live figure did not occur in the window.'));
     }
 
     // The sheet, checked against the game's own arithmetic.
@@ -2763,18 +4518,105 @@ const commands = {
           + `${((r.rel > 0 ? '+' : '') + (100 * r.rel).toFixed(1) + '%').padStart(9)}`);
       }
       if (off.length) {
-        console.log(f.dim('  game (base + its own affixes) vs model. A damage delta on a wrong sheet\n'
-          + '  is not a damage error - fix the sheet first.'));
+        // The affix rows are the RECORDING build's arithmetic. On a window
+        // from another build a difference here is the patch before it is the
+        // model: the 2026-10 build moved the Epic and Legendary item-level
+        // bonus, and a pre-patch snapshot of such a weapon reads several
+        // percent off (Emsey's August window: Dexterity 169 against 175).
+        console.log(f.dim(era.onThisBuild === true
+          ? '  game (base + its own affixes) vs model. A damage delta on a wrong sheet\n'
+            + '  is not a damage error - fix the sheet first.'
+          : '  game (base + its own affixes, as the RECORDING build baked them) vs the\n'
+            + '  model on today\'s data. On a window from another build a row here is the\n'
+            + '  patch before it is the model, and a damage delta on a moved sheet is not\n'
+            + '  a damage error.'));
       }
     }
 
     console.log('');
     console.log(f.dim(
-      'PER-HIT and SHARE are model MINUS capture, so a positive number is the model\n'
-      + 'claiming too much. Read PER-HIT first: it needs no clock and no fight boundary,\n'
-      + 'so a disagreement there is a formula error and nothing else.\n'
+      'PER-HIT, SHARE and RATE are model MINUS capture, so a positive number is the model\n'
+      + 'claiming too much. Read PER-HIT first: what one hit deals does not depend on how often\n'
+      + 'it lands. It holds a mean to a mean: the model\'s hit, its ordinary and critical outcomes\n'
+      + 'weighed at the build\'s crit chance over the model\'s own fight, against whichever hits\n'
+      + 'this window holds.\n'
+      + 'A disagreement there is a formula error or a STATE - something the hit found standing,\n'
+      + 'which the window holds in one mix and the model\'s fight in another: a charge level, a\n'
+      + 'buff\'s stack count, a register another press had spent, the side of the target you\n'
+      + 'stood on. Over a few hits it is also the die: which of them happened to crit. It is the\n'
+      + 'formula only where the ORDINARY and CRITICAL halves (--split) disagree on a window that\n'
+      + 'is one state: one block of play (--window <from>..<to>, or --since / --until), played\n'
+      + 'as it was pressed (--replay) or for as long as it lasted (--fight <s>).\n'
+      + (stateMixes.length
+        ? 'What this build holds of that kind, as far as the model knows:\n'
+          + stateMixes.map((m) => (m.kind === 'use rider'
+            ? `  ${m.name}${m.amount != null ? ` puts +${Math.round(m.amount * 100)}% in the damage bracket of` : ' is spent by'} the next of `
+              + `${m.spenders.map((x) => x.name).join(', ')} to find it ready, and is then away for its cooldown: each of those lines is a mix\n`
+              + `  of presses that found it and presses that did not - ${+m.spent.toFixed(1)} of ${+m.presses.toFixed(1)} in the model's fight, and the capture's mix is its own.\n`
+            : m.kind === 'side'
+              ? `  A base attack landed from behind the target takes +${Math.round(m.amount * 100)}% (the upgrade perk of ${m.weapons.map((w) => w.name).join(' and of ')}), and the model\n`
+                + `  bills it on ${Math.round(m.fraction * 100)}% of the swings: a window fought from one side holds all of them or none - --behind-fraction 1 from behind, 0 from the front.\n`
+              : `  ${m.name} is priced at ${m.mean.toFixed(1)} of its ${m.cap} stacks, the mean over the model's fight: a hit landed at another count is off by the difference.\n`)).join('')
+        : '')
+      + (spanFacts?.mixed
+        ? 'This window is several stretches that were not played alike (see above the table):\n'
+          + 'the mix comes first here.\n'
+        : '')
+      + (era.onThisBuild === true ? ''
+        : 'This window is not known to be recorded on this build (see the top): a disagreement\n'
+          + 'can also be whatever the patch changed about that skill.\n')
+      + (undecidedNote
+        ? 'On this window it can also be the difficulty: the target stood at MaxLevel,\n'
+          + 'Heroic reads other armour rows for it, and the model was priced on the rows\n'
+          + 'every other difficulty reads (see the top). The same offset on every row is\n'
+          + 'that, not a formula.\n'
+        : '')
+      + (rate
+        ? 'RATE is how often a line lands - its rows per second of the model\'s fight against its\n'
+          + 'rows per second of the capture\'s time in play (first hit to last, breaks over 30s left\n'
+          + 'out) - and the two totals above the table are compared the same way. It is like for\n'
+          + 'like on a window that is one fight on one target; a disagreement there with PER-HIT in\n'
+          + 'agreement is the rotation or the clock: what was pressed when, what a cast cut short,\n'
+          + 'how fast a bar filled.\n'
+        : '')
+      + (poolRows
+        ? 'A line whose PER-HIT reads `pool` is a pool other hits pay into - a part of their damage,\n'
+          + 'paid out again tick by tick. What one tick deals follows how much the fight was dealing,\n'
+          + 'not a formula of its own: it has no per-hit figure, is held to SHARE, and is counted apart.\n'
+        : '')
       + 'MISSING is damage the game did and the bench cannot see. PHANTOM is damage the\n'
-      + 'bench claims and the game never recorded. Both outrank any delta.'));
+      + 'bench claims and the game never recorded. Both outrank any delta.'
+      + (t.carriedIn
+        ? '\nCARRIED-IN is damage dealt in this window by something pressed or applied before\n'
+          + 'it opened. The model has a line for it in a fight that presses it and none in\n'
+          + 'this one, which pressed nothing: it is no hole in the model and no evidence\n'
+          + 'about it either, and coverage and SHARE are measured without it.'
+        : '')
+      + (cmp.rows.some((r) => r.affinity)
+        ? '\nA row named <skill> (<Affinity>) is one affinity of a skill the capture logs under\n'
+          + 'several, where the model prices them as different hits (a status\'s tick and the\n'
+          + 'direct hit its re-application plays): each is held to its own rows.'
+        : '')));
+    {
+      // The ceiling, said where it matters: a line that logs whole numbers is
+      // compared half a point up, and a hit that never varies can still sit
+      // half a point from that.
+      const small = cmp.rows.filter((r) => r.status === 'BOTH' && r.logLift > 0 && r.liveMean > 0 && r.liveMean < 60);
+      console.log(f.dim(
+        'A direct hit is logged as a whole number, the CEILING of what the formula gives, so a\n'
+        + `whole-number line is compared with the model's figure plus ${INTEGER_STREAM.lift} (the MODEL column prints\n`
+        + 'the figure itself). On a hit that never varies the true lift is anywhere in (0, 1]'
+        + (small.length
+          ? ':\n' + small.slice(0, 6).map((r) => `  ${r.id} is within ±${(100 * 0.5 / r.liveMean).toFixed(1)}% of where it is printed`).join('\n')
+          : '.')));
+      if (!args.flags.split) {
+        const few = cmp.rows.filter((r) => r.status === 'BOTH' && r.liveHits > 0 && r.liveHits < 30).length;
+        if (few) {
+          console.log(f.dim(`${few} line${few > 1 ? 's hold' : ' holds'} fewer than 30 hits: there the mean is mostly which hits happened to crit.\n`
+            + '--split compares ordinary and critical hits apart.'));
+        }
+      }
+    }
     if (built.gaps.length) {
       console.log('\n' + f.warn('the dump cannot see:'));
       for (const g of built.gaps) console.log(f.warn(`  - ${g}`));
@@ -2817,17 +4659,125 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
                    committed fingerprint - every sheet row, every script,
                    every bytecode citation - and print the work list, split
                    into what needs an in-game log, what the SHEET check can
-                   confirm, and what is a model re-read. --accept records the
-                   new build once addressed; --json <file> dumps the report
+                   confirm, and what is a model re-read. A citation is opened,
+                   not just located: MOVED, body CHANGED, STUB (the client no
+                   longer carries the body) and MISSING are four different
+                   answers. --reanchor lists the citations whose function
+                   merely moved and what needs a person (--write rewrites the
+                   former in place, --only <path> narrows it). --accept
+                   records the new build once addressed, and is refused while
+                   a citation is stale (--with-stale-citations defers them,
+                   on the record: every later run lists the ones still
+                   owed); --json <file> dumps the report; --against
+                   <data.cdb or install dir> diffs the game data against an
+                   older copy instead of the fingerprint (the code still
+                   against the fingerprint), and then says what changed
+                   inside each row; --row <sheet>:<id> prints one row's
+                   changes in full, a skill's script among them
   bench audit      every assumption and gap in the model
   bench verify     hold the model against a recorded capture and print the
                    per-skill difference, signed. Needs --character <Name>,
                    whose gear comes from the modkit's own inventory dump and
                    whose damage comes from the HLX probe's log. Defaults to
-                   the last 3 play sessions (--sessions n, --since <ms>),
+                   the span of the capture's richest snapshot of that
+                   character (else its last 3 play sessions, --sessions n),
                    optionally one target archetype (--target). --json emits
                    the whole ledger. This is the only command that can report
                    the model wrong without a person deciding that it is.
+                   ONE PIECE OF A CAPTURE: --since <ms> and --until <ms> give
+                   a window by its two ends (epoch milliseconds, the log's
+                   own ts_ms; either alone leaves the other open), and
+                   --window <from>..<to> gives one too and may be repeated
+                   for several at once. A given window that holds no row of
+                   the character (or none on --target) is refused, with
+                   where its rows are. A given window is priced with the
+                   snapshot STANDING when it opens - the first written
+                   inside it when none stands, else the nearest in time,
+                   and the build line says which; --snapshot <n> (or
+                   @<ms>) names the build instead, and --snapshots lists
+                   every snapshot of the character with what each changed.
+                   A window is compared with ONE model fight: when it is
+                   several stretches of play that were not played alike
+                   (some press, some do not; a buff pressed in few of them)
+                   the ledger says so above the table, because PER-HIT then
+                   mixes states - which a snapshot's whole span usually
+                   does. It also says when a neighbouring snapshot is the
+                   same build written again, with rows it did not read.
+                   The ledger says when a window holds two builds, when
+                   other players hit the same target inside it, when it
+                   holds no press (the model then swings its chain and
+                   presses nothing) and when it holds no base attack (the
+                   model then stands still between presses). What a
+                   window with no press holds of skills pressed, or of
+                   statuses applied, before it opened is filed CARRIED-IN
+                   instead of MISSING, with what the log shows standing at
+                   the opening; the model's fight opens on nothing. --split
+                   compares ordinary and critical hits apart, which is the
+                   comparison to read on a window of a few presses.
+                   --behind-fraction <0..1> says which side of the target a
+                   window was fought from (1 behind, 0 in front), for a
+                   build whose weapon upgrade pays only from behind: the
+                   ledger names the perk when the build holds one. A pool
+                   other hits pay into is held to SHARE and prints "pool"
+                   for PER-HIT.
+                   A skill the log holds under two affinities, where the
+                   model prices them as two hits (a status's tick and the
+                   direct hit its re-application plays), is two rows,
+                   <skill> (<Affinity>). The model's fight is as long as
+                   --fight says (200 s): on a window where something ramps
+                   from nothing - a stack counter - give it the window's
+                   own length. --replay plays one window's recorded presses
+                   at their own times instead of the model's rotation, which
+                   is what holds a use-on-cooldown register to the presses
+                   that really found it ready; the window has to say where
+                   it starts (--since, or --window <from>..), because that
+                   is the fight's first second, and the replayed fight is
+                   as long as the window (or as --fight says; fifteen
+                   seconds past the last press when the window is left
+                   open). A recorded press that falls inside a swing of the
+                   chain cuts it, as the game does: before the swing's hit
+                   it deals nothing and the chain stays on that link, after
+                   it the hit stands and the swing ends there.
+                   ONE TARGET: a unit is not one target (three yard dummies
+                   are three), so with --target <unit> each row is held to
+                   the INSTANCE the character was fighting at that moment -
+                   the target of its latest press, or where its latest base
+                   attack landed - and what it landed on the unit's other
+                   instances meanwhile (a spread, an area) is left out,
+                   counted and said. --target <unit>#<n> names one instance
+                   as the log writes it; --all-instances reads them all (so
+                   does --targets above 1). The ledger prints the capture's
+                   damage a second over its time in play beside the model's,
+                   and RATE per line: how often it lands, model against
+                   capture.
+                   A summon's swings are logged under the pet's own skill
+                   and compared there when the capture holds them under the
+                   character's name (probe v10 on). Slots the snapshot
+                   cannot read - the Mage's conduits on build 25782799 -
+                   are filled from what the character's own rows show, and
+                   the ledger says so; --skills <pool>=<a,b,...> names them
+                   (--skills conduits=Mage_Conduit_Power,Mage_Conduit_Power).
+                   A given window opens the Mage's fight at the Spark the
+                   log carries for its first row: under half the pool no
+                   conduit fires until Spark comes back.
+                   --capture <file> reads another log than the live
+                   hlx/logs/bench-probe.csv (a bare name is looked up in that
+                   folder): the probe starts a new log with each build, and
+                   the ledger says which build its window was recorded on.
+                   --dump builds the character from the modkit's inventory
+                   dump even when the capture holds a snapshot of it.
+                   --target <unit> picks the capture rows (hits on that
+                   unit) and prices the model on it, at the level the
+                   capture logged; --price-as <target> prices the model on
+                   something else (a mode: Ratsar@heroic, a rift:
+                   ImpDemon_Rift@scaled, or none). A dummy window recorded
+                   before the 2026-10 build is priced on \`none\` by itself:
+                   the Dummy had no armour then. A boss logged at MaxLevel
+                   stood in Veteran or in Heroic, the capture does not say
+                   which, and Heroic reads other armour rows for some: the
+                   ledger opens by saying so when it matters, and
+                   --price-as <unit>@heroic or @veteran settles it. \`heroic\`
+                   speaks for every heroic boss and cannot filter a capture.
 
 The UI in your browser
   The same sheet the packaged desktop app shows, out of this process. It costs
@@ -2861,6 +4811,9 @@ Searching a rotation
                           Restart 0 always starts from the order the model
                           derives, so the answer can never be worse than it.
   --kit-restarts <n>      restarts for the kit search inside each round (3)
+  --validate <n>          how many rolled fights the rotation found is held
+                          against the derived order over, to say whether its
+                          edge is outside the spread (default 200; 1 skips it)
 
 Stat profiles
   A profile PINS every stat to a flat number, replacing whatever the level curve
@@ -2884,8 +4837,14 @@ Stat profiles
                           "does a stat repartition change the rotation", and what
                           carrying a single rotation everywhere costs.
   --no-arsenal            (bench weapons) leave the arsenal slot empty
+  --pairs                 (bench weapons) sweep every ORDERED (mainhand,
+                          arsenal) pair of the best weapons instead
+  --top <n>               (with --pairs) how many weapons are paired
+                          (default 6, at least 2)
 
 Common flags
+  --help, -h              this text
+  --version, -V           the version, and nothing else
   --class <name>          Warrior | Rogue | Mage | Priest
   --level <n>             default: the game's MaxLevel
   --verbose               optimize prints the build and where its damage came
@@ -2895,15 +4854,27 @@ Common flags
                           coverage note, and the assumptions-and-gaps list
   --goal <g>              dps | hps | sps | ehp | mixed (default dps)
   --weight <g>=<n>        blend goals, e.g. --weight dps=1 --weight ehp=0.25
-  --target <t>            dummy | small | trash | big | elite | boss | dungeon
-                          | reference | any unit id     (default boss, 0.40/0.40
-                          at your own level)
-  --target-level <n>      the level the foe SPAWNED at, when it differs from
-                          yours. The resist pool is built at its level and
-                          divided at yours, so a foe below you mitigates less
-                          than its intent says. Defaults to parity, except for
-                          the rift and arena families whose levels were fitted
-                          from real fights (see bench targets)
+  --mix <0..1>            the physical share of the damage effective HP is
+                          computed against; the rest is magical (default 0.5)
+  --slot <slot>           (bench rank, bench items) the slot to rank or list;
+                          required there, and bench slots names them
+  --all                   (bench rank) every row, not the first fifteen
+  --no-empty              (optimize, rotation) the search may not leave a slot
+                          empty - the off hand excepted
+  --target <t>            none | dummy | reference | trash | small | big | elite
+                          | boss | dungeon | heroic | any unit id   (default
+                          boss, 0.40/0.40 at your own level). \`none\` mitigates
+                          nothing; \`dummy\` is the training dummy's own row,
+                          which carries armour since the 2026-10 build. A unit
+                          id stands at its row's level in Normal difficulty;
+                          add @veteran or @heroic to stand it at MaxLevel
+                          (Heroic also reads its heroic rows - Nepsilon@heroic),
+                          @scaled to build its pool at your level, as a rift
+                          does. \`bench targets\` prints all of it
+  --target-level <n>      the level the foe STANDS at. The resist pool is
+                          built at its level and divided at yours, so a foe
+                          below you mitigates less than its row says. Overrides
+                          whatever the target name implies (see bench targets)
   --fight <s>             how long the simulated fight is    (default 200s)
   --fights <n>            roll the procs for real n times and report the mean
                           and the spread; 1 folds them in at their expected
@@ -2911,7 +4882,12 @@ Common flags
   --rotation-file <json>  play an AUTHORED rotation instead of the derived
                           order and the lookahead: the file bench rotation
                           --json writes, or a bare ["Skill_A", ...] priority
-                          list. Skills not listed are never pressed
+                          list. Skills not listed are never pressed. bench
+                          sheet --build <that file> plays the rotation saved
+                          in it without being asked, as long as the build
+                          still holds every skill it presses, and says so
+                          on its ROTATION line; a search (optimize, rank) is
+                          handed a rotation only by this flag
   --lookahead <s>         seconds of rollout when choosing a cast (default 8);
                           0 gives a plain first-available priority list. The
                           fight is played both ways and the better kept.
@@ -2919,9 +4895,10 @@ Common flags
                           Only Area and Aura steps scale with it, and nothing
                           in the data says how many there are - it is an input.
   --target-health <pct>   what percent of its health the target is standing at
-                          (default 100). Eight script clauses compare the
+                          (default 100). Some script clauses compare the
                           TARGET's health against a threshold - Execution is
-                          +25% under 35% - and which phase of a fight you are
+                          +25% under 35%; bench audit counts them and says
+                          which are priced - and which phase of a fight you are
                           asking about is an input, not something the tool can
                           derive. At 100 an execute rider is correctly worth
                           zero and the output says which ones those were.
@@ -2952,25 +4929,61 @@ Common flags
   --talent-points <n>     points to spend in the tree (default: the full 16)
   --rarity-cap <r>        highest rarity a roll may reach (default: derived
                           per slot - see )
-  --no-rarity-roll        pin every item to the rarity the CDB authors it at
-                          (by default rarity is treated as rolled at drop, so
-                          Epic and Legendary versions are on the table)
-  --exclude <regex>       drop matching item ids       (default ^GM_)
-  --include-all           no id exclusions at all
+  --no-rarity-roll        pin every weapon to the rarity the CDB authors it at
+                          (by default a weapon's rarity is treated as rolled at
+                          drop, so Epic and Legendary versions are on the
+                          table; gear never rolls one and keeps its row's)
+  --exclude <regex>       drop matching item ids       (default: none)
+  --include-all           no id exclusions at all, and offer the rows nothing
+                          in this install hands out (withheld by default -
+                          bench audit says how that is read)
+  --infusions <list>      which infusions the search may hand out: learnable
+                          (default - every one this install does not show to
+                          be unobtainable), all, none, or a comma list of ids
+                          or names
+  --infusion-stat <s>     what an infused piece nobody owns is taken to have
+                          rolled as its bonus stat: none (default, priced 0),
+                          best, or a rating (CritChance, Fervor,
+                          ArmorPenetration, SpellPenetration). Only a piece of
+                          the infusion's own faction is ever paid it
   --fervor-scope <s>      all | skills | none   (default all)
                           measured in game: a combo finisher moved by exactly
                           its Fervor, so base attacks get it too
+  --no-fervor-damage      the same as --fervor-scope none
   --no-mastery            drop the unverified mastery multipliers
+  --tick-source <s>       instigator | carrier   (default instigator)
+                          whose Fervor, mastery and crit a status tick takes:
+                          the unit that applied it (read on this build, not
+                          yet measured) or the unit wearing it (the rule the
+                          previous build measured)
   --chain-persists        let the base-attack chain hold its place through a
                           skill cast (reported from play: it does not)
-  --drops <s>             authored | scaled   (default scaled)
-                          whether an unpinned WEAPON's stats follow its own
-                          row's level or a drop at yours. Gear is unaffected
-                          either way: the live bakes show authored-level gear
-                          keeping its level exactly (a level-20 necklace logs
-                          iLevel 210 on a level-25 character) while a weapon
-                          generates at the source's level. Rarity follows the
-                          same split - only a weapon rolls one
+  --behind-fraction <f>   0..1   (default 0.41)
+                          the share of base attacks that land from behind the
+                          target. The daggers' upgrade perk pays only there
+                          (+8% on its row, more with the weapon's rarity) and
+                          where you stand is not in the game data: 0.41 is
+                          what a player's sessions measured. 1 is every swing
+                          from behind, 0 none
+  --pickups <f>           0..1   (default 1)
+                          the share of a weapon passive's ground drops you
+                          walk into, for a cast armed by collecting them (the
+                          clouds a censer drops around you). The drops are on
+                          an authored timer; whether you reach one is not in
+                          the game data. 1 takes every drop the moment it
+                          lands and is not a measurement - a build that holds
+                          such a passive says what rides on it, and bench
+                          audit names the rows and their numbers
+  --drops <s>            authored | scaled   (default scaled)
+                          whether an unpinned WEAPON or piece of WORN ARMOUR
+                          is priced at its own row's level or as a drop at
+                          yours, the row's level then being a floor (measured:
+                          armour whose row authors level 1 logs 25 on a
+                          level-25 character). Necks, rings, trinkets and
+                          whatever is crafted are priced at their row's level
+                          either way - for a dropped necklace that is an
+                          assumption the capture does not hold (bench audit).
+                          Only a weapon rolls its rarity
   --swing-floor <s>       the measured floor on a chain link's swing period
                           (default 0; --swing-floor 0.7 restores the old read)
   --build <file.json>     start from a saved build - either a bare loadout or
@@ -2985,8 +4998,15 @@ Pinning
   --pin weapon1=Sword_Swarm*3          fix an item at 3 upgrade stars
   --pin trinket=none                   force a slot empty
   --pin feet/enchantfeet=none          force one socket empty
-  --pin chest=Chest_RManfish_Cle@Epic  assume a particular drop rarity
+  --pin weapon1=Spear_Eruption@Epic    a weapon at the rarity it rolled (only a
+                                       weapon rolls one - gear keeps its row's)
   --pin weapon1=Spear_Eruption^10*0    an instance that dropped at level 10, 0 stars
+  --pin chest=Chest_EBee_Fig~Infusion_Bee_DPS/CritChance
+                                       an infused piece: ~<infusion>, then
+                                       optionally /<the rating its bonus stat
+                                       rolled> and ! if the piece is Prismatic.
+                                       ~none pins it not infused; with no ~ part
+                                       the search chooses the infusion
   --pin neck=Necklace_Z2RCraft+MaPen   craft jewellery pays ONE of the generic
                                        aptitudes it names; this picks which
 
@@ -3081,6 +5101,10 @@ async function applyQuestlog(args) {
   console.log();
 }
 
+// The commands that read --character. One entry today; a command that learns
+// to build from a dump or a snapshot adds itself here.
+const READS_CHARACTER = new Set(['verify']);
+
 async function main(argv) {
   const args = parseArgs(argv);
   const cmd = args._[0];
@@ -3090,6 +5114,13 @@ async function main(argv) {
   if (!cmd || args.flags.help || args.flags.h) { console.log(USAGE); return; }
   const fn = commands[cmd];
   if (!fn) die(`unknown command "${cmd}"\n\n${USAGE}`);
+  // --character names the character a capture recorded, and `verify` is the
+  // one command that reads it. Everywhere else it was ignored without a word:
+  // `bench sheet --class Warrior --character Emsai` printed an empty sheet.
+  if ((args.flags.character ?? args.flags.char) != null && !READS_CHARACTER.has(cmd)) {
+    die(`--character is read by \`bench verify\` only. \`bench ${cmd}\` would ignore it: `
+      + 'a build is given with --class and --pin, or a questlog link.');
+  }
   try {
     await applyQuestlog(args);
     // `verify` streams a capture, so a command may be async now. Awaiting a

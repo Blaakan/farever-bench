@@ -117,6 +117,11 @@ export function normalize(characterPayload, talentPayload, { buildIndex = 0 } = 
 // said that the bench cannot carry; it is never empty on a real build, because
 // the class-skill bar always lands there.
 // ---------------------------------------------------------------------------
+// Every key of an equipment entry the translation reads. Anything else that
+// is set is reported, so a field questlog adds cannot go unnoticed.
+const ENTRY_KEYS = new Set(['id', 'level', 'upgradeLevel', 'gradeOverride', 'enchant', 'corruptedGift',
+  'arsenalSkills', 'infusion', 'infusionBonusStat', 'infusionStat', 'prismatic']);
+
 export function translate(build, engine) {
   const { cat } = engine;
   const warnings = [];
@@ -143,7 +148,7 @@ export function translate(build, engine) {
     const hosted = new Set(cat.socketsFor(host));
     const hits = cat.augmentTypes
       .filter((t) => hosted.has(t.id))
-      .filter((t) => cat.augmentCandidates(t.id).some((a) => a.id === augId));
+      .filter((t) => cat.augmentCandidates(t.id, { includeUnreleased: true }).some((a) => a.id === augId));
     return hits.length === 1 ? hits[0].id : null;
   };
 
@@ -176,6 +181,16 @@ export function translate(build, engine) {
       rarity = rarities[entry.gradeOverride - 1];
       if (!rarity) {
         warnings.push(`${key}: gradeOverride ${entry.gradeOverride} is outside the rarity ladder, ignored`);
+      } else if (!cat.isWeaponType(item.type)) {
+        // ONLY A WEAPON HAS A RARITY OF ITS OWN. On gear the override either
+        // restates the row's rarity (nothing to say) or names an item that
+        // cannot exist - and a pin carrying it is refused by the CLI, which
+        // would turn one stray field into a failed import.
+        if (rarity !== item.rarity) {
+          warnings.push(`${key}: gradeOverride ${entry.gradeOverride} asks for a ${rarity} ${itemId}, which is ${item.rarity} - `
+            + 'only a weapon rolls its rarity, gear keeps its row\'s; ignored');
+        }
+        rarity = null;
       }
     }
     if (!rarity && weaponSlots.has(slot)) rarity = item.rarity;
@@ -184,6 +199,34 @@ export function translate(build, engine) {
     if (entry.level != null) spec += `^${entry.level}`;
     if (rarity) spec += `@${rarity}`;
     if (weaponSlots.has(slot) || entry.upgradeLevel) spec += `*${entry.upgradeLevel ?? 0}`;
+
+    // The infusion, IF the link carries one. What questlog.gg names these
+    // fields is not known - no build seen so far has one - so the game's own
+    // names are accepted (`infusion`, `infusionBonusStat` / `infusionStat`,
+    // `prismatic`; an id either bare or as {id}) and anything else on the
+    // entry that this translation does not read is NAMED below rather than
+    // dropped in silence. A key that is present and null says "not infused".
+    if ('infusion' in entry) {
+      const infId = typeof entry.infusion === 'string' ? entry.infusion : (entry.infusion?.id ?? null);
+      if (!infId) spec += '~none';
+      else if (!cat.infusions.has(infId)) warnings.push(`${key}: no infusion "${infId}" in the catalog, dropped`);
+      else if (!cat.canInfuse(item)) warnings.push(`${key}: ${infId} dropped - ${cat.whyNotInfusable(item)}`);
+      else {
+        spec += `~${infId}`;
+        const raw = entry.infusionBonusStat ?? entry.infusionStat ?? null;
+        const stat = typeof raw === 'string' ? raw : (raw?.id ?? null);
+        if (stat) {
+          if (cat.infusionBonusPool(item).includes(stat)) spec += `/${stat}`;
+          else warnings.push(`${key}: infusion bonus stat "${stat}" is not one ${itemId} can roll, dropped`);
+        }
+        if (entry.prismatic === true) spec += '!';
+      }
+    }
+    for (const k of Object.keys(entry)) {
+      if (!ENTRY_KEYS.has(k) && entry[k] != null) {
+        warnings.push(`${key}: questlog records "${k}" and this translation does not read it`);
+      }
+    }
 
     // Craft jewellery names several generic aptitudes and pays one. questlog
     // records no such choice, so if the catalog offers one the bench's default

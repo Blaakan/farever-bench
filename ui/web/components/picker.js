@@ -12,6 +12,15 @@
 // openGear on a slot that already holds something opens ON that item, with the
 // configuration the loadout holds - it is the edit path as well as the pick
 // path, and there is no other way to restar an equipped weapon.
+//
+// Two things the catalog decides and this file only shows:
+//   * the rows it WITHHOLDS (nothing in the install hands them out, or every
+//     copy exists above the character's level) are listed apart, dimmed, each
+//     with the source reader's sentence. They can still be picked - a person
+//     may, a search never does - and the config column repeats the reason;
+//   * whether a piece can carry an INFUSION, which ones light its bonus line,
+//     and which infusions anything hands out. The three infusion fields of a
+//     gear entry are written here and nowhere else in the page.
 // ---------------------------------------------------------------------------
 
 import {
@@ -38,6 +47,15 @@ const fmtPct = (c) => {
 };
 
 const num = (v) => (Number.isFinite(v) ? v : null);
+
+// The level a list row prints under its name - see `itemRow` for what the
+// label may and may not claim. `levelRange[0]` is the level the row's band
+// starts at, which the server floors at the level every copy is made at.
+const levelLabel = (it, charLevel = App.state?.level) => {
+  const lo = num(it.levelRange?.[0]);
+  if (it.level != null) return `lvl ${Math.max(it.level, lo ?? it.level)}`;
+  return lo != null && num(charLevel) != null && lo !== charLevel ? `lvl ${lo}` : 'at your level';
+};
 
 // ------------------------------------------------------------------ search
 
@@ -156,13 +174,22 @@ function actionRow(sym, name, sub, fn) {
 function openGear(slotId) {
   const slotDef = App.boot?.slots?.find((s) => s.id === slotId);
   const items = App.catalog?.slots?.[slotId] || [];
+  // What the catalog does not offer for this slot, with why (see the header).
+  const heldBack = App.catalog?.withheld?.[slotId] || [];
+  const infusions = App.boot?.infusions || [];
+  const infConsts = App.boot?.constants?.infusion || null;
+  // Is infusion a thing for THIS slot at all - does any row of it carry one.
+  // Only then does a piece that cannot be infused say why.
+  const slotInfuses = [...items, ...heldBack].some((i) => i.infusable);
 
   // Editing beats re-picking: a filled slot opens on the item it holds, so
   // changing one star is a click and Equip rather than finding the row again.
   // The entry can name an item the catalog no longer lists (a level change
   // drops rows), and then there is nothing to edit and the picker opens blank.
   const equipped = App.state?.loadout?.gear?.[slotId] || null;
-  const current = equipped ? items.find((i) => i.id === equipped.item) : null;
+  const current = equipped
+    ? (items.find((i) => i.id === equipped.item) || heldBack.find((i) => i.id === equipped.item) || null)
+    : null;
 
   const body = openModal(current
     ? `${slotDef?.label || slotId} - editing ${snip(current.name, 30)}`
@@ -183,7 +210,9 @@ function openGear(slotId) {
   let selRow = null;
   // replaced by configOf() the moment anything is selected; nothing reads it
   // before that, because renderConf() draws the empty hint instead.
-  let cfg = { rarity: null, stars: 0, level: null };
+  let cfg = { rarity: null, stars: 0, level: null, infusion: 'auto', infusionStat: null, prismatic: false };
+  // Whether the infusion list also shows the ones nothing hands out.
+  let showAllInfusions = false;
   let pvEl = null;
   let pvSeq = 0;
   let pvTimer = null;
@@ -199,10 +228,38 @@ function openGear(slotId) {
     const br = bestRarity(App.boot, it);
     if (br) nm.style.color = rarityColor(App.boot, br.id);
     mid.append(nm);
+    // The AUTHORED level when the row has one - it is the greens' only
+    // distinguishing number and their equip floor - and the truth when it has
+    // none, which used to print as "lvl null": the piece is priced at YOUR
+    // level. That is all this label may say. Most rows that author no level
+    // are the faction sets and trinkets, but a crafted trinket and three rows
+    // whose acquire line reads "Starting outfit" or "Base clothing" author
+    // none either, and "drops at your level" printed on those was a claim
+    // about how they are come by that the same row's acquire line
+    // contradicted.
+    //
+    // ...and never a level below the one every copy of the row is made at
+    // (the bottom of its range, which the server floors there): the Demon Epic
+    // armour authors `level: 1` and exists only at the cap, and "lvl 1" on it
+    // read as a piece a new character could wear. The same floor decides a
+    // row that authors NO level: its range starts at the character's level
+    // unless every copy is made higher up, and then "at your level" is false
+    // - a level-24 Mage read it on three Epic pants whose reason, one line
+    // below, says a copy only exists at 25, and whose tooltip prices item
+    // level 300. So the bottom of the range is printed whenever it is not
+    // the character's own level.
     const sub = el('psub');
-    sub.textContent = [it.typeName || it.type, `lvl ${it.level}`, it.faction]
+    sub.textContent = [it.typeName || it.type, levelLabel(it), it.factionName || it.faction]
       .filter(Boolean).join(' · ');
     mid.append(sub);
+    // A withheld row says why right under its name - the reason is the point
+    // of listing it at all, so it is not left to a hover.
+    if (it.withheld) {
+      r.classList.add('held');
+      const why = el('pnote');
+      why.textContent = it.withheld.why;
+      mid.append(why);
+    }
     r.append(mid);
     const right = el('pright');
     if (it.gives) {
@@ -210,9 +267,13 @@ function openGear(slotId) {
       g.textContent = it.gives;
       right.append(g);
     }
-    if (it.acquire) {
+    // Where it comes from: the atlas's line, else what the install itself
+    // says hands the row out (the catalog's source reader - every Epic piece
+    // has only that). A withheld row has already said.
+    const from = it.acquire || (it.withheld ? null : it.source?.why);
+    if (from) {
       const a = el('pacq');
-      a.textContent = snip(it.acquire, 52);
+      a.textContent = snip(from, 52);
       right.append(a);
     }
     r.append(right);
@@ -240,11 +301,23 @@ function openGear(slotId) {
       'let the optimizer fill this slot',
       () => { App.clearSlot(slotId); close(); }));
     const terms = queryTerms(search.value);
-    for (const it of items) {
-      if (terms.length && !hayMatch(
-        hayOf(it, it.name, it.typeName || it.type, it.faction,
-              it.gives, it.acquire, it.flavor), terms)) continue;
-      rows.append(itemRow(it));
+    const shown = (it) => !terms.length || hayMatch(
+      hayOf(it, it.name, it.typeName || it.type, it.faction, it.factionName,
+            it.gives, it.acquire, it.source?.why, it.flavor), terms);
+    for (const it of items) if (shown(it)) rows.append(itemRow(it));
+    // ...then what is NOT offered, apart and under its own heading.
+    const held = heldBack.filter(shown);
+    if (held.length) {
+      const sep = el('psep');
+      sep.textContent = `Not offered - ${held.length} ${held.length === 1 ? 'row' : 'rows'} `
+        + 'the optimizer will not pick (each says why; you still can)';
+      rows.append(sep);
+      for (const it of held) rows.append(itemRow(it));
+    }
+    if (App.catalog?.withheldNote) {
+      const n = el('psep');
+      n.textContent = `Nothing is withheld: ${App.catalog.withheldNote}`;
+      rows.append(n);
     }
   };
 
@@ -257,9 +330,14 @@ function openGear(slotId) {
 
   // Stars maxed by default: an upgraded weapon is what a player is comparing
   // against, and 0/4 is a number nobody keeps.
+  // ...and its infusion left to the optimizer: "auto" pins the piece and not
+  // what it is infused with (on the sheet that is a piece with no infusion).
   const defaultConfig = (it) => {
     const rarity = authoredRarity(it)?.id || null;
-    return { rarity, stars: maxStarsFor(it, rarity), level: null };
+    return {
+      rarity, stars: maxStarsFor(it, rarity), level: null,
+      infusion: 'auto', infusionStat: null, prismatic: false,
+    };
   };
 
   // What the loadout already says about this item. Missing stars mean zero -
@@ -278,8 +356,17 @@ function openGear(slotId) {
       rarity,
       stars: Math.max(0, Math.min(stars, maxStarsFor(it, rarity))),
       level: lvl == null ? null : Math.max(b.lo, Math.min(b.hi, lvl)),
+      // The infusion the entry states; with none stated, whether that is the
+      // user's "none" or simply undecided is what the pin says.
+      infusion: !it.infusable ? 'auto'
+        : (equipped.infusion || (App.state.pins.infusions.has(slotId) ? 'none' : 'auto')),
+      infusionStat: it.infusable ? (equipped.infusionStat || null) : null,
+      prismatic: it.infusable && !!equipped.prismatic,
     };
   };
+
+  // The infusion the config holds, as an id - or null for "auto" and "none".
+  const infusionOf = () => (cfg.infusion !== 'auto' && cfg.infusion !== 'none' ? cfg.infusion : null);
 
   const isEquipped = (it) => !!equipped && !!it && it.id === equipped.item;
 
@@ -307,6 +394,11 @@ function openGear(slotId) {
           rarity: cfg.rarity, stars: cfg.stars,
         };
         if (cfg.level != null) bodyReq.level = cfg.level;
+        if (infusionOf()) {
+          bodyReq.infusion = infusionOf();
+          if (cfg.infusionStat) bodyReq.infusionStat = cfg.infusionStat;
+          if (cfg.prismatic) bodyReq.prismatic = true;
+        }
         const t = await App.api('/api/tooltip/item', bodyReq);
         if (seq !== pvSeq || !veil || !pvEl) return;
         pvEl.innerHTML = `<div class="tooltip">${itemTipHtml(App.boot, t)}</div>`;
@@ -449,6 +541,116 @@ function openGear(slotId) {
     return levelSlider(b.lo, b.hi, b.scales);
   };
 
+  // ---- infusion -----------------------------------------------------------
+
+  // Three controls, shown for a piece the game lets carry an infusion:
+  //
+  //   which one   "the optimizer's choice", "none", or an infusion. The list
+  //               is the ones something hands out on this build (the
+  //               catalog's source reader decides, and its sentence is printed
+  //               under the choice); the rest appear only when asked for.
+  //               Infusions of the piece's own faction come first: they are
+  //               the ones that light its bonus line.
+  //   bonus roll  the rating its bonus line rolled, from the ones the piece
+  //               can roll - or not stated, and then no bonus is priced.
+  //   prismatic   the item flag that lights the bonus whatever the faction.
+  const infusionControl = (it) => {
+    const box = el('infctl');
+    const own = it.infusionFaction?.id;
+    const chosen = infusionOf();
+    const def = (id) => infusions.find((x) => x.id === id) || null;
+    const listed = infusions.filter((x) => x.obtainable || showAllInfusions || x.id === chosen);
+    const hidden = infusions.length - infusions.filter((x) => x.obtainable).length;
+
+    const il = el('', 'label');
+    il.textContent = 'Infusion';
+    box.append(il);
+    const sel = el('', 'select');
+    const opt = (value, text, parent = sel) => {
+      const o = el('', 'option');
+      o.value = value;
+      o.textContent = text;
+      if (value === cfg.infusion) o.selected = true;
+      parent.append(o);
+    };
+    opt('auto', 'the optimizer\'s choice');
+    opt('none', 'none - keep it not infused');
+    const group = (label, list) => {
+      if (!list.length) return;
+      const g = el('', 'optgroup');
+      g.label = label;
+      for (const x of list) opt(x.id, x.obtainable ? x.name : `${x.name} (nothing hands it out)`, g);
+      sel.append(g);
+    };
+    group(`${it.infusionFaction?.name || own} - lights this piece's bonus`, listed.filter((x) => x.faction === own));
+    group('other factions - the bonus stays dark unless Prismatic', listed.filter((x) => x.faction !== own));
+    sel.addEventListener('change', () => {
+      cfg.infusion = sel.value;
+      if (!infusionOf()) { cfg.infusionStat = null; cfg.prismatic = false; }
+      renderConf();
+    });
+    box.append(sel);
+
+    const hint = el('hint');
+    if (cfg.infusion === 'auto') {
+      hint.textContent = 'not infused on this sheet; the optimizer may infuse it';
+    } else if (cfg.infusion === 'none') {
+      hint.textContent = 'pinned not infused - the optimizer keeps it that way';
+    } else {
+      const d = def(chosen);
+      hint.textContent = d
+        ? `${d.factionName} infusion · ${d.obtainable ? 'pattern: ' : 'nothing hands out its pattern on this build: '}${d.source?.why || ''}`
+        : 'this infusion is not in this game version';
+    }
+    box.append(hint);
+
+    if (hidden > 0) {
+      const row = el('infall', 'label');
+      const cb = el('', 'input');
+      cb.type = 'checkbox';
+      cb.checked = showAllInfusions;
+      cb.addEventListener('change', () => { showAllInfusions = cb.checked; renderConf(); });
+      row.append(cb, document.createTextNode(
+        ` also list the ${hidden} nothing hands out on this build`));
+      box.append(row);
+    }
+
+    if (chosen) {
+      const sl = el('', 'label');
+      sl.textContent = 'Bonus roll';
+      box.append(sl);
+      const ss = el('', 'select');
+      const pool = (it.infusionPool || []).slice();
+      // A stated roll outside the pool (a saved build can carry one) stays
+      // selectable, so opening the picker does not silently change it.
+      if (cfg.infusionStat && !pool.some((p) => p.stat === cfg.infusionStat)) {
+        pool.push({ stat: cfg.infusionStat,
+          name: `${App.boot?.attributes?.[cfg.infusionStat]?.name || cfg.infusionStat} (not a roll this piece is expected to have)` });
+      }
+      const so = (value, text) => {
+        const o = el('', 'option');
+        o.value = value;
+        o.textContent = text;
+        if (value === (cfg.infusionStat || '')) o.selected = true;
+        ss.append(o);
+      };
+      so('', 'not stated - no bonus is priced');
+      for (const p of pool) so(p.stat, p.name);
+      ss.addEventListener('change', () => { cfg.infusionStat = ss.value || null; renderConf(); });
+      box.append(ss);
+
+      const pr = el('infall', 'label');
+      const pc = el('', 'input');
+      pc.type = 'checkbox';
+      pc.checked = !!cfg.prismatic;
+      pc.addEventListener('change', () => { cfg.prismatic = pc.checked; renderConf(); });
+      pr.append(pc, document.createTextNode(
+        ` ${infConsts?.texts?.prismatic || 'Prismatic'} - its bonus is lit whatever the infusion's faction`));
+      box.append(pr);
+    }
+    return box;
+  };
+
   const renderConf = () => {
     conf.replaceChildren();
     pvEl = null;
@@ -471,6 +673,13 @@ function openGear(slotId) {
       en.textContent = 'equipped - this is your current configuration; '
         + 'change what you need and press Equip';
       conf.append(en);
+    }
+    // A row the catalog withholds can be equipped, and is told what it is.
+    if (it.withheld) {
+      const hn = el('heldnote');
+      hn.textContent = `Not offered: ${it.withheld.why}. `
+        + 'You can still equip it; the optimizer will not pick it.';
+      conf.append(hn);
     }
 
     // rarity --------------------------------------------------------------
@@ -526,6 +735,12 @@ function openGear(slotId) {
     // instance level ------------------------------------------------------
     conf.append(levelControl(it));
 
+    // infusion ------------------------------------------------------------
+    if (it.infusable && infusions.length) conf.append(infusionControl(it));
+    else if (slotInfuses && it.notInfusable) {
+      conf.append(dimLevel(`cannot be infused - ${it.notInfusable}`));
+    }
+
     // equip / cancel ------------------------------------------------------
     const br = el('btnrow');
     const eq = el('btn btn-red', 'button');
@@ -537,7 +752,14 @@ function openGear(slotId) {
       const entry = { item: it.id, rarity: cfg.rarity };
       if (cfg.stars > 0) entry.stars = cfg.stars;
       if (cfg.level != null) entry.level = cfg.level;
-      App.setGear(slotId, entry);
+      // ...and the infusion only when one is named. "none" writes nothing and
+      // PINS that nothing; "auto" writes nothing and leaves it to the search.
+      if (it.infusable && infusionOf()) {
+        entry.infusion = infusionOf();
+        if (cfg.infusionStat) entry.infusionStat = cfg.infusionStat;
+        if (cfg.prismatic) entry.prismatic = true;
+      }
+      App.setGear(slotId, entry, { infusionPinned: it.infusable && cfg.infusion !== 'auto' });
       close();
     });
     const ca = el('btn btn-tan', 'button');
@@ -568,19 +790,14 @@ function openGear(slotId) {
 
 // ----------------------------------------------------------- augment picker
 
-// Best-effort: which max-tier talent does this DemonSigil grant?
+// Which talent this DemonSigil grants. The server says (`grants.id`, read off
+// the item's own skill); guessing it from the names matched none of the
+// twelve, because every sigil is called "Sigil of Bet'Hatesht".
 function sigilTalent(aug) {
-  const tal = App.boot?.talents?.[App.state?.cls];
-  const all = tal?.nodes || [];
-  if (!all.length) return null;
-  const maxTier = all.reduce((m, n) => Math.max(m, n.tier | 0), 0);
-  const nodes = all.filter((n) => (n.tier | 0) === maxTier);
-  const flat = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  return nodes.find((n) => n.name && flat(aug.effect).includes(flat(n.name)))
-      || nodes.find((n) => flat(aug.id).includes(flat(n.id))
-                        || flat(n.id).includes(flat(aug.id)))
-      || nodes.find((n) => n.name && flat(aug.name).includes(flat(n.name)))
-      || null;
+  const id = aug?.grants?.id;
+  if (!id) return null;
+  const nodes = App.boot?.talents?.[App.state?.cls]?.nodes || [];
+  return nodes.find((n) => n.id === id) || null;
 }
 
 function openAugment(socketKey) {
@@ -618,10 +835,13 @@ function openAugment(socketKey) {
       sub.textContent = a.effect;
       mid.append(sub);
     }
+    // The effect line already names the talent ("Grants the talent X."); what
+    // the row can add is what that talent DOES, which is the reason to pick
+    // one sigil over another.
     const talent = isSigil ? sigilTalent(a) : null;
-    if (talent) {
+    if (talent?.desc) {
       const note = el('pnote');
-      note.textContent = `grants tier-4 talent “${talent.name}”`;
+      note.textContent = snip(talent.desc, 110);
       mid.append(note);
     }
     r.append(mid);
@@ -633,7 +853,7 @@ function openAugment(socketKey) {
       r.append(right);
     }
     App.bindTip(r, augTipHtml(App.boot, a,
-      talent ? `grants tier-4 talent “${talent.name}”` : null));
+      talent?.desc ? `${talent.name}: ${talent.desc}` : null));
     r.addEventListener('click', () => {
       App.setAugment(socketKey, a.id);
       close();

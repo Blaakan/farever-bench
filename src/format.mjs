@@ -7,6 +7,10 @@
 // distrusted the first time somebody checks it.
 // ---------------------------------------------------------------------------
 
+import { fileURLToPath } from 'node:url';
+import { acceptedBuild } from './drift.mjs';
+
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const useColour = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = (code, s) => (useColour ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 export const dim = (s) => c('2', s);
@@ -42,14 +46,24 @@ export function signedPct(v, digits = 2) {
 
 export function header(engine, version) {
   const m = engine.meta;
-  return [
+  const lines = [
     `${bold('farever-bench')} ${version}`,
     dim(`cdb ${m.cdbSha.slice(0, 8)}  boot ${m.bootSha ? m.bootSha.slice(0, 8) : '(absent)'}  game ${m.game}`),
-  ].join('\n');
+  ];
+  // A number computed on a build the model was not accepted on says so, on
+  // every command, before the number.
+  const acc = acceptedBuild(REPO_ROOT, m);
+  if (acc && !acc.same) {
+    lines.push(warn(`this install is not the build the model was accepted on (${String(acc.at).slice(0, 10)}) - run bench update`));
+  }
+  return lines.join('\n');
 }
 
-// The attributes worth showing. All 78 exist; these are the ones a gearing
-// decision turns on, in a deliberate order rather than sheet order.
+// The attributes worth showing. The sheet has 80 rows; these are the ones a
+// gearing decision turns on, in a deliberate order rather than sheet order.
+// `AllAttributes` is deliberately not among them: nothing grants it, a skill
+// that scales on it reads the mean of the four main attributes instead (see
+// `scalingValue` in damage.mjs), so its sheet value is always 0.
 const SHEET_ORDER = [
   ['Primary', ['Strength', 'Dexterity', 'Intellect', 'Faith', 'Vitality']],
   ['Offence', ['WeaponPower', 'CritChanceRating', 'CritChance', 'CritDamage',
@@ -115,14 +129,35 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set(), indifferent
   const { cat } = engine;
   const cls = cat.classes.find((x) => x.unit === loadout.class);
   const rows = [];
+  // The INFUSION column exists only for a build that wears something an
+  // infusion can sit on, so a naked weapon comparison prints as it always did.
+  const showInfusion = cat.combatSlots().some((s) => {
+    const g = loadout.gear[s.id];
+    const it = g?.item ? cat.itemById.get(g.item) : null;
+    return !!it && (!!g.infusion || cat.canInfuse(it));
+  });
+  const infusionCell = (slot, g, it, opts) => {
+    if (!g.infusion) return cat.canInfuse(it) ? dim('-') : '';
+    const name = cat.infusions.get(g.infusion)?.name ?? g.infusion;
+    const tag = g.prismatic ? ' ' + warn('prismatic') : '';
+    if (!g.infusionStat) return name + tag;
+    const stat = g.infusionStat.replace(/Rating$/, '');
+    const socketed = cat.socketsFor(it).map((t) => loadout.augments?.[`${slot.id}/${t}`]).filter(Boolean);
+    const v = cat.infusionBonus(it, g.infusionStat, { ...opts, socketed });
+    return cat.infusionBonusActive(it, g)
+      ? `${name}${tag}  +${v} ${stat}`
+      : `${name}${tag}  ` + dim(`(+${v} ${stat}, dark)`);
+  };
   for (const slot of cat.combatSlots()) {
     const g = loadout.gear[slot.id];
     if (!g?.item) {
-      rows.push([short(slot.id), dim('(empty)'), '', '', '', '', pinnedGear.has(slot.id) ? 'pinned' : '']);
+      rows.push([short(slot.id), dim('(empty)'), '', '', '', '', ...(showInfusion ? [''] : []), pinnedGear.has(slot.id) ? 'pinned' : '']);
       continue;
     }
     const it = cat.itemById.get(g.item);
-    const rarity = g.rarity ?? it.rarity;
+    // A rarity of its own is a WEAPON's; anything else is its row's, whatever
+    // a build file says (see catalog.instanceRarity).
+    const rarity = cat.instanceRarity(it, g);
     // The SAME arithmetic the stats were computed with, or the table contradicts
     // the sheet beside it: loadout.mjs clamps the stars to what the item can
     // actually take and honours the instance level, and printing the unclamped
@@ -144,12 +179,88 @@ export function gearBlock(engine, loadout, { pinnedGear = new Set(), indifferent
       // is what you actually looted, so name which one this row assumes.
       it.faction ?? (paid ? warn(paid) : dim('-')),
       ratingGiven(cat, it, cls.aptitude, rarity, g.generic) ?? dim('-'),
+      ...(showInfusion ? [infusionCell(slot, g, it, {
+        charLevel: loadout.level, stars, flawless: !!g.flawless, rarity, level: g.level ?? null,
+      })] : []),
       pinnedGear.has(slot.id) ? bold('pinned')
         : indifferent.has(slot.id) ? warn('no effect')
         : (rolled ? dim('rolled') : ''),
     ]);
   }
-  return table(['SLOT', 'ITEM', 'RAR', 'UPG', 'iLVL', 'FACTION', 'GIVES', ''], rows, { align: [null, null, null, null, 'r'] });
+  return table(['SLOT', 'ITEM', 'RAR', 'UPG', 'iLVL', 'FACTION', 'GIVES', ...(showInfusion ? ['INFUSION'] : []), ''],
+    rows, { align: [null, null, null, null, 'r'] });
+}
+
+/**
+ * The infusion sets a build wears: per set the pieces, the rank that count
+ * reaches, what of it is in the number and what is not; then the bonus lines,
+ * and - after a search - what the search was allowed to hand out.
+ *
+ * @param ev      an evaluation (its `infusions` is what the engine attached)
+ * @param search  optimize()'s `infusion` descriptor, when a search ran
+ */
+export function infusionBlock(engine, loadout, ev, { search = null, verbose = false } = {}) {
+  const { cat } = engine;
+  if (!cat.infusions.size) return null;
+  const inf = ev?.infusions ?? { sets: [], pieces: [] };
+  const can = cat.combatSlots().filter((s) => {
+    const g = loadout.gear[s.id];
+    return g?.item && cat.canInfuse(cat.itemById.get(g.item));
+  }).length;
+  const caps = cat.infusionCaps;
+  const out = [];
+  if (!inf.sets.length) {
+    out.push(dim(can
+      ? `  (no piece is infused - ${can} of the pieces worn can be; a set pays at ${caps.join(' / ')} pieces of one infusion)`
+      : `  (nothing worn can be infused - only ${cat.infusionMinRarity} armour with a faction can)`));
+  } else {
+    // SCORED is the stat rows and what the set does in the fight, each in a
+    // few words on a line of its own (a set that fights says more than a cell
+    // holds); what each part came to in THIS fight follows it.
+    out.push(table(['  SET', 'PIECES', 'RANK', 'SCORED'], inf.sets.flatMap((s) => {
+      const said = s.priced.length ? s.priced : [dim(s.attached ? 'nothing at this rank' : '-')];
+      return said.map((text, i) => (i === 0
+        ? ['  ' + s.name, String(s.pieces), s.attached ? `${s.rank}  ${s.title}` : dim(`-  (${s.nextCap} for the first)`), text]
+        : ['', '', '', text]));
+    }), { align: [null, 'r'] }));
+    for (const s of inf.sets.filter((x) => (x.fought ?? []).length)) {
+      out.push(dim(`  ${s.name} in this fight: ${s.fought.join('; ')}`));
+    }
+    const unscored = inf.sets.filter((s) => s.unpriced.length);
+    if (unscored.length) {
+      out.push(warn(`  ${unscored.length} set${unscored.length === 1 ? ' has' : 's have'} an effect that is not scored`)
+        + (verbose ? ':' : dim(' - what is listed above is what each is worth here; --verbose for what is left out and why')));
+      if (verbose) {
+        for (const s of unscored) out.push(dim(`    ${s.name}: ${s.unpriced.join('; ')}${s.why ? ' - ' + s.why : ''}`));
+      }
+    }
+  }
+  // The bonus lines: what is lit, what is dark, and what nobody stated.
+  const lit = inf.pieces.filter((p) => p.lit && p.value);
+  const dark = inf.pieces.filter((p) => p.infusion && p.stat && !p.lit);
+  const blind = inf.pieces.filter((p) => p.infusion && !p.stat);
+  if (lit.length || dark.length || blind.length) {
+    const bits = [];
+    if (lit.length) bits.push(`${lit.length} lit bonus line${lit.length === 1 ? ' pays' : 's pay'} ${lit.reduce((n, p) => n + p.value, 0)} rating`);
+    if (dark.length) bits.push(`${dark.length} dark (the infusion is another faction's and the piece is not Prismatic)`);
+    if (blind.length) {
+      const low = blind.reduce((n, p) => n + p.ceiling, 0);
+      bits.push(`${blind.length} with no roll stated, priced at 0`
+        + (low > 0 ? ` (up to ${low} rating if the faction-matched ones are lit)` : ''));
+    }
+    out.push(dim('  bonus stat: ' + bits.join('; ')));
+  }
+  if (search) {
+    out.push(dim(`  searched: ${search.offered.length} of ${cat.infusions.size} infusions`
+      + (search.statPolicy === 'none' ? '; an unowned piece\'s bonus roll is priced at 0 (--infusion-stat best|<rating> to ask)'
+        : `; an unowned faction-matched piece is taken to have rolled ${search.statPolicy === 'best' ? 'its best rating' : search.statPolicy}`)));
+    for (const w of search.withheld ?? []) {
+      out.push(dim(`  withheld: ${cat.infusions.get(w.id)?.name ?? w.id} - ${w.why}`));
+    }
+    if ((search.withheld ?? []).length) out.push(dim('  (--infusions all offers them anyway)'));
+    if (!search.offered.length) out.push(dim('  (no infusion was offered to the search)'));
+  }
+  return out.join('\n');
 }
 
 // Which secondary rating this piece pays out for this class - the cross of the
@@ -212,7 +323,7 @@ export function augmentBlock(engine, loadout, { pinnedAug = new Set() } = {}) {
             // that one function alone printed "nothing this model can read"
             // beside a talent the fight was already playing.
             if (engine.plan.empowermentIds(1).has(sk)) {
-              return dim(`grants ${name} - a next-cast register`);
+              return dim(`grants ${name} - ${engine.plan.empowermentLabel(sk) ?? 'a next-cast register'}`);
             }
             return warn(`grants ${name} - nothing this model can read; taken because free beats empty`);
           }).join(', ');
@@ -322,7 +433,21 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
       // and correctly zero for the fight you described. Same species as the
       // crowd-control line below - the input decides it, so the input is named.
       ['off at this target health', 'read and correctly worth zero at the health you stated - --target-health moves it'],
-      ['chain', 'the weapon\'s base-attack chain is shorter than its moveSet declares'],
+      // Sibling of the health line: an owner-wide rider that is read and
+      // worth nothing against a target immune to crowd control.
+      ['off against this target', 'read and correctly worth zero against this target - a stunnable one moves it'],
+      // ...and the same for a clause that asks how many enemies a cast hit.
+      ['off at this target count', 'read and correctly worth zero at the number of targets you stated - --targets moves it'],
+      // ...and the third of the family: read, and zero because of what the
+      // BUILD holds - a rider with no crowd control to ride, a register
+      // nothing arms, a clause behind a rank the weapon has not reached.
+      // These were filed under `conditional`, whose blurb says the reader
+      // cannot evaluate something; it had evaluated it, and the answer was no.
+      ['off in this build', 'read and correctly worth zero in this build - what would switch it on is under each'],
+      // ...and a press the FIGHT left out: slotted, in the rotation, and not
+      // pressed because the fight played with it and without it and was
+      // better without. The numbers it was left out on are the whole content.
+      ['not pressed', 'slotted, and left unpressed: the fight was played with it and without it - the numbers are under each'],
       ['crowd control', 'a stun, root or slow - worth nothing while the simulated foe does not act'],
       ['foe is passive', 'it fires on a block or on being hit, and the simulated foe never attacks'],
       // ...and the half-and-half case, which used to be filed under the line
@@ -332,9 +457,19 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
       ['status', 'its payload is a status that declares nothing readable'],
       ['debuff', 'it only debuffs the target, and nothing it debuffs changes damage'],
       ['script magnitude', 'the amount is computed by a script from the hit that applied it'],
+      // A status the script hands to somebody else on your side - an ally it
+      // names by leaving you out, a summon. Not a magnitude the reader failed
+      // at. (It used to add "this fight has one hero and nobody beside
+      // them", which is false of a build whose own totem or bees are the
+      // recipients.)
+      ['lands on an ally', 'its script hands it to an ally or a summon, not to you or to your target'],
       ['script', 'everything it does lives in its hscript body'],
       ['nothing declared', 'no effect, no affix and no status anywhere in the row'],
     ];
+    // The kinds whose per-row reason is printed under the row - see the note
+    // where it is used.
+    const WHY_SHOWN = new Set(['off at this target health', 'half of it fires',
+      'off against this target', 'off at this target count', 'off in this build', 'not pressed']);
     const byKind = new Map();
     for (const u of un) {
       const k = u.kind ?? 'script';
@@ -347,6 +482,13 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
     // the explanation, and that is what `--verbose` is for.
     out.push(warn(`not scored in this build (${un.length})`
       + (verbose ? ', by cause:' : dim(' - --verbose for what and why'))));
+    // The one thing said in the short form too: a line of this build that is
+    // priced on an INPUT nothing in the data gives and a flag states - how
+    // many of a passive's drops are walked into. It can be what puts the
+    // weapon on the build, so it is not left for --verbose to mention.
+    for (const u of un) {
+      if (u.input?.says) out.push(warn('priced on an input: ') + u.input.says);
+    }
     if (!verbose) return out.join('\n');
     for (const [kind, blurb] of KINDS) {
       const list = byKind.get(kind);
@@ -368,7 +510,10 @@ export function skillsBlock(engine, loadout, ev, { pinnedSkills = new Set(), ver
         // worth zero" reads as "this rune is worthless".
         // ...and the same exception again, for the same reason: the blurb says
         // a script is half live, and the half a reader needs is WHICH half.
-        if ((kind === 'off at this target health' || kind === 'half of it fires') && u.why) {
+        // The other two "read and zero" kinds take it too: which target
+        // flag, which missing stun, which rank is the whole content of the
+        // line, and the passive's name alone reads as "this does nothing".
+        if (WHY_SHOWN.has(kind) && u.why) {
           out.push('      ' + dim(u.why));
         }
       }
@@ -400,13 +545,17 @@ export function talentBlock(engine, loadout, alloc, cov, { verbose = true } = {}
       n?.branch ?? "-",
       n?.name ?? id,
       granted.has(id) ? warn("from sigil") : cap > 1 ? `${rank}/${cap}` : "",
-      blind.has(id) && rank === 1 ? dim("gate point") : "",
+      // At any rank: a node holding two such points is two gate points, and
+      // it used to print neither (Life Current 2/2, with no word beside it).
+      // The search hands back the ones nothing stands on (optimize.mjs), so
+      // what is tagged here is a point the allocation needs to be legal.
+      blind.has(id) ? dim(rank > 1 ? "gate points" : "gate point") : "",
       // `readableValue` looks for an affix, an effect or a status. A node whose
       // whole payload is a MECHANIC has none of those and is still scored, so
       // asking it alone printed "nothing readable" beside a talent the fight
       // was already playing.
       v.readable ? (affixSummary(v.affixes) || v.kind)
-        : engine.plan.empowermentIds(1).has(id) ? dim("a next-cast register")
+        : engine.plan.empowermentIds(1).has(id) ? dim(engine.plan.empowermentLabel(id) ?? "a next-cast register")
           : dim("nothing readable"),
     ];
   });
@@ -478,7 +627,7 @@ export function damageBlock(ev, { verbose = false } = {}) {
   ].join('\n');
 }
 
-export function throughputBlock(engine, ev, { goal }) {
+export function throughputBlock(engine, ev, { goal, authored = null }) {
   const t = ev.throughput;
   const s = ev.survivability;
   const spread = t.fights > 1 && t.dpsSd > 0
@@ -500,27 +649,41 @@ export function throughputBlock(engine, ev, { goal }) {
     ),
     '',
     bold('ROTATION') + dim(`   attacks ${t.attackRate.toFixed(2)}/s, combos ${t.comboRate.toFixed(2)}/s`)
-      + (t.rotationSearched
+      // An AUTHORED list was played (--rotation-file, or the rotation a
+      // build was saved with): say whose, where this line used to print
+      // "priority: highest damage per second of commitment" over a fight
+      // that had followed somebody's list instead.
+      + (authored ? dim(`\n  ${authored}`)
+        : t.rotationSearched?.lookahead > 0
         ? dim(`\n  played both ways over a ${t.rotationSearched.lookahead}s lookahead and kept the better: `
           + `priority order ${num(t.rotationSearched.greedy, 1)}, sequenced `
           + `${num(t.rotationSearched.sequenced, 1)}`
           + (t.rotationSearched.won === 'sequenced'
             ? ` - sequencing wins by ${signedPct(t.rotationSearched.sequenced / Math.max(t.rotationSearched.greedy, 1e-9) - 1, 1)}`
-            : ' - nothing here rewards ordering, so priority order stands'))
+            // (Not "nothing here rewards ordering" over an order that was
+            // just moved for a press that lands on you - the lines below.)
+            : (t.rotationSearched.landers?.of ?? []).some((l) => l.placed !== 'rank')
+              ? ' - the rollout does not beat it, so priority order stands, with the press below placed in it'
+              : ' - nothing here rewards ordering, so priority order stands'))
         : dim('\n  priority: highest damage per second of commitment, cooldowns and charges permitting'))
+      // A press that lands on you, for a status that waits for a landing,
+      // was played more than one way (sim.mjs `simulate`): every order
+      // played is printed with what it came to, and the one kept is marked.
+      + (() => {
+        const L = t.rotationSearched?.landers;
+        if (!L?.played?.length) return '';
+        const nameOf = new Map(L.of.map((l) => [l.id, l.name]));
+        const said = { tail: 'last in the order', out: 'never pressed' };
+        const way = (p) => Object.entries(p).map(([id, at]) => `${nameOf.get(id) ?? id} ${said[at] ?? at}`).join(' and ')
+          || 'the order as ranked';
+        const one = L.of.length === 1;
+        return dim(`\n  ${L.of.map((l) => l.name).join(' and ')} land${one ? 's' : ''} on you for a status that waits for a `
+          + `landing, so ${L.exhaustive ? `every order that places ${one ? 'it' : 'them'} was` : 'some of the orders that place them were'} played:`
+          + L.played.map((w) => `\n    ${num(w.total, 1)}  ${way(w.placing)}${w.kept ? '  <- kept' : ''}`).join(''));
+      })()
       + (t.oversubscribed
         ? '\n' + warn('  the cooldowns fill the whole clock, so the base-attack chain never runs. '
           + 'That is a legal rotation, not an error - but it means the filler is worth nothing here.')
-        : '')
-      // A link the weapon's own item row does not list is not a detail: the
-      // combo finisher is what charges prayers and what every isFinalCombo
-      // guard rolls against, so the chain's LENGTH sets those rates. Say when
-      // it had to be recovered from the weapon type.
-      + ((ev?.rotation?.chain?.filled ?? []).length
-        ? dim(`\n  chain is ${ev.rotation.chain.links.length} links, per moveSet `
-          + `${ev.rotation.chain.moveSet}; ${ev.rotation.chain.filled.length} of them `
-          + `(${ev.rotation.chain.filled.map((f) => f.skill).join(', ')}) come from the weapon `
-          + 'type because this weapon\'s own row omits them')
         : ''),
     table(
       ['  SKILL', 'KIND', 'PER CAST', 'EVERY', 'SHARE', ''],
@@ -588,8 +751,9 @@ export function runeBlock(engine, loadout, ev) {
   return [
     bold('RUNES'),
     table(['  SKILL', 'SLOTTED', 'READABLE', 'WHAT IT CHANGES'], rows),
-    dim('  READABLE counts how many of the three gate a step, suppress one, gate a stat affix or'
-      + '\n  override a prop. Where it is 0, the pick is a tie broken arbitrarily - the rune may'
+    dim('  READABLE counts how many of the three gate a step, suppress one, gate a stat affix,'
+      + '\n  override a prop, or change something the script readers take (a cost, a resource, a'
+      + '\n  rider, a status). Where it is 0, the pick is a tie broken arbitrarily - the rune may'
       + '\n  still do something in game. The pool is every skill this build KNOWS, not only the ones'
       + '\n  the model can already score, because a rune-gated step is what gives some of them their'
       + '\n  damage in the first place.'),

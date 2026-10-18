@@ -15,9 +15,11 @@
 // reads all of it - roughly ten seconds - because sampling the head of the file
 // is how two separate analyses of this capture reached false conclusions.
 // ---------------------------------------------------------------------------
-import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { requireGame } from '../src/lib/game.mjs';
-import { streamCapture, aggregate, sessions, archetype, UNATTRIBUTED } from '../src/capture.mjs';
+import {
+  streamCapture, aggregate, sessions, archetype, UNATTRIBUTED, resolveCapture, describeMissingCapture,
+} from '../src/capture.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -37,7 +39,20 @@ function opt(name, fallback = null) {
 }
 const flag = (name) => argv.includes(`--${name}`);
 
-const file = opt('file') ?? join(requireGame(argv), 'hlx', 'logs', 'bench-probe.csv');
+// The live log is rotated when the game is patched, so the default may not
+// exist yet and the log beside it is another build's: say so and list what is
+// there, rather than fail on a path. A bare --file name is looked up in the
+// install's log folder; a path that exists needs no install at all.
+const file = (() => {
+  const named = opt('file');
+  if (named && existsSync(named)) return named;
+  const resolved = resolveCapture(requireGame(argv), named);
+  if (!resolved.exists) {
+    console.error(describeMissingCapture(resolved, '--file'));
+    process.exit(1);
+  }
+  return resolved.path;
+})();
 const source = opt('source');
 const target = opt('target');
 const top = Number(opt('top', '25'));
@@ -73,12 +88,23 @@ if (cmd === 'info') {
     distinctSources: sources.size,
     unattributed,
     lastUnattributedLine: lastUnattributed,
+    // One per boot from probe v10 on: which hlboot.dat that stretch ran against.
+    sessionRows: r.sessionRows,
     events: Object.fromEntries([...events.entries()].sort((a, b) => b[1] - a[1])),
   };
   if (asJson) { console.log(JSON.stringify(out, null, 2)); process.exit(0); }
 
   console.log(`${file}`);
   console.log(`${r.rows.toLocaleString()} rows over ${n(out.spanHours, 1)}h, ${sources.size.toLocaleString()} distinct sources`);
+  // Which build the rows describe is the first thing to know about a log.
+  if (r.sessionRows.length) {
+    const last = r.sessionRows[r.sessionRows.length - 1];
+    const boots = new Set(r.sessionRows.map((s) => `${s.bootBytes}/${s.bootMtimeMs}`));
+    console.log(`${r.sessionRows.length} boot(s) recorded (${last.probe ?? 'probe ?'}), against ${boots.size} hlboot.dat - `
+      + `the last one ${last.bootBytes ?? '?'} bytes; \`bench verify\` says whether that is the installed one`);
+  } else {
+    console.log('no session row: written by probe v9 or older, so the file does not say which build it was recorded on');
+  }
   if (r.malformed) console.log(`WARNING: ${r.malformed} malformed row(s) - the probe wrote something this reader does not understand`);
   console.log(`unattributed: ${unattributed.toLocaleString()} (${pct(unattributed / r.rows)}), last at line ${lastUnattributed.toLocaleString()}`);
   console.log('');

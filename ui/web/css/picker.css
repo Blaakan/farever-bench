@@ -181,3 +181,48 @@
   border: 1px dashed #d8c6ac;
   border-radius: 8px;
 }
+
+/* ------------------------------------------------ rows the catalog withholds */
+
+/* Listed apart, under their own heading, dimmed - and each says why right
+   under its name, because the reason is the point of listing it at all. */
+.prows .psep {
+  margin: 10px 4px 4px;
+  padding-top: 8px;
+  border-top: 1px dashed #d8c6ac;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+.pitem.held .ico,
+.pitem.held .pname,
+.pitem.held .psub,
+.pitem.held .pright { opacity: .55; }
+.pitem.held .pnote { white-space: normal; color: #7a4a12; }
+.pitem.held:hover .ico,
+.pitem.held:hover .pname { opacity: .9; }
+
+.pconf .heldnote {
+  margin: 0 0 4px;
+  padding: 5px 9px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #7a4a12;
+  background: #f2e0bf;
+  border: 1px solid #c99a4b;
+  border-radius: 6px;
+}
+
+/* ------------------------------------------------------- infusion controls */
+
+.pconf .infctl { margin-top: 10px; padding-top: 4px; border-top: 1px dashed #d8c6ac; }
+/* a checkbox line: the label wraps its own box, so it is not a block label */
+.pconf label.infall {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+  margin: 6px 0 2px;
+  cursor: pointer;
+}
+.pconf label.infall input { flex: none; }

@@ -29,10 +29,11 @@
 // ---------------------------------------------------------------------------
 
 import { budget, resistForReduction, STAT_GROUPS } from './model.mjs';
+import { buildSources } from './sources.mjs';
 
 // The slots a build is actually optimising. Tools, bags, mount, glider and
 // the four consumable slots are read but never scored - see docs/MODEL.md.
-const COMBAT_CATEGORIES = new Set(['Left', 'Right', 'Weapons']);
+export const COMBAT_CATEGORIES = new Set(['Left', 'Right', 'Weapons']);
 
 export function buildCatalog(cdb, ctx) {
   const itemTypes = cdb.byId('itemType');
@@ -71,7 +72,8 @@ export function buildCatalog(cdb, ctx) {
    * REFINED after the questlog import put the rule on trial: "gear" was too
    * wide. WORN ARMOUR scales like a weapon - its authored level is a FLOOR,
    * not a pin: the loot entry's UseItemLevel flag writes `item.level` into the
-   * entry's `minLvl` (fn@20760, HItem.hx:617-618), a minimum, and the player's
+   * entry's `minLvl` (the line filter fn@21756 ops 3-15, HItem.hx:650-651, on
+   * build 25782799: no minLvl, an item, flags & 4), a minimum, and the player's
    * level-25 wardrobe includes faction sets whose rows author level 1; pinning
    * them crushed three live slots to iLevel 11. What stays fixed is the jewel
    * box - the bakes above are all GearNeck/GearFinger rows, and the player's
@@ -139,9 +141,14 @@ export function buildCatalog(cdb, ctx) {
   // A "generic" aptitude is one the game puts on jewellery: no display name
   // and no `combines`, carrying only a rating. Anyone can wear those.
   const aptitudes = cdb.byId('aptitude');
+  // ...and one some ITEM names. `InfusionBonus` (new on build 25782799) is
+  // nameless and combines nothing too, but no item row carries it: it is the
+  // table $HInfusion.getInfusionBonusAptitude@21690 fetches by id for the
+  // infusion bonus line, not something a piece is made of.
+  const aptitudesOnItems = new Set(cdb.lines('item').flatMap((it) => (it.aptitudes ?? []).map((a) => a.ref)));
   const isGeneric = (id) => {
     const a = aptitudes.get(id);
-    return !!a && !a.name && !(a.combines ?? []).length;
+    return !!a && !a.name && !(a.combines ?? []).length && aptitudesOnItems.has(id);
   };
 
   // The hero units, one per playable class, and the aptitude each maps to.
@@ -176,6 +183,14 @@ export function buildCatalog(cdb, ctx) {
       faction: it.faction ?? null,
       affinity: it.affinity ?? null,
       level: it.level ?? null,
+      // The level a row with no `level` of its own is GIVEN at load: the
+      // anonymous fn@19878 (DataCache.hx:546-553, ops 12-42) writes
+      // `type.props.defaultMinLevel` into `def.level` for anything under Gear
+      // that authors none - 13, on Head and Shoulders only. It is a WEAR gate
+      // and deliberately not folded into `level`: that field also feeds the
+      // non-scaling price (`--drops authored`), where it would move 48 rows
+      // from the character's level to 14.
+      minLevel: it.level ?? (ch.includes('Gear') ? (itemTypes.get(it.type)?.props?.defaultMinLevel ?? null) : null),
       iLevel: it.iLevel ?? null,
       aptitudes: (it.aptitudes ?? []).map((a) => a.ref),
       affixes: it.affixes ?? [],
@@ -219,6 +234,71 @@ export function buildCatalog(cdb, ctx) {
       .map((a) => a.id);
   }
 
+  // WHICH SLOT'S SOCKETS HAND OUT THEIR AUGMENT'S SKILL. Every one but the
+  // arsenal's. st.item.Gear.getSkills@9762 collects an equipped piece's
+  // skills, and the skills of what is socketed in it come from two loops:
+  // ops 4-75 run only when the piece's equip slot is not the string
+  // "Slot_Weapon2", and ops 76-133 only when `canGiveSlotSkills(hero)` -
+  // which st.item.Weapon.canGiveSlotSkills@9839 answers false for
+  // `hero.secondaryWeapon` and st.item.Gear.canGiveSlotSkills@9774 answers
+  // true. So an enchant in the ARSENAL weapon's socket grants no passive,
+  // while its stat lines - affixes, not skills - are another path and stay.
+  //
+  // MEASURED 2026-10-13: Emsey carried Devote in the arsenal daggers and
+  // Flaming Weapon in the main-hand pair. Over 15,489 of her damage rows the
+  // log holds 1,531 Flaming Weapon hits and not one Enchant_Devote_Status
+  // row, where the Warrior and the Priest - Devote in the main hand - logged
+  // 223 and 326. The model had been paying her five stacks, +30 FervorRating
+  // on every line.
+  //
+  // One predicate, asked by every walker that turns sockets into skills.
+  const ARSENAL_SLOT = 'Slot_Weapon2';
+  function socketGrantsSkills(slotId) {
+    return slotId !== ARSENAL_SLOT;
+  }
+
+  // --- where an item comes from --------------------------------------------
+  // Built on first use: it reads every prefab in the install (see
+  // sources.mjs), which a run that never asks does not have to pay for.
+  //
+  // Whether rows nothing hands out are OFFERED is a property of the run, set
+  // once like `setDropsScale` - `--include-all` - so that the dozen call sites
+  // that list candidates cannot disagree about it.
+  let includeUnreleasedMode = false;
+  function setIncludeUnreleased(v) { includeUnreleasedMode = !!v; }
+  let sourcesMemo = null;
+  const sources = () => (sourcesMemo ??= buildSources(cdb));
+  /** live | unreleased | unknown, with the sentence that says why. */
+  function release(item) {
+    return sources().release(item.id);
+  }
+  // THE LOWEST LEVEL AN INSTANCE OF THIS ROW CAN EXIST AT, when every open
+  // source of it states one. Two sources do:
+  //
+  //   * a Heroic boss table. st.Activity.getLevel@10293 returns
+  //     round(Const.Hero.MaxLevel) for difficulty 1 and 2, and dropBossLoot
+  //     makes the loot at the activity's level;
+  //   * a container that declares `props.gainItem.levelRange` -
+  //     GainItem.getSourceItemLevel@32110 ops 25-39 clamp the opener's level
+  //     into it. Hero Gear Cache and Chaotic Gear Cache are both {25, 25}.
+  //
+  // Every Epic armour piece and Epic trinket has only such sources, so there
+  // is no level-20 Epic chest to wear: Gear.updateInf@9757 writes the instance
+  // level into `def.level` and $HItem.getNoEquipReason@21730 ops 16-21 refuse
+  // a hero below it. The bench used to offer them at charLevel x 10 + 50 to
+  // any level. INFERRED, and said so: that the server makes heroic loot at
+  // exactly getLevel() is read from the client's copy of dropBossLoot, whose
+  // callee is a server stub on this build.
+  const floorCache = new Map();
+  function minInstanceLevel(item) {
+    let v = floorCache.get(item.id);
+    if (v === undefined) {
+      v = sources().minInstanceLevel(item.id) ?? null;
+      floorCache.set(item.id, v);
+    }
+    return v;
+  }
+
   // --- effective level ------------------------------------------------------
   // iLevel is ten times the level. Items with neither (every `*_R<Faction>_*`
   // row - 501 of them) drop at the character's level, so that is what they
@@ -237,11 +317,20 @@ export function buildCatalog(cdb, ctx) {
   function setDropsScale(v) { dropsScale = !!v; }
   function effectiveLevel(item, {
     charLevel, stars = 0, flawless = false, rarity = null, level = null, socketed = null,
+    levelOnly = false,
   }) {
     // `level` is the INSTANCE level - what the thing actually dropped at. The
     // authored `item.level` is a reference, and a real drop is often higher, so
     // checking the tool against a character sheet needs the instance level.
-    const authored = item.iLevel ?? (item.level != null ? item.level * 10 : null);
+    // The LEVEL first, and the authored `iLevel` only for a row with none. An
+    // instance's item level is recomputed, not carried: Gear.updateInf@9757
+    // ops 2-12 write the instance level into `def.level` and then OVERWRITE
+    // `def.iLevel` with $HItem.getBaseILevel@21728 = required level x 10 +
+    // rarity.props.iLevelBonus. Reading the column first was harmless for the
+    // 296 rows that author iLevel = level x 10 and wrong for the 48 Demon
+    // armour rows that author `level 1, iLevel 1`: under `--drops authored` an
+    // Epic one priced at 1 + 50 = iLevel 51, a number no instance can have.
+    const authored = item.level != null ? item.level * 10 : (item.iLevel ?? null);
     // SCALING IS FOR THE GENERATED: weapons and worn armour take the source's
     // level (authored acts as a floor); jewellery keeps the level on its own
     // row. Scaling everything offered a level-6 Uncommon necklace at iLevel
@@ -259,12 +348,19 @@ export function buildCatalog(cdb, ctx) {
     // suffix and is not a recipe at all.
     const scales = dropsScale && !isCrafted(item.id)
       && (isWeaponType(item.type) || isArmorType(item.type));
+    // ...and never below the level its SOURCE makes it at, where every source
+    // in this install states one - see `minInstanceLevel`. An explicit
+    // instance level (`^N`) still names the instance exactly.
+    const floor = level != null ? null : minInstanceLevel(item);
     const baseILevel = level != null ? level * 10
-      : scales ? Math.max(authored ?? 0, charLevel * 10)
-        : (authored ?? charLevel * 10);
+      : Math.max(floor != null ? floor * 10 : 0,
+        scales ? Math.max(authored ?? 0, charLevel * 10) : (authored ?? charLevel * 10));
+    // The instance's LEVEL alone, for the one reader that wants it without
+    // what rarity, stars and sockets add on top (`instanceLevel` below).
+    if (levelOnly) return baseILevel / 10;
     const rar = cdb.byId('rarity').get(rarity ?? item.rarity);
     // WHAT YOU SOCKET RAISES THE HOST'S GEAR LEVEL. Read from
-    // Gear.getILevel@8123 (src/st/item/Gear.hx:48-51), which is three lines:
+    // Gear.getILevel@9760 (src/st/item/Gear.hx:48-51), which is three lines:
     //
     //   lvl  = Item.getILevel(this)                              // base + rarity, + flawless
     //   lvl += round(upgradeLevel * Item_GearUpgradeILevelBonus)  // the stars
@@ -285,6 +381,16 @@ export function buildCatalog(cdb, ctx) {
       + socketBonus
       + (flawless ? ctx.consts.flawlessILevelBonus : 0);
     return iLevel / 10;
+  }
+  // THE LEVEL AN INSTANCE STANDS AT - what Gear.updateInf@9757 ops 2-12 write
+  // into `def.level`, before any item-level bonus. It is the level an item's
+  // own SKILLS are scaled at when the item pays their flat (a trinket's
+  // status: $HSkill.getStepEffectItemScaling@21779's closure fn@21783 op 14
+  // reads `item.level`), so it follows the same branches as the stats above:
+  // the pinned instance level, else the source's floor, the character's level
+  // for what is generated at it, the row's own level otherwise.
+  function instanceLevel(item, { charLevel, level = null }) {
+    return effectiveLevel(item, { charLevel, level, levelOnly: true });
   }
 
   // --- upgrade stars --------------------------------------------------------
@@ -343,31 +449,43 @@ export function buildCatalog(cdb, ctx) {
     return cdb.byId('rarity').get(rarity ?? item.rarity)?.props?.gearUpgrades ?? 0;
   }
 
-  // Rarity is NOT a property of an item id. `st.Player.dropLoot` picks it with
-  // a weighted random draw over `rarity.props.generationChance`, banded by
-  // level, filtered to at least the item's authored rarity - which is why a
-  // CDB-Rare sword can be sitting in your bag as Legendary. So the unit a tool
-  // ranks is (item, rarity), and for gear you do not own yet the right answer
-  // is a distribution rather than a point.
+  // Rarity is NOT a property of a WEAPON's item id. `ent.Hero.makeLootItem@7953`
+  // rolls it: ops 140-242 collect every rarity whose
+  // `rarity.props.generationChance` band covers the loot level, inside the
+  // loot entry's own minRarity/maxRarity; ops 243-303 take Legendary out and
+  // roll it alone at `its chance / the sum of all of them`; ops 304-380 draw
+  // the rest by weight. That is why a CDB-Rare sword can be sitting in your
+  // bag as Legendary, and why the unit a tool ranks is (item, rarity). (The
+  // comment this replaces named `st.Player.dropLoot`; on this build
+  // st.Player.dropLoot@8181 is a three-op server stub.)
   //
-  // How high it can go is NOT declared anywhere in the CDB. The seven columns
-  // that touch `rarity` are an item's own rarity, `conds.minRarity`, per-rarity
-  // atbRatio overrides, icons, enchant materials, scrap quantities and recipe
-  // models; `lootTable` carries no rarity at all. So the ceiling is a content
-  // decision living in code, and today equipment stops at Rare while weapons
-  // reach Legendary. Two derivations stand in for it, and both move on their
-  // own when the data does:
+  // ...and it is a property of everything ELSE's. Ops 126-129 of the same
+  // function are `isSameType(inf.type, "Weapon")` and jump past the whole roll
+  // when it fails; ops 414-421 write the result through
+  // st.item.Weapon.set_rarity@9846, and `rarity` is an instance field of
+  // st.item.Weapon alone - st.item.Gear has level, upgradeLevel, slots,
+  // infusion and infusionBonusStat. An Epic chest is its own row, authored
+  // Epic; a Rare one never becomes it.
+  //
+  // How high a WEAPON can go is not declared on its row or on its slot: the
+  // floor and the ceiling are written into the loot entry by its source (a
+  // dungeon weapon is floored at Rare, a heroic boss's at Epic, a cache at its
+  // own `gainItem.rarity.min` / `.max` - the one place a column does state
+  // them, st.skill.GainItem.onStartStep@32109 ops 99-110), and nothing
+  // compares against the row's own rarity. So two derivations stand in, and
+  // both move on their own when the data does:
   //
   //   * `rarity.flags.AllowRandomWeaponDrop` is the one thing in the database
   //     that names the weapon/non-weapon split. It is set on Uncommon, Rare,
   //     Epic and Legendary and clear on Common, so it reads as "a random WEAPON
   //     drop may produce this" - which is the weapon ceiling, read rather than
   //     hardcoded.
-  //   * For every other slot, the ceiling is the highest rarity actually
-  //     AUTHORED on a stat-bearing item that fits it. Shop cosmetics such as
-  //     Head_Shop are Epic and grant nothing, so requiring an aptitude keeps
-  //     them from raising it. That yields Rare today and becomes Epic by itself
-  //     the day a patch authors an Epic chest.
+  //   * For every other slot there is nothing to roll, so the "ceiling" is
+  //     simply the highest rarity AUTHORED on a stat-bearing item that fits
+  //     it. Shop cosmetics such as Head_Shop are Epic and grant nothing, so
+  //     requiring an aptitude keeps them from raising it. It read Rare until
+  //     build 25782799 authored an Epic tier for the eight armour slots and
+  //     the trinket; necklaces and rings still stop at Rare.
   //
   // `bench rarity` prints both alongside the raw data, so a patch that moves
   // either one is visible rather than silently absorbed.
@@ -395,11 +513,13 @@ export function buildCatalog(cdb, ctx) {
       for (const it of items) {
         if (it.isAugment || !it.slots.includes(slotId)) continue;
         if (!it.aptitudes.length) continue;
+        // A row nothing in this install hands out cannot be the top of a slot.
+        if (release(it).state === 'unreleased') continue;
         if ((rarityOrder.get(it.rarity) ?? 0) > (rarityOrder.get(best) ?? -1)) best = it.rarity;
       }
       hit = {
         rarity: best ?? 'Rare',
-        why: 'highest rarity authored on a stat-bearing item for this slot',
+        why: 'highest rarity AUTHORED on a stat-bearing item for this slot - gear keeps its row\'s rarity and never rolls one',
         derived: true,
       };
     }
@@ -407,8 +527,25 @@ export function buildCatalog(cdb, ctx) {
     return hit;
   }
 
+  /**
+   * The rarity an INSTANCE of this row has. A weapon's is its own - whatever
+   * it rolled - and anything else's is its row's: `rarity` is an instance
+   * field of st.item.Weapon alone (see below), so a build file that says
+   * `Chest_RManfish_Cle` is Epic describes an item that cannot exist, and it
+   * is priced as the Rare chest it is rather than as a phantom.
+   */
+  function instanceRarity(item, g) {
+    return isWeaponType(item.type) ? (g?.rarity ?? item.rarity) : item.rarity;
+  }
+
   /** @param ceiling a rarity id no roll may exceed; defaults to rarityCeiling() */
   function attainableRarities(item, charLevel, slotId = null, ceiling = null) {
+    // ONLY A WEAPON ROLLS ONE - makeLootItem@7953 ops 126-129, see above. This
+    // had no such guard, and nobody noticed while every gear slot's ceiling
+    // was Rare; the Epic tier turned it into a phantom Epic roll on 466 of the
+    // 615 gear rows, shown by the UI picker and accepted by `--pin
+    // chest=X@Epic`.
+    if (!isWeaponType(item.type)) return [{ rarity: item.rarity, chance: null, authored: true }];
     const floor = rarityOrder.get(item.rarity) ?? 0;
     const capId = ceiling ?? (slotId ? rarityCeiling(slotId).rarity : null);
     const cap = capId != null ? (rarityOrder.get(capId) ?? Infinity) : Infinity;
@@ -418,14 +555,184 @@ export function buildCatalog(cdb, ctx) {
       if (rank < floor) continue;
       const band = (r.props?.generationChance ?? [])
         .find((b) => charLevel >= b.minLevel && charLevel <= b.maxLevel);
-      const chance = band?.chance ?? 0;
+      const raw = band?.chance ?? 0;
       // An item's own authored rarity is always attainable - it is what the row
       // says the thing IS - even if it sits above the ceiling.
-      if (r.id === item.rarity) { out.push({ rarity: r.id, chance: chance || null, authored: true }); continue; }
+      if (r.id === item.rarity) { out.push({ rarity: r.id, raw, authored: true }); continue; }
       if (rank > cap) continue;
-      if (chance > 0) out.push({ rarity: r.id, chance, authored: false });
+      if (raw > 0) out.push({ rarity: r.id, raw, authored: false });
     }
-    return out;
+    // THE CHANCE IS A SHARE OF THE ALLOWED SET, not the band's own number: the
+    // game sums every chance inside the entry's bounds and draws against that
+    // sum (ops 243-380). The bands at level 11-30 are Rare 0.50 / Epic 0.19 /
+    // Legendary 0.01, so a weapon floored at Rare is Rare 71.4% / Epic 27.1% /
+    // Legendary 1.43% - printing the raw 19% and 1% beside a Rare that was
+    // never printed read as three numbers summing to 0.70. Flooring at the
+    // ROW's rarity is this bench's stand-in for the source's floor (a dungeon
+    // floors weapons at Rare, which is also what every dungeon weapon row
+    // authors); a heroic boss or a Hero Weapon Cache floors at Epic, and that
+    // reads Epic 95% / Legendary 5% through the same arithmetic.
+    //
+    // NOT modelled, and it only ever RAISES Legendary: the roll goes through
+    // st.Player.rollLuck@8178, which adds a streak-breaker
+    // (base + misses x increment, capped) while the hero carries the counter's
+    // status inside an instance.
+    const total = out.reduce((s, o) => s + o.raw, 0);
+    return out.map(({ raw, ...o }) => ({ ...o, chance: total > 0 && raw > 0 ? raw / total : null }));
+  }
+
+  // --- infusion -------------------------------------------------------------
+  // An INFUSION is a set passive worn on armour (new on build 25782799). The
+  // instance carries three things - st.item.Gear.infusion (an InfusionPassive
+  // skill id), .infusionBonusStat (an attribute id rolled when the piece was
+  // looted) and the Prismatic bit of st.Item.flags - and four rules read them:
+  //
+  //   WHO CAN CARRY ONE  $HInfusion.canBeInfused@21689: the type chain reaches
+  //                      "Armor", the ROW's rarity index is at least
+  //                      Item_InfusionMinRarity's, and getFactionOrigin@21696
+  //                      (props.factionOrigin, else faction) is not null.
+  //                      Nothing else - no faction match is needed to infuse.
+  //   THE SET RANK       $HInfusion.getRankFromStacks@21691: how many entries
+  //                      of Item_InfusionCaps the count of equipped pieces
+  //                      carrying the SAME infusion reaches
+  //                      (ent.Hero.refreshInfusions@7739 counts per id).
+  //   THE BONUS LINE     st.item.Gear.getInfusionBonusAffix@9767:
+  //                      round(Item_InfusionBonusRatio x computeAtbScaling(inf,
+  //                      getILevel(), [the InfusionBonus rows whose endAtb is
+  //                      the rolled stat], false, null)), a flat affix.
+  //   WHEN IT IS LIT     st.item.Gear.isInfusionBonusActive@9766: a rolled stat
+  //                      AND an infusion AND (Prismatic OR the infusion
+  //                      pattern's faction == the piece's faction origin). It
+  //                      does not read the set rank: one matched piece alone
+  //                      is paid.
+  //
+  // What the client does NOT show is the attach itself. refreshInfusions ends
+  // at Hero.hx:307 and its `ret` is tagged line 321 - the lines that add the
+  // skill and set its rank are compiled out with the rest of the server. So
+  // "the passive exists from the first cap, at the set's rank" is INFERRED
+  // from the rank function and the game's own "(2) Set / (4) Set / (6) Set"
+  // titles, and is in the audit as the one thing to measure.
+  const infusionConsts = ctx.consts.infusion ?? { present: false, caps: [], minRarity: null, bonusRatio: 0 };
+  // The aptitude row the bonus line is priced from. The id is the game's own
+  // literal: $HInfusion.getInfusionBonusAptitude@21690 loads "InfusionBonus".
+  const infusionBonusApt = infusionConsts.present ? (aptitudes.get('InfusionBonus') ?? null) : null;
+  if (infusionConsts.present && !infusionBonusApt) {
+    throw new Error('the Item_Infusion* constants are present but aptitude InfusionBonus is not - the game changed shape');
+  }
+  // skill id -> {id, name, pattern, faction}. $HInfusion.tryFetchPatterns@21683
+  // builds the same map: every item whose type IS "InfusionPattern", keyed by
+  // props.ref.skill.
+  const infusions = new Map();
+  if (infusionConsts.present) {
+    const skillRows = cdb.byId('skill');
+    for (const it of cdb.lines('item')) {
+      if (it.type !== 'InfusionPattern') continue;
+      const skillId = it.props?.ref?.skill;
+      const sk = skillId ? skillRows.get(skillId) : null;
+      if (!sk) throw new Error(`infusion pattern ${it.id} names no skill row (props.ref.skill = ${skillId})`);
+      infusions.set(skillId, {
+        id: skillId, name: sk.texts?.name ?? skillId, pattern: it.id, faction: it.faction ?? null,
+      });
+    }
+  }
+  const factionOrigin = (item) => item.raw?.props?.factionOrigin ?? item.faction ?? null;
+
+  /** null when the piece can be infused, else the rule it fails, as a sentence. */
+  function whyNotInfusable(item) {
+    if (!infusionConsts.present) return 'this build of the game has no Infusion system';
+    if (!item.chain.includes('Armor')) {
+      // Both nouns off the itemType sheet: what this piece is, and which
+      // types sit under Armor on this build.
+      const typeName = (id) => itemTypes.get(id)?.texts?.name?.v ?? itemTypes.get(id)?.texts?.name ?? id;
+      const armour = [...new Set(items.filter((x) => x.chain.includes('Armor')).map((x) => x.type))].map(typeName);
+      return `${item.name} (${item.id}) is a ${typeName(item.type)}, and only armour - `
+        + `${armour.join(', ')} - can be infused`;
+    }
+    // The AUTHORED rarity, never a loadout's: armour has no instance rarity at
+    // all (see attainableRarities), so nothing a build file says about a Rare
+    // row can make it infusable.
+    if ((rarityOrder.get(item.rarity) ?? -1) < (rarityOrder.get(infusionConsts.minRarity) ?? Infinity)) {
+      return `${item.name} (${item.id}) is ${item.rarity}, and a piece must be ${infusionConsts.minRarity} or better `
+        + 'to be infused';
+    }
+    if (!factionOrigin(item)) return `${item.name} (${item.id}) belongs to no faction, and only faction gear can be infused`;
+    return null;
+  }
+  const canInfuse = (item) => !!item && whyNotInfusable(item) === null;
+
+  /** The set's rank: how many of Item_InfusionCaps this piece count reaches. */
+  const infusionRank = (pieces) => infusionConsts.caps.filter((c) => pieces >= c).length;
+
+  // The ratings a piece's bonus can be: every InfusionBonus row, minus what
+  // the piece ALREADY pays. $HInfusion.pickInfusionBonusStat@21694 copies
+  // UnitAttributes.infusionBonusAttributes and removes the endAtb of every
+  // statGroup-3 row of getItemExpectedScalings@21697 - the rows that survive
+  // the item's own rarity and faction conditions, the same filter
+  // `contribute` applies. NOT every rating its aptitudes author: a Fighter
+  // authors three, and removing all three would leave a pool of one.
+  function infusionBonusPool(item) {
+    if (!infusionBonusApt) return [];
+    const paid = new Set();
+    for (const aptId of item.aptitudes ?? []) {
+      for (const e of aptitudes.get(aptId)?.atbScaling ?? []) {
+        if (statGroupNames[e.statGroup ?? 0] !== 'ratings') continue;
+        const c = e.conds ?? {};
+        if (c.minRarity != null && (rarityOrder.get(item.rarity) ?? -1) < (rarityOrder.get(c.minRarity) ?? 0)) continue;
+        if ((c.factions ?? []).length && !c.factions.some((f) => f.ref === item.faction)) continue;
+        paid.add(e.endAtb);
+      }
+    }
+    return [...new Set(infusionBonusApt.atbScaling.map((e) => e.endAtb))].filter((a) => !paid.has(a));
+  }
+
+  /**
+   * What the bonus line is worth on this instance, as the integer the game
+   * shows. computeAtbScaling@21737, with the three things that make it differ
+   * from an ordinary rating line: the rows are InfusionBonus's (150 -> 1000,
+   * gearOnly, so the gear ratio at ops 118-121 is skipped), the divide flag is
+   * passed FALSE (op 31 at the call site - no division by the item's aptitude
+   * count), and the result is scaled by Item_InfusionBonusRatio and rounded
+   * once. A level-25 Epic piece is item level 300, so the curve is read at
+   * level 30: 0.4 x 461.0 x the type's ratings ratio = +14 on a chest (0.075).
+   *
+   * @param opts the same instance description `effectiveLevel` takes
+   */
+  function infusionBonus(item, stat, opts) {
+    if (!infusionBonusApt || !stat) return 0;
+    const rows = infusionBonusApt.atbScaling.filter((e) => e.endAtb === stat);
+    if (!rows.length) return 0;            // ops 4-9: no matching row, nothing
+    const effLevel = effectiveLevel(item, opts);
+    // start and end are the MEAN over the matching rows (ops 63-95); there is
+    // exactly one per rating today.
+    const start = rows.reduce((s, e) => s + (e.start ?? 0), 0) / rows.length;
+    const end = rows.reduce((s, e) => s + (e.end ?? 0), 0) / rows.length;
+    let amount = budget(effLevel, start, end, ctx.consts.earlyMaxLevel);
+    if (!rows[0].gearOnly) {
+      amount *= budget(effLevel, ctx.consts.gearStatsBounds[0], ctx.consts.gearStatsBounds[1], ctx.consts.earlyMaxLevel);
+    }
+    if (Math.round(amount) <= 0) return 0; // ops 130-134
+    const ratios = inherited(item.type, (t) => t?.atbRatio) ?? {};
+    return Math.round(infusionConsts.bonusRatio * amount * (ratios[statGroupNames[rows[0].statGroup ?? 0]] ?? 0));
+  }
+
+  /** isInfusionBonusActive@9766, on a loadout's gear entry. */
+  function infusionBonusActive(item, g) {
+    if (!g?.infusion || !g?.infusionStat || !canInfuse(item)) return false;
+    if (g.prismatic) return true;
+    const inf = infusions.get(g.infusion);
+    return !!inf && inf.faction != null && inf.faction === factionOrigin(item);
+  }
+
+  // Can this infusion be LEARNED on this build - i.e. does anything hand out
+  // its pattern. Read from the install, never from the id: on build 25782799
+  // eight patterns drop from Heroic bosses whose Heroic is released, four from
+  // bosses whose Heroic is not, and the three Nightling ones are in no loot
+  // table at all - a merchant's shop list in a level file sells them.
+  function infusionSource(id) {
+    const inf = infusions.get(id);
+    if (!inf) return null;
+    const r = sources().release(inf.pattern);
+    return { state: r.state, why: r.why, pattern: inf.pattern };
   }
 
   // --- handedness -----------------------------------------------------------
@@ -582,7 +889,7 @@ export function buildCatalog(cdb, ctx) {
     // Armour pays ONCE however many aptitudes the item names.
     const armorPaid = new Set();
 
-    // THE BAKE, as `generateItemAffixes@20747` actually computes it. Three
+    // THE BAKE, as `generateItemAffixes@21736` actually computes it. Three
     // terms were missing and they only reconcile together - each one alone
     // makes the other two look wrong, which is why a first attempt at just the
     // gearRatio was reverted.
@@ -665,6 +972,15 @@ export function buildCatalog(cdb, ctx) {
 
     // Authored affixes are already integers, so the same slot rule applies.
     applyAffixes(item.affixes, mods, affixFactor, affixFactor !== 1);
+
+    // The infusion bonus line, when this instance carries one that is lit.
+    // Gear.getAffixes@9768 ops 7-20 append it to the piece's own affix list as
+    // one more flat row. Only armour can carry it and every armour slot's
+    // affixFactor is 1, so no slot rule is applied to it.
+    if (opts.infusion && opts.infusionStat && infusionBonusActive(item, opts)) {
+      const v = infusionBonus(item, opts.infusionStat, opts);
+      if (v) mods.flat.set(opts.infusionStat, (mods.flat.get(opts.infusionStat) ?? 0) + v);
+    }
   }
 
   // The mean of the character's aptitudes' armorReduction - what the runtime
@@ -679,13 +995,22 @@ export function buildCatalog(cdb, ctx) {
   return {
     cdb, ctx,
     slots, slotById, classes, items, itemById,
-    chain, inherited, socketsFor, augmentTypes,
-    effectiveLevel, setDropsScale, maxStars, canUpgrade, upgradeSkillFor, isCombatGear,
+    chain, inherited, socketsFor, socketGrantsSkills, augmentTypes,
+    effectiveLevel, instanceLevel, setDropsScale, maxStars, canUpgrade, upgradeSkillFor, isCombatGear,
     upgradableTypes: upgradeSkillByType,
-    usableBy, payingAptitudes, genericChoices, isWeaponType, isCrafted,
+    usableBy, payingAptitudes, genericChoices, isWeaponType, isArmorType, isCrafted,
     contribute, applyAffixes, armorReductionFor,
-    rarityOrder, isGeneric, attainableRarities, rarityCeiling, isWeaponSlot,
+    rarityOrder, isGeneric, attainableRarities, instanceRarity, rarityCeiling, isWeaponSlot,
     allowsOffhand, handednessOf,
+    // Infusion - see the block above for what each rule is read from.
+    infusions, infusionCaps: infusionConsts.caps, infusionMinRarity: infusionConsts.minRarity,
+    canInfuse, whyNotInfusable, factionOrigin, infusionRank,
+    infusionBonusPool, infusionBonus, infusionBonusActive, infusionSource,
+    // Where things come from - see sources.mjs.
+    release, minInstanceLevel, sources, setIncludeUnreleased,
+    /** Every stat-bearing row nothing in this install hands out, with why. */
+    unreleasedItems: () => items.filter((it) => it.aptitudes.length || it.isAugment)
+      .map((it) => ({ item: it, ...release(it) })).filter((x) => x.state === 'unreleased'),
 
     combatSlots: () => slots.filter((s) => s.combat),
 
@@ -697,14 +1022,29 @@ export function buildCatalog(cdb, ctx) {
     // multiplies the search space by about three and turns a definite answer
     // into a probabilistic one, which is the right trade only when the
     // question is "what should I chase" rather than "what should I wear".
-    candidates(slotId, { aptitude, charLevel, rarities = null, exclude = null, rarityRoll = false, rarityCap = null } = {}) {
+    //
+    // `includeUnreleased` re-admits rows nothing in this install hands out
+    // (see sources.mjs). Off by default, because recommending a chest that
+    // sits only in a loot table nothing points at is not a recommendation;
+    // left unstated it follows the run's own setting (setIncludeUnreleased).
+    candidates(slotId, {
+      aptitude, charLevel, rarities = null, exclude = null, rarityRoll = false, rarityCap = null,
+      includeUnreleased = null,
+    } = {}) {
+      includeUnreleased ??= includeUnreleasedMode;
       const out = [];
       for (const it of items) {
         if (it.isAugment) continue;
         if (!it.slots.includes(slotId)) continue;
         if (!usableBy(it, aptitude)) continue;
-        if (it.level != null && it.level > charLevel) continue;
+        // `minLevel` is the row's own level or, where it has none, the type's
+        // defaultMinLevel - 13 for a head or shoulder piece.
+        if (it.minLevel != null && it.minLevel > charLevel) continue;
         if (exclude && exclude.test(it.id)) continue;
+        // An instance that can only exist above your level cannot be worn.
+        const floor = minInstanceLevel(it);
+        if (floor != null && floor > charLevel) continue;
+        if (!includeUnreleased && release(it).state === 'unreleased') continue;
 
         // ROLLING IS WEAPON-ONLY TOO, and for the same reason: the drop chain
         // rolls generation rarity for a Weapon and hands gear its authored row
@@ -735,9 +1075,11 @@ export function buildCatalog(cdb, ctx) {
     // Every augment that can sit in a given socket type. Augments are not
     // dropped gear - they are crafted from an authored recipe - so their
     // rarity is fixed and never rolled.
-    augmentCandidates(socketType, { exclude = null } = {}) {
+    augmentCandidates(socketType, { exclude = null, includeUnreleased = null } = {}) {
+      includeUnreleased ??= includeUnreleasedMode;
       return items.filter((it) => it.isAugment && it.augmentType === socketType
-        && !(exclude && exclude.test(it.id)));
+        && !(exclude && exclude.test(it.id))
+        && (includeUnreleased || release(it).state !== 'unreleased'));
     },
   };
 }

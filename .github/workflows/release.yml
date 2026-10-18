@@ -25,10 +25,16 @@
 # WHAT THIS WORKFLOW CANNOT DO IS RUN THE TEST SUITE. `test/run.mjs` reads the
 # player's own `data.cdb` and `hlboot.dat` and asserts against the values in
 # them; a hosted runner owns no copy of Farever, so the suite cannot pass here
-# and a green tick from a runner that skipped it would be a lie. The suite is
-# gated where a release is actually cut - `tools/release.mjs`, on a machine
-# that owns the game - and this job runs every check that does NOT need the
-# game instead:
+# and a green tick from a runner that skipped it would be a lie. What it CAN
+# do is refuse a tree the suite never passed on: a full green run on a machine
+# that owns the game writes `model/suite-pass.json` (the tree it passed on,
+# the game build it passed against), that file is committed with the tree, and
+# `tools/release.mjs` checks it here against the tree being released and
+# against the build the model is accepted on. No stamp, a stamp for another
+# tree, or a suite that passed on a patch nobody has accepted: no release.
+# The `unverified` input overrides that, and the release says so in its own
+# changelog entry and notes. This job also runs every check that does NOT
+# need the game:
 #
 #   * every .js/.mjs/.cjs under bin/ src/ tools/ ui/ parses;
 #   * nothing game-derived is committed. That is the repo's core promise -
@@ -55,6 +61,11 @@ on:
         type: string
         required: false
         default: ''
+      unverified:
+        description: Release although no suite stamp vouches for this tree (written into the changelog entry)
+        type: boolean
+        required: false
+        default: false
 
 # The version bump is a commit on the branch; two of them racing would fight
 # over the same line of package.json.
@@ -171,12 +182,14 @@ jobs:
         env:
           BUMP: ${{ inputs.bump }}
           NOTES: ${{ inputs.notes }}
+          UNVERIFIED: ${{ inputs.unverified }}
         # Through the environment, never interpolated into the command line:
         # `notes` is free text from whoever pressed the button. release.mjs
         # writes it into the notes file itself, so no shell ever parses it.
         run: |
           args=("$BUMP" --notes-out "$RUNNER_TEMP/release-notes.md")
           if [ -n "$NOTES" ]; then args+=(--notes "$NOTES"); fi
+          if [ "$UNVERIFIED" = "true" ]; then args+=(--unverified); fi
           version=$(node tools/release.mjs "${args[@]}")
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Releasing v$version"

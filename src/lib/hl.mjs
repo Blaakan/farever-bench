@@ -15,20 +15,28 @@
 //   ints floats strings [bytes v5+] [debugfiles if flags&1]
 //   types globals natives functions constants
 //
+// Version 6 (the September 2026 build, HashLink 2.0's format) changes one
+// thing: each debug `assign` carries a third index, where the local's scope
+// ENDS - hashlink's hlmodule.h calls it ASSIGN_SCOPE_END and Haxe's genhl.ml
+// writes it as `scope_end + 1` from close_scopes. It is an op position,
+// 1-based like the assign position and EXCLUSIVE (the first op after the
+// scope, so a function-scope local ends at nops or nops+1); 0 means the
+// compiler did not say. Nothing else in the layout moved.
+//
 // Every count and index uses HashLink's own varint ("index"): one byte for
 // 0..127, two bytes for 13-bit values, four bytes for 29-bit values, with a
 // sign bit in the second and third forms. Getting this wrong desyncs the
-// stream within a handful of reads, so the whole 40MB file parsing to exactly
-// EOF is itself the checksum.
+// stream within a handful of reads, so the whole file (14.6MB on the
+// September 2026 build) parsing to exactly EOF is itself the checksum.
 //
 // Function NAMES are not stored on functions. They come from the object
 // types: a class's `protos` name its methods (name + findex) and its
 // `bindings` name its statics (field index + findex). Resolving those is what
-// turns "findex 4835" into `ent.Unit.applyDamage` - the exact citations
+// turns a bare findex into `ent.Unit.applyDamage` - the exact citations
 // docs/MODEL.md has carried all along.
 // ---------------------------------------------------------------------------
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 
 export const TYPE_KINDS = [
   'void', 'u8', 'u16', 'i32', 'i64', 'f32', 'f64', 'bool', 'bytes', 'dyn',
@@ -67,11 +75,12 @@ export const OPCODES = [
   ['SetEnumField', 3],
   ['Assert', 0], ['RefData', 2], ['RefOffset', 3], ['Nop', 0],
   ['Prefetch', 3], ['Asm', 3],
-  // Farever's toolchain is a HashLink fork with one opcode past OAsm. Its
-  // shape was determined EMPIRICALLY: with one argument, the entire 40MB
-  // hlboot.dat parses to exactly EOF; with zero, the stream desyncs 150KB
-  // later. What it does is unknown - the name says only where it came from.
-  ['Shiro101', 1],
+  // OCatch(global): upstream HashLink from 1.16 (opcodes.h, hlcode.ml's
+  // `OCatch of global`), emitted once per caught type right after OTrap; the
+  // argument is the global holding the caught exception class. Its shape was
+  // first found empirically - one index parses the whole file to exactly EOF,
+  // zero or two desync - and then named from the source.
+  ['Catch', 1],
 ];
 const CALL_FAMILY = new Set(['CallN', 'CallMethod', 'CallThis', 'CallClosure', 'MakeEnum']);
 
@@ -118,14 +127,34 @@ class Reader {
   }
 }
 
+// ONE PARSE PER FILE. A parsed boot is about 300 MB of objects, and one process
+// asks for the same file many times over - the catalog's source reader, `bench
+// update`, and a dozen groups of the suite, which together held 3.6 GB of
+// identical parses and ran the default heap out. So the last parse is kept
+// behind a WeakRef: handed back while anyone still holds it, free to be
+// collected when nobody does. The key is the path, the size and the mtime - a
+// patched install is another file - and a parse with opcode overrides is
+// never shared. Nothing may write to what this returns.
+let lastParse = null;
 export function readHlb(path, { opOverrides = null } = {}) {
+  if (opOverrides) return parseHlb(path, { opOverrides });
+  const st = statSync(path);
+  const key = `${path}:${st.size}:${st.mtimeMs}`;
+  const hit = lastParse?.key === key ? lastParse.ref.deref() : null;
+  if (hit) return hit;
+  const code = parseHlb(path);
+  lastParse = { key, ref: new WeakRef(code) };
+  return code;
+}
+
+function parseHlb(path, { opOverrides = null } = {}) {
   const buf = readFileSync(path);
   const r = new Reader(buf);
   if (r.byte() !== 0x48 || r.byte() !== 0x4c || r.byte() !== 0x42) {
     throw new Error(`${path} is not HashLink bytecode (no HLB magic)`);
   }
   const version = r.byte();
-  if (version < 2 || version > 5) throw new Error(`unsupported HLB version ${version}`);
+  if (version < 2 || version > 6) throw new Error(`unsupported HLB version ${version}`);
   const flags = r.uindex();
   const nints = r.uindex();
   const nfloats = r.uindex();
@@ -313,7 +342,10 @@ export function readHlb(path, { opOverrides = null } = {}) {
         const nassigns = r.uindex();
         assigns = new Array(nassigns);
         for (let j = 0; j < nassigns; j++) {
-          assigns[j] = { name: strings[r.uindex()], at: r.index() };
+          // v6 adds where the local's scope ends: an op position, 1-based like
+          // `at` and exclusive, 0 = not stated (code.c stores it minus one; it
+          // is kept raw here so `at` and `end` share one convention).
+          assigns[j] = { name: strings[r.uindex()], at: r.index(), end: version >= 6 ? r.index() : null };
         }
       }
     }
@@ -427,7 +459,8 @@ export function disasm(code, findex) {
   lines.push(`  // ${f.regs.length} regs: ${f.regs.map((t, i) => `r${i}:${typeName(code, t)}`).join(' ')}`);
   const assignAt = new Map();
   for (const a of f.assigns ?? []) {
-    // Positions are 1-based op indexes; 0 and negatives name arguments.
+    // Positions are 1-based op indexes; 0 marks an argument and a negative
+    // one a captured variable (genhl.ml writes -(env register + 1)).
     if (a.at > 0) assignAt.set(a.at - 1, (assignAt.get(a.at - 1) ?? []).concat(a.name));
   }
   for (let i = 0; i < f.ops.length; i++) {
@@ -471,6 +504,7 @@ export function disasm(code, findex) {
       case 'JNotEq': s = `if r${A[0]} != r${A[1]} ${jump(2)}`; break;
       case 'JAlways': s = `goto ${i + 1 + A[0]}`; break;
       case 'Switch': s = `switch r${A[0]} [${o.extra.map((x, k) => `${k}:${i + 1 + x}`).join(' ')}] end ${i + 1 + A[1]}`; break;
+      case 'Catch': s = `catch global@${A[0]} :${typeName(code, code.globals[A[0]])}`; break;
       case 'Add': s = `r${A[0]} = r${A[1]} + r${A[2]}`; break;
       case 'Sub': s = `r${A[0]} = r${A[1]} - r${A[2]}`; break;
       case 'Mul': s = `r${A[0]} = r${A[1]} * r${A[2]}`; break;

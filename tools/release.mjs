@@ -5,6 +5,7 @@
 //
 //   node tools/release.mjs <patch|minor|major> [--notes "..."] [--notes-out f]
 //   node tools/release.mjs --zip-only          the download, no bump, no writes
+//   node tools/release.mjs --check             may this tree be released? exit 0/1
 //
 // Zero dependencies, git through child_process, stdout is ONLY the new version
 // so CI can do `VERSION=$(node tools/release.mjs patch)`; every other word
@@ -37,6 +38,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateRawSync } from 'node:zlib';
 import { findGame } from '../src/lib/game.mjs';
+import { treeHash, loadSuiteStamp, suiteGate, loadAcceptedStamp, loadFingerprint } from '../src/drift.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const say = (...a) => console.error(...a);
@@ -60,7 +62,7 @@ function git(args, { soft = false } = {}) {
 // --- arguments --------------------------------------------------------------
 
 function parseArgs(argv) {
-  const out = { bump: null, notes: '', notesOut: null, skipTests: false, zipOnly: false };
+  const out = { bump: null, notes: '', notesOut: null, skipTests: false, zipOnly: false, unverified: false, check: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--notes') out.notes = argv[++i] ?? '';
@@ -68,11 +70,20 @@ function parseArgs(argv) {
     else if (a === '--notes-out') out.notesOut = argv[++i] ?? null;
     else if (a.startsWith('--notes-out=')) out.notesOut = a.slice(12);
     else if (a === '--skip-tests') out.skipTests = true;
+    else if (a === '--unverified') out.unverified = true;
+    else if (a === '--check') out.check = true;
     else if (a === '--zip-only') out.zipOnly = true;
     else if (a === '-h' || a === '--help') {
       say('usage: node tools/release.mjs <patch|minor|major|none> [--notes "..."] [--notes-out FILE]');
-      say('                              [--skip-tests]');
+      say('                              [--skip-tests] [--unverified]');
       say('       node tools/release.mjs --zip-only');
+      say('       node tools/release.mjs --check');
+      say('');
+      say('  --skip-tests  do not run test/run.mjs here. The committed suite stamp');
+      say('                (model/suite-pass.json) still has to vouch for this tree.');
+      say('  --unverified  release with nothing vouching for it. Said in the changelog');
+      say('                entry and in the release notes.');
+      say('  --check       evaluate that gate and exit 0 or 1. Runs nothing, writes nothing.');
       say('');
       say('  none  cut the version already in package.json instead of raising it.');
       say('        The first release needs it: 0.1.0 is written in the manifests');
@@ -85,6 +96,10 @@ function parseArgs(argv) {
   // bump and naming one would be a lie about what the run did.
   if (out.zipOnly) {
     if (out.bump) die('--zip-only builds the download from the version already in package.json - drop the bump');
+    return out;
+  }
+  if (out.check) {
+    if (out.bump) die('--check only answers whether this tree may be released - drop the bump');
     return out;
   }
   if (!['patch', 'minor', 'major', 'none'].includes(out.bump))
@@ -241,35 +256,67 @@ function prependSection(file, heading, body) {
 // release is cut from.
 //
 // So: an install present means the suite runs and a failure is fatal. No
-// install means the suite is not failing, it is unrunnable - that is the CI
-// case, it is said out loud, and the release continues.
+// install means the suite is unrunnable here - that is the CI case, and it
+// used to be said out loud and then WAVED THROUGH: releases are dispatched
+// from the Actions tab, so every release was cut on the one machine that
+// could not check it, and one could go out with the suite crashing and the
+// model unaccepted on the live build.
+//
+// What can travel to a runner is a statement. A full green run of
+// test/run.mjs writes model/suite-pass.json: the tree it passed on (a hash
+// over src/, bin/, tools/, test/ and the UI server) and the game build it
+// passed against. It is committed with that tree. The gate below needs no
+// game: the stamp must describe THIS tree, and the build it passed on must be
+// the build the model is accepted on (model/accepted-build.json) - a suite
+// that is green on a patch nobody has accepted is patch work in flight, not a
+// release. Where the suite can run it runs first, and refreshes the stamp.
+//
+// --skip-tests skips the run, not the gate. --unverified skips both, and the
+// release says so in its own changelog entry and notes.
+function releaseGate() {
+  const fp = loadAcceptedStamp(ROOT) ?? loadFingerprint(ROOT);
+  const accepted = fp ? { at: fp.at, cdbSha: fp.cdbSha, bootSha: fp.bootSha ?? null } : null;
+  return suiteGate({ stamp: loadSuiteStamp(ROOT), tree: treeHash(ROOT), accepted });
+}
+
+const UNVERIFIED_NOTE = '> **Unverified release.** Cut with `--unverified`: no run of `test/run.mjs` '
+  + 'vouches for this tree against the game build the model is accepted on.';
+
 function runSuite() {
-  if (args.skipTests) {
+  if (args.unverified) {
     say('');
     say('  ###########################################################');
-    say('  ##  --skip-tests: this release was NOT checked against   ##');
-    say('  ##  the game data. Nothing has run test/run.mjs. The     ##');
-    say('  ##  next person to trust these numbers is trusting you.  ##');
+    say('  ##  --unverified: NOTHING vouches for this release. No   ##');
+    say('  ##  suite ran, no stamp was checked. The changelog entry ##');
+    say('  ##  and the release notes say so. The next person to     ##');
+    say('  ##  trust these numbers is trusting you.                 ##');
     say('  ###########################################################');
     say('');
+    say(`release: for the record, the gate says: ${releaseGate().reason}`);
     return;
   }
   // An empty argv on purpose: this script's own flags are not the CLI's, and
   // `--notes patch` must never be read as a path to an install.
-  const game = findGame([]);
-  if (!game) {
-    say('release: no Farever install on this machine, so test/run.mjs cannot run here.');
-    say('release: the suite reads data.cdb and hlboot.dat - cut the release from a');
-    say('release: machine that owns the game if you want it checked.');
-    return;
+  const game = args.skipTests ? null : findGame([]);
+  if (args.skipTests) {
+    say('release: --skip-tests - test/run.mjs is not run here; the committed suite stamp has to vouch for this tree.');
+  } else if (!game) {
+    say('release: no Farever install on this machine, so test/run.mjs cannot run here');
+    say('release: (it reads data.cdb and hlboot.dat) - the committed suite stamp has to vouch for this tree.');
+  } else {
+    say(`release: running test/run.mjs against ${game}`);
+    const r = spawnSync(process.execPath, [join(ROOT, 'test', 'run.mjs')],
+      { cwd: ROOT, stdio: 'inherit' });
+    if (r.error) die(`could not run test/run.mjs: ${r.error.message}`);
+    if (r.status !== 0)
+      die(`test/run.mjs exited ${r.status} - nothing has been written. Fix the suite; `
+        + '--unverified releases anyway and says so in the changelog.');
   }
-  say(`release: running test/run.mjs against ${game}`);
-  const r = spawnSync(process.execPath, [join(ROOT, 'test', 'run.mjs')],
-    { cwd: ROOT, stdio: 'inherit' });
-  if (r.error) die(`could not run test/run.mjs: ${r.error.message}`);
-  if (r.status !== 0)
-    die(`test/run.mjs exited ${r.status} - nothing has been written. Fix the suite, `
-      + 'or --skip-tests if you already know why it fails.');
+  const gate = releaseGate();
+  if (!gate.ok)
+    die(`${gate.reason}. Nothing has been written. --unverified releases anyway, and writes `
+      + 'that fact into the changelog entry and the release notes.');
+  say(`release: ${gate.reason}`);
 }
 
 // --- the download -------------------------------------------------------------
@@ -289,8 +336,16 @@ function runSuite() {
 // Everything option 2 (`bench ui`) and option 3 (`bench <command>`) need, and
 // nothing else. ui/electron and ui/package.json are deliberately absent: they
 // describe the Electron build, which is the OTHER download.
+//
+// model/accepted-build.json is the one file of model/ that ships: the date
+// and the two hashes of the game build the model was accepted on. Without it
+// a downloaded copy cannot know the game was patched after it was released,
+// and the header line that says so never prints. The fingerprint itself
+// (half a megabyte of row hashes) stays in the repository; the suite checks
+// that this list and the exe's (ui/package.json extraResources) both carry
+// the stamp.
 const SHIPPED = [
-  'bin', 'src', 'docs',
+  'bin', 'src', 'docs', 'model/accepted-build.json',
   'ui/server.mjs', 'ui/api.mjs', 'ui/view.mjs', 'ui/icons.mjs',
   'ui/optimize-worker.mjs', 'ui/lib', 'ui/web', 'ui/API.md', 'ui/README.md',
   'bench.cmd', 'bench-ui.cmd', 'bench-ui.sh',
@@ -517,6 +572,13 @@ function buildZip(version) {
 
 const args = parseArgs(process.argv.slice(2));
 
+// May this tree be released? The gate alone: no suite, no version, no write.
+if (args.check) {
+  const gate = releaseGate();
+  say(`release: ${gate.reason}`);
+  process.exit(gate.ok ? 0 : 1);
+}
+
 const rootPkg = join(ROOT, 'package.json');
 const uiPkg = join(ROOT, 'ui', 'package.json');
 for (const f of [rootPkg, uiPkg]) if (!existsSync(f)) die(`missing ${f}`);
@@ -579,7 +641,7 @@ const prevTag = inRepo
   ? git(['describe', '--tags', '--abbrev=0', '--match', 'v*'], { soft: true })
   : null;
 const subjects = inRepo ? subjectsSince(prevTag) : [];
-const body = sectionBody(group(subjects), args.notes);
+const body = sectionBody(group(subjects), args.unverified ? [UNVERIFIED_NOTE, args.notes.trim()].filter(Boolean).join('\n\n') : args.notes);
 const date = new Date().toISOString().slice(0, 10);
 
 // `none` moves no version and adds no section - the manifests and the
@@ -593,8 +655,11 @@ if (args.bump !== 'none') {
 }
 // The notes are what the release page shows, so they come from the section
 // being released - the one already written when nothing was bumped.
+// (An unverified `none` release has no new section to carry the warning, so
+// the notes carry it in front of the section already written.)
 if (args.notesOut) {
-  writeFileSync(args.notesOut, args.bump === 'none' ? sectionOf(changelog, next) || body : body);
+  const written = args.bump === 'none' ? sectionOf(changelog, next) : null;
+  writeFileSync(args.notesOut, written ? (args.unverified ? `${UNVERIFIED_NOTE}\n\n${written}` : written) : body);
 }
 
 // Last, so the package.json and the CHANGELOG.md inside the zip are the ones

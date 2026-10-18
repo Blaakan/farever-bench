@@ -1,21 +1,86 @@
 // Diff the model's per-item bake against the game's OWN logged bake.
 //
-// captures/2026-08-02-v2/bench-probe-bakes.csv is a postfix on
-// $HItem.generateItemAffixes@20747: item id, the iLevel it was called with, and
-// every affix line that came back. That is not a tooltip reading - it is the
-// function's return value - so any disagreement is the model's.
+//   node tools/bake-diff.mjs [<bakes.csv>] [--game <dir>] [--all]
+//
+// The probe's bake log (hlx/logs/bench-probe-bakes.csv in the install) is a
+// postfix on $HItem.generateItemAffixes@21736: item id, the iLevel it was
+// called with, and every affix line that came back. That is not a tooltip
+// reading - it is the function's return value - so any disagreement is the
+// model's.
+//
+// WHICH ROWS. The log is append-only across boots and across patches (223 MB
+// from August to October 2026), and a signature here is item@rarity@iLevel
+// with the last row winning - so the whole file holds today's model against
+// bakes of every build it was ever appended on, and cannot say which. From
+// schema v10 the probe opens each boot's rows with a `session` row naming
+// the hlboot.dat they were recorded against. So by default this reads the
+// install's own log, and of it only the rows after the LAST session row: one
+// boot, one build. It says which boot that was and whether it is the
+// hlboot.dat in the install now. A log with no session row (an older probe)
+// is read whole, and that is said too; --all forces the whole file.
 import { createEngine } from '../src/engine.mjs';
+import { lastSession } from '../src/drift.mjs';
+import { findGame } from '../src/lib/game.mjs';
 import fs from 'node:fs';
+import { join } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
-const CSV = process.argv[2]
-  ?? 'D:/Gits/farever-hlx/captures/2026-08-02-v2/bench-probe-bakes.csv';
+const argv = process.argv.slice(2);
+const ALL = argv.includes('--all');
+const positional = argv.find((a, i) => !a.startsWith('--') && argv[i - 1] !== '--game');
+const game = findGame(argv);
+const CSV = positional ?? (game ? join(game, 'hlx', 'logs', 'bench-probe-bakes.csv') : null);
+if (!CSV || !fs.existsSync(CSV)) {
+  console.error(CSV
+    ? `no bake log at ${CSV} - the probe writes it on the first login after it is installed`
+    : 'no Farever install found and no csv given: node tools/bake-diff.mjs <bakes.csv> | --game <dir>');
+  process.exit(1);
+}
 const eng = createEngine({ quiet: true });
 const { cat } = eng;
+
+// The window: where the last boot's rows start, and which boot that was.
+const session = lastSession(CSV);
+const from = !ALL && session?.found ? session.next : 0;
+const day = (ms) => (Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString().slice(0, 10) : '?');
+if (ALL || !session?.found) {
+  console.log(`${CSV}: reading the WHOLE log${ALL ? ' (--all)' : ' - it has no session row (written by a probe older than v10)'}. `
+    + 'Rows of every build it was appended on are mixed, the last one written winning per item@rarity@iLevel.');
+} else {
+  const bootPath = game ? join(game, 'hlboot.dat') : null;
+  const boot = bootPath && fs.existsSync(bootPath) ? fs.statSync(bootPath) : null;
+  // The probe reads the file's mtime in whole seconds.
+  const same = boot && session.bootBytes === boot.size && Math.abs(session.bootMtimeMs - boot.mtimeMs) < 2000;
+  console.log(`${CSV}: the rows after its last session row (probe v${session.probe ?? '?'}, ${day(session.ts)}), recorded against a hlboot.dat of `
+    + `${session.bootBytes} bytes dated ${day(session.bootMtimeMs)} - `
+    + (boot ? (same ? 'the hlboot.dat in this install.' : 'NOT the hlboot.dat in this install now: another build\'s bakes against this build\'s data.')
+      : 'no install here to compare it with.'));
+}
+
+// Lines from an offset, read in chunks: the log does not fit a string.
+function* linesFrom(path, start) {
+  const fd = fs.openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(1 << 20);
+    const dec = new StringDecoder('utf8');
+    let rest = '';
+    for (let pos = start; ;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, pos);
+      if (n <= 0) break;
+      pos += n;
+      const parts = (rest + dec.write(buf.subarray(0, n))).split('\n');
+      rest = parts.pop();
+      yield* parts;
+    }
+    if (rest) yield rest;
+  } finally { fs.closeSync(fd); }
+}
 
 // One row per (item, rarity, iLevel); `bake` rows carry level_arg, `item_affixes`
 // rows carry item_ilevel. Both name the same number.
 const truth = new Map();
-for (const line of fs.readFileSync(CSV, 'utf8').trim().split('\n').slice(1)) {
+for (const raw of linesFrom(CSV, from)) {
+  const line = raw.replace(/\r$/, '');
   const f = line.split(',');
   const [, event, itemId, rarity, , levelArg] = f;
   // ONLY `bake` rows. They carry the iLevel `generateItemAffixes` was actually

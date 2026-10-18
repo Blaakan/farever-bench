@@ -3,12 +3,25 @@
 //
 // The HLX modkit writes two files per character into the game directory:
 //
-//   farever-inventory-<Name>.json   { character, equipped[], bank[], bags[] }
+//   farever-inventory-<Name>.json   { character, bankSlots, equipped[], bank[], bags[] }
 //   farever-jobs-<Name>.json        { character, jobs[], runes[] }
 //
 // An entry is `{kind, level, upgrade, rarity, count, class}` where `kind` is the
-// CastleDB item id, `upgrade` is the star count, and `rarity` of -1 means the
-// item never rolled one and takes its authored rarity.
+// CastleDB item id, `upgrade` is the star count, and `rarity` is an INDEX into
+// the modkit's own list (Common, Uncommon, Rare, Epic, Legendary) - set for a
+// weapon, which is the only thing that rolls one, and -1 for everything else.
+//
+// A modkit built for the Infusion update writes four more keys on every gear
+// entry, and these are the spelling the whole bench uses - loadout, --json,
+// the pin grammar, the capture snapshot:
+//
+//   infusion      the InfusionPassive skill id infused into the piece, or null
+//   infusionStat  the attribute id its infusion bonus rolled, or null (the
+//                 game's field is `infusionBonusStat`; that name is accepted
+//                 on the way in)
+//   prismatic     the Prismatic item flag: true, false, or null when the flags
+//                 object could not be read
+//   flawless      the Flawless item flag, same three values
 //
 // This is the only path in the bench that produces a build nobody chose: the
 // character as actually equipped, which is what a capture recorded and
@@ -57,6 +70,15 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
         // with it; and Rare permits three upgrades against Epic's four, so a
         // four-star instance silently loses its fourth.
         rarity: g.rarity ?? null,
+        // The Flawless flag was parsed by capture.mjs and dropped here, so a
+        // flawless piece verified one Item_FlawlessILevelBonus short.
+        flawless: !!g.flawless,
+        // The infusion fields, when the probe wrote them. Key PRESENCE is the
+        // signal - a snapshot from a probe that predates them must read as
+        // "not recorded", never as "not infused".
+        ...('infusion' in g ? { infusion: g.infusion } : {}),
+        ...('infusionStat' in g ? { infusionStat: g.infusionStat } : {}),
+        ...('prismatic' in g ? { prismatic: g.prismatic } : {}),
       })),
     },
     // Runes are not in the snapshot - the class has to come from somewhere, so
@@ -225,6 +247,7 @@ export function fromSnapshot(cat, snap, { level = null, unit = null } = {}) {
     built.unusable?.length
       ? `${built.unusable.length} item(s) in the snapshot this class cannot wear (${built.unusable.slice(0, 3).join(', ')}) - the probe read a backpack rather than the equipment; skipped`
       : null,
+    ...built.gearGaps.map((g) => g.replace(/\bthis dump\b/g, 'this snapshot').replace(/\bthe dump\b/g, 'the snapshot')),
     ...(snap.errors ?? []).map((e) => `the probe reported it could not read ${e.what}: ${e.why}`),
     'consumables and persistent buffs are still not captured',
   ].filter(Boolean);
@@ -277,6 +300,12 @@ export function classFromRunes(cat, runes = []) {
   return [...votes.entries()].sort((a, b) => b[1] - a[1])[0][0];
 }
 
+// The modkit's own index for a weapon's rolled rarity - kNames[] in
+// farever-mods host/src/hl_reader.cpp `rarity_index`. It is the WRITER's list
+// and not the rarity sheet's row order, so it is spelled here and each name is
+// checked against the sheet where it is used.
+const DUMP_RARITY = ['Common', 'Uncommon', 'Rare', 'Epic', 'Legendary'];
+
 // Build a loadout from an equipped list. Items are placed into the first slot
 // they are legal for that is still free, in dump order - which is how a second
 // dagger reaches the arsenal and a second ring reaches the other finger.
@@ -307,6 +336,22 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
   const placed = [];
   const ignored = [];
   const unknown = [];
+  // Infusion fields that named something this catalog cannot place: an id no
+  // InfusionPattern names, a stat that is not an attribute, an infusion on a
+  // piece the game's own rule says cannot carry one. Kept apart from
+  // `unknown`, which is a list of item kinds.
+  const unknownInfusions = [];
+  // Values that were there and could not be read: a rarity index outside the
+  // modkit's list, a flag the modkit reported as unreadable.
+  const unreadable = [];
+  // Did ANY equipped entry carry an infusion key. A dump from before the
+  // modkit learnt them has none, and that is "not recorded", not "not infused".
+  let sawInfusionKeys = false;
+  let infusableWorn = 0;
+  // Keys this reader does not know, with how many entries carried one.
+  const strangeKeys = new Map();
+  const KNOWN_KEYS = new Set(['kind', 'level', 'upgrade', 'rarity', 'count', 'class',
+    'infusion', 'infusionStat', 'infusionBonusStat', 'prismatic', 'flawless']);
 
   const clsRow = cat.classes.find((c) => c.unit === cls);
   const unusable = [];
@@ -325,20 +370,77 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
     if (!free) { ignored.push(e.kind); continue; }
 
     taken.add(free);
-    // Rarity arrives two ways. The modkit dump writes an index with -1 for
-    // "never rolled one"; a capture snapshot writes the rolled rarity's id
-    // ("Epic"). Only the id is usable - it is what the catalog keys on - so a
-    // number is treated as the dump's sentinel and dropped, and the item's
-    // authored rarity stands in.
-    const rolled = typeof e.rarity === 'string' && e.rarity ? e.rarity : null;
+    for (const k of Object.keys(e)) {
+      if (!KNOWN_KEYS.has(k) && e[k] != null) strangeKeys.set(k, (strangeKeys.get(k) ?? 0) + 1);
+    }
+    // Rarity arrives two ways. A capture snapshot writes the rolled rarity's
+    // id ("Epic"). The modkit dump writes an INDEX, -1 for "never rolled one"
+    // - and the index is into the modkit's own list, not into the rarity
+    // sheet's row order (farever-mods host/src/hl_reader.cpp `rarity_index`,
+    // kNames[] = Common, Uncommon, Rare, Epic, Legendary). This used to keep
+    // only the string and drop every number as the sentinel, so a dumped
+    // Legendary five-star sword was priced as its authored Rare and clipped
+    // to three stars: the four characters on disk read 12-15 points of their
+    // primary attribute low.
+    let rolled = null;
+    if (typeof e.rarity === 'string' && e.rarity) rolled = e.rarity;
+    else if (Number.isInteger(e.rarity) && e.rarity >= 0) rolled = DUMP_RARITY[e.rarity] ?? null;
+    if ((typeof e.rarity === 'string' && e.rarity) || (Number.isInteger(e.rarity) && e.rarity >= 0)) {
+      if (!rolled || !cat.rarityOrder.has(rolled)) {
+        unreadable.push(`${item.id}: rarity ${JSON.stringify(e.rarity)} is not a rarity this build knows`);
+        rolled = null;
+      }
+    }
+    // ...and only a weapon has one of its own (see catalog.instanceRarity).
+    if (rolled && !cat.isWeaponType(item.type)) rolled = null;
+
+    // The infusion fields. Only what resolves reaches the loadout; the rest is
+    // named. A stat OUTSIDE the pool this bench computes is kept - the piece
+    // carries whatever the server rolled, and the engine prices it as stored
+    // and says so.
+    const inf = {};
+    if ('infusion' in e || 'infusionStat' in e || 'infusionBonusStat' in e || 'prismatic' in e) sawInfusionKeys = true;
+    if (cat.canInfuse(item)) infusableWorn++;
+    if (e.infusion) {
+      if (!cat.infusions.has(e.infusion)) unknownInfusions.push(`${e.infusion} (on ${item.id}): no infusion pattern names it`);
+      else if (!cat.canInfuse(item)) unknownInfusions.push(`${e.infusion} (on ${item.id}): ${cat.whyNotInfusable(item)}`);
+      else inf.infusion = e.infusion;
+    }
+    const stat = e.infusionStat ?? e.infusionBonusStat ?? null;
+    if (stat) {
+      if (cat.cdb.has('attribute', stat)) inf.infusionStat = stat;
+      else unknownInfusions.push(`${stat} (the bonus stat on ${item.id}): not an attribute`);
+    }
+    if (e.prismatic === true) inf.prismatic = true;
+    if (e.flawless === true) inf.flawless = true;
+    if (('prismatic' in e && e.prismatic === null) || ('flawless' in e && e.flawless === null)) {
+      unreadable.push(`${item.id}: its item flags (Flawless, Prismatic) could not be read`);
+    }
+
     loadout.gear[free] = {
       item: item.id,
       stars: e.upgrade ?? 0,
       ...(rolled ? { rarity: rolled } : {}),
       ...(e.level ? { level: e.level } : {}),
+      ...inf,
     };
     placed.push({ slot: free, item: item.id, stars: e.upgrade ?? 0 });
   }
+
+  // What the gear list could not say, as sentences. Shared with fromSnapshot,
+  // which builds its own gap list around these.
+  const gearGaps = [
+    infusableWorn && !sawInfusionKeys
+      ? `infusions are not in this dump - ${infusableWorn} piece${infusableWorn === 1 ? '' : 's'} worn can carry one and every one reads un-infused`
+      : null,
+    unknownInfusions.length
+      ? `${unknownInfusions.length} infusion field(s) could not be placed and were dropped: ${unknownInfusions.slice(0, 3).join('; ')}`
+      : null,
+    unreadable.length
+      ? `${unreadable.length} value(s) in the dump could not be read: ${unreadable.slice(0, 3).join('; ')}`
+      : null,
+    ...[...strangeKeys].map(([k, n]) => `the dump records "${k}" on ${n} item${n === 1 ? '' : 's'} and this reader does not read it`),
+  ].filter(Boolean);
 
   // The VALUE is the rune id, not a boolean: every consumer reads
   // Object.values(loadout.runes).flat() - the plan, the engine's cache key -
@@ -355,6 +457,9 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
     placed,
     ignored,
     unknown,
+    unknownInfusions,
+    unreadable,
+    gearGaps,
     unusable,
     // What a capture-verify run must not treat as zero. Each of these is a real
     // input the dump cannot see, and each has been measured to move a headline
@@ -364,6 +469,7 @@ export function toLoadout(cat, dump, { level = null, unit = null } = {}) {
       'talents are not in the dump - only runes are',
       'consumables and persistent buffs are not in the dump',
       level === null ? `character level assumed ${lvl} from the highest equipped item` : null,
+      ...gearGaps,
     ].filter(Boolean),
   };
 }

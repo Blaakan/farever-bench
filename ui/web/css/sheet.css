@@ -26,6 +26,12 @@
   border: 1px solid #c99a4b;
   color: #7a4a12;
 }
+/* The page-level notice ("this install is not the build the model was
+   accepted on"): the strip an illegal build gets, but outside every view, so
+   it brings its own margins - the left one clears the crest flag hanging off
+   the band, as the tabs' padding does (style.css). Sets no `display`, so
+   `hidden` still hides it. */
+.build-notice { margin: 10px 16px 0 236px; }
 @keyframes sheet-shimmer {
   from { background-position: 130% 0; }
   to   { background-position: -30% 0; }
@@ -211,7 +217,16 @@
   text-align: center;
   line-height: 17px;
 }
-.tooltip .trank-d { color: #cbbfa8; }
+/* A set-bonus title ("(4) Set") in place of a rank number: a pill, not a dot. */
+.tooltip .trank-n.trank-t {
+  width: auto;
+  height: auto;
+  padding: 0 7px;
+  border-radius: 9px;
+  white-space: nowrap;
+}
+/* pre-line: an infusion's line is its sentence plus the stat line under it. */
+.tooltip .trank-d { color: #cbbfa8; white-space: pre-line; }
 .tooltip .trank.off { opacity: .45; }
 .tooltip .trank.off .trank-n { background: #3a2f22; color: #9c8f78; }
 
@@ -232,3 +247,148 @@
   border-radius: 3px;
   z-index: 2;
 }
+
+/* --------------------------------------------------------- infusion block */
+
+/* Under the three columns: the sets the build wears, what of each is in the
+   number, each piece's bonus line, and - in the editor - what the optimizer
+   may hand out. Full width, and every row wraps: the same block is drawn in
+   the half-width result pane. */
+.infblock {
+  margin-top: 14px;
+  background: var(--parchment-2);
+  border: 1px solid #e0d0ba;
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.infblock .ornhead { font-size: 18px; margin: 2px 0 10px; }
+
+.infset { margin-bottom: 8px; }
+.infset-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: var(--parchment-3);
+}
+.infset-row .ico {
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid #1f1a12;
+  background-color: #17120c;
+}
+.infset-mid { flex: 1; min-width: 0; }
+.infset-name { font-family: Georgia, serif; font-size: 15px; color: var(--ink); }
+.infset-sub { font-size: 11px; color: var(--ink-soft); }
+/* what of the set is IN the number - green when something is, dim when not */
+.infset-scored {
+  flex: none;
+  max-width: 55%;
+  text-align: right;
+  font-size: 12px;
+  font-weight: bold;
+  color: #2f6b2a;
+}
+.infset-scored.none { color: var(--ink-soft); font-weight: normal; font-style: italic; }
+
+.infnote { font-size: 12px; color: var(--ink-soft); font-style: italic; margin: 4px 2px; }
+.infwarn { font-size: 12px; color: #7a4a12; margin: 4px 2px; }
+
+/* what the set does that is NOT scored: folded, the count is the headline */
+.inf-unscored { font-size: 12px; color: var(--ink-soft); margin: 4px 2px 0; }
+.inf-unscored summary { cursor: pointer; color: #7a4a12; }
+.inf-unscored ul { margin: 4px 0 0 18px; padding: 0; }
+.inf-unscored li { margin: 2px 0; }
+
+/* one line per infused piece: slot, then its bonus line */
+.infpieces {
+  margin: 8px 0 2px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 2px 14px;
+}
+.infpieces .infnote { grid-column: 1 / -1; }
+.infpiece { display: flex; gap: 8px; font-size: 12px; align-items: baseline; }
+.infpiece-slot { flex: none; width: 74px; color: var(--ink-soft); font-family: Georgia, serif; }
+.infpiece-what.lit { color: #2f6b2a; font-weight: bold; }
+.infpiece-what.dark,
+.infpiece-what.blind { color: #8d7a62; font-style: italic; }
+
+/* the editor's search controls / the result's search summary */
+.infsearch { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #d8c6ac; }
+.inflabel { font-family: Georgia, serif; font-size: 13px; color: var(--ink-soft); margin-bottom: 6px; }
+.inforbs { display: flex; flex-wrap: wrap; gap: 8px; }
+.inforb { position: relative; cursor: pointer; }
+.inforb .skillorb { display: flex; align-items: center; justify-content: center; }
+/* "nothing hands out its pattern on this build": worn by an orb's corner and
+   by the line that explains it, like the rune page's dot */
+.inf-nosrc {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #7a3428;
+  border: 1px solid #e8c987;
+  vertical-align: -1px;
+}
+.inforb .inf-nosrc {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .4);
+}
+.infpolicy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.infpolicy select {
+  padding: 4px 6px;
+  font-size: 13px;
+  border: 1px solid #cdb897;
+  border-radius: 6px;
+  background: #fff9f0;
+  color: var(--ink);
+}
+
+/* the infusion a tile's piece carries: its icon in the corner, ringed gold
+   while the piece's bonus line is lit */
+.slot .inf-badge {
+  position: absolute;
+  left: -6px;
+  top: -6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid #6e5a3f;
+  background: #241c12;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  z-index: 2;
+  pointer-events: none;
+}
+.slot .inf-badge .ico { border-radius: 50%; }
+.slot .inf-badge.lit {
+  border-color: var(--gold-bright);
+  box-shadow: 0 0 5px rgba(232, 201, 135, .9);
+}
+/* a piece the catalog withholds: the rim is dashed, the tooltip says why */
+.slot.held { outline-style: dashed; outline-color: #c99a4b; }
+
+/* the item tooltip's infusion block, and a warning line */
+.tooltip .tinf { color: var(--gold-bright); font-family: Georgia, serif; }
+.tooltip .tinf-h { color: #d8c9ad; margin-top: 3px; }
+.tooltip .tinfbonus.off { opacity: .45; }
+.tooltip .twarn { color: #f0a36a; margin-top: 6px; font-size: 12px; }
+
+/* A pinned skill pool's pip (the rune page's gold dot, runes.css) made a
+   control: it says the optimizer keeps this selection, and a click unpins. */
+.pinpip.poolpin { display: inline-block; align-self: center; margin-left: 6px; cursor: pointer; }
+.pinpip.poolpin:hover { background: #fff3c9; }

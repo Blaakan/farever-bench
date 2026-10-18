@@ -173,6 +173,14 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
    * build without Rage Shield gets nothing - and without this it was scored
    * +6% damage and -6% damage taken regardless.
    */
+  // Which node a swing-riding status's own script names as what keeps it from
+  // being spent, by the status's name - read once, off every status row.
+  const keeps = new Map();
+  for (const row of cdb.lines('skill')) {
+    if (!row.props?.status || !row.script) continue;
+    const kept = combat.profile(row.id, 1)?.swingPlay?.keptBy;
+    if (kept) keeps.set(kept, row.texts?.name ?? row.id);
+  }
   function readableValue(skillId, rank = 1, { have = null } = {}) {
     const key = skillId + '@' + rank + (have?.size ? '%' + [...have].sort().join('+') : '');
     let v = valueCache.get(key);
@@ -244,7 +252,63 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     // ...and resource income, which is a value like any other: Seasoned
     // Soldier's Rage per physical critical strike is what pays for a Raging
     // Smash, and the tree printed "nothing readable" beside it.
-    const gains = plan.resourceGainsOf(skillId, { rank });
+    //
+    // ...when the fight can PAY it. A gain whose guard names no event the
+    // fight raises comes back as "when this is cast", and a talent is never
+    // cast: `resolve` drops exactly those, so printing them here told the
+    // player "+15 Spark" beside a node worth nothing in the fight (Spark
+    // Flask pays on a flask use, Life Current on a heal) - and the allocation
+    // tiebreak below then ranked that phantom above nodes with real damage.
+    // They are kept apart, with the reason, and do not make a node readable.
+    //
+    // WHAT THE FIGHT PAYS IS ASKED OF THE FIGHT, not of the event list alone:
+    // `resolve` drops Conduit Residues' gain from the income too, and then
+    // carries it on the conduit gauge (`plan.conduitRefundOf`, the reader
+    // the gauge itself uses). Called unpaid, a node the fight does pay for
+    // printed "nothing" and lost the tiebreak to nodes worth less.
+    const allGains = plan.resourceGainsOf(skillId, { rank });
+    const refund = plan.conduitRefundOf(skillId, rank);
+    const onGauge = (g) => !!refund && g.hook === 'onConduitTriggers' && g.atb === refund.atb;
+    const paid = (g) => g.on === 'time' || (Array.isArray(g.on) ? g.on : [g.on]).some((e) => e !== 'cast') || onGauge(g);
+    const gains = allGains.filter(paid);
+    const unpaidGains = allGains.filter((g) => !paid(g));
+    // In the gain's own words. One the gauge carries is "back on a conduit
+    // trigger"; one nothing pays says which hook it sits in, because "an
+    // event the fight does not raise" is not the reason for a clock: Infinite
+    // Resources counts combat time in onUpdate, and time is something this
+    // fight has - what is missing is a reader for that clock.
+    const rollOf = (g) => ((g.chance ?? 1) < 1 ? `, ${Math.round(g.chance * 100)}% of the time` : '');
+    const gainLabel = (g) => (onGauge(g) ? `+${g.amount} ${g.atb} back on a conduit trigger${rollOf(g)}`
+      : `+${g.amount} ${g.atb}${g.critGated ? ' per crit' : ''}`);
+    const unpaidLabel = (g) => `+${g.amount} ${g.atb} `
+      + (g.hook === 'onUpdate' ? 'on a clock its own script keeps (onUpdate), which this reader does not follow'
+        : g.needsSkill
+          ? `on a use of ${skills.get(g.needsSkill)?.texts?.name ?? `the row ${g.needsSkill}`}, an event this reader does not put on the fight's clock`
+          : `on an event this fight does not raise${g.hook ? ` (${g.hook})` : ''}`);
+    // WHAT THE FIGHT PRICES THROUGH A CHANNEL OF ITS OWN, which is neither an
+    // affix nor an effect nor a modifier and so read "nothing" here while the
+    // damage table beside it carried the node's line:
+    //   * a next-cast register or the Mage chain (`plan.empowermentIds`:
+    //     Surge of Violence, Chaincast, High Voltage, and the nodes that fire
+    //     conduits off the chain);
+    //   * a status the node puts on you whose script plays a damage step on
+    //     your swings (Purging Strikes - a sixth of a Priest's damage, beside
+    //     the word "nothing").
+    //   * a node whose whole effect is to keep such a status from being
+    //     spent - Solar Devotion, named by Sunlight's own script
+    //     (`!hasSkill(Skill.<it>)`), and worth what the fight then plays.
+    const register = plan.empowermentIds(3).has(skillId) ? (plan.empowermentLabel(skillId, 3) ?? 'a next-cast register')
+      : keeps.has(skillId) ? `keeps ${keeps.get(skillId)} from being spent by the swing that plays it` : null;
+    const swingRiders = (statuses.applied ?? [])
+      .filter((a) => a.to === 'Self')
+      .map((a) => ({ status: a.status, prof: combat.profile(a.status, rank) }))
+      .filter((x) => x.prof?.swingPlay)
+      .map((x) => {
+        const stepFx = [...(x.prof.effects ?? []).filter((e) => e.stepId === x.prof.swingPlay.stepId),
+          ...((x.prof.scripted ?? []).find((st) => st.stepId === x.prof.swingPlay.stepId)?.effects ?? [])]
+          .filter((e) => e.kind === 'Damage' && (e.baseVal || e.scaling.length));
+        return stepFx.length ? { status: x.status, on: x.prof.swingPlay.on, effects: stepFx, duration: x.prof.duration } : null;
+      }).filter(Boolean);
     const FIELD = {
       dmgMult: 'damage', critDmgMult: 'crit damage', critChance: 'crit chance',
       armorIgnore: 'armour ignored', magicArmorIgnore: 'magic armour ignored',
@@ -255,31 +319,111 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
     // one-skill shape rides out as a mod so the SHEET can name it as a gap, and
     // counting it here printed "+5% damage" beside the very talent the sheet
     // was simultaneously calling "rider not read" - two commands, opposite
-    // claims, same tree. Venomous Finisher is the row: its rider is
-    // `vars.damage * target.getStatusCount(...)`, and the flat first term is
-    // exactly what this label used to print.
+    // claims, same tree. Venomous Finisher was the row, on the accepted
+    // build: its rider was `vars.damage * target.getStatusCount(...)`, and the
+    // flat first term is exactly what this label used to print. (Build
+    // 25782799 re-scripted it as Venomous Assassin, and no node has the shape
+    // today; the filter stays for the next one that does.)
     const readMods = mods.filter((m) => m.scope !== 'one-skill-per-count');
+    // WHICH status the target has to be wearing is the guard's own word. The
+    // flag is called targetBleeding because the Warrior tree got there first;
+    // Finish the Job's guard says Poison, and it printed "vs bleeding".
+    const vsTarget = (m) => (!m.targetBleeding ? ''
+      : !m.targetType || /^(?:Bleed|Hemorage)$/.test(m.targetType) ? ' vs bleeding'
+        : ` vs ${m.targetType}-afflicted`);
+    // ...and a health-gated rider says its affinity and its line (Bullying
+    // the Weak: one clause for Magic hits, another for Physical ones).
+    const vsHealth = (m) => (m.targetHealth
+      ? `${m.affinity ? ` (${m.affinity})` : ''} at ${m.targetHealth.op} ${+(m.targetHealth.threshold * 100).toFixed(2)}% target health`
+      : '');
+    // A heal share of ONE NAMED ROW's damage names the row: "of it healed
+    // back one-skill" says neither what "it" is nor which skill.
+    const healOf = (m) => (m.field === 'healShare' && m.scope === 'one-skill' && m.skill
+      ? `${Math.round(m.amount * 100)}% of ${cdb.byId('skill').get(m.skill)?.texts?.name ?? m.skill}'s damage healed back` : null);
     const modLabel = readMods.length
-      ? [...new Set(readMods.map((m) => `${m.amount > 0 ? '+' : ''}${Math.round(m.amount * 100)}% `
+      ? [...new Set(readMods.map((m) => healOf(m) ?? (`${m.amount > 0 ? '+' : ''}${Math.round(m.amount * 100)}% `
         + `${FIELD[m.field] ?? m.field} ${SCOPE[m.scope] ?? m.scope}`.trim()
-        + (m.targetBleeding ? ' vs bleeding' : '')))].join(', ')
+        + vsTarget(m) + vsHealth(m))))].join(', ')
       : '';
+    // WHAT THE FIGHT PLAYS FOR THIS NODE that is none of the above: a status
+    // on a named event (a dose gate, another skill's cast, another status's
+    // application), a rider on a status's own hits, a bank, cooldown handed
+    // to a named skill. The fight scores all of these since build 25782799
+    // rebuilt the Rogue tree out of them, and the tree printed "nothing" for
+    // seventeen of its twenty-two nodes while it did. The descriptors are the
+    // plan's own (`hitHooksOf`), so the two cannot drift apart.
+    const pct = (x) => `${+(x * 100).toFixed(2)}%`;
+    const evented = statuses.dots.filter((d) => !d.pool
+      && ['dose-gate', 'cast-of', 'apply-of'].includes(d.trigger?.on));
+    const hooks = plan.hitHooksOf(skillId, rank).filter((h) => h.kind !== 'companion');
+    const gifts = plan.cooldownGiftsOf(skillId, rank);
+    const fightLabels = [
+      ...evented.map((d) => (d.trigger.on === 'dose-gate'
+        ? `${d.name} at ${d.trigger.gate.need} doses`
+          + (hooks.some((h) => h.kind === 'reapply' && h.status === d.status) ? ', a direct hit when re-applied' : '')
+        : `${d.name} ${d.trigger.why}`)),
+      ...hooks.filter((h) => h.kind !== 'reapply' || !evented.some((d) => d.status === h.status)).map((h) => (
+        h.kind === 'reapply' ? `a direct hit when ${h.statusName} is re-applied`
+          : h.kind === 'step-rider' ? `+${pct(h.amount)} ${FIELD[h.field] ?? h.field} on ${h.statusName}'s direct hit`
+            : h.kind === 'stack-rider' ? `+${pct(h.per)} ${h.statusName} damage per stack of ${h.counterName} (${h.cap})`
+              : h.kind === 'cooldown' ? `${pct(h.chance)} per ${h.statusName} hit: ${h.seconds}s off weapon skills`
+                : h.kind === 'per-typed' ? `+${pct(h.amount)} periodic damage per ${h.statusType} on the target`
+                  : `+${pct(h.per)} combo finisher damage per ${h.feedName ?? h.feedType} applied (${h.cap})`)),
+      ...gifts.map((g) => (g.call === 'resetCooldown' ? `resets ${g.targetName}` : `${g.seconds}s off ${g.targetName}`)
+        + (g.events.includes('combo') && g.events.includes('attack') ? ' per attack or combo finisher'
+          : g.events.includes('combo') ? ' per combo finisher' : g.events.includes('attack') ? ' per attack' : '')
+        + (g.critGated ? ' that crits' : '') + (g.chance < 1 ? `, ${pct(g.chance)} of the time` : '')),
+    ];
+    // A step whose every play site is a hook the fight never raises (a kill,
+    // a block) is DECLARED - the tree still says so - and is not something a
+    // point can buy in this fight, so the walk's tiebreak must not chase it:
+    // it spent four points reaching Toxic Miasmas, whose Area plays on a kill.
+    const unraised = new Set((prof?.scripted?.length
+      ? plan.scriptedRiders(skillId, prof, { rank, talents: have }).refused : [])
+      .filter((r) => r.cause === 'unraised-hook').map((r) => r.step));
+    const inert = (st) => unraised.has(st.stepId) || plan.stepIsDead(skillId, st.stepId);
     // What this node WOULD have given if another one were taken. Kept out of
     // `readable` - it is worth nothing in this build - but carried so the
     // output can say why rather than printing a blank beside a node whose text
     // plainly promises something.
     const needs = statuses.unmetDeps ?? [];
+    // What a pool banks AS is its own status's type - the first one the game
+    // flags as a DoT - and whose crits feed it is the guard's scope. Virulent
+    // Contamination pools weapon-skill crits as a Poison; it read "80% of its
+    // crits as a bleed".
+    const poolAs = (d) => {
+      const t = (d.types ?? []).find((x) => !/^(?:Buff|Debuff)$/.test(x)) ?? 'Bleed';
+      return /^(?:Bleed|Hemorage)$/.test(t) ? 'a bleed' : `${/^[AEIOU]/.test(t) ? 'an' : 'a'} ${t.toLowerCase()}`;
+    };
+    const riderLabel = swingRiders.length
+      ? `an extra hit on your ${swingRiders[0].on === 'combo' ? 'finishers' : swingRiders[0].on === 'attack' ? 'swings' : 'swings and finishers'} `
+        + `for ${swingRiders[0].duration}s (${swingRiders[0].effects.flatMap((e) => e.scaling.map((s) => `${s.ratio} x ${s.atb}`)).join(' + ') || 'a flat amount'})`
+      : '';
     v = {
-      affixes, buffs, effects, granted, dots, mods, gains, needs,
+      affixes, buffs, effects, granted, dots, mods, gains, needs, unpaidGains, register, swingRiders,
+      // The fight-played shapes, and the effects a point can actually buy.
+      fight: { evented, hooks, gifts },
+      liveEffects: [
+        ...(prof?.effects ?? []),
+        ...(prof?.scripted ?? []).filter((st) => !inert(st)).flatMap((st) => st.effects),
+        ...granted.flatMap((g) => stepEffects(combat.profile(g, 3))),
+      ],
       readable: affixes.length > 0 || buffs.length > 0 || effects.length > 0
-        || dots.length > 0 || readMods.length > 0 || gains.length > 0,
+        || dots.length > 0 || readMods.length > 0 || gains.length > 0 || fightLabels.length > 0
+        || !!register || swingRiders.length > 0,
       kind: affixes.length ? 'affix' : buffs.length ? 'status'
         : dots.length ? `${Math.round(dots[0].pool.fraction * 100)}% of `
           + `${dots[0].pool.magic ? 'magic' : dots[0].pool.physical ? 'physical' : 'its'} `
-          + `${dots[0].pool.crit ? 'crits' : 'damage'} as a bleed`
-          : modLabel || (gains.length ? gains.map((g) => `+${g.amount} ${g.atb}${g.critGated ? ' per crit' : ''}`).join(', ') : '')
+          + `${dots[0].pool.weaponSkill ? 'weapon-skill ' : ''}`
+          + `${dots[0].pool.crit ? 'crits' : 'damage'} as ${poolAs(dots[0])}`
+          : [modLabel, ...fightLabels].filter(Boolean).join(', ')
+            || (gains.length ? gains.map(gainLabel).join(', ') : '')
             || (granted.length && effects.length ? 'grants a skill' : effects.length ? 'effect' : '')
-            || (needs.length ? `nothing without ${needs[0].needsName}` : 'none'),
+            || register || riderLabel
+            || (needs.length ? `nothing without ${needs[0].needsName}` : '')
+            || (unpaidGains.length
+              ? `nothing this fight pays: ${unpaidGains.map(unpaidLabel).join(', ')}`
+              : 'none'),
       // `props.talent.maxPoints` caps how many points a node takes. It is 2 on
       // 48 of the 88 nodes - every tier-2, and two thirds of tier 3 - so "one
       // point per node" was wrong for more than half the tree.
@@ -356,6 +500,12 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
    * in order so thresholds are satisfiable, and stops when it runs out of
    * points OR out of readable nodes - it does NOT spend the remainder on nodes
    * it cannot value, because that would be inventing a recommendation.
+   *
+   * It does buy a GATE point in such a node, toward readable value above it
+   * in the branch (`promise` below) - before it can know whether the budget
+   * reaches that value. Where it does not, the point bought nothing: the
+   * search takes those back from the ranks it finally keeps (optimize.mjs,
+   * "points that bought nothing are handed back").
    */
   function suggest(unitId, { level, points = null, granted = new Set(), value = null } = {}) {
     const tree = treeFor(unitId);
@@ -385,10 +535,33 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       let w = 0;
       for (const a of v.affixes) w += Math.abs(a.val ?? 0);
       for (const b of v.buffs) for (const a of b.affixes) w += Math.abs(a.val ?? 0) * (b.stacks ?? 1);
-      for (const e of v.effects) w += Math.abs(e.baseVal ?? 0) + e.scaling.reduce((s, x) => s + Math.abs(x.ratio) * 50, 0);
+      // Only the effects something in this fight can play: a step whose every
+      // call site waits for a kill is declared and is not buyable here.
+      for (const e of (v.liveEffects ?? v.effects)) w += Math.abs(e.baseVal ?? 0) + e.scaling.reduce((s, x) => s + Math.abs(x.ratio) * 50, 0);
       for (const m of v.mods) w += Math.abs(m.amount ?? 0) * 50;
       for (const d of v.dots) w += Math.abs(d.pool?.fraction ?? 0) * 50;
       for (const g of v.gains) w += Math.abs(g.amount ?? 0) * 5;
+      // ...and what the fight plays off a status's hits, on the same rough
+      // scale (a coefficient of 0.2 counts 10): a status on a named event at
+      // its own coefficients, a rider at its amount, a counter or a bank at
+      // its cap. A tiebreak, like the rest of this.
+      for (const d of v.fight?.evented ?? []) {
+        for (const e of d.prof?.effects ?? []) w += e.scaling.reduce((s, x) => s + Math.abs(x.ratio) * 50, 0) * 0.25;
+      }
+      for (const h of v.fight?.hooks ?? []) {
+        w += (h.kind === 'step-rider' || h.kind === 'per-typed' ? h.amount
+          : h.kind === 'stack-rider' || h.kind === 'combo-bank' ? h.per * h.cap
+            : h.kind === 'cooldown' ? h.chance * h.seconds : 0.2) * 50;
+      }
+      // Cooldown handed to a named skill is worth the casts it buys, so it
+      // weighs something only where a press of that skill is scored as the
+      // row stands - this walk knows no runes - and then thinned by its
+      // roll. Any weight above zero is bought before a gate point toward a
+      // better node, and Prosecutor's seconds off Judgment were: two points
+      // the walk used to put in Authority, for a node the fight scores at
+      // nothing unless a rune makes Judgment a cast. The fight says so by
+      // name when the node is held (`resolve`, the cooldown mutations).
+      for (const g of v.fight?.gifts ?? []) if (g.pressed) w += g.chance * (g.seconds ?? 1) * 10;
       return w;
     };
     // `value(nodeId, rank, ranksSoFar)` lets a caller rank a point by the real
@@ -624,6 +797,32 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       const g = gains[gains.length - 1];
       what.push(`+${g.amount} ${g.atb}`);
     }
+    // A status the row's script applies only behind this rune, where the
+    // status reader keeps it and the fight therefore prices it. Spirited
+    // Disciple was the case: +5 to both masteries on the presses that release
+    // three prayers at once, in the number, beside "nothing this model can
+    // read" in this column.
+    for (const b of plan.runeStatusesOf(skillId, runeId, { rank: 3 })) {
+      const need = b.trigger?.readyPrayers;
+      const said = `applies ${b.name}`
+        + (need ? ` on a press that finds ${need.op === '==' ? 'exactly' : need.op} ${need.n} prayer${need.n === 1 ? '' : 's'} ready` : '');
+      // Two statuses under one name (a buff and the dot beside it) are one line.
+      if (!what.includes(said)) what.push(said);
+    }
+    // ...and a status the rune has the row's script EXTEND on an event the
+    // fight raises itself (`extendOn`, skills.mjs: Mystic Continuum, half a
+    // second on Mystic Empowerment each time a weapon skill gets a charge
+    // back). The fight plays it - the search slots the rune for it - and the
+    // column said "nothing this model can read" beside the pick.
+    {
+      const held = (runes) => { const st = plan.statusesOf(skillId, { rank: 3, runes }); return [...st.self, ...st.onTarget]; };
+      const bare = held(new Set());
+      for (const b of held(new Set([runeId]))) {
+        if (!b.extendOn || bare.find((x) => x.status === b.status)?.extendOn) continue;
+        const said = `extends ${b.name} by ${b.extendOn.amount}s each time a weapon skill gets a charge back`;
+        if (!what.includes(said)) what.push(said);
+      }
+    }
     return what;
   }
 
@@ -753,7 +952,9 @@ export function buildTalentPlan(cdb, ctx, cat, combat, plan) {
       const from = slot.id === 'Slot_Weapon2' && chosen?.length ? chosen : item.skills;
       for (const id of from ?? []) push(id);
       for (const s of cat.inherited(item.type, (t) => t?.skills) ?? []) push(s.skill ?? s.ref);
-      for (const type of cat.socketsFor(item)) {
+      // ...except that the arsenal's sockets hand out no skill at all
+      // (catalog.mjs socketGrantsSkills).
+      for (const type of cat.socketGrantsSkills(slot.id) ? cat.socketsFor(item) : []) {
         const augId = loadout.augments?.[`${slot.id}/${type}`];
         for (const id of (augId ? cat.itemById.get(augId)?.skills : null) ?? []) push(id);
       }

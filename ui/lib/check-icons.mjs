@@ -22,12 +22,14 @@ import { parseDds } from './dds.mjs';
 import { decodeBc7 } from './bc7.mjs';
 import { encodePng } from './png.mjs';
 import { openPak } from './pak.mjs';
+import { requireGame } from '../../src/lib/game.mjs';
 
-// The install to read: named on the command line, else the one the engine
-// finds the same way every other tool here does.
-const GAME = process.argv[2] ?? null;
-const OUT = join(tmpdir(), 'farever-bench-checks') +
-            '03ac7b29-54a5-4bd9-91f4-206ef2a78fbc/scratchpad/icon-check';
+// The install to read: named on the command line (a bare path, or --game
+// <path>), else the one the engine finds the same way every other tool here
+// does.
+const GAME = process.argv[2] && !process.argv[2].startsWith('--')
+  ? process.argv[2] : requireGame();
+const OUT = join(tmpdir(), 'farever-bench-checks', 'icon-check');
 const PORTRAIT = 'UI/Portraits/Items/AugmentDemon/' +
                  'Items_Loot_GearAccessory_GearUpgrade_APToCrit_01.prefab.png';
 const CELL = 64, COLS = 32;

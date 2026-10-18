@@ -14,6 +14,25 @@
 // An augment key is `<slot>/<augmentType>`, because legality is per host item:
 // the same AugmentJeweller gem is a different decision on your neck than on
 // either finger.
+//
+// A gear entry describes an INSTANCE, so beside `item` it may carry what the
+// instance rolled or was given:
+//
+//   rarity        a weapon's rolled rarity id (gear keeps its row's)
+//   stars         upgrade level
+//   level         the level this copy dropped at
+//   flawless      the Flawless item flag
+//   infusion      the InfusionPassive skill id infused into it, e.g.
+//                 "Infusion_Bee_DPS" (st.item.Gear.infusion)
+//   infusionStat  the attribute id its infusion bonus rolled, e.g.
+//                 "CritChanceRating" (st.item.Gear.infusionBonusStat); absent
+//                 means not known, and then no bonus is priced
+//   prismatic     true when the piece carries the Prismatic item flag, which
+//                 lights the bonus whatever the infusion's faction
+//
+// The last three are ONE spelling everywhere - loadout, --json, the dump and
+// snapshot importers, the pin grammar - and the game's own field name
+// `infusionBonusStat` is accepted on the way in.
 // ---------------------------------------------------------------------------
 
 import { computeSheet } from './model.mjs';
@@ -55,6 +74,65 @@ export function illegalReason(cat, loadout) {
   return null;
 }
 
+// An infusion on something the game will not infuse, or one that is not an
+// infusion at all. Kept apart from `illegalReason` on purpose: that one is
+// what `pruneIllegal` consults before deleting the offhand, and an infusion
+// problem is no reason to take a shield off.
+//
+// Only what the GAME refuses is refused here ($HInfusion.canBeInfused@21689).
+// A bonus stat outside the pool this bench computes is NOT: a real looted
+// piece carries whatever the server rolled, getInfusionBonusAffix@9767 pays
+// any stat an InfusionBonus row names, and a character ingested from a dump
+// must stay scorable - the engine names it as a gap instead.
+export function infusionIllegalReason(cat, loadout) {
+  for (const slot of cat.combatSlots()) {
+    const g = loadout.gear[slot.id];
+    if (!g?.item || !g.infusion) continue;
+    const item = cat.itemById.get(g.item);
+    if (!item) continue;                      // evaluate() names the missing item
+    if (!cat.infusions.has(g.infusion)) {
+      return `${g.infusion} (on ${slot.id}) is not an infusion - no InfusionPattern item names it. `
+        + `Known: ${[...cat.infusions.keys()].join(', ') || 'none on this build'}`;
+    }
+    const why = cat.whyNotInfusable(item);
+    if (why) return `${slot.id} cannot carry ${cat.infusions.get(g.infusion).name}: ${why}`;
+  }
+  return null;
+}
+
+/**
+ * The infusion sets a build wears: one entry per distinct infusion, with how
+ * many equipped pieces carry it and the rank that count reaches.
+ *
+ * Counted the way ent.Hero.refreshInfusions@7739 counts (ops 5-52): one per
+ * equipped Gear instance whose `infusion` is set, keyed by the infusion id -
+ * so two infusions never add up to one set, and a piece between two caps adds
+ * nothing. `rank` is $HInfusion.getRankFromStacks@21691; `nextCap` is the
+ * piece count the next rank needs, or null at the top.
+ *
+ * THIS RANK IS ITS OWN NAMESPACE. It is not `--rank` (weapon mastery, 1-3 per
+ * weapon skill) and not a talent's points; every `minRank`/`rank >= N` on an
+ * InfusionPassive row is answered with this number and no other.
+ */
+export function infusionSets(cat, loadout) {
+  const by = new Map();
+  for (const slot of cat.combatSlots()) {
+    const g = loadout.gear[slot.id];
+    if (!g?.item || !g.infusion) continue;
+    let e = by.get(g.infusion);
+    if (!e) {
+      const inf = cat.infusions.get(g.infusion);
+      by.set(g.infusion, e = { id: g.infusion, name: inf?.name ?? g.infusion, faction: inf?.faction ?? null, pieces: 0, slots: [] });
+    }
+    e.pieces++;
+    e.slots.push(slot.id);
+  }
+  const caps = cat.infusionCaps ?? [];
+  return [...by.values()]
+    .map((e) => ({ ...e, rank: cat.infusionRank(e.pieces), nextCap: caps.find((c) => c > e.pieces) ?? null }))
+    .sort((a, b) => b.pieces - a.pieces || a.id.localeCompare(b.id));
+}
+
 // Drop anything the handedness rule forbids. Used by the search, which changes
 // the mainhand constantly and must not leave an illegal shield behind.
 export function pruneIllegal(cat, loadout) {
@@ -91,7 +169,7 @@ export function evaluate(cat, loadout, {
 
   const opts = { aptitude: cls.aptitude, charLevel: loadout.level, armorReduction };
 
-  const bad = illegalReason(cat, loadout);
+  const bad = illegalReason(cat, loadout) ?? infusionIllegalReason(cat, loadout);
   if (bad) throw new Error(`loadout: ${bad}`);
 
   for (const slot of cat.combatSlots()) {
@@ -105,9 +183,10 @@ export function evaluate(cat, loadout, {
     if (!cat.usableBy(item, cls.aptitude)) {
       throw new Error(`loadout: ${cls.unit} cannot use ${item.id} (needs ${item.aptitudes.join('/')})`);
     }
-    const rarity = g.rarity ?? item.rarity;
+    // A weapon's rolled rarity; a gear piece's own row's - see instanceRarity.
+    const rarity = cat.instanceRarity(item, g);
     const stars = Math.min(g.stars ?? 0, cat.maxStars(item, rarity));
-    // What is SOCKETED into this piece, because Gear.getILevel@8123 adds every
+    // What is SOCKETED into this piece, because Gear.getILevel@9760 adds every
     // socketed item's own iLevel to the host's gear level - so an Epic
     // Corrupted Gift (iLevel 10) is worth a whole effective level of stats on
     // top of the affixes it swaps. The sockets have to be resolved BEFORE the
@@ -123,6 +202,10 @@ export function evaluate(cat, loadout, {
       // Which of an item's generic aptitudes this instance rolled. Only craft
       // jewellery names more than one; everything else ignores it.
       generic: g.generic ?? null,
+      // The infusion bonus line - `contribute` pays it only while it is lit
+      // (catalog.infusionBonusActive). It rides the INSTANCE's item level, so
+      // it has to see the same stars/level/sockets the bake does.
+      infusion: g.infusion ?? null, infusionStat: g.infusionStat ?? null, prismatic: !!g.prismatic,
     }, mods);
   }
 
@@ -157,60 +240,6 @@ export function evaluate(cat, loadout, {
   return { sheet, mods, cls, armorReduction };
 }
 
-/**
- * The standing, weaponless, floored primaries - the basis a TRINKET-granted
- * status tick reads. Live, Trinket_Demon_Status pays a constant 45.00 per tick
- * in Emsey's snapshot state, and 45.00 = 0.2 x 225 where 225 is exactly
- * floor(each base primary) + the flat primary affixes of every NON-WEAPON
- * piece (138 + 87) - not the combat sheet (whose four-primary sum is 294 and
- * would tick 59), and not any weapon-mixed variant. 2,407 capture rows sit on
- * the integer. The mechanism behind the weapon exclusion was not isolated in
- * the client; the basis is stated here as measured, and a second wearer with
- * primary affixes on more attributes would discriminate the near-miss
- * decompositions (rounded-base + Dex-only lands on the same 225 for this one
- * build).
- */
-export function standingPrimaries(cat, loadout, { baseStatsFor, primaries }) {
-  const cls = classOf(cat, loadout);
-  const armorReduction = cat.armorReductionFor(cls.aptitude);
-  const mods = { flat: new Map(), addRatio: new Map(), mulRatio: new Map() };
-  const opts = { aptitude: cls.aptitude, charLevel: loadout.level, armorReduction };
-  const WEAPON = new Set(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_OffhandWeapon']);
-  for (const slot of cat.combatSlots()) {
-    if (WEAPON.has(slot.id)) continue;
-    const g = loadout.gear[slot.id];
-    if (!g?.item) continue;
-    const item = cat.itemById.get(g.item);
-    if (!item) continue;
-    const rarity = g.rarity ?? item.rarity;
-    const stars = Math.min(g.stars ?? 0, cat.maxStars(item, rarity));
-    const socketed = [];
-    for (const type of cat.socketsFor(item)) {
-      const augId = loadout.augments?.[`${slot.id}/${type}`];
-      if (augId) socketed.push(augId);
-    }
-    cat.contribute(item, slot.id, {
-      ...opts, stars, rarity, flawless: !!g.flawless, level: g.level ?? null, socketed,
-      generic: g.generic ?? null,
-    }, mods);
-  }
-  for (const sock of socketsOf(cat, loadout)) {
-    if (WEAPON.has(sock.slot)) continue;
-    const augId = loadout.augments[sock.key];
-    if (!augId) continue;
-    const aug = cat.itemById.get(augId);
-    if (!aug) continue;
-    const af = cat.slotById.get(sock.slot)?.affixFactor ?? 1;
-    cat.applyAffixes(aug.affixes, mods, af, af !== 1);
-  }
-  const base = baseStatsFor(cls.unit, loadout.level);
-  const out = new Map();
-  for (const atb of primaries) {
-    out.set(atb, Math.floor(base.get(atb) ?? 0) + (mods.flat.get(atb) ?? 0));
-  }
-  return out;
-}
-
 // Every skill id this build touches, with where it came from. Used for
 // reporting and for the coverage manifest; the rotation itself is built by
 // skills.mjs, which knows which of these you actually get to press.
@@ -239,6 +268,9 @@ export function skillsOf(cat, loadout) {
   }
 
   for (const sock of socketsOf(cat, loadout)) {
+    // The arsenal weapon's sockets hand out no skill (catalog.mjs
+    // socketGrantsSkills).
+    if (!cat.socketGrantsSkills(sock.slot)) continue;
     const augId = loadout.augments[sock.key];
     const aug = augId ? cat.itemById.get(augId) : null;
     for (const s of aug?.skills ?? []) add(s, sock.key);

@@ -2,22 +2,24 @@
 // model.mjs - the stat engine.
 //
 // Everything here was read out of the game's own compiled code (hlboot.dat
-// ships HashLink bytecode v4 with full debug info), not inferred from the
-// shape of the data. Each formula carries the function index and source line
-// it came from, so a future patch can be re-checked against the same place.
+// ships HashLink bytecode - v6 since build 25782799, v4 before - with full
+// debug info), not inferred from the shape of the data. Each formula carries
+// the function it came from as `name@findex`, the form `bench update` scans
+// and re-anchors, and its source line, so a future patch can be re-checked
+// against the same place.
 //
 // The four load-bearing facts:
 //
 //   1. One function drives every stat curve in the game
-//      (HAttributes.field#6, @src/const/HAttributes.hx:15-24):
+//      ($HAttributes.getAtbLevelScaling@21639, src/const/HAttributes.hx:15-24):
 //
 //         budget(L, min, max) = min * (max/min) ^ ((L-1) / (EarlyMaxLevel-1))
 //
 //      with EarlyMaxLevel = 50, taken from the `constant` sheet - never
 //      hardcoded, because the level cap is 25 today and will move.
 //
-//   2. Rating -> percent (ent.Unit.getAtbScaling, findex 4801,
-//      @src/ent/Unit.hx:1383):
+//   2. Rating -> percent (ent.Unit.getAtbScaling@4880,
+//      src/ent/Unit.hx:1398):
 //
 //         contribution = (rating / budget(L, min, max)) * target
 //
@@ -30,8 +32,9 @@
 //      level gained.
 //
 //   3. Armor and MagicArmor bypass their authored start/end entirely. The
-//      same function hardcodes those two attribute indices and returns the
-//      algebraic inverse of the mitigation formula instead (field#5):
+//      same function hardcodes those two attribute indices (ops 8-15) and
+//      returns the algebraic inverse of the mitigation formula instead
+//      ($HAttributes.getResistanceLevelScaling@21638):
 //
 //         resistFor(L, red) = red * (a + b*L) / (1 - red)
 //
@@ -41,7 +44,7 @@
 //      not as a number. Interpolating the authored Armor columns instead is
 //      wrong at every level except 1 and 50.
 //
-//   4. Composition (ent.Unit.atb, findex 4796):
+//   4. Composition (ent.Unit.atb@4875, src/ent/Unit.hx:1344):
 //
 //         atb = (stored + scaling + flat) * (modAdd * modMul)
 //
@@ -54,9 +57,9 @@ export const STAT_GROUPS = ['primary', 'vitality', 'armor', 'ratings'];
 
 // --- the universal curve ---------------------------------------------------
 
-// HAttributes.field#6. Returns 0 for the degenerate row the game also guards
-// against (min ~ 0 with max 0), so an unauthored budget contributes nothing
-// rather than producing NaN.
+// $HAttributes.getAtbLevelScaling@21639. Returns 0 for the degenerate row the
+// game also guards against (min ~ 0 with max 0, ops 16-21), so an unauthored
+// budget contributes nothing rather than producing NaN.
 export function budget(level, min, max, maxLevel) {
   if (min == null || max == null) return 0;
   if (Math.abs(min) < 1e-10 && max === 0) return 0;
@@ -65,15 +68,15 @@ export function budget(level, min, max, maxLevel) {
   return min * Math.pow(step, level - 1);
 }
 
-// HAttributes.field#5 - the inverse of the mitigation curve, used as the
-// Armor/MagicArmor budget.
+// $HAttributes.getResistanceLevelScaling@21638 - the inverse of the mitigation
+// curve, used as the Armor/MagicArmor budget.
 export function resistForReduction(level, red, [a, b]) {
   if (!(red > 0) || red >= 1) return 0;
   return (red * (a + b * level)) / (1 - red);
 }
 
-// ent.GameObject.getAffinityDamageReduction (findex 4510,
-// @src/ent/GameObject.hx:748-802). Note the level is the ATTACKER's, the flat
+// ent.GameObject.getAffinityDamageReduction@4582
+// (src/ent/GameObject.hx:862-916). Note the level is the ATTACKER's, the flat
 // affinity reductions are added to the resulting fraction rather than to the
 // resist pool, and the result is floored at 0 but never capped at 1.
 //
@@ -206,8 +209,8 @@ export function buildAffixRules(cdb) {
   };
 
   /** Fold one multiplicative value into whatever is already there. */
-  // MRatio and MRatioMin are TWO channels, not one fold: atbValModMul@4795
-  // ops 36-48 aggregate kind 2 (product, from 1) and kind 3 (min, from 1)
+  // MRatio and MRatioMin are TWO channels, not one fold: atbValModMul@4874
+  // ops 36-46 aggregate kind 2 (product, from 1) and kind 3 (min, from 1)
   // separately and MULTIPLY the two results. One order-dependent accumulator
   // gets a mixed chain wrong - MRatio 1.2 then MRatioMin 0.5 is 0.6 in the
   // game and was 0.5 here. Every MRatioMin row today targets MoveSpeedFactor,
@@ -248,6 +251,46 @@ export function buildAffixRules(cdb) {
 
 // --- constants -------------------------------------------------------------
 
+// The four numbers the Infusion system runs on, each named by its reader on
+// build 25782799:
+//
+//   Item_InfusionMinRarity  $HInfusion.canBeInfused@21689 ops 12-21
+//                           `inf.rarity.index >= Item_InfusionMinRarity.index`
+//   Item_InfusionCaps       $HInfusion.getRankFromStacks@21691 ops 4-23
+//                           rank = how many caps the piece count reaches
+//   Item_InfusionBonusRatio st.item.Gear.getInfusionBonusAffix@9767 ops 35-40
+//                           round(ratio x computeAtbScaling(...))
+//   Item_PrismaticChance    ent.Hero.makeLootItem@7953 ops 454-463: once a
+//                           looted piece that can be infused has its bonus
+//                           stat, rollLuck@8178 rolls this for the Prismatic
+//                           flag. A LOOT roll, so nothing here prices it; it
+//                           has one reader - the audit entry on the bonus
+//                           line (engine.mjs), which says what a Prismatic
+//                           piece is and how often one drops.
+//
+// Read TOLERANTLY, unlike every other constant: a data.cdb from before the
+// update has none of them, and that is "this build has no Infusion", not "the
+// game changed shape". `present` is what every consumer asks first.
+function loadInfusionConstants(cdb) {
+  const ids = ['Item_InfusionMinRarity', 'Item_InfusionCaps', 'Item_InfusionBonusRatio', 'Item_PrismaticChance'];
+  if (!ids.slice(0, 3).every((id) => cdb.has('constant', id))) {
+    return { present: false, minRarity: null, caps: [], bonusRatio: 0, prismaticChance: 0 };
+  }
+  const minRarity = cdb.constant('Item_InfusionMinRarity')?.other?.rarity ?? null;
+  if (!minRarity || !cdb.has('rarity', minRarity)) {
+    throw new Error('constant Item_InfusionMinRarity names no rarity row - the game changed shape');
+  }
+  return {
+    present: true,
+    minRarity,
+    // Ascending, because the rank is a COUNT of caps reached and the rule the
+    // output prints ("2 more for the next rank") reads them in order.
+    caps: cdb.constantFloats('Item_InfusionCaps').slice().sort((a, b) => a - b),
+    bonusRatio: cdb.constant('Item_InfusionBonusRatio'),
+    prismaticChance: cdb.has('constant', 'Item_PrismaticChance') ? cdb.constant('Item_PrismaticChance') : 0,
+  };
+}
+
 export function loadConstants(cdb) {
   return {
     maxLevel: cdb.constant('MaxLevel'),
@@ -258,6 +301,7 @@ export function loadConstants(cdb) {
     resistFormula: cdb.constantFloats('ResistanceScalableReductionFormula'),
     gearUpgradeILevelBonus: cdb.constant('Item_GearUpgradeILevelBonus'),
     flawlessILevelBonus: cdb.constant('Item_FlawlessILevelBonus'),
+    infusion: loadInfusionConstants(cdb),
     skillRecoveryTime: cdb.constant('Skill_RecoveryTime'),
     attacksRecoveryRatio: cdb.constant('Attacks_RecoveryRatio'),
     comboWindow: cdb.constant('ComboWindow'),

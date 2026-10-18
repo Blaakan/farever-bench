@@ -13,6 +13,8 @@
 //   App.bindTip(el, source)        -> game-style tooltip on hover
 //   App.setGear / setAugment / setSkills / setRune / setTalent / setClass /
 //   App.setLevel / clearSlot       -> loadout mutations (all mark pins)
+//   App.setOption(key, value)      -> one of App.state.options
+//   App.unpinSkills(poolKey)       -> hand a skill pool back to the optimizer
 //   App.api(path, body?)           -> fetch JSON (POST when body given)
 //   App.toast(msg, isError)
 // ---------------------------------------------------------------------------
@@ -28,15 +30,28 @@ const App = window.App = {
     level: 25,
     name: 'Bencher',
     loadout: null,      // engine-shaped loadout JSON
+    // `infusions` holds the slots whose INFUSION is the user's own statement
+    // - "this one" or "none" - as `gear` holds the slots whose piece is. They
+    // are two sets because they are two decisions: equipping a chest says
+    // which chest, and the search may still be left to say what to infuse it
+    // with (the CLI's rule for a pin without a `~` part).
     pins: { gear: new Set(), augments: new Set(), skills: new Set(),
-            runes: new Set(), talents: false },
+            runes: new Set(), talents: false, infusions: new Set() },
     // targetHealth is the fraction of its health the target stands at, and it
     // rides every /api/sheet and /api/optimize call from here. There is no
     // control for it yet because there is no control for `target` or `targets`
-    // either - this object is a fixed default and nothing in the page edits it.
+    // either - most of this object is a fixed default the page never edits.
     // The field is wired end to end regardless, so the API can drive it.
+    //
+    // The two the page DOES edit are the infusion search's (the Infusions
+    // block of the profile view): which infusions the optimizer may hand out
+    // - "learnable" is every one the install does not show to be unobtainable,
+    // or an explicit list of ids - and what the bonus roll of a piece nobody
+    // owns is taken to be ("none" prices no bonus line at all). The sheet
+    // ignores both; they ride its requests like the rest.
     options: { target: 'boss', targetLevel: null, fight: 200, targets: 1,
-               targetHealth: 1, lookahead: 0, rank: 3, mix: 0.5, goal: 'dps' },
+               targetHealth: 1, lookahead: 0, rank: 3, mix: 0.5, goal: 'dps',
+               infusions: 'learnable', infusionStat: 'none' },
   },
   views: new Map(),
 };
@@ -181,7 +196,7 @@ App.setClass = async (cls) => {
   App.state.cls = cls;
   App.state.loadout = emptyLoadout();
   App.state.pins = { gear: new Set(), augments: new Set(), skills: new Set(),
-                     runes: new Set(), talents: false };
+                     runes: new Set(), talents: false, infusions: new Set() };
   App.result = null;
   await App.loadCatalog();
   touch();
@@ -194,10 +209,15 @@ App.setLevel = async (level) => {
   touch();
 };
 
-App.setGear = (slotId, entry) => {
+// `infusionPinned`: the entry's infusion - or its having none - is the user's
+// own choice and the optimizer keeps it. Left false, the piece is pinned and
+// its infusion is the search's to decide.
+App.setGear = (slotId, entry, { infusionPinned = false } = {}) => {
   const l = App.state.loadout;
   if (entry) l.gear[slotId] = entry; else delete l.gear[slotId];
   App.state.pins.gear.add(slotId);
+  if (entry && infusionPinned) App.state.pins.infusions.add(slotId);
+  else App.state.pins.infusions.delete(slotId);
   // dropping a mainhand that allowed an offhand invalidates the offhand
   if (slotId === 'Slot_Weapon1') {
     const mh = entry && App.findItem('Slot_Weapon1', entry.item);
@@ -214,6 +234,7 @@ App.setGear = (slotId, entry) => {
 App.clearSlot = (slotId) => {           // unpin entirely (search may fill it)
   delete App.state.loadout.gear[slotId];
   App.state.pins.gear.delete(slotId);
+  App.state.pins.infusions.delete(slotId);
   for (const k of Object.keys(App.state.loadout.augments)) {
     if (k.startsWith(slotId + '/')) {
       delete App.state.loadout.augments[k];
@@ -232,9 +253,22 @@ App.setAugment = (key, id) => {
   touch();
 };
 
-App.setSkills = (poolKey, ids) => {
+// A pool is pinned by a selection that FILLS it - that is a choice the
+// optimizer should keep. Any click used to pin, a deselect included: emptying
+// a pool pinned it, the server refilled it with the defaults, and the search
+// then handed back that default as "the user's selection" with nothing on the
+// page to say a pin existed. So a partial selection leaves the pool to the
+// search, and a pinned pool wears a pip that unpins it (sheet.js).
+App.setSkills = (poolKey, ids, { full = true } = {}) => {
   App.state.loadout.skills[poolKey] = ids;
-  App.state.pins.skills.add(poolKey);
+  if (full) App.state.pins.skills.add(poolKey);
+  else App.state.pins.skills.delete(poolKey);
+  touch();
+};
+
+// Hand a pool back to the optimizer; the selection stays as it is on the sheet.
+App.unpinSkills = (poolKey) => {
+  App.state.pins.skills.delete(poolKey);
   touch();
 };
 
@@ -252,6 +286,14 @@ App.setTalent = (nodeId, rank) => {
   touch();
 };
 
+// One of the options every request carries. The sheet is refreshed with it:
+// most options move its numbers, and the two that do not (the infusion
+// search's) cost one cheap request to keep this a single rule.
+App.setOption = (key, value) => {
+  App.state.options[key] = value;
+  touch();
+};
+
 // ------------------------------------------------------------- catalog
 
 App.loadCatalog = async () => {
@@ -259,8 +301,13 @@ App.loadCatalog = async () => {
     `/api/catalog?class=${App.state.cls}&level=${App.state.level}`);
 };
 
+// A row the catalog WITHHOLDS is still a row: the picker lists it apart with
+// the reason, and a build can wear one (a saved file, or the user's own
+// pick). So a lookup reads both lists - looking only at the offered one drew
+// such a piece as "not in this game version's catalog", which it is.
 App.findItem = (slotId, itemId) =>
-  App.catalog?.slots?.[slotId]?.find((i) => i.id === itemId) || null;
+  App.catalog?.slots?.[slotId]?.find((i) => i.id === itemId)
+  || App.catalog?.withheld?.[slotId]?.find((i) => i.id === itemId) || null;
 
 // The 12 doll slots in the game's visual order.
 App.dollSlots = () => {
@@ -327,11 +374,27 @@ const bindChrome = () => {
   syncChrome();
 };
 
+// -------------------------------------------------- the build notice
+
+// A number computed on a build the model was not accepted on says so, on every
+// command, before the number - that is the CLI's rule, and a page of numbers is
+// no different. The server sends the CLI's own sentence (`meta.notice`, null
+// when this install IS the accepted build) and the strip stays up for the whole
+// session: it is a fact about the install, not a toast about an action.
+const showBuildNotice = () => {
+  const host = document.getElementById('build-notice');
+  const text = App.boot?.meta?.notice;
+  if (!host) return;
+  host.textContent = text ? `⚠ ${text}` : '';
+  host.hidden = !text;
+};
+
 // -------------------------------------------------------------- boot
 
 (async function main() {
   try {
     App.boot = await App.api('/api/bootstrap');
+    showBuildNotice();
     App.state.loadout = emptyLoadout();
     await App.loadCatalog();
     bindChrome();

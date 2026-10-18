@@ -123,6 +123,9 @@ export async function startServer({ benchRoot, host = '127.0.0.1', port = 0, gam
 
   return {
     port: server.address().port,
+    // The "not the accepted build" sentence, or null - for whoever prints the
+    // startup banner (this file's own main, and `bench ui`).
+    notice: api.notice ?? null,
     close: () => new Promise((resolvePromise) => {
       api.close();
       for (const s of sockets) s.destroy();
@@ -186,9 +189,10 @@ if (isMain) {
     host: flag('--host') ?? '127.0.0.1',
     game: flag('--game'),
   })
-    .then(({ port: p }) => {
+    .then(({ port: p, notice }) => {
       const url = `http://127.0.0.1:${p}/`;
       console.log(`farever-bench ui on ${url}`);
+      if (notice) console.log(`  warning: ${notice}`);
       if (args.includes('--open')) openBrowser(url);
       else console.log('  (--open launches your browser for you)');
       console.log('  press Ctrl+C to stop');

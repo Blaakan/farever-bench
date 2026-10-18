@@ -6,6 +6,86 @@ can check. This document is the handoff: the method that got there, the exact
 remaining items with the reads already done against them, and what "done" means
 per class.
 
+## Where this stands on build 25959898 (2026-10-17)
+
+This document was written as the handoff of 2026-08-03 and most of it is the
+record of that program. The September 30 update (build 25782799) moved the
+ground under it, and two hotfix builds followed (25933712 on 2026-10-14,
+25959898 on 2026-10-15), so read the rest through this section. The live work
+list is [TODO.md](TODO.md); the rules are [MODEL.md](MODEL.md); what was
+measured is [GROUND-TRUTH.md](GROUND-TRUTH.md).
+
+**State.** Build 25959898 accepted on 2026-10-17, 4,305 checks green on it
+(`model/suite-pass.json`). Baselines, `optimize`,
+level 25, default target: Warrior 841.7, Rogue 1,082.3, Mage 718.8, Priest
+579.1. They are not comparable with any baseline below: another game build,
+another default target (ul'Serous at your level, where it was Ratsar at a
+fitted level), an Epic tier of armour, and infusion sets.
+
+**What changed in the method.** The three steps below - read the data, read
+the compiled code, measure in game - stand, with three amendments the update
+forced.
+
+- *The compiled code is half of what it was.* The client ships 202
+  server-side functions as a bare `throw` on build 25782799 and on 25959898:
+  `applyDamage`, `addStatus`, `Status.refresh`, `applyAffixes`, `playStep`,
+  `dropLoot`. A rule read in one of those bodies in August cannot be re-read;
+  the pipeline calls such a citation STUB and will not re-anchor it for you.
+  What is left is the shared code, and a rule read from it is a rule about
+  what the client computes - for several of them the server's use of it is
+  assumed, and the capture is the only referee.
+- *The dummy is not a zero.* Every protocol below that says "the 0-armor
+  dummy" was written when the Dummy unit authored no armour. It authors 40%
+  now, at level 1: a level-25 character gets 89.9% through, penetration
+  shows on it, and a single swing no longer reads a formula bare. Design a
+  protocol as a RATIO of two hits on the same dummy, or price it with
+  `--target dummy`.
+- *A measurement is a window, and it is of one build.* The first capture on
+  the new build was misread on its first night by ledgers over whole
+  snapshot spans; the same rows one block at a time settled most of it. The
+  rules a comparison now rests on - the log ceils, a window must match what
+  was pressed, a rate is comparable only like for like - are at the end of
+  GROUND-TRUTH.md, and `bench verify` takes `--since` / `--until` /
+  `--window`, `--split`, `--replay`, `--fight` and `--behind-fraction` for
+  them. And a capture is evidence about the build it was recorded on: on
+  25959898 every ledger of the 2026-10-13 capture says it is another build's.
+
+**Where each class is against the program below.** All of it measured on
+2026-10-13, on build 25782799.
+
+- *Warrior*: still the calibrated class. The dummy's pool to the integer,
+  Domination's register (the armed Shockwave's ×1.722 included), Rampage's
+  three charge levels, Brutal Frenzy's second strike and its re-roll, base
+  attacks within 1.3% on two links of the chain block and +4.1% on the
+  third. Surging Force's +21% was the window (154 alone). Open: Domination's
+  rank-3 bonus paid at a share of the fight, the Raclette Pan's crit chance,
+  and a default search that ends below its previous optimum on 25959898.
+- *Rogue*: its tree was rebuilt by the update, re-read node by node off the
+  scripts, and stepped through in game one talent point at a time. The dose
+  gate, the Blast and the riders' one bracket hold, and the night corrected
+  the Combo Points' rule, Gash's divisor and count, the trinket's item
+  scaling and the arsenal enchant; the position effect was the daggers'
+  perks. Open: Urge to Kill (its Finishers held 4.07 points where the model
+  finds 2.12), Infernal Plunge pressed too eagerly, the rate (+4.8% a second).
+- *Mage*: Queen's Decree, refused until then, was what read three spells 21
+  to 36% low; the imps' line folds onto the capture's, Demonic Discharge is
+  priced per bolt, Mystic Empowerment and its Cooldown Reduction latch are
+  priced. Open: Chaos Bolts' reset rolled once a finisher where the game
+  rolls per bolt, the staff's second link (+6.6%), six talents unpriced.
+- *Priest*: the whole-span ledger reads 11 match, 2 close, 0 miss. The auras
+  lose their spawn hit, the status steps a swing plays are not attacks,
+  Faithful Winds' lane is pressed for Sunlight, Soothing Rays is priced. Its
+  search is about 2.4 times as long as it was.
+
+**What is new and unmeasured.** Infusion amounts (other players' rows say
+when three sets fire, nothing says how much), heroic targets, crowd-control
+immunity, and what the install hands out are all read from the client; they
+are the largest block of assumption in the tool. Build 25959898 released two
+Heroics, and the withheld list followed with no change of code. See
+MODEL.md, "The September 30 update".
+
+## The 2026-08-03 handoff
+
 State at handoff (2026-08-03): **832 checks green**; baselines Warrior 617.5,
 Rogue 351.8, Mage 238.3, Priest 316.5 (`optimize`, level 25, named boss). The
 Warrior and the Priest moved when the buff-cooldown bucketing was fixed — see
@@ -54,6 +134,10 @@ work list, ahead of everything in the older sections:**
    Domination's +25% inside a stun window. Two traps recorded in MODEL.md:
    Domination's `rank >= 3` belongs to ONE alternative of a disjunction, and its
    amount is 0.15 in the row but 0.25 from rank 2 through `props.rankOverride`.
+   *(2026-10: all of this is the 2026-08 build's Domination. The update
+   rewrote the script - a stun-armed register at 0.10 / 0.15 and an
+   owner-wide 0.25 at rank 3 - and retuned Bloodrage Aura's crit from +3 / +5
+   to +2 / +3. The reader rules learnt here stand.)*
 3. **ComboWindow — SETTLED** (`980e9ac`), and the disputed read was right. One
    cumulative clock from the END of the last completed basic to the START of the
    next predicts **52/52**; literal start-to-start scores 18/52 and a banked
@@ -66,7 +150,8 @@ work list, ahead of everything in the older sections:**
    the Rage ledger closing to the point **refutes the M2 mastery**.
 5. **Damage riders SUM — LANDED** (`bf5a60a`). Berserk is authored at exactly
    0.20 and was not retuned; v1's ×1.183 was Enchant_Devote ramp contamination.
-   `computeDamage@4841` seeds one `modMult` from `hitData.dmgMult` that every
+   `computeDamage@4841` (the 2026-08 build's number; `ent.Unit.computeDamage@4920`
+   on build 25959898) seeds one `modMult` from `hitData.dmgMult` that every
    rider `+=`s, so two +20% riders give ×1.40. Scripted `dmgMult` also stopped
    going through the sheet's DamageModifier, which multiplies.
 6. **Bleed tick ratio — CLOSED, measurement-side.** `ceil(round(0.100 × H) / 4)`
@@ -174,10 +259,14 @@ weapon tooltips against the Legendary 5★ pin. Neither can rescue Ratsar.
   declare. The free Warrior optimum moved much further, 488.6 → 617.5, because
   two dead bar slots becoming real cooldowns changes which KIT wins, not just
   what the old one scores.
-- **`bench talents` undercounts what the model reads.** The READS AS column
-  calls `talents.readableValue()`, which only sees declared affixes, effects and
-  statuses, so `Warrior_Talent_SurgeOfViolence` prints "nothing" while the same
-  run's augment line prints "grants Surge of Violence - a next-cast register".
+- **`bench talents` undercounts what the model reads.** *(2026-10: largely
+  closed. The table reads script shapes now - Surge of Violence prints "a
+  next-cast register", Chaincast "the chain: every 4 skills, ..." - and its
+  structure paragraph is computed from the same table: 62 of 88 nodes read on
+  build 25782799. What is left is in TODO.md.)* The READS AS column
+  called `talents.readableValue()`, which only saw declared affixes, effects and
+  statuses, so `Warrior_Talent_SurgeOfViolence` printed "nothing" while the same
+  run's augment line printed "grants Surge of Violence - a next-cast register".
   Measured on the questlog build: granting it is worth **+20.6 dps** (629.3 vs
   608.7), 44 Raging Smash casts against 34 and a higher figure per cast, so both
   halves of the register — the cost waiver and the forced crit — are live. A
@@ -188,10 +277,17 @@ weapon tooltips against the Legendary 5★ pin. Neither can rescue Ratsar.
 - The **three-rider sum** is still untested together: the v2 session was a GS
   build, so the axe's combo-bleed rider never fired. It wants an axe session with
   a finisher on a bleeding target inside Berserk during the stun.
-- **TODO — `armorIgnore` is folded into penetration additively, and the game
+- **~~TODO~~ LANDED in the verification era (2026-08-06 .. 11): mitigation
+  composes as two multiplies** - see MODEL.md §4 - and since 2026-10 the
+  operator split noted at the end of this item is carried too: an ignore a
+  script ASSIGNS on one named skill's hits is a `set`, one it adds is an
+  `add`, and the larger of a set and the category riders stands. The item as
+  it was written: **`armorIgnore` is folded into penetration additively, and the game
   multiplies.** `mitigate()` at `src/damage.mjs:922-923` computes
   `pen = sheet(ArmorPenetration) + armorIgnore × 100` and applies one
-  `(1 - pen/100)`. `getAffinityDamageReduction@4510` applies **two** separate
+  `(1 - pen/100)`. `getAffinityDamageReduction@4510` (the 2026-08 build's
+  number and ops; @4582 on build 25959898, whose ops MODEL.md §4 gives)
+  applies **two** separate
   multiplies on the pool: `resist ×= (1 - clamp(armorIgnore, 0, 1))` at ops
   133–147 (physical) / 80–95 (magic), and only then `resist ×= (1 - pen/100)`
   at ops 259–263. So the model computes `(1 - a - b)` where the game computes
@@ -230,9 +326,13 @@ weapon tooltips against the Legendary 5★ pin. Neither can rescue Ratsar.
    how WeaponPower, the 60/40 mix, the fervor+mastery bracket, Spark costs,
    Combo Points, `on: Code`, `getStackFactor` and `areaHit` were settled. Full
    debug info: follow the `; L####` source lines.
-3. **Measure in game** — the user runs 5-minute protocols on the 0-armor dummy:
+3. **Measure in game** — the user runs 5-minute protocols on the training
+   dummy (which authored no armour when this was written, and authors 40% at
+   level 1 since the 2026-10 build - see the section at the top):
    naked character sheet, bag-vs-equipped tooltips, single-swing damage,
-   stopwatch cadences. Every past measurement reproduced the model to the
+   stopwatch cadences. Since 2026-10-13 the faster instrument is a driven
+   capture: the probe logs every hit with its target's level, and
+   `bench verify` prints the model minus the capture per skill. Every past measurement reproduced the model to the
    integer once the formula was right; design the protocol so one read
    discriminates between candidate formulas.
 4. **Refuse and NAME** what none of the three can price. A refusal without a
@@ -276,12 +376,17 @@ messages in the repo's voice with **no AI attribution**; caches must stay bounde
   a search was re-simulating lists it had already played. Searched-over-derived
   went +0.5% → +2.2%.
 - **`on: Code` steps are not part of the cast.** 158 steps declare it, 72 carry
-  a real amount, and all of them were billed on their skill's cast. Brutal
+  a real amount, and all of them were billed on their skill's cast. *(2026-10:
+  214 steps and 107 with an amount of their own on build 25782799.)* Brutal
   Frenzy's finisher now prices the measured 133 instead of 161, and its 0.3 step
   rides a 15% base-attack roll. Refusing `Halos_Demon_Skill2`'s leash damage (the
   foe must walk out) freed the Mage search onto an arsenal worth 24 dps more.
-- **The stack counter, damage side.** `getStackFactor@20772` multiplies a DoT
+- **The stack counter, damage side.** `getStackFactor@20772` (the 2026-08
+  build's number; `$HSkill.getStackFactor@21771` on build 25959898) multiplies a DoT
   tick by the live stack count. Five stacks of Lethal Poison were priced as one.
+  *(2026-10: true of the 2026-08 build's stacking Lethal Poison, which the
+  update removed - the poison is one stack behind a gate of three doses now.
+  The stack factor itself stands.)*
 - **`Mono` never cleaves** — settled at the opcode level, promoted from
   `unmodelled` to `verified`, with a patch tripwire on `props.hitCount`.
 - **The gear bake, LANDED.** Gear ratio, the aptitude divisor, the item's own
@@ -310,7 +415,14 @@ has the most refusals outstanding):
 2. **Drain the unscored list.** Run `optimize`, `weapons --across`, and
    `layouts` per class; every `not scored in this build` entry gets a data-read,
    a bytecode-read, or a measurement protocol — or a better reason.
-3. **Finish the class resource.**
+3. **Finish the class resource.** *(2026-10 status. Mage: the three
+   economies landed on 2026-08-11 - chain, summons, conduits - and Conduit
+   Residues is paid through the gauge; six talents remain unpriced and
+   named (TODO.md). Rogue: Combo Points landed in August; the update then
+   rebuilt the tree and it was re-read whole - what remains is Urge to
+   Kill's window. Priest: prayers are released by Judgment, each readied by
+   its own event; Alacrity is still a rune the model cannot rank. The three
+   bullets below are the 2026-08-03 list.)*
    - Mage: the conduit gauge and the finisher's flat 10 Spark have landed.
      Remaining — base Spark regen as time income (0.005 × MaxSpark × 1.3 per
      second on a 3s tick, plus the talent income: Infinite Resources +3/2s,
@@ -320,7 +432,10 @@ has the most refusals outstanding):
      count, which waits on the stack counter's affix side.
    - Rogue: CP income/spend lands; remaining — the distinct-kind dedup
      (consecutive same skill pays once), M1 crit extra, M2 cap 5, M3 refund 1,
-     UrgeToKill (8s→1s finisher CD + 1 CP/s window).
+     UrgeToKill (8s→1s finisher CD + 1 CP/s window). *(2026-10: the dedup is
+     done - a point is paid to a skill different from the last one that paid,
+     measured on 157 to 160 of 181 Finishers - and the Finisher spends what the
+     pool holds. What remains for the points is Urge to Kill.)*
    - Priest: prayer charging is modelled; verify each prayer's rank riders and
      Judgment's rune choices (Alacrity −2s/prayer is a cooldown mutation).
 4. **Calibrate once per class in game.** One naked-dummy session each — the
@@ -328,7 +443,9 @@ has the most refusals outstanding):
 
 ## Cross-class engine items, with the reads already done
 
-- **Stack counter, affix side.** `applyAffixes@6083` multiplies every affix by
+- **Stack counter, affix side.** `applyAffixes@6083` (the 2026-08 build's
+  number; `BaseSkill.applyAffixes@6190` on build 25959898, a server-only stub
+  there, so this body can no longer be re-read) multiplies every affix by
   `getAffixMultiplier() = stacks`; a stat buff is still counted at its cap. Three
   call shapes consume `stacks`, not one — `applyAffix` in engine.mjs, the local
   `put` inside the memoised `restat`, and `talents.mjs`'s weighing loop — and one
@@ -355,11 +472,19 @@ has the most refusals outstanding):
   (catches the Stones). The measured cost of leaving them frozen: <1% in a
   filler-heavy fight, ~40% at a 25% swing clock.
   Two traps: `isBaseAttack` **includes** the combo finisher
-  (`BaseSkill.isBaseAttack@6046`), which the model's `attack` bucket does not —
+  (`BaseSkill.isBaseAttack@6046` then, `@6152` on build 25782799), which the
+  model's `attack` bucket did not when this was written and does since
+  2026-10: a bare `isBaseAttack` guard reaches the finisher in every reader —
   a 25% under-count that is invisible at uptime 1 and immediate under thinning;
   and `onInflictDamage` fires per damage instance **including your own dot
   ticks**, so a bleed Warrior's proc rate is far above its swing rate.
-- **Cooldown mutations, wave 2.** The dynamic-target family is **26 sites in 20
+- **Cooldown mutations, wave 2.** *(2026-10: READ. `skill.kind`, a bare `kind`
+  and a no-argument `resetCooldown()` are all taken as the script's own skill;
+  `onSkillProc` and `onHitNewTarget` are events; a reset on a Magic critical
+  strike and a refund per hit of one named skill are played in the fight.
+  Still refused and named: the `s.kind` broadcast form and a method call on
+  another object, the off-hand skill excepted. The census below is the
+  2026-08 one.)* The dynamic-target family is **26 sites in 20
   rows**, not ~15: `skill.kind`, bare `kind` and no-arg `resetCooldown()` all
   resolve to the script's own skill id, so every one is a pure self-mutation;
   `s.kind` is the loop variable of `forAllWeaponSkills`/`forAllClassSkills` and
@@ -373,7 +498,11 @@ has the most refusals outstanding):
   bonus, not a roll). Bonus finding that contradicts current behaviour: the
   `<Type>_Upgrade` skill's rank is the weapon's **rarity index** and it does not
   attach below 3 upgrade levels.
-- **"Next cast free/empowered" register.** One shape, four realisations: a
+- **"Next cast free/empowered" register.** *(2026-10: a build carries a LIST
+  of registers now, armed three ways - a finisher's roll (Surge of Violence),
+  a counter of active casts (the Mage chain), a stun attempt (Domination,
+  measured 2026-10-13) - each one flag, spent before it is armed. Phase
+  Strike has not been re-checked.)* One shape, four realisations: a
   damage multiplier on the cast's SkillContext, a forced crit on the HitData, a
   cost waiver via `evalCost`, and a cooldown/cast-time waiver.
   `Warrior_Talent_SurgeOfViolence` is a cost waiver **and** a forced crit on the
@@ -394,7 +523,8 @@ has the most refusals outstanding):
   (foe passive), and **8 refused for causes that are mostly fixable** — five of
   those (four Stones + PrismaticPearl) only because of the `hasStatus`
   self-block above, and all five are exactly computable. `Trinket_Demon`'s DoT is
-  fully authored and worth 0 today. `Trinket_Bee` now prices: its summon step is
+  fully authored and worth 0 today. *(2026-10: it is priced, through its item:
+  36.25 a tick against 37 logged on 2026-10-13.)* `Trinket_Bee` now prices: its summon step is
   `on: Code`, played by a 5%-per-weapon-skill roll rather than by a press, and
   the pet's cadence is taken as the slowest of the three numbers its own row
   authors (steps, cooldown, duration), with the Foe AI loop named as unread.
@@ -417,6 +547,13 @@ has the most refusals outstanding):
 
 A level-25 Warrior, 0-armour dummy. These are the numbers the gear-bake rewrite
 has to land against, and the first one already retired a hypothesis.
+
+*(2026-10: the sheet arithmetic in this section still reproduces on build
+25782799. The swing arithmetic in (1) does not carry over: the dummy authors
+armour now, `GS_Base_Attack`'s ratio is 0.7 where it was 0.95, and the
+WeaponPower rule under it was replaced - the "do not re-open this without a
+naked read" below is about the 2026-08 rule, which that naked read
+confirmed for its build.)*
 
 **(0) COMPLETELY NAKED — the control, and it is exact.** All sixteen attributes
 match to the displayed digit: Vitality 38, Strength 34, Dexterity/Faith/Intellect
@@ -530,7 +667,8 @@ no measurement here touches.
 
 ## Historical: why half of it must not land
 
-**`gearRatio` is real, and it is measured.** `generateItemAffixes@20747` runs the
+**`gearRatio` is real, and it is measured.** `generateItemAffixes@20747` (the
+2026-08 build's number; `$HItem.generateItemAffixes@21736` on build 25959898) runs the
 level curve a SECOND time on `GearStatsRatio_Scaling_Bounds` (0.5 → 0.9) and
 multiplies every row that is not flagged `gearOnly` by the result. Four
 independent derivations of the function — one reading the disassembly top-down,
@@ -634,7 +772,11 @@ each half makes the other look wrong.
 
 ## The in-game protocols, written out
 
-Each is one session on the 0-armor dummy. Design note: every one of these is
+Each is one session on the training dummy - a 0-armor target when these were
+written, a 40%-armour unit at level 1 since the 2026-10 build, so read a
+protocol below as a ratio of two hits or price it with `--target dummy`. The
+protocols owed on the new build are in TODO.md, grouped by where you have to
+stand. Design note: every one of these is
 built so a single reading discriminates between candidate formulas.
 
 1. ~~**Mage conduit gauge.**~~ **DONE, 2026-08-02.** The trigger rule turned out
@@ -650,7 +792,8 @@ built so a single reading discriminates between candidate formulas.
    counter stays at 0 — that proves absorption is positional. (ii) Play normally
    for 120s walking into every cloud and stopwatch from combat start to the
    prompt lighting up; that number *is* the absorption fraction,
-   `f = 30 / seconds`. (iii) Cast it and read the damage integer — it should be
+   `f = 30 / seconds`. *(2026-10: on build 25782799 the constant is 21 - seven
+   clouds, the cap, at one per 3s - and `f` is what `--pickups` takes.)* (iii) Cast it and read the damage integer — it should be
    `ceil(3 × (Faith + Intellect) × your brackets)`, which also confirms the
    rank-2 full magic-armour ignore.
 3. **Blessing's rank-3 crit rider (2 min).** `Mace_Benediction_Passive_Status`

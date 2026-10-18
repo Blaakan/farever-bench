@@ -4,8 +4,10 @@
 //
 // Exposes (exact contract):
 //   window.SheetView = { renderBuild(host, { loadout, view, boot, catalog,
-//                                            title, readOnly }) }
-// where `view` is a /api/sheet-shaped response (or null while computing).
+//                                            title, readOnly, search }) }
+// where `view` is a /api/sheet-shaped response (or null while computing) and
+// `search` - the optimize result's only - is what the search was allowed to do
+// (which infusions it could hand out, and why the others were withheld).
 // renderBuild never touches App.state; only interactive renders (readOnly
 // false - i.e. the live profile view) wire handlers, and those mutate solely
 // through App.setGear / setSkills / setAugment / clearSlot + window.Picker.
@@ -57,8 +59,14 @@ export const bestRarity = (boot, item) => {
 
 const starsStr = (n) => '★'.repeat(Math.max(0, n | 0));
 
+// Offered rows first, then the ones the catalog withholds: a build can wear a
+// withheld piece (a saved file, the user's own pick) and it is still a row.
 const findItem = (catalog, slotId, itemId) =>
-  catalog?.slots?.[slotId]?.find((i) => i.id === itemId) || null;
+  catalog?.slots?.[slotId]?.find((i) => i.id === itemId)
+  || catalog?.withheld?.[slotId]?.find((i) => i.id === itemId) || null;
+
+const slotShort = (boot, slotId) =>
+  boot?.slots?.find((s) => s.id === slotId)?.label || String(slotId).replace(/^Slot_/, '');
 
 // ------------------------------------------------------ colour derivation
 // The API hands out exactly one '#rrggbb' per rarity and per class. Every
@@ -161,17 +169,47 @@ export function itemTipHtml(boot, t) {
       h += `<div class="taffix">${esc(a.display)}</div>`;
     }
   }
+  // The infusion block, in the game's own order and words (the server fills
+  // its text rows): the line naming the infusion, then - whenever a bonus roll
+  // is stated - the bonus block under the PIECE's faction, shown dimmed while
+  // the piece is not paid it, with the reason. The game shows a dark line too;
+  // hiding it would hide the one thing there is to fix.
+  if (t.infusion) {
+    h += `<hr><div class="tinf">${esc(t.infusion.text || t.infusion.name)}</div>`;
+    if (!t.infusion.obtainable) {
+      h += `<div class="twarn">nothing hands out its pattern on this build: ${esc(t.infusion.source?.why)}</div>`;
+    }
+  }
+  if (t.infusionBonus) {
+    const b = t.infusionBonus;
+    h += `${t.infusion ? '' : '<hr>'}<div class="tinfbonus${b.active ? '' : ' off'}">`
+       + `<div class="tinf-h">${esc(b.title || 'Infusion bonus')}`
+       + (b.prismatic ? ` <span class="tmeta">${esc(boot?.constants?.infusion?.texts?.prismatic || 'Prismatic')}</span>` : '')
+       + `</div><div class="taffix">${esc(b.display)}</div></div>`;
+    if (b.note) h += `<div class="tmeta">${esc(b.note)}</div>`;
+  } else if (t.infusion && t.infusionPool?.length) {
+    h += `<div class="tmeta">its bonus roll is not stated, so no bonus is priced - it is one of `
+       + `${t.infusionPool.map((p) => `+${esc(p.value)} ${esc(p.name)}`).join(', ')}</div>`;
+  }
   if (t.skills?.length) {
     h += `<div class="tmeta">Skills: ${t.skills.map((s) => esc(s.name)).join(' · ')}</div>`;
   }
   if (t.gives) h += `<div class="tmeta">gives ${esc(t.gives)}</div>`;
   if (t.flavor) h += `<hr><div class="tdesc">${esc(t.flavor)}</div>`;
+  // Where it comes from: the atlas's line when it has one, else what the
+  // install itself says hands the row out (the catalog's source reader). A
+  // row NOTHING hands out has no source to print - its reader's sentence is
+  // the reason it is not offered, and is said once, as that.
   if (t.acquire) h += `<div class="tacquire">${esc(t.acquire)}</div>`;
+  else if (t.source?.why && t.source.state !== 'unreleased') {
+    h += `<div class="tacquire">Source: ${esc(t.source.why)}</div>`;
+  }
+  if (t.withheld) h += `<div class="twarn">Not offered: ${esc(t.withheld.why)}</div>`;
   const pins = (t.track || [])
     .map((p) => `${esc(p.label || 'map pin')} (${esc(p.x)}, ${esc(p.y)})`)
     .join(' · ');
   if (pins) h += `<div class="tmeta">${pins}</div>`;
-  if (t.faction) h += `<div class="tmeta">Faction: ${esc(t.faction)}</div>`;
+  if (t.faction) h += `<div class="tmeta">Faction: ${esc(t.factionName || t.faction)}</div>`;
   return h;
 }
 
@@ -199,6 +237,9 @@ const itemTipBody = (loadout, slotId, entry) => {
   if (entry.rarity != null) body.rarity = entry.rarity;
   if (entry.stars != null) body.stars = entry.stars;
   if (entry.level != null) body.level = entry.level;
+  if (entry.infusion) body.infusion = entry.infusion;
+  if (entry.infusionStat) body.infusionStat = entry.infusionStat;
+  if (entry.prismatic) body.prismatic = true;
   return body;
 };
 
@@ -226,14 +267,26 @@ const skillTip = (loadout, skillId) => () =>
 // A weapon skill is three skills: the base cast plus what ranks 2 and 3 add.
 // The bench assumes all three (options.rank defaults to weaponSkillMaxRank),
 // so the tooltip shows the whole ladder and marks which lines are live.
+//
+// The same shape carries the other two ladders the server knows. A talent, a
+// status or a class skill comes back as ONE line at the rank it is worn at; an
+// infusion comes back as its set bonuses, each with the game's own `title`
+// ("(4) Set") where a mastery line has only a number, and a `desc` that can
+// run over several lines (the sentence, then the stat line that set turns on).
 export function rankLadderHtml(t) {
   const rows = (t.ranks || []).filter((r) => r?.desc);
   if (!rows.length) return t.desc ? `<div class="tdesc">${esc(t.desc)}</div>` : '';
+  // One untitled line is not a ladder, and a number beside it would read as a
+  // mastery rank the row does not have (Blink is not "rank 3" of anything).
+  const lone = (t.ranks || []).length === 1 && !rows[0].title;
   let h = '';
   for (const r of rows) {
     const on = r.active !== false;
     h += `<div class="trank${on ? '' : ' off'}">`
-       + `<span class="trank-n">${esc(r.rank)}</span>`
+       + (lone ? ''
+         : r.title
+           ? `<span class="trank-n trank-t">${esc(r.title)}</span>`
+           : `<span class="trank-n">${esc(r.rank)}</span>`)
        + `<span class="trank-d">${esc(r.desc)}</span></div>`;
   }
   return h;
@@ -265,6 +318,7 @@ export function renderBuild(host, opts = {}) {
     boot: opts.boot || App.boot,
     catalog: opts.catalog || App.catalog,
     inter: !readOnly,             // every handler is gated on this
+    search: opts.search || null,  // an optimize result's: what was searched
   };
   host.replaceChildren();
   const sheet = el('sheet');
@@ -280,6 +334,8 @@ export function renderBuild(host, opts = {}) {
   const cols = el('columns');
   cols.append(statsPanel(ctx), paperDoll(ctx), weaponsPanel(ctx));
   sheet.append(cols);
+  const inf = infusionBlock(ctx);
+  if (inf) sheet.append(inf);
   host.append(sheet);
 }
 
@@ -422,12 +478,31 @@ function slotTile(ctx, slotDef, o = {}) {
       st.textContent = starsStr(entry.stars);
       t.append(st);
     }
-    const lv = entry.level ?? item?.level;
+    // The level the piece is PRICED at: the one the user set, else the
+    // server's default for the row - the top of its range when it scales with
+    // you, the bottom when it keeps its own. Reading `item.level` here badged
+    // an equipped Demon piece (authored level 1, priced at yours) with a "1".
+    const rng = Array.isArray(item?.levelRange) ? item.levelRange : null;
+    const lv = entry.level
+      ?? (rng ? rng[item.levelScales !== false ? 1 : 0] : item?.level);
     if (lv != null) {
       const b = el('lvl-badge');
       b.textContent = lv;
       t.append(b);
     }
+    // The infusion the piece carries, as its own icon in the corner; ringed
+    // when its bonus line is lit (the sheet says - a roll that is stated, on
+    // a piece of the infusion's faction or a Prismatic one).
+    if (entry.infusion) {
+      const def = ctx.boot?.infusions?.find((x) => x.id === entry.infusion);
+      const ib = el('inf-badge');
+      ib.append(App.icon(def?.icon, 20));
+      const piece = ctx.view?.infusions?.pieces?.find((p) => p.slot === slotId);
+      if (piece?.lit) ib.classList.add('lit');
+      t.append(ib);
+    }
+    // A piece the catalog withholds wears a mark, and its tooltip says why.
+    if (item?.withheld) t.classList.add('held');
     App.bindTip(t, () =>
       App.api('/api/tooltip/item', itemTipBody(ctx.loadout, slotId, entry))
         .then((r) => itemTipHtml(ctx.boot, r)));
@@ -537,7 +612,25 @@ function poolTileRow(ctx, pool) {
   const chosen = chosenOf(pool, ctx.loadout);
   for (const opt of pool.options || []) row.append(skillTile(ctx, pool, opt, chosen));
   for (const g of pool.alsoGranted || []) row.append(passiveTile(ctx, g));
+  const pip = poolPinPip(ctx, pool);
+  if (pip) row.append(pip);
   return row;
+}
+
+// The mark a PINNED pool wears, and the way to take the pin off. A pin nobody
+// can see is a search that hands your own selection back and does not say so;
+// this is the rune page's pip, made a control. Editor only: the result pane
+// shows the optimizer's answer, which has no pins.
+function poolPinPip(ctx, pool) {
+  if (!ctx.inter || !App.state?.pins?.skills?.has(pool.key)) return null;
+  const pip = el('pinpip poolpin', 'span');
+  App.bindTip(pip, '<div class="tname">Pinned</div>'
+    + '<div class="tdesc">The optimizer keeps this selection. Click to unpin and let it choose.</div>');
+  pip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    App.unpinSkills(pool.key);
+  });
+  return pip;
 }
 
 // Selection has to be the loudest thing in the panel, so it gets three
@@ -604,7 +697,7 @@ function poolOrbs(ctx, pool) {
       t.addEventListener('click', () => poolClick(ctx, pool, opt.id));
     }
     return t;
-  });
+  }).concat(poolPinPip(ctx, pool) || []);
 }
 
 function poolClick(ctx, pool, id) {
@@ -625,7 +718,8 @@ function poolClick(ctx, pool, id) {
     chosen.shift();                       // at capacity: swap out the oldest
     chosen.push(id);
   }
-  App.setSkills(pool.key, chosen);
+  // Only a selection that fills the pool is a pin - see App.setSkills.
+  App.setSkills(pool.key, chosen, { full: chosen.length >= (pool.slots | 0) });
 }
 
 function poolRemove(ctx, pool, id) {
@@ -633,7 +727,7 @@ function poolRemove(ctx, pool, id) {
   const i = chosen.indexOf(id);
   if (i < 0) return;
   chosen.splice(i, 1);
-  App.setSkills(pool.key, chosen);
+  App.setSkills(pool.key, chosen, { full: chosen.length >= (pool.slots | 0) });
 }
 
 function classPoolRow(ctx, pool) {
@@ -644,6 +738,8 @@ function classPoolRow(ctx, pool) {
   const cnt = el('pcount', 'span');
   cnt.textContent = `${Math.min(chosen.length, pool.slots | 0)}/${pool.slots | 0}`;
   lab.append(cnt);
+  const pip = poolPinPip(ctx, pool);
+  if (pip) lab.append(pip);
   row.append(lab);
   for (const opt of pool.options || []) row.append(skillTile(ctx, pool, opt, chosen));
   for (const g of pool.alsoGranted || []) row.append(passiveTile(ctx, g));
@@ -683,6 +779,258 @@ function socketRow(ctx, slotId) {
     row.append(b);
   }
   return row;
+}
+
+// ------------------------------------------------------ the infusion block
+
+// Which infusions the search may hand out, as the list of ids the page's
+// option stands for: "learnable" is every one the install does not show to be
+// unobtainable (the model's own default), or the explicit list.
+export const offeredInfusions = (boot, option) => {
+  const all = boot?.infusions || [];
+  if (Array.isArray(option)) return all.filter((x) => option.includes(x.id)).map((x) => x.id);
+  if (option === 'all') return all.map((x) => x.id);
+  if (option === 'none') return [];
+  return all.filter((x) => x.obtainable).map((x) => x.id);
+};
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+// The sets a build wears, what of each is IN the number and what is not, each
+// infused piece's bonus line - and, in the editor, what the optimizer may hand
+// out. Everything printed is the sheet's own (view.infusions is the engine's
+// attach, named); nothing here decides a rank or a price. The block is absent
+// on a build of the game with no infusions.
+function infusionBlock(ctx) {
+  const defs = ctx.boot?.infusions || [];
+  if (!defs.length) return null;
+  const consts = ctx.boot?.constants?.infusion || {};
+  const caps = consts.caps || [];
+  const box = el('infblock');
+  const head = el('ornhead');
+  head.textContent = consts.texts?.header || 'Infusions';
+  box.append(head);
+
+  const inf = ctx.view?.infusions;
+  if (!inf) {
+    const w = el('infnote');
+    w.textContent = ctx.view ? '' : 'computing…';
+    box.append(w);
+  } else if (!inf.sets.length) {
+    const n = el('infnote');
+    const can = inf.infusable.length;
+    n.textContent = can
+      ? `no piece is infused - ${can} of the pieces worn can be; a set pays at ${caps.join(' / ')} pieces of one infusion`
+      : `nothing worn can be infused - only ${rarityName(ctx.boot, consts.minRarity)} armour with a faction can`;
+    box.append(n);
+  } else {
+    for (const s of inf.sets) box.append(infusionSetRow(ctx, s));
+    const pl = infusionPieces(ctx, inf);
+    if (pl) box.append(pl);
+  }
+
+  if (ctx.inter) box.append(infusionSearchControls(ctx, defs));
+  else if (ctx.search?.infusions) box.append(infusionSearchSummary(ctx, ctx.search.infusions));
+  return box;
+}
+
+function infusionSetRow(ctx, s) {
+  const wrap = el('infset');
+  const row = el('infset-row');
+  row.append(App.icon(s.icon, 38));
+  const mid = el('infset-mid');
+  const nm = el('infset-name');
+  nm.textContent = s.name;
+  const sub = el('infset-sub');
+  // The rank is the SET's - how many of the caps its piece count reaches -
+  // and its title is the game's own ("(4) Set").
+  sub.textContent = [s.factionName, plural(s.pieces, 'piece', 'pieces'),
+    s.attached ? s.title : `below the first set bonus (${s.nextCap})`]
+    .filter(Boolean).join(' · ');
+  mid.append(nm, sub);
+  row.append(mid);
+  const sc = el('infset-scored');
+  // "; " between entries: one can be a whole clause with commas of its own
+  // (a set's part in the fight: "Wet on the foe: +2% ... a stack, up to 3,
+  // one stack on ..."), which is also how the engine's own sentence joins them.
+  sc.textContent = s.priced.length ? `scored: ${s.priced.join('; ')}`
+    : (s.attached ? 'scored: nothing at this rank' : 'nothing attached');
+  if (!s.priced.length) sc.classList.add('none');
+  row.append(sc);
+  App.bindTip(row, skillTip(ctx.loadout, s.id));
+  wrap.append(row);
+
+  if (s.note) {
+    const n = el('infnote');
+    n.textContent = s.note;
+    wrap.append(n);
+  }
+  if (s.source?.state === 'unreleased') {
+    const w = el('infwarn');
+    w.textContent = `nothing hands out its pattern on this build - ${s.source.why}`;
+    wrap.append(w);
+  }
+  if (s.unpriced.length) {
+    // What the set does that the fight does not score, by name. Folded: the
+    // list is the audit, the count is the headline.
+    const det = el('inf-unscored', 'details');
+    const sum = el('', 'summary');
+    sum.textContent = `${plural(s.unpriced.length, 'thing', 'things')} this set does ${s.unpriced.length === 1 ? 'is' : 'are'} NOT scored`
+      + (s.priced.length ? ' - what is listed above is what it is worth here' : ' - it is worth nothing here');
+    det.append(sum);
+    const ul = el('', 'ul');
+    for (const u of s.unpriced) {
+      const li = el('', 'li');
+      li.textContent = u;
+      ul.append(li);
+    }
+    det.append(ul);
+    if (s.why) {
+      const why = el('infnote');
+      why.textContent = s.why;
+      det.append(why);
+    }
+    // the fold is this block's own control in the read-only result pane too
+    det.classList.add('opt-allow');
+    wrap.append(det);
+  }
+  return wrap;
+}
+
+// One line per piece that carries an infusion or a stated roll, then the one
+// sentence that adds them up - what is lit, what is dark, what nobody stated.
+function infusionPieces(ctx, inf) {
+  const rows = inf.pieces.filter((p) => p.infusion || p.stat);
+  if (!rows.length) return null;
+  const box = el('infpieces');
+  for (const p of rows) {
+    const r = el('infpiece');
+    const where = el('infpiece-slot', 'span');
+    where.textContent = slotShort(ctx.boot, p.slot);
+    const what = el('infpiece-what', 'span');
+    if (p.stat) {
+      what.textContent = p.display || `+${p.wouldBe} ${p.statName}`;
+      what.classList.add(p.lit ? 'lit' : 'dark');
+      if (!p.lit) what.textContent += ' (dark - not paid)';
+    } else {
+      what.textContent = 'no bonus roll stated - priced at 0'
+        + (p.ceiling > 0 ? ` (up to +${p.ceiling})` : '');
+      what.classList.add('blind');
+    }
+    r.append(where, what);
+    if (p.note) {
+      App.bindTip(r, `<div class="tname">${esc(p.itemName)}</div>`
+        + `<div class="ttype">${esc(p.infusionName || 'not infused')}${p.prismatic ? ' · Prismatic' : ''}</div>`
+        + `<div class="tdesc">${esc(p.note)}</div>`);
+    }
+    box.append(r);
+  }
+  const lit = rows.filter((p) => p.lit && p.value);
+  const dark = rows.filter((p) => p.infusion && p.stat && !p.lit);
+  const blind = rows.filter((p) => p.infusion && !p.stat);
+  const bits = [];
+  if (lit.length) {
+    bits.push(`${plural(lit.length, 'lit bonus line pays', 'lit bonus lines pay')} ${lit.reduce((n, p) => n + p.value, 0)} rating`);
+  }
+  if (dark.length) bits.push(`${dark.length} dark (the infusion is another faction's and the piece is not Prismatic)`);
+  if (blind.length) {
+    const low = blind.reduce((n, p) => n + p.ceiling, 0);
+    bits.push(`${blind.length} with no roll stated, priced at 0`
+      + (low > 0 ? ` (up to ${low} rating if the faction-matched ones are lit)` : ''));
+  }
+  if (bits.length) {
+    const sum = el('infnote');
+    sum.textContent = `bonus stat: ${bits.join('; ')}`;
+    box.append(sum);
+  }
+  return box;
+}
+
+// The editor's two search controls: which infusions the optimizer may hand
+// out, and what it takes an unowned piece's bonus roll to be. An orb is lit
+// when the infusion is offered. The default offers every one the install does
+// not show to be unobtainable; the others carry a mark and say why on hover,
+// and can still be lit - a player may know better than a client build does.
+function infusionSearchControls(ctx, defs) {
+  const box = el('infsearch');
+  const opt = App.state?.options || {};
+  const offered = new Set(offeredInfusions(ctx.boot, opt.infusions));
+  const lab = el('inflabel');
+  lab.textContent = `The optimizer may hand out ${offered.size} of ${defs.length}`;
+  box.append(lab);
+
+  const orbs = el('inforbs');
+  for (const d of defs) {
+    const holder = el('inforb');
+    const orb = el('skillorb ' + (offered.has(d.id) ? 'picked' : 'off'));
+    orb.append(App.icon(d.icon, 32));
+    holder.append(orb);
+    if (!d.obtainable) holder.append(el('inf-nosrc', 'span'));
+    App.bindTip(holder, () => skillTip(ctx.loadout, d.id)().then((h) => h
+      + `<div class="tmeta">${esc(d.factionName)} infusion</div>`
+      + `<div class="${d.obtainable ? 'tacquire' : 'twarn'}">`
+      + `${d.obtainable ? 'Pattern: ' : 'nothing hands out its pattern on this build: '}${esc(d.source?.why)}</div>`));
+    holder.addEventListener('click', () => {
+      const next = new Set(offered);
+      if (next.has(d.id)) next.delete(d.id); else next.add(d.id);
+      const ids = defs.filter((x) => next.has(x.id)).map((x) => x.id);
+      // Back on exactly the learnable set is back on the default, by name.
+      const learnable = defs.filter((x) => x.obtainable).map((x) => x.id);
+      App.setOption('infusions',
+        ids.length === learnable.length && ids.every((id, i) => id === learnable[i]) ? 'learnable' : ids);
+    });
+    orbs.append(holder);
+  }
+  box.append(orbs);
+
+  const held = defs.filter((d) => !d.obtainable);
+  if (held.length) {
+    const n = el('infnote');
+    const dot = el('inf-nosrc', 'span');
+    n.append(dot, document.createTextNode(
+      ` ${plural(held.length, 'infusion', 'infusions')} nothing hands out on this build - withheld unless you light ${held.length === 1 ? 'it' : 'them'} (hover says why)`));
+    box.append(n);
+  }
+
+  const pol = el('infpolicy');
+  const pl = el('', 'label');
+  pl.textContent = 'An infused piece nobody owns is taken to have rolled';
+  const sel = el('', 'select');
+  const choices = [['none', 'nothing - no bonus line is priced'], ['best', 'its best rating'],
+    ...(ctx.boot?.constants?.infusion?.stats || []).map((s) => [s.id, s.name])];
+  for (const [value, text] of choices) {
+    const o = el('', 'option');
+    o.value = value;
+    o.textContent = text;
+    if (value === (opt.infusionStat || 'none')) o.selected = true;
+    sel.append(o);
+  }
+  sel.addEventListener('change', () => App.setOption('infusionStat', sel.value));
+  pol.append(pl, sel);
+  box.append(pol);
+  return box;
+}
+
+// The result pane's counterpart: what THIS search was allowed to do.
+function infusionSearchSummary(ctx, s) {
+  const box = el('infsearch');
+  const line = el('infnote');
+  line.textContent = `searched: ${s.offered.length} of ${s.total} infusions`
+    + (s.statPolicy === 'none' ? '; an unowned piece\'s bonus roll is priced at 0'
+      : `; an unowned faction-matched piece is taken to have rolled ${s.statPolicy === 'best' ? 'its best rating'
+        : (ctx.boot?.attributes?.[s.statPolicy]?.name || s.statPolicy)}`);
+  box.append(line);
+  for (const w of s.withheld || []) {
+    const l = el('infwarn');
+    l.textContent = `withheld: ${w.name} - ${w.why}`;
+    box.append(l);
+  }
+  if (!s.offered.length) {
+    const l = el('infnote');
+    l.textContent = 'no infusion was offered to the search';
+    box.append(l);
+  }
+  return box;
 }
 
 // --------------------------------------------------------- the live view
