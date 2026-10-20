@@ -8,23 +8,62 @@
 // seconds, and its messages are relayed over SSE.
 // ---------------------------------------------------------------------------
 
-import { existsSync, readFileSync } from 'node:fs';
+import {
+  existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, unlinkSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
+import { randomBytes } from 'node:crypto';
 
 import { createEngine, GOALS } from '../src/engine.mjs';
 import { illegalReason, infusionIllegalReason, infusionSets } from '../src/loadout.mjs';
 import { ratingGiven, affixSummary } from '../src/format.mjs';
 import { acceptedBuild } from '../src/drift.mjs';
+import { readSheet, reportItems, recordedPieces, SheetError, benchVersion } from '../src/charsheet.mjs';
+import {
+  buildSubmission, reportItems as submitItems, problemsOf, uploadLink, receiptText, parseReceipt, pendingReceipt,
+  sendRefusal, SHEET_MAX_BYTES, LOG_MAX_BYTES, NOTE_MAX, SEND_TIMEOUT_MS,
+  sendSubmission, deleteSubmission,
+} from '../src/submit.mjs';
+import { SubmissionError } from '../src/submission-public.mjs';
 import {
   buildView, sanitizeLoadout, clampStars, withheldItems, withheldReason, factionName, infusionRatings,
 } from './view.mjs';
 
 // A thrown ApiError picks the status; anything else is a bug and reads 500.
+// `extra` is merged into the error body beside the sentence, for the
+// refusals a page can act on rather than only print (`needs: "class"` from
+// /api/import and /api/submit/preview, a send's receipt).
 class ApiError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, extra = null) { super(message); this.status = status; this.extra = extra; }
 }
+
+// Every route and the one method it answers. ui/server.mjs reads this
+// (`routeMethod`) BEFORE a body is read: a request in any other method is a
+// 405, an OPTIONS preflight included, and a path not listed here is a 404. A
+// new route is a row here and a case in `handle`; its body cap is the
+// server's, by path (`bodyCapFor`: 40 MB for the two routes that take a
+// file, /api/import and /api/submit/preview, 1 MB for everything else).
+const ROUTES = new Map([
+  ['/api/bootstrap', 'GET'],
+  ['/api/catalog', 'GET'],
+  ['/api/sheet', 'POST'],
+  ['/api/tooltip/item', 'POST'],
+  ['/api/tooltip/skill', 'POST'],
+  ['/api/optimize/start', 'POST'],
+  ['/api/optimize/events', 'GET'],
+  ['/api/optimize/cancel', 'POST'],
+  ['/api/import', 'POST'],
+  ['/api/submit/preview', 'POST'],
+  ['/api/submit/bundle', 'POST'],
+  ['/api/submit/send', 'POST'],
+  ['/api/submit/delete', 'POST'],
+  ['/api/submit/receipts', 'POST'],
+]);
+
+/** The method a route answers, or null when there is no such route. */
+export const routeMethod = (pathname) => ROUTES.get(pathname) ?? null;
 
 const toHex = (n) => '#' + (n ?? 0).toString(16).padStart(6, '0');
 
@@ -861,7 +900,10 @@ export const gameText = { affixLine, fillLinks };
 
 // --- the api ----------------------------------------------------------------
 
-export async function createApi({ benchRoot, game = null }) {
+// `submitOff`: the sentence ui/server.mjs refuses every /api/submit/ route
+// with on a bind beyond loopback (null on loopback), served in bootstrap so
+// the dialog can say it before anyone fills it in.
+export async function createApi({ benchRoot, game = null, submitOff = null }) {
   const version = (() => {
     try { return JSON.parse(readFileSync(join(benchRoot, 'package.json'), 'utf8')).version ?? '0.1.0'; }
     catch { return '0.1.0'; }
@@ -1180,6 +1222,19 @@ export async function createApi({ benchRoot, game = null }) {
             prismatic: groupText(cdb, 'inventory_item_flags', 'Prismatic'),
           },
         } : null,
+      },
+      // "Send a fight": the caps src/submit.mjs holds a bundle to - the page
+      // checks a file against them before reading it, and a dialog that
+      // copied them would go on saying the old ones after the module moved
+      // one - how long a send waits for pCloud's answer (the module's, which
+      // the dialog says while it waits), and, on a bind beyond loopback, the
+      // sentence every submit route is refused with (null on loopback).
+      submit: {
+        sheetMaxBytes: SHEET_MAX_BYTES,
+        logMaxBytes: LOG_MAX_BYTES,
+        noteMax: NOTE_MAX,
+        sendTimeoutMs: SEND_TIMEOUT_MS,
+        off: submitOff,
       },
     };
     return bootstrapCache;
@@ -2469,6 +2524,795 @@ export async function createApi({ benchRoot, game = null }) {
     return { ok: true };
   }
 
+  // --- a file the page uploaded, and the class and level beside it ----------
+  // One reader for both routes that take a file (/api/import and
+  // /api/submit/preview), so the two cannot come to take a file, or refuse
+  // one, two ways.
+
+  // A refused value as the sentence quotes it: short, and as JSON.
+  const quoted = (v) => String(JSON.stringify(v ?? null)).slice(0, 60);
+
+  // {name, text} or {name, base64}, as {name, data} - data the text, or the
+  // bytes. Absent is null, for the caller to say what is missing in its own
+  // words. `what` is the field's name in the sentences (`file`, `log`, ...).
+  function parseFilePart(part, what) {
+    if (part == null) return null;
+    if (typeof part !== 'object' || Array.isArray(part)) {
+      throw new ApiError(400, `${what} must be a file: {name, text} with the file as text, or {name, base64} with its bytes - not ${quoted(part)}`);
+    }
+    if (part.name != null && typeof part.name !== 'string') {
+      throw new ApiError(400, `${what}.name must be the file's name, not ${quoted(part.name)}`);
+    }
+    const hasText = typeof part.text === 'string';
+    const hasBytes = typeof part.base64 === 'string';
+    if (hasText === hasBytes) {
+      throw new ApiError(400, hasText
+        ? `${what} carries both text and base64 - send one of them`
+        : `${what} needs its content: text (the file as a string) or base64 (its bytes)`);
+    }
+    if (hasText) return { name: part.name ?? null, data: part.text };
+    // Buffer.from skips what is not base64 without a word, which would hand
+    // the reader a file nobody sent.
+    const b64 = part.base64.replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(b64)) throw new ApiError(400, `${what}.base64 is not base64`);
+    return { name: part.name ?? null, data: Buffer.from(b64, 'base64') };
+  }
+
+  // The class and level a file that does not say them is taken to be - the
+  // modkit dump names neither - read off `obj.class` and `obj.level`; each
+  // null when not given. `prefix` is where they stand in the body ('' for
+  // /api/import, 'sheetOptions.' for the preview). The range is readSheet's
+  // to judge, in its own sentence; the TYPE is this reader's, since readSheet
+  // is also handed a level it does not use (a sheet that names its own) and
+  // would print an object as "[object Object]" in the note that says so. A
+  // level is a whole number, or its digits as a string (what a form field
+  // holds); an empty field is none.
+  function parseClassLevel(obj, prefix) {
+    const cls = obj?.class == null || obj.class === '' ? null : obj.class;
+    if (cls != null && typeof cls !== 'string') {
+      const classes = eng.cat.classes;
+      throw new ApiError(400, `${prefix}class must be a class id - a unit id (${classes.map((c) => c.unit).join(', ')}) `
+        + `or an aptitude id (${classes.map((c) => c.aptitude).join(', ')}) - not ${quoted(obj.class)}`);
+    }
+    const level = obj?.level == null || obj.level === '' ? null : obj.level;
+    if (level != null && !Number.isInteger(level) && !(typeof level === 'string' && /^\s*\d+\s*$/.test(level))) {
+      throw new ApiError(400, `${prefix}level must be a character level - a whole number, or left out - not ${quoted(obj.level)}`);
+    }
+    return { cls, level };
+  }
+
+  // --- POST /api/import -------------------------------------------------------
+  // A character file the user picked or dropped on the page, read by the ONE
+  // reader behind `bench import` and `--import` (src/charsheet.mjs readSheet):
+  // the documented character sheet, a build the bench saved, a bare loadout,
+  // or the modkit's inventory dump. The page and the CLI therefore cannot come
+  // to read one file two ways, and the report the page prints is the CLI's
+  // own lines (`reportItems`: each line with the kind the reader gives it),
+  // not a second wording of the same fields.
+  //
+  // What comes back is a build the page can install as it is: readSheet
+  // guarantees sanitizeLoadout removes nothing from `loadout` and neither
+  // illegality asker objects, and `pins` is what the file RECORDED - a slot
+  // it left out stays open to the search, a slot it wrote null stays empty.
+  //
+  // The only refusals are readSheet's own sentences (not JSON, none of the
+  // four shapes, a newer version, a class or level that is not one) and a body
+  // that does not carry a file. One of them is a question rather than a
+  // verdict: the modkit dump never names the class, so that refusal carries
+  // the reader's facts (classAsked), and the page asks and sends the same file
+  // again.
+  function importSheet(body) {
+    const file = parseFilePart(body?.file, 'file');
+    if (!file) throw new ApiError(400, 'body needs a file: {name, text} with the file as text, or {name, base64} with its bytes');
+    const input = file.data;
+    const { cls, level } = parseClassLevel(body, '');
+
+    let r;
+    try {
+      r = readSheet(eng, input, { cls, level });
+    } catch (e) {
+      if (!(e instanceof SheetError)) throw e;
+      throw new ApiError(400, e.message, classAsked(e));
+    }
+    const items = reportItems(r);
+    return {
+      format: r.format,
+      version: r.version,
+      name: r.name,
+      unit: r.unit,
+      aptitude: r.aptitude,
+      level: r.level,
+      rank: r.rank,
+      loadout: r.loadout,
+      pins: r.pins,
+      // Of each piece, what the FILE stated (the loadout fills in what it
+      // left open): the page sends it back with the build in the editor for
+      // the pieces it still holds as imported (/api/submit/preview).
+      pieces: recordedPieces(r),
+      report: items.map((i) => i.text),
+      reportItems: items,
+      dropped: r.dropped,
+      notes: r.notes,
+      gaps: r.gaps,
+      unknownKeys: r.unknownKeys,
+      unreadable: r.unreadable,
+      buildMismatch: r.buildMismatch,
+      observed: r.observed,
+      source: r.source,
+    };
+  }
+
+  // The reader's "which class?" as data (charsheet.mjs SheetError's facts,
+  // which buildSubmission passes on): `needs: "class"`, the name the file
+  // carries (`character`) and the classes every weapon it lists allows
+  // (`classes`). The page words its own question from them - the reader's
+  // sentence names the CLI's --class - and offers the first of `classes`.
+  // null for any other refusal: the reader says when it is the question.
+  function classAsked(e) {
+    if (e?.needs !== 'class') return null;
+    return {
+      needs: 'class',
+      character: typeof e.character === 'string' && e.character !== '' ? e.character : null,
+      classes: Array.isArray(e.classes) ? e.classes.filter((u) => typeof u === 'string') : null,
+    };
+  }
+
+  // --- POST /api/submit/* -------------------------------------------------------
+  // "Send a fight": a combat log and the build it was fought in, packed by
+  // src/submit.mjs - the module behind `bench submit` - and uploaded to the
+  // project's folder on pCloud only on the Send click. The packing, the
+  // names removed, the manual route's title and every sentence are that
+  // module's, so the page and the CLI cannot pack or describe one fight two
+  // ways.
+  //
+  // THE FILES TRAVEL ONCE. The page uploads them to /preview; the bundle made
+  // from them is held here, under a random previewId, and every later route
+  // names it by that id and takes nothing else - no file, no path, no
+  // address. What /send sends is therefore the bundle the player looked at,
+  // byte for byte, and the only one who can send it is a page that READ the
+  // preview's answer: the bench's own page, since the server's guard keeps
+  // every other page from reading anything here (ui/server.mjs).
+  //
+  // THE NETWORK. /send and /delete are the only routes of this server that
+  // reach the network, through src/submit.mjs's sendSubmission (the zip, to
+  // the project's pCloud folder) and deleteSubmission (a request for a sent
+  // fight's deletion, to the same folder). The suite holds each to its own
+  // `case` below: the two handlers are called from those cases and nowhere
+  // else (API.md pitfall 22 says what that reader of the source needs of
+  // them).
+  //
+  // HELD, AND SENT ONCE. A preview is kept 30 minutes and at most 8 are kept
+  // (each holds its zip, up to 25 MB). A send pCloud confirms consumes it; a
+  // send that failed keeps it, so "Send again" sends the SAME bundle - same
+  // id, same delete token, same bytes. pCloud keeps every upload (a second
+  // one under a name it holds is renamed beside the first), so if the first
+  // did arrive the folder holds two identical copies under one id, and the
+  // maintainer drops one. A failure after the request left hands the page
+  // the receipt as well: the fight may have arrived, and that receipt is
+  // the only way to ask for its deletion.
+  //
+  // ONE SUBMISSION, HOWEVER MANY SENDS. A preview whose send may have
+  // arrived is never dropped to make room for a newer one, and its 30
+  // minutes count from the last try - "Send again" has to find it. When it
+  // is gone all the same (the bench restarted), /preview builds it again
+  // from a receipt (`again`), which goes to buildSubmission whole (its
+  // `receipt`, as `bench submit --receipt` gives it): its id, delete token,
+  // time, SHA-256, sentAt and link, so the same files make the same zip,
+  // byte for byte, on the game build and bench version it was made on - and
+  // anything else is refused, since one id names one bundle - and a send of
+  // it puts at most an identical copy beside the first rather than a second
+  // fight.
+  //
+  // THE RECEIPT IS KEPT BEFORE A BYTE LEAVES. A send whose answer is lost -
+  // a timeout, a dropped connection, or the window closed while it waits,
+  // which in the app ends this server too - may still have put the fight in
+  // the folder. So /send writes the receipt into the bench's own folder (see
+  // receiptFolder) before it sends, as `bench submit --send` writes its own
+  // (beside the zip, or with no --zip in this same folder), and replaces it
+  // with the completed one (its sentAt set) after; a folder it cannot write
+  // refuses the send. /receipts lists that folder, so a receipt nobody
+  // saved is in front of the player the next time the dialog opens, and
+  // /delete forgets the kept copy once the request for its deletion is in
+  // the folder. "Save receipt" is still where a player keeps their own: the
+  // folder is the bench's cache. A receipt holds the delete token, and
+  // whoever reads it can ask for the fight's deletion, so it is written for
+  // this account alone - the file 0600, a folder it makes 0700 - which keeps
+  // the files at rest from the other accounts on Linux and macOS, where
+  // `node ui/server.mjs` is how the UI runs and a default write is readable
+  // by every local account. That is all the modes do: while this server
+  // runs, any program on this machine that can reach 127.0.0.1 - another
+  // account's included - can ask /receipts for the kept receipts, their
+  // tokens with them. One more reason the server listens on loopback only,
+  // and Send a fight is off on any other --host (ui/server.mjs).
+  //
+  // A DELETION IS A REQUEST. An uploader can delete nothing behind the
+  // link: /delete uploads <id>.withdraw.json, the receipt's id and token,
+  // and the maintainer deletes the fight and the request when they next
+  // read the folder. Asked through this copy's own link only - the module's
+  // rule (deleteSubmission), which `bench submit --delete` asks too.
+  //
+  // WHAT IS NOT SENT is the module's to say (sendRefusal), the rule `bench
+  // submit --send` asks, and this server keeps no rule of its own: the
+  // preview says its sentence as `sendRefused`, and /send refuses it (409)
+  // before anything is written or sent. Save .zip still saves the bundle,
+  // as --zip does. Three things are refused:
+  //
+  //   - a bundle built again from a receipt whose fight arrived (`again`
+  //     with its sentAt set): sent again, it would only be stored as a
+  //     second copy beside the first;
+  //   - a bundle built again from a receipt written for another upload link
+  //     than this copy's, or when this copy has none: it is sent again where
+  //     it may already be, or not at all;
+  //   - a sheet of another class than the log's: sent, it would be the
+  //     project's evidence for the wrong build - unless the module decided,
+  //     building it, that the class given beside the file
+  //     (`sheetOptions.class`, what --class is to the CLI) names the class
+  //     the file names itself, which says the log's header is the one that
+  //     is wrong. A modkit dump, whose only class is the one chosen for it,
+  //     and the build in the editor are never vouched for.
+  //
+  // THE BUILD IN THE EDITOR goes as what the editor STATED: its loadout with
+  // the page's pins, written by the module (buildSubmission's editor input,
+  // charsheet.mjs pinnedSheet) by the rule `bench submit` writes a build
+  // typed with flags by. What it is told - it wears nothing, no weapon, or
+  // none of the weapons the log's character fought with, or holds what no
+  // pin states - is the module's too (submit.mjs problemsOf), in the page's
+  // words, as `bench submit` is told it in its own.
+
+  const PREVIEW_TTL_MS = 30 * 60 * 1000;
+  const PREVIEW_MAX = 8;
+  const PREVIEW_ID_RE = /^[0-9a-f]{32}$/;
+  // previewId -> { sub, link, uploadProblem, sendRefused, at, sending,
+  // receipt }, where `link` is the upload link the preview was made with
+  // (null for none) and `receipt` is set once a send of it failed after
+  // leaving: it may have arrived, and the preview is then not dropped for a
+  // newer one.
+  const previews = new Map();
+  // previewId -> { at, receipt }: a preview already sent, for the 409 that
+  // says so (and hands the first send's receipt back to a page whose answer
+  // was lost on the way).
+  const sentPreviews = new Map();
+  let previewSweeper = null;
+
+  function sweepPreviews(now = Date.now()) {
+    for (const [id, p] of previews) if (!p.sending && now - p.at > PREVIEW_TTL_MS) previews.delete(id);
+    for (const [id, s] of sentPreviews) if (now - s.at > PREVIEW_TTL_MS) sentPreviews.delete(id);
+    if (!previews.size && !sentPreviews.size && previewSweeper) { clearInterval(previewSweeper); previewSweeper = null; }
+  }
+
+  // A new preview, held. The oldest one that is neither being sent nor
+  // waiting for "Send again" makes room for it - a Map iterates in the order
+  // its keys were set, so the first is the oldest. The sweeper frees an
+  // expired zip without waiting for the next call, and never keeps the
+  // process alive.
+  function holdPreview(entry) {
+    sweepPreviews();
+    for (const [id, p] of previews) {
+      if (previews.size < PREVIEW_MAX) break;
+      if (!p.sending && !p.receipt) previews.delete(id);
+    }
+    const id = randomBytes(16).toString('hex');
+    previews.set(id, entry);
+    if (!previewSweeper) {
+      previewSweeper = setInterval(() => sweepPreviews(), 60 * 1000);
+      previewSweeper.unref?.();
+    }
+    return id;
+  }
+
+  function rememberSent(id, receipt) {
+    previews.delete(id);
+    sentPreviews.set(id, { at: Date.now(), receipt });
+    for (const key of sentPreviews.keys()) {
+      if (sentPreviews.size <= 32) break;
+      sentPreviews.delete(key);
+    }
+  }
+
+  // The receipt, and the file the page offers as "Save receipt": the
+  // module's own text, which says what the key does - and where the bench
+  // keeps its own copy, when it does.
+  function receiptFields(receipt) {
+    const kept = keptPathOf(receipt.id);
+    return {
+      receipt,
+      receiptText: receiptText(receipt),
+      receiptName: `farever-bench-receipt-${receipt.id.slice(0, 8)}.json`,
+      kept: existsSync(kept) ? kept : null,
+    };
+  }
+
+  // --- the receipts the bench keeps --------------------------------------
+  // One file per submission id, in the cache folder the rest of the bench
+  // uses (FAREVER_BENCH_CACHE, which the app points at its own data folder
+  // and the self-test at a scratch one; read when used, since both set it
+  // before this server starts). It is the one thing there that cannot be
+  // made again, which the dialog says beside every copy it names.
+  function receiptFolder() {
+    return join(process.env.FAREVER_BENCH_CACHE || join(benchRoot, '.cache'), 'submit-receipts');
+  }
+  const KEPT_NAME_RE = /^farever-bench-receipt-([0-9a-f]{32})\.json$/;
+  function keptPathOf(id) {
+    return join(receiptFolder(), `farever-bench-receipt-${id}.json`);
+  }
+
+  // The receipt kept for a submission id, or null: none, or a file that does
+  // not read as one.
+  function keptReceipt(id) {
+    try {
+      return parseReceipt(readFileSync(keptPathOf(id)));
+    } catch {
+      return null;
+    }
+  }
+
+  // Written whole or not at all - half a receipt asks for nothing - in the
+  // module's own words (receiptText).
+  // For this account alone (see the header): a mode applies only to a file
+  // or a folder the call creates, so a temporary file left by a crash goes
+  // first rather than lending the receipt its mode.
+  function writeKept(receipt) {
+    const path = keptPathOf(receipt.id);
+    mkdirSync(receiptFolder(), { recursive: true, mode: 0o700 });
+    const tmp = `${path}.${process.pid}.tmp`;
+    try { unlinkSync(tmp); } catch { /* none left over */ }
+    writeFileSync(tmp, receiptText(receipt), { mode: 0o600 });
+    renameSync(tmp, path);
+    return path;
+  }
+
+  // Before a send: the receipt that asks for the deletion of whatever the
+  // send leaves behind, on disk. A completed receipt already kept for this
+  // id (a bundle built again from it) is left as it is, since it says more.
+  // `wrote` is whether this made the file, so a send refused before its
+  // request left, or refused by pCloud, takes it back: no fight carries its
+  // id. A folder that cannot be written refuses the send (507) - with no
+  // receipt kept, the deletion of a fight whose answer was lost could not be
+  // asked for.
+  function keepPending(held) {
+    const path = keptPathOf(held.sub.id);
+    const before = keptReceipt(held.sub.id);
+    if (before?.sentAt) return { path, wrote: false };
+    const receipt = pendingReceipt(held.sub, { link: held.link });
+    try {
+      writeKept(receipt);
+    } catch (e) {
+      throw new ApiError(507, `Nothing was sent: the bench could not keep this send's receipt as ${path} (${e?.code ?? e?.message ?? e}), `
+        + 'and with no receipt kept, the deletion of a fight whose answer was lost could not be asked for - make that folder writable, '
+        + 'or send the fight with bench submit --send');
+    }
+    return { path, wrote: before === null };
+  }
+
+  // A kept copy whose submission is gone: true when there was one to remove.
+  function forgetKept(id) {
+    try {
+      unlinkSync(keptPathOf(id));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Every receipt the bench keeps, newest first; a file of a receipt's name
+  // that does not read as that receipt is named, not dropped.
+  function listKept() {
+    const folder = receiptFolder();
+    let names = [];
+    let problem = null;
+    try {
+      names = readdirSync(folder);
+    } catch (e) {
+      if (e?.code !== 'ENOENT') problem = `${folder} could not be read (${e?.code ?? e?.message ?? e})`;
+    }
+    const receipts = [];
+    const unreadable = [];
+    for (const name of names) {
+      const m = KEPT_NAME_RE.exec(name);
+      if (!m) continue;
+      let r = null;
+      try { r = parseReceipt(readFileSync(join(folder, name))); } catch { r = null; }
+      if (!r || r.id !== m[1]) { unreadable.push(name); continue; }
+      receipts.push({ file: join(folder, name), ...receiptFields(r) });
+    }
+    const when = (x) => Date.parse(x.receipt.sentAt ?? x.receipt.createdAt ?? '') || 0;
+    receipts.sort((a, b) => when(b) - when(a));
+    return { folder, receipts, unreadable, problem };
+  }
+
+  // The held preview a body names, or the refusal that says why there is
+  // none: a previewId of the wrong shape (400), one sent already (409, with
+  // that send's receipt), one not held (404).
+  function previewFor(body) {
+    sweepPreviews();
+    const id = body?.previewId;
+    if (typeof id !== 'string' || !PREVIEW_ID_RE.test(id)) {
+      throw new ApiError(400, 'previewId must be the id /api/submit/preview answered with (32 hex characters), '
+        + `not ${String(JSON.stringify(id ?? null)).slice(0, 60)}`);
+    }
+    const sent = sentPreviews.get(id);
+    if (sent) {
+      throw new ApiError(409, `This preview was sent already (submission ${sent.receipt.id.slice(0, 8)}): a preview is sent once, `
+        + 'and its bundle is in the project\'s folder now', receiptFields(sent.receipt));
+    }
+    const held = previews.get(id);
+    if (!held) {
+      throw new ApiError(404, 'No preview with that id is held: a preview is kept for 30 minutes and only the 8 latest are kept, '
+        + 'so this one ran out, made way for a newer one, or was made before the bench restarted - the files are to be previewed again, '
+        + 'and a bundle whose send was not answered is built again from its receipt as the same submission');
+    }
+    return { id, held };
+  }
+
+  const isPlain = (v) => v != null && typeof v === 'object' && !Array.isArray(v);
+  const named = (v) => typeof v === 'string' && v !== '';
+  const asSentence = (t) => (/[.!?]$/.test(t) ? t : `${t}.`);
+
+  // --- the build in the editor, as what the editor STATED ------------------
+  // A loadout has no "not stated": a slot the editor left alone is in it
+  // empty, the tree and the rune slots empty - and written whole, all of it
+  // went to the project as the character's, recorded ("15 slots recorded
+  // empty, no talent point spent, 0 runes") from a page that opens on an
+  // empty Mage. The page's pins are what the player stated, as `bench
+  // submit`'s flags are, and the module writes the build from them
+  // (buildSubmission's editor input, charsheet.mjs pinnedSheet - one rule
+  // for the CLI and the page): a slot, a piece's infusion, its sockets, a
+  // skill pool, the tree and the rune slots are recorded when pinned, and
+  // left out - not recorded, a gap the sheet report names - when not.
+  //
+  // The pins are checked here for their shape only, so a page that sent a
+  // wrong one is told in this route's words. Absent is no pin at all.
+  function editorPins(p) {
+    const out = { talents: false };
+    if (p != null && !isPlain(p)) {
+      throw new ApiError(400, `sheet.editor.pins must be the page's pins {gear, augments, skills, runes, talents, infusions}, not ${quoted(p)}`);
+    }
+    for (const k of ['gear', 'augments', 'skills', 'runes', 'infusions']) {
+      const v = p?.[k] ?? [];
+      if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+        throw new ApiError(400, `sheet.editor.pins.${k} must be a list of ids, not ${quoted(p[k])}`);
+      }
+      out[k] = new Set(v);
+    }
+    if (p?.talents != null && typeof p.talents !== 'boolean') {
+      throw new ApiError(400, `sheet.editor.pins.talents must be true or false, not ${quoted(p.talents)}`);
+    }
+    out.talents = p?.talents === true;
+    return out;
+  }
+
+  // Of a pinned piece, the fields the editor STATES (pinnedSheet's
+  // `pieces`). A piece the editor still holds as an import put it there goes
+  // with what its FILE stated (`sheet.editor.pieces`: charsheet.mjs
+  // recordedPieces, which /api/import answered with and the page sends back
+  // for those pieces alone): the loadout an import fills in what the file
+  // left open - a weapon's row rarity, 0 stars - and those fills are not the
+  // character's. Any other piece was put there by the picker, which writes
+  // the rarity always, the stars when rolled and the level when set, so a
+  // field the entry lacks was not stated and goes as not recorded, never as
+  // the value the bench would assume. Flawless has no control on the page:
+  // stated only where the loadout carries it. The Prismatic flag is not one
+  // of a picker piece's: pinnedSheet states it with a pinned infusion and
+  // only then (the picker's box beside the infusion, unticked, is "not
+  // Prismatic", as `~infusion` with no `!` is on the command line).
+  const PIECE_FIELDS = ['level', 'rarity', 'stars', 'flawless', 'prismatic', 'infusionStat'];
+  function editorPieces(loadout, given) {
+    if (given != null && !isPlain(given)) {
+      throw new ApiError(400, `sheet.editor.pieces must be /api/import's pieces {slot: {level, rarity, ...}}, not ${quoted(given)}`);
+    }
+    const out = {};
+    for (const [slot, g] of Object.entries(isPlain(loadout.gear) ? loadout.gear : {})) {
+      if (!isPlain(g)) continue;
+      const file = given?.[slot];
+      if (file != null) {
+        if (!isPlain(file) || Object.entries(file).some(([k, v]) => !PIECE_FIELDS.includes(k) || typeof v !== 'boolean')) {
+          throw new ApiError(400, `sheet.editor.pieces.${slot} must be {${PIECE_FIELDS.join(', ')}}, each true or false, not ${quoted(file)}`);
+        }
+        out[slot] = { ...file };
+        continue;
+      }
+      out[slot] = {
+        level: Number.isInteger(g.level),
+        rarity: named(g.rarity),
+        stars: Number.isInteger(g.stars),
+        flawless: typeof g.flawless === 'boolean',
+      };
+    }
+    return out;
+  }
+
+  function submitPreview(body) {
+    if (body == null || typeof body !== 'object' || Array.isArray(body)) throw new ApiError(400, 'body needs a sheet and a log');
+    // --- the build: the editor's, or a file
+    const given = body.sheet;
+    if (!isPlain(given) || (given.file == null) === (given.editor == null)) {
+      throw new ApiError(400, 'sheet needs one of two things: file (a character sheet: {name, text} or {name, base64}) '
+        + 'or editor (the build in the editor: {loadout, pins, name, rank})');
+    }
+    let sheet;
+    // The editor's build, as given, and its pins.
+    let ed = null;
+    let pins = null;
+    if (given.editor != null) {
+      ed = given.editor;
+      if (!isPlain(ed) || !isPlain(ed.loadout)) {
+        throw new ApiError(400, 'sheet.editor needs the loadout of the build in the editor, as /api/sheet takes it');
+      }
+      if (ed.name != null && typeof ed.name !== 'string') {
+        throw new ApiError(400, `sheet.editor.name must be the character's name, not ${quoted(ed.name)}`);
+      }
+      if (ed.rank != null && !Number.isInteger(ed.rank)) {
+        throw new ApiError(400, `sheet.editor.rank must be a whole weapon-skill rank, not ${quoted(ed.rank)}`);
+      }
+      pins = editorPins(ed.pins);
+      // Written by the module from the pins (see above): the rule `bench
+      // submit` writes a build typed with flags by.
+      sheet = {
+        loadout: structuredClone(ed.loadout), name: ed.name || null, rank: ed.rank ?? null,
+        pins, pieces: editorPieces(ed.loadout, ed.pieces),
+      };
+    } else {
+      sheet = parseFilePart(given.file, 'sheet.file');
+    }
+    // --- what a sheet that does not say is taken to be (/api/import's
+    // class and level, by the same rules)
+    let sheetOptions = null;
+    if (body.sheetOptions != null) {
+      if (!isPlain(body.sheetOptions)) throw new ApiError(400, 'sheetOptions must be {class, level}, for a sheet that does not say them');
+      sheetOptions = parseClassLevel(body.sheetOptions, 'sheetOptions.');
+    }
+    // --- the fight
+    const log = parseFilePart(body.log, 'log');
+    if (log && body.log.mtimeMs != null) {
+      if (!Number.isFinite(body.log.mtimeMs)) {
+        throw new ApiError(400, `log.mtimeMs must be the file's time in epoch milliseconds, not ${quoted(body.log.mtimeMs)}`);
+      }
+      log.mtimeMs = body.log.mtimeMs;
+    }
+    const summary = parseFilePart(body.summary, 'summary');
+    if (body.note != null && typeof body.note !== 'string') throw new ApiError(400, 'note must be text');
+    if (body.keepName != null && typeof body.keepName !== 'boolean') {
+      throw new ApiError(400, `keepName must be true or false, not ${quoted(body.keepName)}`);
+    }
+    // --- the submission this bundle is built again as, when it is one: a
+    // receipt, given to the module whole (see the header). Read here only to
+    // say, in this route's words, that it is none.
+    let again = null;
+    if (body.again != null) {
+      try {
+        again = parseReceipt(body.again);
+      } catch (e) {
+        throw new ApiError(400, `again: ${e?.message ?? e}`);
+      }
+    }
+
+    // --- where Send would go: the upload link, read now and kept with the
+    // preview, so the send goes where the page was told it would. A
+    // FAREVER_BENCH_UPLOAD_LINK that is no upload link switches Send off,
+    // and says why. The link itself is never handed to the page.
+    let link = null;
+    let uploadProblem = null;
+    try { link = uploadLink(); } catch (e) { uploadProblem = String(e?.message ?? e); }
+
+    let sub;
+    try {
+      sub = buildSubmission(eng, {
+        sheet, sheetOptions, log, summary, note: body.note ?? null, keepName: body.keepName === true,
+        ...(again ? { receipt: again } : {}),
+      });
+    } catch (e) {
+      if (!(e instanceof SubmissionError)) throw e;
+      // A refusal of the receipt itself (the module's `receipt` fact), named
+      // by the field it came in.
+      if (e.receipt === true) throw new ApiError(e.status ?? 400, `again: ${e.message}`);
+      // The reader's "which class?", as /api/import asks it - with the class
+      // the fight's log names (the module's `logClass` on its refusal: null
+      // when the log names none or does not read), which the dialog offers
+      // first.
+      const asked = classAsked(e);
+      if (asked) asked.logClass = typeof e.logClass === 'string' ? e.logClass : null;
+      throw new ApiError(e.status ?? 400, e.message, asked);
+    }
+
+    // --- what stops Send - the module's rules and sentence, the ones
+    // `bench submit --send` asks (a receipt whose fight arrived, a receipt
+    // of another upload link than this copy's, a sheet of another class
+    // than the log's unless the class given beside the file vouched for it).
+    const refusal = sendRefusal(sub, { link });
+    const sendRefused = refusal ? refusal.message : null;
+
+    const entry = { sub, link, uploadProblem, sendRefused, at: Date.now(), sending: false, receipt: null };
+    const previewId = holdPreview(entry);
+    // The module's report, each line with its kind (and `warn` where the
+    // module warns of it) - its problems, a stated build's included, in the
+    // page's words; why Send is off (the module's first line, when the link
+    // set is none) and what stops Send, first - each warned of, as every
+    // problem is.
+    // (After the module's own first two lines when the link set is none:
+    // its Problem line and the manual route "until that link is set right".)
+    const items = submitItems(sub, { link, uploadProblem });
+    if (sendRefused) items.splice(uploadProblem ? 2 : 0, 0, { kind: 'refused', text: `Problem: ${asSentence(sendRefused)}`, warn: true });
+    return {
+      previewId,
+      // The submission this bundle is - the id its receipt names, so a page
+      // that lost a send's answer can find that receipt among the kept ones.
+      id: sub.id,
+      expiresAt: new Date(entry.at + PREVIEW_TTL_MS).toISOString(),
+      upload: link !== null,
+      uploadProblem,
+      sendRefused,
+      logClass: sub.logClass ?? null,
+      // the manual route's issue title (the GitHub form opens with it)
+      title: sub.issueTitle,
+      files: sub.files,
+      zipName: sub.zipName,
+      zipBytes: sub.zipBytes,
+      formUrl: sub.formUrl,
+      report: items.map((i) => i.text),
+      reportItems: items,
+      problems: problemsOf(sub),
+    };
+  }
+
+  // Save .zip: the held bundle, byte for byte, as often as the page asks.
+  function submitBundle(body) {
+    const { held } = previewFor(body);
+    return { name: held.sub.zipName, base64: held.sub.zip.toString('base64'), bytes: held.sub.zip.length };
+  }
+
+  // An async route's answer (the optimizeEvents pattern: it writes `res`
+  // itself, once).
+  function reply(res, status, data) {
+    if (res.headersSent || res.writableEnded) return;
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(data));
+  }
+
+  // A refusal of /send or /delete. The route's own keep their status, and so
+  // do the module's, which already say what pCloud answered: a refusal of
+  // its (503 the link closed or unknown, 507 the folder full, 429 this
+  // address turned away, 502 anything else - `arrived: false`: nothing of
+  // it was kept, and it carries no receipt), 502 for pCloud unreached or an
+  // answer that is not its API's (with the receipt: the fight may have
+  // arrived), 400 for what the module refuses before anything leaves. A
+  // receipt the module attached travels with the sentence.
+  // It never throws: the two routes that use it are not awaited by anyone,
+  // and a rejection nobody handles ends a plain Node process.
+  function replyError(res, e) {
+    try {
+      if (e instanceof ApiError) { reply(res, e.status, { error: e.message, ...(e.extra ?? {}) }); return; }
+      if (e instanceof SubmissionError) {
+        const s = e.status;
+        const status = Number.isInteger(s) && s >= 400 && s < 600 ? s : 500;
+        reply(res, status, {
+          error: e.message, ...(e.arrived === false ? { arrived: false } : {}), ...(e.receipt ? receiptFields(e.receipt) : {}),
+        });
+        return;
+      }
+      reply(res, 500, { error: String(e?.message ?? e) });
+    } catch (bug) {
+      reply(res, 500, { error: String(bug?.message ?? bug) });
+    }
+  }
+
+  // How long a send waits for pCloud, as the 409 of a second send says it.
+  const sendWait = () => (SEND_TIMEOUT_MS >= 60_000 ? `${Math.round(SEND_TIMEOUT_MS / 60_000)} minutes` : `${Math.round(SEND_TIMEOUT_MS / 1000)} s`);
+
+  // Send: the held bundle to the project's pCloud folder, on the player's
+  // consent. Called from its `case` alone (see the header).
+  async function submitSend(res, body) {
+    let id;
+    let held;
+    try {
+      if (body?.consent !== true) {
+        throw new ApiError(400, 'Nothing was sent: a send needs consent: true, which the dialog sends once '
+          + '"I understand the zip goes to the project\'s folder on pCloud, where only the maintainer can read it" is ticked');
+      }
+      ({ id, held } = previewFor(body));
+      if (held.sending) {
+        throw new ApiError(409, `This preview is being sent already - the answer goes to the send that started it, within ${sendWait()}`);
+      }
+      // What the module refuses to send (see the header) - asked first, as
+      // sendSubmission and `bench submit --send` ask it: refused before the
+      // receipt is written, so nothing carries its id and a completed
+      // receipt kept for it stays as it is. The module asks the same rules
+      // again before its request leaves.
+      if (held.sendRefused) throw new ApiError(409, held.sendRefused);
+      if (held.link === null) {
+        throw new ApiError(409, held.uploadProblem
+          ? `Send is off: ${held.uploadProblem}`
+          : `Send is off in this copy of the bench (no upload link is set) - save the .zip and attach it to a new issue: ${held.sub.formUrl}`);
+      }
+    } catch (e) {
+      replyError(res, e);
+      return;
+    }
+    // The receipt on disk first (see the header); no await between the
+    // `sending` test above and the flag below, so two sends cannot both pass.
+    let kept;
+    try {
+      kept = keepPending(held);
+    } catch (e) {
+      replyError(res, e);
+      return;
+    }
+    held.sending = true;
+    try {
+      // The bench version that built the bundle, which the module holds the
+      // send to - as `bench submit --send` passes its own.
+      const done = await sendSubmission(held.sub, { link: held.link, benchVersion: benchVersion() });
+      // The receipt is its six fields; the name the zip went under is no
+      // field of it, and travels beside it.
+      const { uploadedAs, ...receipt } = done;
+      // The completed receipt over the pending one; if that write fails, the
+      // pending one still asks for the fight's deletion, and the page has
+      // this one.
+      try { writeKept(receipt); } catch { /* the pending copy stays, and still asks for it */ }
+      rememberSent(id, receipt);
+      reply(res, 200, {
+        sent: { id: receipt.id, uploadedAs, sentAt: receipt.sentAt, zipSha256: receipt.zipSha256 },
+        ...receiptFields(receipt),
+      });
+    } catch (e) {
+      held.sending = false;
+      if (e instanceof SubmissionError && e.receipt) {
+        // It may have arrived: held for Send again, from now.
+        held.receipt = e.receipt;
+        held.at = Date.now();
+      } else if (kept.wrote) {
+        // Refused before the request left, or by pCloud, which then kept
+        // none of it (`arrived: false`): no fight carries its id. A receipt
+        // kept before an earlier send of this bundle stays - that send may
+        // have arrived.
+        forgetKept(held.sub.id);
+      }
+      replyError(res, e);
+    }
+  }
+
+  // Delete: a request for a past submission's deletion, uploaded with its
+  // receipt to the project's pCloud folder through this copy's own upload
+  // link (a receipt of another link is the module's 400, which says how to
+  // ask there). Called from its `case` alone.
+  async function submitDelete(res, body) {
+    let receipt;
+    try {
+      const given = body?.receipt;
+      if (given == null || (typeof given !== 'string' && (typeof given !== 'object' || Array.isArray(given)))) {
+        throw new ApiError(400, 'receipt must be the receipt a send gave you - the text of the file, or its JSON');
+      }
+      receipt = parseReceipt(given);
+      // Not while that very submission is on its way: the send's answer
+      // would write its receipt back as completed after the request forgot
+      // it, and the dialog would show a fight sent whose deletion is asked.
+      for (const p of previews.values()) {
+        if (p.sending && p.sub.id === receipt.id) {
+          throw new ApiError(409, `Submission ${receipt.id.slice(0, 8)} is being sent right now - nothing was asked: ask for its deletion `
+            + `once that send is answered, within ${sendWait()}`);
+        }
+      }
+    } catch (e) {
+      replyError(res, e);
+      return;
+    }
+    try {
+      await deleteSubmission(receipt, { link: uploadLink() });
+      // The request is in the folder: the kept copy has done its work.
+      reply(res, 200, { ok: true, requested: true, id: receipt.id, forgotten: forgetKept(receipt.id) });
+    } catch (e) {
+      replyError(res, e);
+    }
+  }
+
+  // The receipts the bench keeps, for the dialog's list - and whether this
+  // copy sends at all (never its link: the page has no use for it).
+  function submitReceipts() {
+    let link = null;
+    let uploadProblem = null;
+    try { link = uploadLink(); } catch (e) { uploadProblem = String(e?.message ?? e); }
+    return { ...listKept(), upload: link !== null, uploadProblem };
+  }
+
   // --- dispatch -------------------------------------------------------------
 
   function handle(req, res, pathname, searchParams, body) {
@@ -2477,6 +3321,14 @@ export async function createApi({ benchRoot, game = null }) {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(data));
     };
+    // A `case` below with no ROUTES row would be reached with no method,
+    // Origin or content-type check and no body (the server reads one only for
+    // a POST row). Such a route is not answered at all: it fails closed, and
+    // visibly, the first time anyone calls it.
+    if (!ROUTES.has(pathname)) {
+      json(404, { error: `no such endpoint ${pathname}` });
+      return true;
+    }
     try {
       switch (pathname) {
         case '/api/bootstrap': json(200, bootstrap()); return true;
@@ -2487,11 +3339,19 @@ export async function createApi({ benchRoot, game = null }) {
         case '/api/optimize/start': json(200, optimizeStart(body)); return true;
         case '/api/optimize/events': optimizeEvents(req, res, searchParams); return true;
         case '/api/optimize/cancel': json(200, optimizeCancel(body)); return true;
+        case '/api/import': json(200, importSheet(body)); return true;
+        case '/api/submit/preview': json(200, submitPreview(body)); return true;
+        case '/api/submit/bundle': json(200, submitBundle(body)); return true;
+        case '/api/submit/receipts': json(200, submitReceipts()); return true;
+        // The two that reach the network: async, they answer `res` themselves
+        // once pCloud has, and never reject.
+        case '/api/submit/send': submitSend(res, body); return true;
+        case '/api/submit/delete': submitDelete(res, body); return true;
         default: json(404, { error: `no such endpoint ${pathname}` }); return true;
       }
     } catch (e) {
       const status = e instanceof ApiError ? e.status : 500;
-      json(status, { error: String(e?.message ?? e) });
+      json(status, { error: String(e?.message ?? e), ...(e instanceof ApiError ? e.extra ?? {} : {}) });
       return true;
     }
   }
@@ -2500,8 +3360,12 @@ export async function createApi({ benchRoot, game = null }) {
     for (const job of jobs.values()) {
       if (!job.done) killJob(job, 'server closing');
     }
+    if (previewSweeper) clearInterval(previewSweeper);
+    previewSweeper = null;
+    previews.clear();
+    sentPreviews.clear();
     icons.close?.();
   }
 
-  return { handle, close, icons, notice };
+  return { handle, close, icons, notice, routeMethod };
 }

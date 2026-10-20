@@ -27,7 +27,27 @@ not pins — `ui/lib/check-api.mjs` holds the assertions.
   The server chooses per gfx row (sniffing is done once server-side).
 - Colors are `'#rrggbb'` strings.
 - All POST bodies and responses are JSON; errors are
-  `{error: "human sentence"}` with status 400 (bad input) or 500 (bug).
+  `{error: "human sentence"}` with status 400 (bad input) or 500 (bug) —
+  and 403, 404, 405, 413 or 415 for a request the server refuses before any
+  route runs (see "Who may call `/api/`" below). The `/api/submit/` routes
+  add 404 (a preview that is not held), 409 (one already sent or being sent,
+  no upload link, a sheet of another class than the log's, a bundle built
+  again from a receipt whose fight arrived, or one built again from a
+  receipt of another upload link; a deletion asked for a submission being
+  sent), 413 (a part over the bundle's caps), 507
+  (a send's receipt could not be kept on disk, so nothing was sent - or
+  pCloud's folder is full), and pCloud's answers in `src/submit.mjs`'s
+  words: 503 (the upload link closed, or unknown to pCloud; a deletion asked
+  with no upload link), 429 (pCloud turns this address away for now) and
+  502 (pCloud could not store it, could not be reached, or answered other
+  than as its API does).
+  Two kinds of refusal carry fields beside the sentence: the reader's
+  class question (`needs: "class"`, `character`, `classes` - `/api/import`
+  and `/api/submit/preview`, which adds `logClass`), and a send's receipt
+  (`receipt`, `receiptText`, `receiptName`, `kept` - see
+  `/api/submit/send`); a send, or a request for a deletion, that pCloud
+  refused says so with `arrived: false` - nothing of it was kept - and
+  carries no receipt.
   Bad input is refused, not repaired into a number: a loadout with no
   `level`, a gear `level` that is not a number, an unknown `goal`, an
   `exclude` that is not a regex, a non-integer `rank`, an `infusions` option
@@ -50,6 +70,40 @@ not pins — `ui/lib/check-api.mjs` holds the assertions.
   with a filled off hand; an infusion that is not one, or on a piece that
   cannot carry it), and a 400 by `/api/optimize/start`, which has no sheet to
   put the sentence on.
+- **Who may call `/api/`.** Listening on loopback does not keep other pages
+  out: any page the user has open can aim a request at
+  `http://127.0.0.1:<port>`, and one on a name that resolves to 127.0.0.1
+  (DNS rebinding) is same-origin with it as far as the browser knows. So
+  `ui/server.mjs` refuses, BEFORE any route runs and before a byte of the
+  body is read, in this order — each as `{error: "sentence"}`:
+
+  | status | refused | why |
+  |---|---|---|
+  | 403 | any `/api/` request (GET too) whose `Host` is not `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>` — plus `<host>:<port>` when the server was bound to another loopback address with `--host` | a rebinding page sends its own name; and `/api/bootstrap` names the install folder, which carries the Windows account name |
+  | 403 | any request under `/api/submit/` when the server is bound BEYOND loopback (`--host 0.0.0.0`, a LAN address): `bootstrap.submit.off`, `Send a fight is off on this server: it listens on <host>, beyond this machine, …` — before the method, the Origin or the body | there the Host cannot be checked and a request with no Origin passes, so anything on the network could send fights to the project's folder from the player's address, read the kept receipts with their delete tokens, and ask for those fights' deletion |
+  | 404 | an `/api/` path that is no route | |
+  | 405 | a route asked in a method it does not take, with an `Allow` header: `GET` for `/api/bootstrap`, `/api/catalog`, `/api/optimize/events`, `POST` for every other route; `OPTIONS` included. Outside `/api/` (icons, files) only `GET`/`HEAD` | a cross-site JSON request needs a CORS preflight, and this server never answers one |
+  | 403 | a POST whose `Origin` header, when the browser sends one, is not `http://<the Host it was addressed to>` (a request with no `Origin` — curl, Node's fetch, the check script — passes) | an ordinary cross-site page |
+  | 415 | a POST whose `content-type` is not `application/json` (parameters such as `; charset=utf-8` are allowed) | a form or a "simple" fetch can send `text/plain` with no preflight |
+  | 413 | a body over its route's cap: **40 MB** for the two routes that carry a file, `/api/import` and `/api/submit/preview`; **1 MB** for every other route — the rest of `/api/submit/` takes an id, a flag or a receipt | |
+  | 400 | a body that is not JSON (`body is not JSON`) | |
+
+  An over-cap body is READ TO ITS END AND THROWN AWAY, then answered 413
+  with the sentence (`the request body is 41 MB, and /api/import takes at
+  most 40 MB - none of it was read`; a body so little over that both sizes
+  round to the same tenth of a MB reads `more than 40 MB`). It is not cut
+  off: a server that closes
+  the socket mid-upload leaves the client a connection reset instead of the
+  reason. Outside `/api/`, a path whose `%`-escape is not one is a 400
+  (`bad url: <path> has a %-escape that is not one`), not a 500.
+  When `--host` binds BEYOND loopback (`0.0.0.0`, a LAN address) the
+  server is reached by names it cannot list, so the Host is not checked
+  there, and the Origin is compared with the request's own Host — which a
+  rebinding page passes, and a request with no Origin passes anyway. That
+  bind gives the guard up for the rest of `/api/`, and `bench ui` warns
+  about it; for `/api/submit/` it is not given up — every route there is
+  refused (the 403 above, `submitOffFor` in `ui/server.mjs`), and the
+  dialog says so from `bootstrap.submit.off` instead of offering Preview.
 
 ## GET /api/bootstrap
 
@@ -112,9 +166,21 @@ Static-per-session data, fetched once at startup.
       // null on a build with no Infusion system
       "infusion": { "caps": [2, 4, 6], "minRarity": "Epic",
           "stats": [ { "id": "CritChanceRating", "name": "Critical" }, … ],
-          "texts": { "header": "Infusions", "prismatic": "Prismatic" } } }
+          "texts": { "header": "Infusions", "prismatic": "Prismatic" } } },
+  // "Send a fight": the caps src/submit.mjs holds a bundle to (SHEET_MAX_BYTES,
+  // LOG_MAX_BYTES, NOTE_MAX), how long a send waits for pCloud's answer
+  // (SEND_TIMEOUT_MS), and why the dialog is off on this server - null on a
+  // loopback bind, the 403 sentence of every /api/submit/ route on a bind
+  // beyond it (see "Who may call /api/")
+  "submit": { "sheetMaxBytes": 524288, "logMaxBytes": 20971520, "noteMax": 2000, "sendTimeoutMs": 600000,
+              "off": null | "Send a fight is off on this server: it listens on 0.0.0.0, beyond this machine, …" }
 }
 ```
+
+`submit` is what the dialog holds a file to before reading it, the note's
+length, and the wait it states while a send is out (in minutes): the
+module's own values, served so that the page never carries a copy that
+outlives a change to them.
 
 An **infusion** is a set passive learned from a pattern item and worn on
 armour. `infusions` is the catalog's list — one entry per `InfusionPattern`
@@ -864,9 +930,785 @@ field what `bench optimize --json` writes — `ui/lib/check-api.mjs` feeds one
 back through the CLI and compares the two files' fields — including the four
 the UI's copy used to lack: `tickSource` (which sheet a status tick is priced
 off), `pinned.infusions` (the slots whose infusion was held),
+`pinned.runes` and `pinned.talents` (the rune slots and the tree the run held,
+so `--build` and `/api/import` hold them again rather than searching them),
 `infusionSearch: { offered, stat }` (what the search could hand out and the
 roll policy; the CLI reads both back as defaults) and `infusions` (the
 engine's `{ sets, pieces }` for the build).
+
+## POST /api/import
+
+A character file the user picked (the band's **Import** button) or dropped on
+the window, read into a build the page installs. Body:
+
+```jsonc
+{ "file": { "name": "farever-inventory-Tester.json",
+            "text": "{\"character\": …}" },     // or "base64": "<its bytes>" - one of the two
+  "class": "Rogue",     // optional: only for a file that does not say (the modkit dump)
+  "level": 25 }         // optional: the same, for the character level
+```
+
+`file.text` is the file as a string (what `File.text()` gives); `file.base64`
+is its bytes, for a client that has bytes. Exactly one of them, and a
+`base64` that is not base64 is a 400 rather than a file nobody sent. `name` is
+the file's name and is only echoed in sentences. `class` (a unit or aptitude
+id, any case) and `level` are what the CLI's `--class` / `--level` are to
+`bench import`: a file that names its own keeps them.
+
+The file is read by `src/charsheet.mjs` `readSheet` — the one reader behind
+`bench import`, `--import` on every command and this route, so the page and
+the CLI cannot read one file two ways. It takes four shapes, told apart by
+their keys: the documented character sheet (`docs/CHARACTER-SHEET.md`), a
+build the bench saved (`optimize --json`, the result pane's **Save build**),
+a bare loadout, and the modkit's `farever-inventory-<Name>.json`. Response:
+
+```jsonc
+{ "format": "farever-character-sheet" | "bench-envelope" | "bench-loadout" | "modkit-inventory",
+  "version": 1 | null,
+  "name": "Example" | null,            // null when the file names nobody
+  "unit": "Rogue", "aptitude": "Assassin", "level": 25,
+  "rank": 3 | null,                    // the weapon-skill rank it records; null = not recorded
+  "loadout": { …the /api/sheet loadout… },
+  "pins": { "gear": ["Slot_Weapon1", …], "augments": ["Slot_Weapon1/AugmentDemon", …],
+            "skills": ["Slot_Weapon2", …], "runes": ["Rogue_Shadowstep", …],
+            "talents": true, "infusions": ["Slot_Chest", …] },
+  "pieces": { "Slot_Weapon1": { "level": true, "rarity": false, "stars": false, "flawless": true,
+                                "prismatic": true, "infusionStat": true }, … },   // what the FILE stated of each piece
+  "report": [ "Read as a character sheet (farever-character-sheet), version 1.",
+              "Character: Example, Rogue (aptitude Assassin), level 25.", … ],
+  "reportItems": [ { "kind": "read", "text": "Read as a character sheet (farever-character-sheet), version 1." },
+                   { "kind": "character", "text": "Character: Example, …" }, { "kind": "gap", "text": "Gap: …", "warn": true }, … ],
+  "dropped": [ { "field": "gear.Slot_Head.sockets", "id": "…", "why": "sentence" } ],
+  "notes": ["…"], "gaps": ["…"], "unknownKeys": ["gear.Slot_Head.colour"],
+  "unreadable": ["talents"],           // what the exporter said it could not read
+  "buildMismatch": null | "sentence",  // written on another build of the game
+  "observed": { "stats": null | { "Vitality": 412, … }, "buffs": null | [ … ],
+                "weaponSkillRanks": null | { … },
+                "iLevel": { "Slot_Weapon1": { "game": 340, "bench": 340 } } },
+  "source": null | { "exporter": "…", "exporterVersion": "…", "steamBuild": "…", … } }
+```
+
+* **`loadout` is installed as it is.** readSheet guarantees that
+  `sanitizeLoadout` removes nothing from it and that neither
+  `illegalReason` nor `infusionIllegalReason` objects (the suite holds that
+  for every shape), so `/api/sheet` prices exactly what the file said. A
+  node a socketed sigil grants is not in `talents` (it costs no point; a
+  note says so) — the sheet grants it from the sigil, so the number is the
+  same.
+* **`pins` is what the file RECORDED**, in the shape `/api/optimize/start`
+  takes: a slot written with an item or as `null` is pinned (worn, or held
+  empty); a slot the file leaves out is left open to the search and named in
+  `gaps`. A skill pool is pinned only when its picks fill it, as the page's
+  own rule is. `infusions` only names slots that are also in `gear`.
+* **`pieces` is what the file STATED of each piece** (`src/charsheet.mjs`
+  `recordedPieces`): a field is false where the import names it not
+  recorded (a gap). `loadout` fills those in - a weapon's row rarity, 0
+  stars, not Flawless - because a loadout has no "not recorded"; sent from
+  the editor as they are, they went as the character's own, where the same
+  file sent as a file left them open. So the page keeps `pieces` and sends
+  it back with the build in the editor (`/api/submit/preview`'s
+  `sheet.editor.pieces`) for each piece the editor still holds as imported.
+* **`report` is what to print** — the lines `bench import` prints, in the
+  order a person checks a file: what it was, who wrote it, the other-build
+  sentence first when there is one, who the character is, what was kept,
+  then each drop with its reason, each gap, the unknown keys, the item
+  levels and observations, the notes. The fields beside it are the same
+  facts for a program; a page does not recompose sentences from them.
+  `reportItems` is the same lines with the kind the reader gives each
+  (`reportItems` in `src/charsheet.mjs`: `read`, `source`, `mismatch` - the
+  file was written on another game build -, `character`, `kept`, `rank`,
+  `dropped`, `gap`, `unknown`, `ilevel`, `ilevels`, `buffs`, `stats`,
+  `note`), and `"warn": true` on a line the reader warns of (`mismatch`,
+  `dropped`, `gap`, `unknown`, `ilevel` - the reader's one table of it,
+  which `bench import` colours by too; no other line has the key): a page
+  marks a line by `warn` and its kind, never by the words it opens with.
+* `rank` is null when the file does not record the weapon-skill ranks (the
+  report's gap line then says the bench's default rank applies).
+
+Applying it (`components/exchange.js`): `App.state.cls = unit`,
+`App.state.level = level`, `App.state.name = name` when it is not null,
+`App.state.loadout = ` a deep copy of `loadout`, `App.state.pins` from `pins`
+(Sets, `talents` a boolean), `App.state.options.rank = rank` — or, when
+`rank` is null, the page's own starting rank (3, the default everything on
+the page falls back to, and `WeaponSkill_MaxRank` - the rank the gap line
+names), so one import's rank never outlives it into the
+next file — `App.result = null`, then `await App.loadCatalog()`,
+`App.refreshSheet()`, `App.render()`. Never through `App.setClass` /
+`App.setLevel`: both start from an empty loadout and empty pins. Two of
+those are not on the sheet, so the report panel says them above the lines:
+a file that names nobody leaves the band's name as it was ("the band keeps
+the name …"), and a rank that changed says what the page now prices with —
+the page has no control for it. The panel is a strip in the page's flow
+under the band, above the tabs: it pushes the sheet down rather than lying
+over the gear it describes (or the Optimize result beside it), and scrolls
+on its own past a third of the window.
+
+The page does not import while Optimize runs (`#optimize-btn` reads
+`Cancel`): a search's answer is about the build it started from, and would
+otherwise land on the imported one with "Apply to editor" beside it. The
+panel asks, and **Stop the search and import** cancels the job first. A file
+dropped while a dialog is open (the exchange modal with no `onDrop`, the item
+picker) is not imported behind it: the drag shows "no drop", and a drop that
+arrives anyway is refused with a sentence.
+
+A 400 is one of readSheet's sentences — not JSON, none of the four shapes, a
+version newer than this bench reads, a class or a level that is not one — or
+one of the route's own: a body that carries no file, both or neither of
+`text` / `base64`, a `class` that is not a string (`class must be a class id
+- a unit id (Warrior, Rogue, Mage, Priest) or an aptitude id (Fighter,
+Assassin, Wizard, Cleric) - not 5`),
+a `level` that is neither a whole number nor its digits as a string (`level
+must be a character level - a whole number, or left out - not {"a":1}`; the
+range is readSheet's). Nothing else refuses a file: a stale id, an item
+the class cannot use or a socket the piece does not have is dropped and named
+in `dropped`, never the whole import. One refusal is a question: a modkit
+dump never names the class, and without `class` it is
+
+```jsonc
+{ "error": "a modkit inventory dump does not say which class \"Tester\" is - every weapon it lists fits a Rogue. Name the class and it is read again: --class on the command line, the class choice in the app",
+  "needs": "class",
+  "character": "Tester" | null,    // the name the file carries
+  "classes": ["Rogue"] | null }    // the unit ids that can use every weapon it lists (every piece, with none); [] when no class can
+```
+
+— the reader's facts (`SheetError`'s `needs`, `character`, `classes`). The
+page words its own question from them - the sentence is the reader's, and
+names the CLI's `--class` - offers the first of `classes` (the editor's
+class when there is none), and sends the same file again with `class`. A
+page acts on `needs`, never on the words. The body cap is the file routes'
+40 MB (413 beyond); a sheet is a few kilobytes.
+
+## POST /api/submit/* — sending a fight to the project
+
+The band's **Send a fight** dialog (`components/exchange.js`). Five routes,
+and the order is the point: the page uploads the files ONCE, to `preview`;
+the server packs them, keeps the bundle, and answers with what Send would do
+with it and a `previewId`. Everything after that names the bundle by that id
+and nothing else: `bundle` hands back the .zip, `send` sends it, and neither
+takes a file, a path or a setting. So what is sent is the bundle the user
+looked at, byte for byte, and a page that cannot read the preview's answer
+(any page but the bench's own - see "Who may call `/api/`") has no id to
+send. `delete` asks for a sent fight's deletion with its receipt, and
+`receipts` lists the receipts the bench keeps.
+
+Behind all five is `src/submit.mjs`, the module `bench submit` uses: the
+bundle, the names it removes, the manual route's title, the receipt and
+every sentence are its own, so the page and the CLI cannot pack or say one
+fight two ways (docs/SUBMITTING.md is the player's account of it). So are the
+rules a page might think its own: Send refuses a sheet of another class
+than the log's, and a bundle built again from a receipt whose fight
+arrived, by the module's `sendRefusal`, the rule `--send` asks
+(`sendRefused`, below); which report lines are warned of is the readers'
+`warn`; and the build in the editor is written from the
+page's pins by the module (`pinnedSheet`), the rule `bench submit` writes a
+build typed with flags by (`editor`, below). **`send` and `delete`
+are the only routes of this server that reach the network**, through that
+module's `sendSubmission` / `deleteSubmission`, and only on the click that
+calls them; the suite's "network call sites" group holds api.mjs to calling
+them from those two routes and nowhere else.
+
+**Where Send goes.** Send uploads the zip to the project's folder on pCloud
+through an upload link, named `<id>.zip` (the full 32-hex submission id),
+with the uploader name `farever-bench` - never the character's, the
+account's or the computer's. Nothing is published: the folder's owner, the
+maintainer, is the one who can read it, and an uploader can put files there
+and do nothing else - list, read or delete. pCloud is a third party: it sees
+the player's address as any website does. The link is `uploadLink()`:
+`UPLOAD_LINK` in `src/submit.mjs`, which `FAREVER_BENCH_UPLOAD_LINK` in the
+environment overrides (`none` / `off` / empty switch Send off; anything else
+must be an upload link, or Send is off and `uploadProblem` says why;
+`ui/lib/check-api.mjs` points it at a pCloud stand-in on 127.0.0.1 and never
+reaches pCloud). It is read when a preview is made and kept with it: the
+preview's `upload` says whether Send is offered, and the send goes through
+the link that preview was made with. No route hands the link to the page
+beside the receipt that names it, and the page never shows it.
+
+**Previews are held in memory**: 30 minutes from the preview, at most 8 at
+once (a ninth drops the oldest), and gone when the server stops. A preview is
+**sent once**: a send pCloud confirmed (`{result: 0}`) consumes it, and after
+that `bundle` and `send` refuse it (409). A send that failed keeps it, so
+**Send again** sends the very same bundle - the same id, delete token and
+bytes. pCloud keeps every upload (a second one under a name it holds is
+renamed beside the first), so if the first send did arrive the folder holds
+two identical copies under one id, and the maintainer drops one
+(`tools/inbox.mjs` reports it). Two sends of one preview at the same moment:
+the second is a 409.
+
+**One submission, however many sends.** A preview whose send failed after
+the request left (it may have arrived) is never dropped for a newer one, and
+its 30 minutes count again from that try. When it is gone all the same -
+the 30 minutes ran out, or the bench restarted - `preview` builds it again
+from its receipt (`again`, below): the receipt's id, delete token, time and
+SHA-256 are `buildSubmission`'s `id`, `deleteToken`, `now` and `zipSha256`,
+so the same files make the same zip, byte for byte, as `bench submit
+--receipt` does, while the game build and the bench version are the ones it
+was made on - anything else is refused, since one id names one bundle - and
+a send of it puts at most an identical copy beside the first rather than a
+second fight.
+
+**The receipt is kept before a byte leaves.** A send whose answer is lost -
+a timeout, a dropped connection, or the app closed while it waits, which
+ends this server too - may still have put the fight in the folder. So `send`
+writes the receipt to `<cache>/submit-receipts/farever-bench-receipt-<id>.json`
+(`<cache>` is `FAREVER_BENCH_CACHE`, which the app sets to its own data
+folder, else the bench's `.cache`) BEFORE it sends, as `bench submit --send`
+writes its own (beside the zip, or with no `--zip` in this same folder),
+and replaces it with the completed receipt (its `sentAt` set) after; a
+folder it cannot write refuses the send (507). `receipts` lists the folder,
+and `delete` forgets the kept copy once the request for its deletion is in
+the folder. It is the one thing in the cache that cannot be made again,
+which the dialog says beside every copy it names: **Save receipt** is still
+where a player keeps their own. A receipt holds the delete token - whoever
+reads it can ask for the fight's deletion - so the file is written mode
+`0600` and a folder the write creates `0700`: on Linux and macOS, where
+`node ui/server.mjs` is how the UI runs, a default write is readable by
+every local account. The modes keep the files at rest from other accounts,
+and that is all they do: while the server runs, any program on this machine
+that can reach `127.0.0.1` - another account's included - can ask
+`receipts` for the kept receipts, their delete tokens with them (a request
+with no `Origin` passes the guard, as curl's does). That is one more reason
+the server listens on loopback only, and Send a fight is off on any other
+`--host` (the 403 above).
+
+**A deletion is a request.** An uploader can delete nothing behind the
+link. So each bundle draws a delete token once, its `manifest.json` carries
+the token's SHA-256 (`deleteTokenSha256`) and the receipt the token itself,
+and `delete` uploads `<id>.withdraw.json` - the receipt's id and token - to
+the same folder. The maintainer deletes the zips of that id and the request
+when the token's SHA-256 is the manifest's (`tools/inbox.mjs` says which):
+when they next read the folder, not when the player asks. Nothing of the
+fight was ever public.
+
+### POST /api/submit/preview
+
+```jsonc
+{ "sheet": { "editor": { "loadout": { …the editor's loadout… },
+                         "pins": { "gear": ["Slot_Weapon1"], "augments": [], "skills": [], "runes": [],
+                                   "talents": false, "infusions": [] },   // App.state.pins, as /api/optimize/start takes them
+                         "name": "Bencher", "rank": null,
+                         "pieces": { "Slot_Weapon1": { "level": true, "rarity": false, … } } } },   // optional: /api/import's, for the pieces still held as imported
+           // or { "file": { "name": "sheet.json", "text": "…" } } - or "base64" for its bytes
+  "sheetOptions": { "class": "Rogue", "level": 25 },   // optional: for a file that does not say (a modkit dump)
+  "log": { "name": "fight_….json.timeline", "base64": "…", "mtimeMs": 1792324809200 },   // or "text"
+  "summary": { "name": "fight_….json", "base64": "…" },   // optional: Wink's summary beside its timeline
+  "note": "…",              // optional, at most 2000 characters
+  "keepName": false,        // optional; true keeps the character's name in the private files
+  "again": "<a receipt's text>" }   // optional: build the submission that receipt names again (or the receipt as an object)
+```
+
+* **`sheet`** is exactly one of the two. `file` is any shape `/api/import`
+  reads, sent the same way (`text`, or `base64` for bytes - exactly one);
+  `sheetOptions` are that route's `class` and `level`, read by the same
+  rules - what `--class` and `--level` are beside `--import`: the class a
+  file that names none (a modkit dump) is read as, and, beside a file that
+  names its own, a second word on it that can vouch for the sheet against a
+  log of another class (`sendRefused`, below). The dialog sends them with a
+  dump's class question, and with the class chosen beside any sheet file.
+  `editor` is the build on the page (`App.state.loadout`,
+  `App.state.pins` with its Sets as lists, `App.state.name`), handed to
+  `buildSubmission` as its editor input `{loadout, name, rank, pins,
+  pieces}` and written there as a sheet of what the editor STATED
+  (`src/charsheet.mjs` `pinnedSheet`) - the rule `bench submit` writes the
+  build its flags typed by, so the page and the CLI cannot record one build
+  two ways. Its `manifest.sheet.sourceFormat` is `bench-editor`. A loadout
+  has no "not stated", and written whole every slot the editor left alone
+  went as recorded empty: the page opens on an empty Mage, and sent from
+  there that was "15 slots recorded empty, no talent point spent, 0 runes",
+  sent as the character's. So the pins decide, as the CLI's flags do:
+  - a pinned slot is recorded, with its piece (an empty one as empty); a
+    slot no pin holds is absent - not recorded, and the sheet report names
+    it as a gap - whatever the editor holds there;
+  - of a pinned piece, the fields it STATES. A piece the editor still holds
+    as the last import put it there states what its FILE did: the page sends
+    `/api/import`'s `pieces` back for it (`sheet.editor.pieces`,
+    `{slot: {level, rarity, stars, flawless, prismatic, infusionStat}}`,
+    each true or false - anything else is a 400), so an imported sheet sent
+    from the editor packs the same pieces as the same file sent as a file,
+    and not the row rarity or the 0 stars the loadout filled in. Any other
+    piece was put there by the picker, and states what its entry carries:
+    the rarity and the level when the entry carries them, the stars when it
+    carries a whole number (the picker writes none for 0), Flawless (no
+    control on the page) only where the loadout carries it. The infusion
+    itself goes when `infusions` pins it, and with it the Prismatic flag
+    (the picker's box beside the infusion, unticked, is "not Prismatic", as
+    `~infusion` without `!` is on the command line) - unless an imported
+    piece's file stated the flag otherwise (`pieces` prismatic: the
+    infusion recorded and the flag not, or the flag and not the infusion);
+  - a piece's sockets when one of them is pinned (`augments`), a skill pool
+    when pinned (`skills` - the page pins one only when its picks fill it),
+    the tree when `talents` is true, the runes when any rune slot is pinned;
+  - `rank` only when given: the page sends the rank the last import
+    recorded, while the editor is still that file's class at that rank, and
+    null otherwise (it has no control for the rank).
+
+  What the editor holds and no pin states - what **Apply to editor** put
+  there, since it leaves the pins as they were, or the rest of a saved
+  build whose import pinned what its run held - goes as not recorded, and
+  the page is told (below, the module's `problemsOf`). A sheet records a piece's sockets and the rune
+  slots whole, so one socket pinned of two, or one rune of three slots,
+  sends the rest as empty; the module says each such case as a problem.
+  `pins` absent is no pin at all. Refused (400): `pins` that is not an
+  object, a list field that is not a list of ids, a `talents` that is not a
+  boolean.
+* **`log`** is the fight: a farever-combat-log file (plain or gzip), Wink's
+  `.json.timeline`, or a Wink summary alone (taken as per-skill totals, and
+  said). `summary` is the `.json` Wink saves beside a timeline: it gives the
+  timeline its real start time. `mtimeMs` is the file's modification time
+  (`File.lastModified`): a timeline with no summary is dated from it, and
+  the report says the start time is estimated. Send logs as `base64`: a log
+  may be gzip, and text would not survive the trip.
+* `note` is the player's own words. It goes into the zip as `note.txt`: with
+  Send only the maintainer reads it; on the manual route it is public with
+  the rest of the zip.
+* **`again`** is a receipt - one `send` handed back, or one the bench kept -
+  whose submission this bundle is built again as: its id, delete token,
+  `createdAt` and `zipSha256` instead of new ones. With the same files and
+  choices, on the game build and bench version it was made on, it is the
+  same zip, byte for byte, and the same title. With others - or the same
+  ones after an update of the game or of the bench - it is refused (400, the
+  module's `These files make another bundle than the one submission <id8>
+  was sent as (SHA-256 … where its receipt says …): an id names one bundle,
+  and what went into it has changed since that receipt was written - the
+  files, the note or what was chosen with them, or this install's game build
+  or the bench's version. Ask for the first one's deletion with that receipt
+  - it may have arrived - and send this one as a new submission.`): the
+  folder would otherwise hold two different fights under it. A receipt
+  written before receipts named their bundle
+  (`zipSha256` null) holds the files to nothing, and the bundle built from it
+  names no SHA-256 either. The receipt goes to the module whole
+  (`buildSubmission`'s `receipt`, as `bench submit --receipt` gives it),
+  and its refusals are the module's, named by this field: one that is none
+  (400, `again: That is not a receipt of a sent fight: …` - one that names
+  no upload link among them), one with no `createdAt` (400, `again: The
+  receipt of submission <id8> does not say when its bundle was made
+  (createdAt), so that bundle cannot be built again byte for byte - the
+  receipt still asks for the deletion of what it sent.`). Its `sentAt` and
+  its `link` say where it may go: a receipt whose fight arrived, or one
+  written for another upload link than this copy's (or for one, when this
+  copy has none), is built again all the same - Save .zip saves it, as
+  `bench submit --receipt <it> --zip` does - but not sent: `sendRefused`
+  says why (below). Other files under a receipt whose fight arrived are
+  refused with the sentence that says that one arrived (`… That one arrived
+  (<sentAt>), so nothing more goes under its id: send this one as a new
+  submission …`). The dialog builds again only from a receipt whose send was
+  not answered.
+
+Response:
+
+```jsonc
+{ "previewId": "<32 hex>",               // names this bundle in the three routes below
+  "id": "<32 hex>",                      // the submission id: the one its receipt names (`receipts` lists them by it)
+  "expiresAt": "2026-10-19T14:30:00.000Z",
+  "upload": true,                        // false: no upload link - no Send, the manual route only
+  "uploadProblem": null | "FAREVER_BENCH_UPLOAD_LINK is \"ftp://x\": it is not an http(s) address - give the upload link pCloud shows for the folder, https://...pcloud.../#/puplink?code=...",
+  // null, or why Send refuses this bundle - `bench submit --send`'s rule and sentence
+  "sendRefused": null | "The sheet is a Mage and the fight's log names its character a Warrior, so it is not sent: … Give the build the fight was fought in - the Warrior's sheet, or that build in the editor."
+                      | "The receipt this bundle is built again from is of submission 2e5d004c, whose fight arrived (2026-10-19T14:02:11.000Z): sending it again would only store a second copy beside the first. …",
+  "logClass": "Warrior" | null,          // the class the log names its character (unit id), null when it names none
+  "title": "Data submission: Warrior 25 vs Dummy, Normal (2e5d004c)",   // the manual route's issue title (formUrl fills it in)
+  "files": [ { "name": "manifest.json", "bytes": 1696 }, { "name": "sheet.json", "bytes": 886 },
+             { "name": "combat-log.jsonl", "bytes": 3725 } ],   // the zip's entries, uncompressed
+  "zipName": "farever-bench-submission-2e5d004c.zip", "zipBytes": 2320,
+  "formUrl": "https://github.com/Blaakan/farever-bench/issues/new?template=data-submission.yml&title=…",
+  "report": [ "What Send does: the zip (2,320 bytes) goes to the project's folder on pCloud (pcloud.com), where only the project's maintainer can read it - nothing is made public -",
+              "  manifest.json  1,696 bytes", …, "On the manual route instead (Save .zip, then the GitHub form: https://github.com/…), the zip is attached to a public issue, …",
+              "Names: 2 removed; your character is \"Submitter\" wherever a file names it.",
+              "The character sheet:", …, "The combat log:", …, "Problem: the sheet is a Mage and …" ],
+  "reportItems": [ { "kind": "refused", "text": "Problem: The sheet is a Mage and …", "warn": true },
+                   { "kind": "private", "text": "What Send does: …" }, { "kind": "file", "text": "  manifest.json  1,696 bytes" }, …,
+                   { "kind": "manual", "text": "On the manual route instead …" },
+                   { "kind": "sheet:gap", "text": "  Gap: …", "warn": true }, { "kind": "log:problem", "text": "  Problem: …", "warn": true }, …,
+                   { "kind": "problem", "text": "Problem: the sheet is a Mage and …", "warn": true } ],
+  "problems": [ "the sheet is a Mage and the log's character a Warrior - the sheet should be the build this fight was fought in, and a bundle that pairs the two is not sent" ] }
+```
+
+* **`title` is the manual route's issue title** - GitHub's form opens with
+  it filled in (`formUrl`): written by `submission-public.mjs` from a fixed
+  list of fields (class, level, what was fought, the id's first eight
+  characters). No note, no file name, no name. Send publishes nothing, so
+  there is no issue body to show: on the manual route the player writes the
+  issue in GitHub's form - print the title, and say that on that route the
+  zip itself is public.
+* **`files` is what Send uploads** - the zip's entries, to the project's
+  folder on pCloud, where only the maintainer reads them. On the manual
+  route (`formUrl`: Save .zip, then the form) every file in it is public,
+  the note and the fight's start time to the millisecond included.
+* **`report` is what to print**, the lines `bench submit` prints (the
+  module's `reportItems(sub, {link})` - the route this copy actually
+  offers, the names removed, the sheet's and the log's own reports, then
+  every problem as `Problem: …`), with the page's own problems after the
+  module's and `uploadProblem`'s line (the module's) and `sendRefused`'s
+  first. `reportItems` is the
+  same lines with the kind of each: the module's (`private` - what Send
+  does -, `file`, `manual`, `title` - the form's title, with no upload link
+  only -, `names`, `heading`, `sheet:<kind>` and `log:<kind>` - the readers'
+  own kinds, the line indented under its heading -, `problem`) and
+  `refused` for `sendRefused`'s line. A line the
+  reader warns of carries `"warn": true` - every problem and `refused`, and
+  the readers' own warned lines (another game build, a drop, a gap, a key
+  not understood, an item level the game disagrees on; a log's problem) -
+  and no other line has the key: the readers' one table of it, which
+  `bench` colours by too. A page marks a line by `warn` (and picks its look
+  by its kind), never by the words it opens with. `problems`
+  is the problems as data, without the prefix - the module's `problemsOf`:
+  what the build in the editor is told first (below), then the bundle's
+  own. A problem does not stop
+  the bundle: it is the player's to read before sending (a summary that was
+  not packed, an estimated start time, a level that differs from the
+  log's).
+* **`sendRefused` stops Send**, and only Send. The rules and the sentence
+  are the module's `sendRefusal` (in the app's words: the remedy names the
+  class choice, the editor, Delete - never a flag), the one `bench submit
+  --send` asks, and this server keeps none of its own: `/send` refuses it
+  too (409, the same sentence) before anything is written or sent, and
+  the page offers no Send for it: Back, to change the build, the class
+  beside its file or the log, and Save .zip, which still saves the bundle
+  as it is (as `--zip` does). Three things are refused, in this order:
+  - a bundle built again from a receipt whose fight arrived (`again` with
+    its `sentAt` set, given to the module as `buildSubmission`'s `sentAt`):
+    pCloud keeps every upload, so sending it again would only store a second
+    copy beside the first (`The receipt this bundle is built again from is
+    of submission <id8>, whose fight arrived (<sentAt>): sending it again
+    would only store a second copy beside the first. A changed bundle goes
+    as a new submission - preview it without the receipt - and Delete, with
+    that receipt, asks for the first one's deletion.`);
+  - a bundle built again from a receipt written for another upload link
+    than the one this copy sends through, or for one when this copy has
+    none: it is sent again where it may already be, or not at all - sent
+    anywhere else, one fight would be kept twice, and a request for its
+    deletion would go to the wrong folder (`The receipt this bundle is built
+    again from is of submission <id8>, written for another upload link than
+    this copy's (or: for an upload link, and this copy has none): a bundle is
+    sent again where it may already be, or not at all - … The bench started
+    with FAREVER_BENCH_UPLOAD_LINK=<its link> sends it there; Save .zip keeps
+    this copy of it meanwhile.` - the one sentence that prints a link);
+  - a sheet of another class than the log's character (the log's header,
+    or a Wink summary's `meClass`) - `bench verify` refuses the same pair.
+    One case sends, as on the CLI: a file that names its own class, with a
+    class given beside it (`sheetOptions.class` - the class chosen beside
+    the file in the dialog, what `--class` is to the CLI) that names the
+    same, which says the log's header is the one that is wrong; the
+    refusal of such a file says so (`… If the log's header is the one that
+    is wrong, choosing <A> as the class beside the sheet file says so, and
+    it is sent.`). The module decides that when it builds the bundle
+    (`classMismatch.vouched`), from what was given and nothing else, and
+    `sendSubmission` asks `sendRefusal` again before its request leaves: a
+    modkit dump, whose only class is the one chosen for it, and the build
+    in the editor are never vouched for (`… A modkit dump names no class,
+    so the class chosen for it is the sheet's only word on it, and cannot
+    say the log is the one that is wrong.`).
+
+  The report's first line says it (after `uploadProblem`'s).
+* **`logClass`** is the class the log names its character (`sub.logClass`,
+  a unit id), or null: what a page offers first when it asks a class.
+* **The build in the editor** is told more, since the page opens on an
+  empty Mage and Send a fight on it is one click - the module's problems for
+  a stated build (`src/submit.mjs` `statedFindings`, worded for the app;
+  `bench submit` tells a build typed with flags the same in its own words,
+  `the build as typed …`), first among them: one that
+  wears nothing (`the build in the editor wears nothing - is it the build
+  this fight was fought in? …`), wears no weapon, or wears none of the
+  weapons whose skills the log's character used (`the log's character used
+  GA_Craft_Skill1 - a skill of GA_Craft - and no weapon the build in the
+  editor wears grants it: …`); and one that holds what no pin states (`the
+  build in the editor holds what no pin states - 2 pieces (Slot_Weapon1,
+  Slot_Chest), its talent points - and that goes as not recorded, not as
+  the character's …`). The sockets and rune slots sent as empty because a
+  sheet records them whole are the module's problems (`Slot_Weapon1: a
+  sheet records a piece's sockets whole, so …, which no pin held, is sent
+  as empty`).
+* `uploadProblem` is the module's sentence when `FAREVER_BENCH_UPLOAD_LINK`
+  is set to something that is not an upload link (`FAREVER_BENCH_UPLOAD_LINK
+  is "<value>": it <why> - give the upload link pCloud shows for the folder,
+  …`: not an http(s) address, not on pCloud, plain http to anything but this
+  machine, no code or a code that is not one): Send is then off, and the
+  report's first line says why (`Problem: Send is off: …` - the module's
+  `reportItems`, given `uploadProblem`), followed by the manual route as the
+  way meanwhile (`Send is off in this copy of the bench until that link is
+  set right. …`), never by "no upload link is set"; `sendRefused`'s line,
+  when there is one, comes after those two.
+* **`id`** is the submission id, as the receipt of a send of this bundle
+  names it: a page whose send got no answer at all (the server stopped while
+  it waited) finds that send's kept receipt by it in `receipts`.
+
+Refused before anything is packed, each a 400 with the route's sentence: a
+body with no `sheet`, or both or neither of `file` / `editor`; a file part
+that is not `{name, text}` or `{name, base64}` (both, neither, base64 that is
+not base64, a name that is not text); an `editor.loadout` that is not an
+object, an `editor.name` that is not text, an `editor.rank` that is not a
+whole number, `editor.pins` not of the pins' shape, `editor.pieces` not of
+`/api/import`'s; a `log` missing; an
+`mtimeMs` that is not a number; a `note` that is not text; a `keepName`
+that is not `true` / `false`; `sheetOptions` whose `class` or `level`
+`/api/import` would refuse (`/api/import` and this route read a file part,
+and a class and level, with the same two readers - `parseFilePart`,
+`parseClassLevel` - so they refuse in the same words). Then `buildSubmission`'s
+own refusals, with its sentences and statuses: a sheet or a log that does not
+read (400 - the reader's sentence, prefixed with which file), a name still
+found in the bundle (400, and nothing was built), a sheet over 512 KB, a log
+over 20 MB once inflated, a note over 2000 characters or a zip over 25 MB
+(413). A modkit dump with no class is read in the class the fight's log
+gives it when the log is of the dump's own character (by name) and every
+weapon the dump lists fits that class (`src/charsheet.mjs`
+`dumpClassFromLog`, the rule `bench submit` and `bench verify` read a
+dump beside a log by), and a problem says so (`a modkit dump names no
+class: it is read as a Warrior - the class the fight's log gives the dump's
+own character, …`). Otherwise it is the same question `/api/import` asks,
+its sentence ending on why the log's class was not taken (`… The fight's
+log names its character a Warrior, a class the dump's weapons do not fit, so
+the dump is not read as one.`): 400 with the reader's facts (`needs: "class"`, `character`, `classes` -
+`buildSubmission` passes them on) and `logClass`, the class the fight's
+log names its character, read by the module's log reader (null when it
+names none, or the log does not read); the page offers `logClass` first
+(when the dump's weapons allow it), else the first of `classes`, and sends
+the preview again with `sheetOptions.class`.
+
+### POST /api/submit/bundle
+
+`{ "previewId": "…" }` → `{ "name": "farever-bench-submission-2e5d004c.zip",
+"base64": "<the zip>", "bytes": 2320 }` - the zip the preview described,
+byte for byte, for **Save .zip** (the page saves it as a Blob download).
+Asked as often as the page likes while the preview is held. The name says
+nothing about the player: on the manual route it is shown on a public issue.
+
+### POST /api/submit/send
+
+`{ "previewId": "…", "consent": true }` → 200:
+
+```jsonc
+{ "sent": { "id": "<32 hex>", "uploadedAs": "<32 hex>.zip",   // the name the zip went under in the folder
+            "sentAt": "2026-10-19T14:02:11.000Z", "zipSha256": "<64 hex>" },
+  "receipt": { "id": "<32 hex>", "deleteToken": "<32 hex>", "link": "https://e.pcloud.com/#/puplink?code=…",
+               "sentAt": "2026-10-19T14:02:11.000Z", "createdAt": "2026-10-19T14:00:00.284Z",
+               "zipSha256": "<64 hex>" },   // its six fields; zipSha256 is the bundle's: `again` holds a rebuild to it
+  "receiptText": "{\n  \"format\": \"farever-bench-receipt\", …",   // receiptText(receipt): the file to keep
+  "receiptName": "farever-bench-receipt-2e5d004c.json",
+  "kept": "…/submit-receipts/farever-bench-receipt-<id>.json" }   // the bench's own copy, or null
+```
+
+`consent` must be the literal `true`: the page sends it only once the box
+"I understand the zip goes to the project's folder on pCloud, where only the
+maintainer can read it" is ticked. The route writes the pending receipt
+(`pendingReceipt`: `sentAt` null) to the bench's folder first - see "The
+receipt is kept before a byte leaves" - then uploads the zip through the
+module's one call site (`sendSubmission`: `POST
+<api>/uploadtolink?code=<code>&names=farever-bench&nopartial=1`, one
+multipart file part `<id>.zip`, `application/zip`; no header of the bench's
+own, never the delete token; a redirect refused rather than followed), with
+the same bench version `bench submit --send` holds it to, and waits for
+pCloud's answer: `bootstrap.submit.sendTimeoutMs` at most (10 minutes, the
+module's `SEND_TIMEOUT_MS` - a 25 MB zip on a slow line). It puts the
+completed receipt in its place and writes its response itself. `sent` is
+what went: `uploadedAs` is the name pCloud was given, and no field of the
+receipt. A send the module refuses before its request leaves, or one pCloud
+refuses (below), takes the pending copy back: no fight carries its id. A
+copy kept by an earlier send of the same bundle stays - that send may have
+arrived.
+
+* **`receiptText` is what the page offers as "Save receipt"**: the receipt
+  with a line saying what its token does. It is the only way the player can
+  ask for the fight's deletion later (`/api/submit/delete`, or `bench submit
+  --delete`). `kept` is where the bench keeps its own copy (null when it
+  has none), which the page names beside **Save receipt**.
+* **A failure after the request left carries the receipt too** - `receipt`
+  (its `sentAt` null), `receiptText`, `receiptName` and `kept` beside
+  `error`: pCloud could not be reached, did not answer in time, or answered
+  other than as its API does, so the fight may have arrived, and that
+  receipt asks for its deletion if it did. The sentence says what to do
+  (keep the receipt; send the same bundle again, which stores at most a
+  duplicate the maintainer drops; or take the manual route). The preview is
+  kept for **Send again**, past any number of newer previews, for 30
+  minutes from this try; after that a preview built with `again` is the
+  same submission.
+* **A refusal pCloud answers carries none.** Its API answers every call
+  with HTTP 200 and a JSON `result`: 0 when it kept the file, and otherwise
+  a number and an `error` sentence - and with `nopartial=1` nothing of the
+  upload was kept. That is `{error, arrived: false}`, the status by the
+  result (below) and pCloud's own sentence in brackets in the module's;
+  nothing of this send needs a deletion asked for. A receipt the page holds
+  from an earlier send of the same preview still stands, and so does the
+  bench's kept copy of it.
+
+| status | when | body |
+|---|---|---|
+| 400 | `consent` is not `true`; `previewId` is not 32 hex characters; the bundle was built by another bench version than this one (the module's sentence) | `{error}` - nothing was sent |
+| 404 | no preview has that id: it expired (30 min), was dropped for a newer one (8 held), or the server restarted - `No preview with that id is held: … - the files are to be previewed again, and a bundle whose send was not answered is built again from its receipt as the same submission` | `{error}` |
+| 409 | the preview was sent already - `This preview was sent already (submission <id8>): a preview is sent once, and its bundle is in the project's folder now`, with the first send's `receipt`, `receiptText`, `receiptName`, `kept`, so a page whose answer was lost can still save it; a send of it is on its way; the preview's `sendRefused` - `The receipt this bundle is built again from is of submission <id8>, whose fight arrived (<sentAt>): sending it again would only store a second copy beside the first. …`, `The receipt this bundle is built again from is of submission <id8>, written for another upload link than this copy's (or: for an upload link, and this copy has none): …`, or `The sheet is a <A> and the fight's log names its character a <B>, so it is not sent: …` - asked first, as `sendSubmission` asks it; then there being no upload link - `Send is off in this copy of the bench (no upload link is set) - save the .zip and attach it to a new issue: <formUrl>`, or `Send is off: <uploadProblem>` when `FAREVER_BENCH_UPLOAD_LINK` is set to something that is not an upload link | `{error}` (+ the receipt fields for the first) - nothing was written or sent by this request |
+| 507 | the receipt could not be written to the bench's folder - `Nothing was sent: the bench could not keep this send's receipt as <path> (<code>), and with no receipt kept, the deletion of a fight whose answer was lost could not be asked for - …` | `{error}` - nothing was sent; the preview stays held |
+| 503 | pCloud: the project's upload link is closed (result 7002 or 7004 - `The project's upload link is closed (pCloud: <its sentence>) - nothing was sent; save the .zip and attach it to a new issue: <formUrl>`), or pCloud does not know it (2012 - `pCloud does not know this copy's upload link (pCloud: …) - nothing was sent; …`) | `{error, arrived: false}` |
+| 507 | pCloud: the folder is full (7007, 7008 - `The project's pCloud folder is full (pCloud: …) - nothing was kept; try again another day, or save the .zip and attach it to a new issue: <formUrl>`) | `{error, arrived: false}` |
+| 429 | pCloud turns this address away for now (4000 - `… nothing was kept; try again later.`) | `{error, arrived: false}` |
+| 502 | pCloud could not store it (2041, 5000, 5001 - `pCloud could not store the zip (pCloud: …) - nothing was kept; send it again later.`), or refused it with any other result (`pCloud refused the upload (result <n>: …) - nothing was kept.`) | `{error, arrived: false}` |
+| 502 | pCloud could not be reached or did not answer in time (`The upload to the project's pCloud folder could not be reached (<code>)` / `did not answer within 600 s` `- the fight may or may not have arrived. Keep this bundle's receipt: …`), or answered other than as its API does - a proxy's page, no `result` (`pCloud answered <status> but not as its API does - whether the fight arrived cannot be told from here. …`) | `{error, receipt, receiptText, receiptName, kept}` |
+
+### POST /api/submit/delete
+
+`{ "receipt": "<the receipt file's text>" }` (or the receipt as an object) →
+`{ "ok": true, "requested": true, "id": "<32 hex>", "forgotten": true }`.
+
+An uploader can delete nothing behind the link, so this ASKS: it uploads one
+file through this copy's own upload link, by the same one call a send makes
+(`deleteSubmission`) - `<id>.withdraw.json`, `application/json`:
+
+```jsonc
+{ "format": "farever-bench-withdrawal", "version": 1,
+  "about": "The sender of submission <id> asks for it to be deleted. The SHA-256 of deleteToken is the deleteTokenSha256 in that submission's manifest.json.",
+  "id": "<32 hex>", "deleteToken": "<32 hex>", "zipSha256": "<64 hex>" | null, "requestedAt": "2026-10-20T09:00:00.000Z" }
+```
+
+The maintainer deletes the zips of that id and the request when the token's
+SHA-256 is the `deleteTokenSha256` of the zip's `manifest.json`
+(`tools/inbox.mjs` says which) - when they next read the folder, not when
+the player asks. Asking twice is harmless, and a receipt kept before a send
+whose answer was lost (`sentAt: null`) asks the same: if that send never
+arrived, the request deletes nothing. `forgotten` says the bench removed its
+own kept copy of that receipt: the request is in the folder.
+
+Asked through this copy's own link and no other - the module's rule, which
+`bench submit --delete` asks too: a receipt anyone could have written names
+any link, and its id and token would go there. So a receipt of another link
+is a 400 before anything leaves (`This receipt is of submission <id8>, sent
+to another upload link than this copy's: a deletion is asked only through
+this copy's own link. If you sent that fight yourself through that link,
+FAREVER_BENCH_UPLOAD_LINK=<its link> asks there.`), and the page shows that
+sentence as it is rather than naming a link itself.
+
+409 while a held preview of that very submission is being sent (`Submission
+<id8> is being sent right now - nothing was asked: ask for its deletion once
+that send is answered, within 10 minutes`): the send's answer would write
+its receipt back as completed after the request forgot it. 400 also for a
+`receipt` that is none (`That is not a receipt of a sent
+fight: …` - one that names no upload link among them); 503 with no upload
+link (`Send is off in this copy of the bench (no upload link is set), so no
+deletion can be asked from it - …`); pCloud's refusals as for a send, with
+`nothing was asked` and `arrived: false`; 502 when pCloud cannot be reached
+or answers other than as its API does (`… the request may or may not have
+arrived; asking again with the same receipt is harmless (the maintainer
+reads one request per id).`). On any refusal the kept copy stays.
+
+### POST /api/submit/receipts
+
+`{}` → the receipts the bench keeps, newest first, and whether this copy
+sends at all - never the link it sends through:
+
+```jsonc
+{ "folder": "…/submit-receipts",
+  "receipts": [ { "file": "…/farever-bench-receipt-<id>.json", "receipt": { …its six fields, zipSha256 null for an older one… },
+                  "receiptText": "…", "receiptName": "farever-bench-receipt-2e5d004c.json", "kept": "…" } ],
+  "unreadable": [ "farever-bench-receipt-<id>.json" ],   // a file of a receipt's name that does not read as that receipt
+  "problem": null | "<folder> could not be read (EACCES)",
+  "upload": true, "uploadProblem": null | "FAREVER_BENCH_UPLOAD_LINK is …" }
+```
+
+A receipt with `sentAt: null` is a send that was never answered: it may have
+arrived. Nothing here reaches the network.
+
+### The dialog (`components/exchange.js`)
+
+**Send a fight** opens it on the build in the editor (sent with the page's
+pins, and with the rank only as the last import recorded it - see
+`/preview`'s `editor`), or a sheet file - a modkit dump asks for its class
+there, as Import does: a question the page words from the refusal's
+`character` and `classes`, with `logClass` chosen first when the dump's
+weapons allow it, else the first of `classes`; any other sheet file has
+"Its class" beside it, "as the file says" unless changed, which goes as
+`sheetOptions.class` (what `--class` is beside `--import`: the class of a
+file that names none, or the file's own class said again where the log
+names another, which the module's refusal names as the way to send it) -,
+the fight's log files, a
+note (`bootstrap.submit.noteMax` characters) and "Keep my character's
+name" (off). On a server
+bound beyond this machine it opens on `bootstrap.submit.off` instead, with
+Preview and the delete link switched off. The
+log picker takes several files: one is the log, whatever it is; two are one
+fight only as Wink's `<name>.json.timeline` (the log) with its `<name>.json`
+(the summary); anything else is said and not sent. **Preview** uploads
+them and shows, from the answer and nothing else: `sendRefused` first,
+when there is one, as what stops Send (in the error colour, with Back and
+Save .zip as the ways on); the problems; then, with `upload`, "What Send
+does" (`The zip - <zipName>, <n> bytes - goes to the project's folder on
+pCloud, where only the project's maintainer can read it. Nothing is made
+public.`, then `files` with their sizes), or without it the title the form
+is filled with and the files as public; the consent box ("I understand the
+zip goes to the project's folder on pCloud, where only the maintainer can
+read it"), the buttons, the sentence that the GitHub form route makes the
+files public while Send makes nothing public; then `report` line for line,
+each warned line (`reportItems`' `warn`) marked, in the look of its kind (a
+drop, a gap, a key not understood, else a warning). **Send** exists only
+with `upload` and no `sendRefused`, and only after the consent box is
+ticked; while it waits the dialog cannot be closed (Esc, ✕ and the veil say
+why instead, with `bootstrap.submit.sendTimeoutMs` in minutes as the most it
+waits), since the answer completes the receipt. A sent fight shows `Sent.
+Submission <id8> is in the project's pCloud folder; only the maintainer can
+read it. Save the receipt: it is how you ask for this fight's deletion
+later (…)` and **Save receipt** - no link, since nothing was published; a
+failure shows the server's sentence, where the bench kept the receipt,
+**Save receipt** and **Send again**. **Save .zip** saves `/bundle` as a Blob
+download; **Open the GitHub form** is `window.open(formUrl)` (Electron hands
+`window.open` to the user's browser). The page sends logs and sheets as
+`base64`, holds a sheet and a log to `bootstrap.submit`'s caps before
+reading either (the module's own, never a copy), never asks the server about
+pCloud before Preview, and never shows the upload link.
+
+**One send is one submission, and its receipt is never dropped unsaid.**
+From the first answer that carries a receipt (a failure that may still
+have arrived included), the dialog holds it until **Save receipt** is
+clicked, and everything that would close it unsaved - Esc, the ✕, the veil,
+Close - asks first: "Save receipt, then close" or "Close without saving",
+naming the bench's kept copy and saying that its folder is a cache (Esc on
+the question answers it "not now"). After a send that was not answered the
+dialog never makes a second bundle behind the player's back: **Send again**
+sends the held preview, and when the server answers 404 (the bench let it
+go) the page posts the same preview body again with the receipt as
+`again`, shows the rebuilt bundle - the same submission and the same
+bytes, which the module holds it to by the receipt's `zipSha256` (other
+bytes are its 400, shown as the error; for an older receipt that names no
+SHA-256, said to be the same bytes when its title and size are) - and
+leaves the click to the player, saying "Send again sends it" only of a
+rebuilt preview Send takes (otherwise that Send is off for it, with
+`sendRefused` or `uploadProblem`). **Save .zip** on a 404 does the same and
+then saves the rebuilt bundle (one that is not the bytes shown is shown
+first, not saved). If the first send did arrive, the folder then holds two
+identical copies under one id, and the maintainer drops one; the dialog
+says so. A send whose request got no answer at all - the server stopped
+while it waited - is one not answered too: the page holds no receipt yet,
+so it asks `receipts` again (every 5 s while the server does not answer)
+and holds the kept receipt whose id is the preview's `id` - as sent, when
+it is completed - or says none is kept, when the send never left; until
+then Back and Close ask as well. A receipt saved while its send was not
+answered is not the completed one: once Send again is answered, Close asks
+to save that one.
+**Back** asks first: a bundle made from the choices is a new submission, so
+it offers "Ask for its deletion, then go back" (`/delete` with the receipt)
+or "Stay". A file dropped on the dialog once a send was tried is refused
+with a sentence for the same reason.
+
+**Drops.** The dialog sets `onDrop`. Dropped files go where they most likely
+belong - the fight's log files, or a lone `.json` while "A character sheet
+file" is chosen with none picked - and a line says where they went, with the
+other place one click away ("It is the character sheet" / "It is the combat
+log"), since a lone `.json` is a sheet or Wink's summary alone.
+
+**The bottom of the dialog.** **Delete a submission I sent…** picks a
+receipt file; the receipts the bench keeps (`/receipts`) are listed under
+it - "Submission <id8>, sent …" or "Submission <id8>, made … - its send was
+not answered" - each with **Save**, **Delete…** and, for one never answered
+and while the dialog has no submission of its own, **Send again…**, which
+builds the next preview with that receipt as `again` (a banner says to
+choose the same files, and that a duplicate in the folder is dropped by the
+maintainer; "Make a new submission instead" drops it). While a never
+answered one is listed, the first page says so above the choices: a new
+bundle is a new submission. Every request for a deletion asks first, and the
+question says what it is - `This uploads a request to delete submission
+<id8> to the project's pCloud folder; the maintainer deletes the fight and
+the request when they next read it.` - and names no link: a receipt of
+another one is the server's 400, shown as it is. After it, `Asked: the
+project's folder holds a request to delete submission <id8>.` A request for
+this dialog's own submission, or for the one whose bundle is on screen (a
+preview built again from its receipt), puts it back on its first page, so
+no Send puts a withdrawn id back in the folder. While the dialog is busy - a
+send on its way above all - the delete links and the question's buttons
+are off (and `/delete` refuses a submission being sent, 409).
 
 ## GET /asset/<path>
 
@@ -1057,3 +1899,43 @@ accepts `atlas:<cellIndex>` as the path for `farever-atlas-icons.dds` cells
     reader's `why`. `cat.candidates` already withholds, so a list built from
     it is right and SILENT — say what was left out (`withheldItems` in
     `view.mjs` asks the same two tests in the same order).
+21. A new route is TWO edits in `api.mjs`: its row in `ROUTES` (the method
+    it answers — the server refuses every other method, and a path with no
+    row, before the body is read) and its `case` in `handle`. A case whose
+    row was forgotten is never run: `handle` answers 404 for any path not in
+    `ROUTES`, because without the row the request would reach it with no
+    method, Origin or content-type check and no body. `check-api.mjs` reads
+    both lists off the source and names the missing half. Its body cap is
+    the server's, by path (`bodyCapFor`): 1 MB unless the route is one of
+    the two that take a file (`FILE_ROUTES` in `ui/server.mjs`), so a new
+    route that takes one is a third edit there. An async route writes `res`
+    itself, as `optimizeEvents` does, and `handle` returns true at once.
+    Three things in the guard bite a client that is not the page: `fetch`
+    from another origin is refused (403), a body sent as `text/plain` to
+    dodge the preflight is refused (415), and a tool that rewrites `Host`
+    (a proxy, an SSH tunnel to another local port) is refused (403) — a
+    tunnel has to keep the server's own port, or the server has to be bound
+    with `--host` to the name it is reached by. And never answer an
+    over-cap body with `req.destroy()`: the client sees `ECONNRESET`, not
+    the 413 sentence (`ui/server.mjs` `readBody` drains it instead).
+22. The two submit routes that reach the network are held to their own
+    `case`s by the suite ("network call sites"): `sendSubmission` may be
+    called only in a function that only `case '/api/submit/send':` calls,
+    `deleteSubmission` likewise for `/api/submit/delete`. Its reader of
+    "the function a call sits in" is a line regex, so inside those two
+    handlers there is no arrow function bound to a name (`const f = () =>`)
+    above the call - it would read as the call's owner - and the helpers
+    they use are declared outside them (`sendWait`, `keepPending`,
+    `replyError`). A preview never sends, the dialog never asks pCloud
+    anything when it opens (no health check, and never pCloud's
+    `showuploadlink`, which tells anyone holding the code the owner's e-mail
+    address: Send's own upload is the only contact; `/receipts` reads the
+    bench's own folder and nothing else), and the send takes only
+    `previewId` and `consent` - never a file, a path or a link from the
+    request; the link is the one the preview was made with. Its order is the
+    receipt on disk (`keepPending`), then `held.sending`, then
+    `sendSubmission` - nothing awaited between the `sending` test and the
+    flag, so two sends cannot both pass it, and nothing sent before the
+    receipt is kept. `/delete` takes the receipt and nothing else; the link
+    it asks through is this copy's own (`uploadLink()`), never the
+    receipt's.

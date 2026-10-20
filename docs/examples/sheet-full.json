@@ -1,0 +1,197 @@
+{
+  "format": "farever-character-sheet",
+  "version": 1,
+  "source": {
+    "exporter": "example-exporter",
+    "exporterVersion": "1.0.0",
+    "writtenAt": "2026-10-19T12:00:00Z",
+    "steamBuild": "25959898",
+    "bootSha256": "c7173926f28c2419dc71662012e8c8c30acf32b9e7b4dfa351482d9041d57cd4"
+  },
+  "character": {
+    "name": "Example",
+    "class": "Rogue",
+    "level": 25
+  },
+  "gear": {
+    "Slot_Weapon1": {
+      "item": "Daggers_Demondash",
+      "level": 25,
+      "upgrade": 4,
+      "rarity": "Epic",
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["DemonGearUpgradeRare_MPToAP", "FormulaWeaponDevote"],
+      "iLevel": 340
+    },
+    "Slot_Weapon2": {
+      "item": "Daggers_DuplicatePoison",
+      "level": 25,
+      "upgrade": 5,
+      "rarity": "Legendary",
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["FormulaWeaponFlamingWeapon"],
+      "iLevel": 370
+    },
+    "Slot_OffhandWeapon": null,
+    "Slot_Head": {
+      "item": "Head_EDemon_AssCle",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["DemonSigil_Rogue_VenomousFinisher"]
+    },
+    "Slot_Neck": {
+      "item": "Necklace_Z2RCraft",
+      "level": 0,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["StrongCutAmber"]
+    },
+    "Slot_Shoulders": {
+      "item": "Shoulders_EBee_Ass",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": []
+    },
+    "Slot_Chest": {
+      "item": "Chest_EKobold_AssWiz",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": true,
+      "prismatic": false,
+      "infusion": "Infusion_Kobold_DPS",
+      "infusionStat": "CritChanceRating",
+      "sockets": ["ReinforcedCopperPlate"],
+      "iLevel": 310
+    },
+    "Slot_Back": {
+      "item": "Back_EKobold_Ass",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["HonedEmbroidery"]
+    },
+    "Slot_Hands": {
+      "item": "Hands_EDemon_AssWiz",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["FormulaHandsDexterity_Z2"]
+    },
+    "Slot_Waist": {
+      "item": "Waist_EKobold_Ass",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": []
+    },
+    "Slot_Legs": {
+      "item": "Legs_EKobold_AssWiz",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": []
+    },
+    "Slot_Feet": {
+      "item": "Feet_EKobold_FigAss",
+      "level": 25,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["FormulaFeetCritical_Z2"]
+    },
+    "Slot_FingerLeft": {
+      "item": "Finger_Z3RCraft_Ap",
+      "level": 0,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["StrongCutAmber"]
+    },
+    "Slot_Trinket": {
+      "item": "Trinket_Kobold_E",
+      "level": 0,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": []
+    },
+    "Slot_FingerRight": {
+      "item": "Finger_Z3RCraft_Cri",
+      "level": 0,
+      "upgrade": 0,
+      "flawless": false,
+      "prismatic": false,
+      "infusion": null,
+      "sockets": ["ResonantCutAmber"]
+    }
+  },
+  "talents": {
+    "Rogue_Talent_LethalPoison": 1,
+    "Rogue_Talent_AcidicSplatter": 1,
+    "Rogue_Talent_Envenom": 1,
+    "Rogue_Talent_LethalDose": 2,
+    "Rogue_Talent_ImprovedMixture": 2,
+    "Rogue_Talent_DeadlyPoison": 2,
+    "Rogue_Talent_NoxiousStrategem": 2,
+    "Rogue_Talent_VenomInfusion": 1,
+    "Rogue_Talent_BullyingTheWeak": 2,
+    "Rogue_Talent_UpTheAnte": 1,
+    "Rogue_Talent_VirulentMagic": 1
+  },
+  "weaponSkills": {
+    "Slot_Weapon2": ["Daggers_DuplicatePoison_Skill1", "Daggers_DuplicatePoison_Passive"]
+  },
+  "classSkills": {
+    "ClassSkill": ["Rogue_Shadowstep", "Rogue_DeathMark", "Rogue_KnivesTempest", "Rogue_UrgeToKill", null]
+  },
+  "runes": ["Rogue_Finisher_M1", "Momentum", "Rogue_DeathMark_M2", "Rogue_KnivesTempest_M1", "Rogue_UrgeToKill_M3"],
+  "weaponSkillRanks": {
+    "Daggers_Demondash_Combo": 3,
+    "Daggers_Demondash_Skill1": 3,
+    "Daggers_Demondash_Skill2": 3,
+    "Daggers_Demondash_Passive": 3,
+    "Daggers_DuplicatePoison_ComboAttack": 3,
+    "Daggers_DuplicatePoison_Skill1": 3,
+    "Daggers_DuplicatePoison_Skill2": 3,
+    "Daggers_DuplicatePoison_Passive": 3
+  },
+  "buffs": [
+    {
+      "id": "ItemStatus",
+      "item": "ElixirOfMinorStrength",
+      "stacks": 1,
+      "remaining": 1745.2
+    }
+  ],
+  "stats": {
+    "Vitality": 214,
+    "Strength": 44,
+    "Dexterity": 166,
+    "CritChance": 15.202235795182705,
+    "ArmorPenetration": 26.061343299391655
+  },
+  "unreadable": []
+}

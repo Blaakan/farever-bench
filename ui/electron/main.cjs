@@ -105,21 +105,25 @@ function normalise(p) {
   }
 }
 
-// benchRoot/.cache is where BOTH halves of the bench keep state: ui/icons.mjs
-// decodes portraits into .cache/ui-icons, and src/lib/game.mjs memoises the
-// install path in .cache/game-path.txt. Both derive that directory from
-// benchRoot alone, so the redirect has to happen underneath them - and it is
-// safe to redirect, because everything under it is regenerable.
+// benchRoot/.cache is where the bench keeps state: ui/icons.mjs decodes
+// portraits into ui-icons/, src/lib/game.mjs memoises the install path in
+// game-path.txt, and the UI keeps the receipt of each fight it sends to the
+// project in submit-receipts/ (ui/api.mjs receiptFolder; `bench submit` uses
+// the same folder). It is safe to redirect, because what is under it is
+// regenerable, with that one exception: a receipt is the only way to ask for
+// a sent fight's deletion and cannot be made again, which is one more reason
+// the target below is userData, kept across launches, and never a temp folder.
 //
 // FAREVER_BENCH_CACHE is the portable half. It is exported before the server
 // is imported, so the server and the optimizer worker it spawns both inherit
-// it, and it means the same thing on every platform. ui/icons.mjs does not
-// read it YET - when it does, its cacheDir becomes <FAREVER_BENCH_CACHE>/
-// ui-icons and no link is needed anywhere. Until then a read-only bench root
-// has no writable cache at all: icons.mjs mkdirs its cacheDir on the first
-// DDS portrait and surfaces the EROFS as a 500.
+// it, and it means the same thing on every platform. ui/icons.mjs and the
+// receipts follow it: their folders are <FAREVER_BENCH_CACHE>/ui-icons and
+// <FAREVER_BENCH_CACHE>/submit-receipts, so a read-only bench root costs
+// them nothing. src/lib/game.mjs does not read it: its memo is derived from
+// the bench root alone, and without a writable one it finds the install
+// again on each start instead of remembering it.
 //
-// The link is what works today. A junction is a Windows concept; everywhere
+// The link covers that last one. A junction is a Windows concept; everywhere
 // else the same redirect is an ordinary symlink, which needs no privilege.
 // It lands whenever the bench root is writable - the portable exe unpacks to
 // a temp directory, so it is - and fails harmlessly on an AppImage's mount.

@@ -97,10 +97,16 @@ unpacks to a fresh temp folder every launch and so keeps its answer in
 `%APPDATA%\farever-bench-ui\settings.json` instead; run it with `--setup` to
 change it.
 
-Everything is read-only. The tool never touches the game process, writes
-nothing to the install directory, and makes no network connection — with one
-opt-in exception: handing it a [questlog.gg build
-link](#importing-a-build-from-questloggg) fetches that build and pins it.
+Everything is read-only. The tool never touches the game process and writes
+nothing to the install directory. It reaches the network in two cases, each
+only when you ask for it in so many words: handing it a [questlog.gg build
+link](#importing-a-build-from-questloggg) fetches that build and pins it; and
+[sending a fight to the project](#sending-a-fight-to-the-project) yourself -
+`bench submit --send`, or Send in the app's "Send a fight" dialog - uploads
+that one bundle to the project's folder on pCloud, and asking for the
+deletion of one you sent (`bench submit --delete`, or "Delete a submission I
+sent…") uploads a small request to the same folder. Nothing is sent without
+that click or that flag.
 
 ---
 
@@ -163,7 +169,12 @@ reconcile row by row.
 
 The same page whether it arrived as an exe or through `bench ui`. Three tabs —
 **Profile**, **Talents**, **Runes** — over a character sheet built to the
-game's own layout, with the game's own icons and tooltips.
+game's own layout, with the game's own icons and tooltips. Beside
+**Optimize** in the top band, **Import** reads a character sheet, a saved
+build or a modkit dump into the editor ([Importing a character
+sheet](#importing-a-character-sheet)), and **Send a fight** packs a fight
+and the build it was fought in for the project ([Sending a fight to the
+project](#sending-a-fight-to-the-project)).
 
 ### The character sheet
 
@@ -188,7 +199,7 @@ otherwise the optimizer chooses it.
 The screenshots on this page were taken before the September 30 update. The
 layout is the same; what they do not show is the Infusions block under the
 sheet, the infusion controls in the picker and its *Not offered* list, all
-described below.
+described below, and the Import and Send a fight buttons in the top band.
 
 The left column starts on the five primaries. **More stats** turns it over to
 everything else — the same second page the game shows you, with the conversions
@@ -354,10 +365,14 @@ of the answer worth reading before you trust the rest of it.
 | [`rarity`](#bench-rarity) | which rarities each slot can reach, and how that is derived |
 | [`audit`](#bench-audit) | every assumption and gap in the model |
 | [`ui`](#quick-setup) | the same sheet in your own browser |
-| [`update`, `verify`](#two-more-commands) | the patch-day pipeline, and the model against a recorded capture |
+| [`update`, `verify`](#two-more-commands) | the patch-day pipeline, and the model against a recorded capture or another program's combat log |
+| [`import`](#importing-a-character-sheet) | what a character sheet or a combat log says, as the bench reads it |
+| [`submit`](#sending-a-fight-to-the-project) | one fight for the project: the build and its log, names removed, as one zip |
 
 Every command takes `--class`, `--level`, `--target`, `--fight`, `--goal`,
-`--game` and the pins; `bench --help` prints the lot. A flag the command line
+`--game` and the pins, and every command that builds takes `--import <file>`,
+a [character sheet](#importing-a-character-sheet) as the build to start from;
+`bench --help` prints the lot. A flag the command line
 does not read is refused with the nearest names (`unknown flag --target-lvl -
 did you mean --target-level?`) where it used to run the defaults in silence.
 Every command prints its
@@ -1391,6 +1406,8 @@ bench verify --character Emsai --target Dummy --since 1791844203301 --until 1791
 bench verify --character Emsay --target Dummy --window 1791846350797..1791846411249 --replay --split
 bench verify --character Emsai --target Ratsar --price-as Ratsar@heroic
 bench verify --character Emsai --capture bench-probe.2026-08-02_2026-08-29.build-2026-07-29.csv
+bench verify --import me.json --capture fight.jsonl                 # a combat log, and the sheet it was fought in
+bench verify --import me.json --capture <id>.json.timeline --split  # a Wink DPS Meter fight, as the meter saved it
 ```
 
 **Read a ledger on one block of play, not on a whole capture.** The bare
@@ -1470,6 +1487,39 @@ logged at the level cap stood in Veteran or in Heroic, the capture does not
 say which, and where Heroic reads other armour rows the ledger warns with
 the size of the difference. `--json` writes the whole ledger.
 
+**A combat log another program wrote is a capture too.** `--capture` reads
+a [`farever-combat-log`](docs/COMBAT-LOG.md), gzipped or not, or a Wink DPS
+Meter `<id>.json.timeline` as the meter saved it, with the `<id>.json` beside
+it read as its summary. Such a log is one fight: its whole span is the window
+unless `--since`, `--until` or `--window` take a part of it, and its own
+character is the default `--character`. A header that names the difficulty
+(Veteran, Heroic) prices the target in that mode unless `--price-as`, or a
+mode on `--target`, says otherwise. A log whose header names another class
+than the build's is refused, and so is a Wink summary on its own: it holds
+per-skill totals, filed under the skill that started each hit, and no row. A
+log whose header carries the installed `hlboot.dat`'s sha256 is said to be
+on this build; any other is "cannot tell", never "another build". `--import
+<sheet>` builds the character from a [character
+sheet](#importing-a-character-sheet) instead of a snapshot or the modkit
+dump, and no snapshot is chosen then unless `--snapshot` names one.
+Above the table the ledger says what the log let it check: what the log's
+reader found as `log:` lines (a hit against no target, a recorder's gap, an
+estimated start, hits with no affinity), a `presses:` line when the log
+records no press of the character and does not say it records them (the
+model then plays its own rotation), a `Spark:` line when a Mage's log
+carries no Spark (its fight opens on a full gauge), and with `--replay`
+where the fight opened: at the first skill start, else at the first press
+or base-attack hit. `--json` carries the same under `combatLog` and
+`replay.opensFrom`.
+[docs/COMBAT-LOG.md](docs/COMBAT-LOG.md) says what each field of a log lets
+verify check, what verify says about a log, and what Wink's files cannot
+carry. One of those is not settled:
+Wink writes a `skill_use` for every skill its character starts, automatic and
+child starts included, and the bench reads one as a press when no other
+skill started it - whether that matches the presses the bench's own probe
+records, and whether the two see the same hits, has not been checked side by
+side.
+
 ### Importing a build from questlog.gg
 
 [questlog.gg](https://questlog.gg/farever/) stores a character-builder link as
@@ -1493,8 +1543,10 @@ bench optimize <link> --level 20 --pin trinket=none
 ```
 
 `--questlog <slug>` takes the slug instead of the URL, and `--questlog-build
-<n>` picks between a character's builds (numbered from 0). **This is the only
-thing in the tool that touches the network.**
+<n>` picks between a character's builds (numbered from 0). **This, and
+[sending a fight to the project](#sending-a-fight-to-the-project) or
+asking for its deletion when you do it yourself, are the only things in the
+tool that touch the network.**
 
 To see the translation without running it — a table of what it read, and the
 command line that reproduces it:
@@ -1518,6 +1570,198 @@ link carries them, become the `~` part of the pin. No builder link seen so
 far carries one, so what the site calls those fields is unknown: the game's
 own names are accepted, and any key on an entry that the translation does
 not read is named rather than dropped.
+
+### Importing a character sheet
+
+A character sheet is a real character written down as it stands - its
+class and level, every piece it wears with its stars, rolled rarity, flags,
+infusion and sockets, the talents it spent, the skills and runes it
+slotted - by whatever can read it: an in-game mod, a memory reader, a
+converter. The bench ships no exporter for the game itself.
+[docs/CHARACTER-SHEET.md](docs/CHARACTER-SHEET.md) is the format for whoever
+writes one, with a [JSON Schema](docs/schema/character-sheet.v1.json) and two
+examples ([minimal](docs/examples/sheet-minimal.json),
+[full](docs/examples/sheet-full.json)).
+
+Every command that builds takes one as its build:
+
+```bash
+bench sheet --import me.json
+bench optimize --import me.json --pin trinket=none
+bench verify --import me.json --capture fight.jsonl
+```
+
+What the sheet recorded is held, an empty slot included; what it left out is
+searched, and named as a gap - a key the sheet does not have means "not
+recorded", never "none". A typed `--pin`, `--skills`, `--rune` or `--talent`
+wins for what it names, and the sheet's weapon-skill rank is the default
+`--rank`. What was read, kept and dropped, and why, is printed before the
+command's own output. `--import` is refused beside `--build` or a questlog
+link, and by the commands that build nothing (`classes`, `slots`, `targets`,
+`talents`, `profiles`, `rarity`, `audit`, `ui`, `update`).
+
+The same reader takes four shapes, told apart by their keys: a character
+sheet (`"format": "farever-character-sheet"`); a build the bench saved
+(`optimize --json`, the UI's **Save build (.json)**), whose pins and
+settings come back with it; a bare loadout; and the modkit's inventory dump
+(`farever-inventory-<Name>.json`), which names no class (give `--class`;
+beside a combat log of the same character, the log's class is taken when the
+dump's weapons fit it, and said) and no level (the highest equipped item's is taken, and said, unless
+`--level` is given), and holds no sockets, talents, picks or runes. A dump
+with nothing equipped, written before a character loaded, is refused, and
+so is a combat log given where the build goes - named as one, with where it
+goes instead.
+
+`bench import <file>` runs nothing. It prints what the file says, as the
+bench reads it - the character, what was kept, what was dropped and why,
+what was left open, the keys it did not know - and it is the validation tool
+for an exporter's author:
+
+```bash
+bench import me.json                   # what was read, kept, dropped and why
+bench import me.json --check           # the same, and exit 1 if anything was dropped, unknown or unreadable
+bench import me.json --json out.json   # the sheet as the bench read it, and the report, as data
+bench import fight.jsonl --check       # a combat log: what it holds, and exit 1 on a problem
+```
+
+The file `--json` writes is `{kind, sourceFormat, sheet, report}`, with
+the version-1 sheet of what the file recorded under `sheet`, and
+`--import` or `bench import` reads it back as that sheet. `--class` and
+`--level` give what a file does not carry. `bench import` reads a
+[combat log](docs/COMBAT-LOG.md) as well and says what it holds: the
+character, the encounter, the build it names, whether it records the
+character's presses, and the damage by skill.
+
+In the UI, **Import** in the top band - or a `.json` dropped anywhere on the
+window - reads the same files into the editor and shows the same report in
+a panel; for a modkit dump it asks which class to read it as. The imported
+build replaces the one in the editor, and what it recorded becomes your
+pins.
+
+### Sending a fight to the project
+
+The bench gets closer to the game each time its numbers are held against a
+real fight. A player who records one can send it: the build it was fought in
+and its combat log, packed as one zip with every other player's name taken
+out and the player's own made `Submitter`.
+[docs/SUBMITTING.md](docs/SUBMITTING.md) is the player's account of it: what
+is sent, where it goes, what stays private, and how to ask for its deletion.
+
+Send uploads the zip to the project's folder on pCloud, in pCloud's EU
+region (`eapi.pcloud.com`), where only the maintainer can read it: no issue
+is opened and nothing is made public. pCloud is a third party and sees the
+sender's IP address, as any website does; the uploader name the bench gives
+it is always "farever-bench", never the player's. The link is `UPLOAD_LINK`
+in `src/submit.mjs`, and `FAREVER_BENCH_UPLOAD_LINK` in the environment
+replaces it (`none` or `off` switches Send off).
+[docs/INTAKE.md](docs/INTAKE.md) is the maintainer's side: the link, its
+limits, and reading what arrived.
+
+```bash
+bench submit --log fight.jsonl --import me.json                # what would be sent, and nothing else
+bench submit --log <id>.json.timeline --class Rogue --pin weapon1=<item>
+bench submit --log fight.jsonl --import me.json --zip --send   # save it, and send it
+bench submit --delete <receipt.json>                           # ask for a sent fight's deletion
+```
+
+- `--log <file>` is the fight: a [`farever-combat-log`](docs/COMBAT-LOG.md),
+  gzipped or not, or Wink's `<id>.json.timeline` as the DPS Meter saved it -
+  the `<id>.json` beside it is read with it, and said (`--summary <file>`
+  names another). A summary on its own goes as totals only.
+- The build is `--import <file>` (any shape `bench import` reads),
+  `--build <file>`, or flags as `bench sheet` takes them (`--class`,
+  `--pin`, `--skills`, `--rune`, `--talent`...), which go as typed: what no
+  flag stated is sent as not recorded, and named. A typed build is written
+  by the same rule as the app's editor build and labelled the same way
+  (`bench-editor`); a piece's Prismatic flag goes with its `~infusion`
+  (true with the trailing `!`, false without), never on its own. A typed
+  build that wears nothing, no weapon or none of the log's weapons is told
+  so, as the app's editor build is.
+- `--note <text>` is up to 2,000 characters for the maintainer, and
+  `--keep-name` keeps your character's name where your files had it.
+- `--zip [<file>]` saves the bundle; with no name, as
+  `farever-bench-submission-<first 8 of its id>.zip`, which names nothing of
+  yours.
+- `--send` sends it, as `<id>.zip`. Its receipt is written before anything
+  leaves - beside the zip as `<name>.receipt.json`, or with no `--zip` in
+  `.cache/submit-receipts/` - so the deletion of a send whose answer is
+  lost can still be asked for; pCloud's answer completes the receipt.
+  `--receipt <file>` builds the same bundle again under that receipt's id,
+  held to the SHA-256 the receipt carries (other files, a changed note or
+  flags are refused, and so are the same ones after an update of the game
+  or of the bench: that refusal says to ask for the first one's deletion
+  and send these as a new submission), and sends it as itself: pCloud
+  keeps every upload, so if the first send did arrive, the folder holds two
+  identical copies under one id and the maintainer drops the duplicate. A
+  receipt whose send pCloud confirmed is built again (`--zip`) but not
+  sent - a second copy would only be stored beside the first - and so is
+  one written for another upload link than this copy's: it goes there or
+  nowhere. A sheet of one
+  class with a log of another is refused (a `--class` beside a sheet that
+  names its own class, naming the same, says the log is the one that is
+  wrong - in the app, the same class chosen beside the file; a modkit dump
+  names no class and cannot; `bench verify` holds the pair to the same
+  rule). Every refusal is `src/submit.mjs`'s, the same sentence the app's
+  Send gives, with the remedy in each one's words. When pCloud turns the
+  upload away - the link closed, the folder full - nothing was kept, and
+  the receipt saved for that send is removed; a receipt named by
+  `--receipt` is kept, since the first send may have arrived.
+- `--delete <receipt>` asks for a sent fight's deletion: it uploads
+  `<id>.withdraw.json`, holding the receipt's delete token, to the same
+  folder, and the maintainer deletes the fight and the request when they
+  next read it. The zip's `manifest.json` carries only the token's SHA-256,
+  so only the receipt's holder can ask. Only this copy's own upload link is
+  asked; a receipt naming another is refused unless
+  `FAREVER_BENCH_UPLOAD_LINK` names that link.
+
+Without `--send` (or `--delete`) nothing leaves the machine, and each run
+packs the bundle anew, under a new id - except with `--receipt`, which
+builds it again under that receipt's id. Such a run also says first when
+`--send` would refuse that bundle, as the app's preview does.
+
+**What becomes public, and what does not.** With Send, nothing: the zip -
+the sheet, the log with its start time to the millisecond, the note - goes
+to the project's folder on pCloud, which only the maintainer reads. Every
+record in it is rebuilt from a list of known fields: display names are
+dropped, every unit is renumbered (you are `1`, another player
+`Player <n>`), the log's text facts are held to their shapes, and a bundle
+in which a removed name still turns up, as a whole value or inside one, is
+not built.
+
+**The manual route.** Save the zip (**Save .zip**, or `--zip`) and attach it
+to a new issue with the [issue form](.github/ISSUE_TEMPLATE/data-submission.yml)
+(**Open the GitHub form** in the app). It needs a GitHub account, and on
+that route every file in the zip, and the zip's own name, is public.
+
+In the UI, **Send a fight** in the top band opens a dialog: the build (the
+one in the editor - sent as its pins state it, so what no pin holds goes as
+not recorded rather than as empty - or a sheet file, with *Its class*
+beside it as `--class` is beside `--import`), the log files (a
+Wink `.json.timeline` and its `.json` chosen together, or dropped on the
+dialog), a note, and *Keep my character's name*. **Preview** packs the
+bundle and shows what Send does with it - the zip goes to the project's
+folder on pCloud, and nothing is made public - and every file with its
+size. **Send** needs the consent box ticked, and is there only when an
+upload link is set and the module does not refuse the bundle - the sheet
+and the log naming different classes (unless *Its class*, beside a file
+that names its own, names the same), or a bundle built again from a
+receipt whose send pCloud confirmed or that was written for another upload
+link than this copy's; **Save .zip** and **Open the GitHub
+form** always are. A send pCloud did not answer can be sent again as
+itself (**Send again**); if the first did arrive, the maintainer drops the
+duplicate. After a send comes **Save receipt**, and the UI
+keeps its own copy of every receipt in the same `submit-receipts` folder
+(for the desktop app, `%APPDATA%\farever-bench-ui\bench-cache\submit-receipts`).
+*Delete a submission I sent…* at the bottom of the dialog takes a receipt
+and uploads its deletion request. A UI started with `--host` beyond this
+machine turns Send a fight off - Preview, Send and Delete, and every
+`/api/submit/` route answers 403: anything on the network could then send
+fights to the project's folder from your address, read the receipts this
+bench keeps and ask for those fights' deletion.
+
+A receipt asks for the deletion of the fight it names, for whoever holds
+it: keep it out of anything you publish. Everything else under `.cache/`
+can be deleted and is made again; `.cache/submit-receipts/` cannot.
 
 ---
 
@@ -2014,8 +2258,9 @@ Stated plainly, because a tool that hides its gaps is worse than no tool.
 [farever-mods](https://github.com/Blaakan/farever-mods) — the `.pak` reader,
 the Steam-library install finder, and the reader for the prefab container the
 level files ship in — same MIT licence, copied rather than depended on so this
-repo clones and runs on its own. `game.mjs`'s cache path is the only change,
-and of `hbson.mjs` only the reader was taken.
+repo clones and runs on its own. `game.mjs` changes its cache path and adds
+`steamBuildId` (the install's Steam build, which a submission's manifest
+names), and of `hbson.mjs` only the reader was taken.
 
 Everything else is new.
 

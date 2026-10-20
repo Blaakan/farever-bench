@@ -6,6 +6,177 @@ Every release of farever-bench, newest first:
 `ui/package.json` always carry the same version - `tools/release.mjs` moves
 them together and refuses to run when they disagree.
 
+## [Unreleased]
+
+Real characters and real fights, from outside the bench: a character sheet
+format any exporter can write and every build command reads; a combat log
+format, with Wink's DPS Meter files read as the meter saves them, that
+`bench verify` holds the model against; and a way for a player to send one
+fight, and the build it was fought in, to the project with every name taken
+out. Send uploads it to the project's folder on pCloud, where only the
+maintainer can read it, and makes nothing public; the GitHub issue form
+takes the same zip, in public, for whoever prefers it.
+
+### Known issues
+
+- **Anyone can upload to the project's folder.** The upload link's code
+  ships in every copy of the bench, so anyone holding a copy can upload any
+  file to the folder, and nothing tells a person from a program. The link
+  takes 1,000 MiB in all, then answers that the folder is full; it has no
+  file limit and no expiry, so a flood of small files is not stopped.
+- **pCloud tells anyone holding the code the owner's e-mail address**: its
+  `showuploadlink` answers without a login, and the answer carries it. The
+  bench never asks; anyone else with a copy can.
+- **A deletion is a request.** `bench submit --delete` and "Delete a
+  submission I sent…" upload a request to the folder, and the maintainer
+  carries it out when they next read the folder, not at once.
+- **Old copies cannot be turned away** except by rotating the link (a new
+  link, and a release that carries it): they then hear that the project's
+  upload link is closed. pCloud cannot answer one version of the bench and
+  not another.
+- **Wink's `skill_use` is read as a press, unverified.** Wink writes one for
+  every skill its character starts, automatic and child starts included;
+  the bench takes one as a press when no other skill started it. Whether
+  that matches the presses the bench's own probe records, and whether the
+  two see the same hits, has not been checked side by side in game.
+- A sheet's buffs and stats are printed and carried, and neither is priced
+  nor compared. A rift recap is not read.
+
+### Added
+
+- **Character sheet v1** (`farever-character-sheet`): the format
+  (`docs/CHARACTER-SHEET.md`), its JSON Schema and two examples, which the
+  suite reads on every run. One rule for presence at every depth: a key
+  that is absent is not recorded and left to the search, `null` or empty is
+  recorded empty, and `unreadable` names what an exporter tried and failed
+  to read. Every id is checked against the install; what the game would not
+  allow is dropped with its reason, and an unknown key is named.
+- **`--import <file>`** on every command that builds: a character sheet, a
+  build the bench saved, a bare loadout or a modkit inventory dump, as the
+  build to start from. What it recorded is held, what it left out is
+  searched and named; a typed pin wins for what it names, and its
+  weapon-skill rank is the default `--rank`.
+- **`bench import <file>`**: what a sheet or a combat log says, as the bench
+  reads it, with `--check` (exit 1 when anything was dropped, unknown or
+  unreadable, or when the log reader names a problem) and `--json <out>`,
+  which writes `{kind, sourceFormat, sheet, report}` - the version-1 sheet
+  of what the file recorded, and the report - and is read back as that
+  sheet by `--import` and `bench import`.
+- **Combat log v1** (`farever-combat-log`: `docs/COMBAT-LOG.md`, a schema
+  and an example): Wink's timeline layout and field names, a header with
+  the start time, the character, the encounter and the build, and optional
+  fields the bench can use - a hit's affinity, the target's level,
+  `source.recordsPresses`, and the character's Rage and Spark on its
+  presses and skill starts.
+- **`bench verify --capture` reads a combat log**: a `farever-combat-log`,
+  gzipped or not, or a Wink DPS Meter `<id>.json.timeline` with the
+  `<id>.json` beside it, unchanged. Its whole span is the window, its
+  character the default `--character`; a Veteran or Heroic header prices
+  the target in that mode; the first skill start opens `--replay`'s fight
+  (in a log that writes none, the first press or base-attack hit, and the
+  replay line says which), and the Spark on the character's first press or
+  skill start opens a Mage's - on a full gauge when the log carries none,
+  and said. The ledger prints what the log's reader found as `log:` lines,
+  and says when a log records no press of the character (the model then
+  plays its own rotation); `--json` carries it all under `combatLog`
+  (`problems`, `notes`, `presses`, `pressesDeclared`, `pools`, `gaugeNote`)
+  and `replay.opensFrom`. `--import <sheet>` is the build; a modkit dump of
+  the log's own character takes the class the log names. A Wink summary on
+  its own is refused: totals, no row. `bin/capture.mjs` reads the same
+  files.
+- **`bench submit`**: one fight packed for the project - the build (a
+  sheet, a saved build, or typed flags, sent as typed), the log and an
+  optional note - as one zip of fixed entries, every record rebuilt from a
+  field allowlist, other players' names removed (`Player <n>` in the log),
+  the player's own made `Submitter` unless `--keep-name`, every uid
+  renumbered, the log's text facts held to their shapes; a bundle in which
+  a removed name turns up, whole or inside any value but the note, is
+  refused. It prints what Send does with it and what the manual route makes
+  public, and sends nothing without `--send`. `--zip [<file>]` saves it;
+  `--send` writes the receipt before anything leaves (beside the zip, or in
+  `.cache/submit-receipts/`), uploads the zip to the project's pCloud
+  folder as `<id>.zip`, and completes the receipt when pCloud answers;
+  `--receipt <file>` sends a bundle whose send was not answered again under
+  its id, held to the SHA-256 the receipt names (if the first did arrive,
+  the folder holds two identical copies and the maintainer drops one); and
+  `--delete <receipt>` asks for a sent fight's deletion through this copy's
+  own upload link only. The zip's `manifest.json` carries the SHA-256 of
+  the receipt's delete token (`deleteTokenSha256`), never the token, so
+  only the receipt's holder can make a valid request. The link is
+  `UPLOAD_LINK` in `src/submit.mjs`; `FAREVER_BENCH_UPLOAD_LINK` replaces it
+  (`none` or `off` switches Send off). `docs/SUBMITTING.md` is the player's
+  account of it.
+- UI: **Import** and **Send a fight** in the top band. Import, or a `.json`
+  dropped on the window, loads a sheet into the editor and shows its
+  report. Send a fight previews what Send does and the files, saves the
+  zip, opens the issue form, sends, asks for a sent fight's deletion, and
+  keeps a copy of every receipt. The build in the editor goes as its pins
+  state it: what no pin holds is sent as not recorded, not as empty - by
+  the same rule, and
+  under the same label (`bench-editor`), as a build `bench submit` typed
+  with flags; a piece's Prismatic flag goes with its infusion and never on
+  its own, in both. A sheet imported into the editor and sent from there
+  says of each piece only what its file said (`/api/import`'s `pieces`):
+  a rarity or stars the file left out are not sent as the character's. A
+  sheet file has *Its class* beside it, what `--class` is beside
+  `--import`. What Send refuses, what a stated build is told (it wears
+  nothing, no weapon, none of the log's weapons, or holds what nothing
+  pins), the class a modkit dump takes from a log of its own character, and
+  which report lines are warned of are `src/`'s (`sendRefusal`,
+  `problemsOf`, `dumpClassFromLog`, and `warn` on the readers' report
+  items): the CLI and the page decide and say them alike, each in its own
+  words. Routes
+  `POST /api/import` and `POST /api/submit/preview`,
+  `/bundle`, `/send`, `/delete` and `/receipts` (`ui/API.md`).
+- `tools/inbox.mjs` and `docs/INTAKE.md`, the maintainer's side: the
+  upload link (making, limiting and rotating it), what arrives in the
+  folder, and carrying out deletion requests. `node tools/inbox.mjs
+  <folder> [--json]` reads a local copy of the folder and says, per
+  submission id, the zip to keep, its duplicates and conflicts, and which
+  deletion requests hold the right token - a request is kept, and looked
+  at, while a zip of its id, or a folder, could not be read; it touches no
+  network and deletes nothing.
+- `.github/ISSUE_TEMPLATE/data-submission.yml`: the manual route, a form
+  that takes the saved zip. Everything attached there is public.
+- `src/lib/game.mjs` gains `steamBuildId`, the install's Steam build, which
+  a submission's manifest names.
+
+### Changed
+
+- **The network statement has two cases.** The tool reaches the network
+  when handed a questlog.gg link, and when the player sends a fight or asks
+  for its deletion; nothing is sent without that click or flag. The suite
+  holds the tree to exactly those two call sites.
+- **The UI server's `/api/` guard.** A request must be addressed to this
+  server by one of its own names (Host) and, from a browser, come from its
+  own page (Origin); a POST must be `application/json`; another method is
+  a 405; a body over its cap is drained and answered 413 with a sentence -
+  40 MB for the two routes that take a file, 1 MB for the rest. On a
+  `--host` beyond this machine, Send a fight is off.
+- **A saved build holds its runes and talents.** The envelope that
+  `optimize --json` and the UI's Save build write records the rune slots
+  and the talent tree the run held, and `--build` holds them again instead
+  of searching them anew.
+- New refusals, each with its sentence: `--import` on a command that builds
+  nothing, or beside `--build` or a questlog link; a combat log given where
+  a build goes, and a modkit dump with nothing equipped; a combat log whose
+  header names another class than the build's; `--send` with a sheet and a
+  log of different classes (a `--class` beside a sheet that names its own
+  class, naming the same, sends it - in the app, the same class chosen
+  beside the file; a modkit dump or a stated build cannot; the UI turns
+  Send off for such a bundle - and `bench verify` holds a sheet and a log
+  to the same rule, so a dump read as the `--class` given is no longer
+  priced against a log of another class); `--send` of a bundle built again
+  from a receipt whose send pCloud confirmed, or one written for another
+  upload link than this copy's (`--zip` and Save .zip still save it);
+  `--delete` with a receipt from another upload link than this copy's; a
+  `FAREVER_BENCH_UPLOAD_LINK` that is not a pCloud upload link;
+  a `bench submit` flag on another command, and a flag `bench submit`
+  would not read. A modkit dump beside a log of its own character takes the
+  log's class only when its weapons fit it, in `bench verify` and
+  `bench submit` alike; otherwise the class is asked, with why the log's
+  was not taken.
+
 ## [0.5.0] - 2026-10-18
 
 The September 30 update (Farever build 25782799, bytecode v6), end to end,

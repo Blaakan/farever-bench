@@ -2,7 +2,8 @@
 // game.mjs - find the Farever install, on somebody else's machine.
 //
 // Copied from Blaakan/farever-mods (tools/lib/game.mjs), same MIT licence, with
-// only the cache path changed for this repo's layout. Kept as a copy rather
+// the cache path changed for this repo's layout and one addition of this
+// repo's own, steamBuildId (marked where it stands). Kept as a copy rather
 // than a dependency so this repo clones and runs on its own.
 //
 // Every tool here needs the same answer to the same question, and each one
@@ -27,7 +28,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync,
          statSync } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
@@ -170,6 +171,41 @@ function inLibrary(lib) {
   }
   return found;
 }
+
+// --- the install's Steam build (farever-bench only, not in farever-mods) ---
+// Which build of the game an install is, as Steam names it: the `buildid` of
+// the app manifest that installed the folder (<library>/steamapps/
+// appmanifest_<appid>.acf, the same files inLibrary reads for `installdir`).
+// A submission records it so the maintainer can tell which patch a fight was
+// fought on without the player having to say. Read from the manifest whose
+// installdir is this folder's name, so a renamed install still answers and
+// another game's manifest never does. Nothing else in the manifest is read:
+// it also names the Steam account that installed the game.
+//
+// Returns the build as a string of digits, or null - an install copied out
+// of a Steam library, a manifest Steam is rewriting, any read that fails.
+export function steamBuildId(gameDir) {
+  if (!gameDir) return null;
+  try {
+    const dir = resolve(gameDir);
+    const common = dirname(dir);
+    if (basename(common).toLowerCase() !== 'common') return null;
+    const steamapps = dirname(common);
+    const want = basename(dir).toLowerCase();
+    for (const f of readdirSync(steamapps)) {
+      if (!/^appmanifest_\d+\.acf$/.test(f)) continue;
+      const txt = readFileSync(join(steamapps, f), 'utf8');
+      const inst = txt.match(/"installdir"\s+"([^"]+)"/);
+      if (!inst || inst[1].toLowerCase() !== want) continue;
+      const b = txt.match(/"buildid"\s+"(\d{1,12})"/);
+      return b ? b[1] : null;
+    }
+  } catch {
+    // No steamapps folder above it, or a manifest that cannot be read.
+  }
+  return null;
+}
+// --- end of the Steam build reader ---------------------------------------
 
 function commonGuesses() {
   const out = [];

@@ -182,6 +182,8 @@ async function main() {
         // What the search actually held, which is the request's list when it
         // sent one and every pinned slot when it did not.
         infusions: result.infusion.pinned,
+        runes: [...(pins.runes ?? [])],
+        talents: !!pins.talents,
       },
       infusion: result.infusion,
     });

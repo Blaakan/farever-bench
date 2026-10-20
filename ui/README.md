@@ -106,8 +106,9 @@ scripts self-test the icon service and the whole API against the live game:
 node ui/lib/check-icons.mjs          # the DDS/BC7/PNG codecs
 node ui/lib/check-icon-service.mjs   # every gfx cell, the rect slicer, the cache
 node ui/lib/check-api.mjs            # every endpoint, several real optimize runs (~2.5 min)
+node ui/lib/check-exchange.mjs       # the Send a fight dialog's own steps, on a stand-in DOM (no server)
 ```
 
-They are the UI's tests — `test/run.mjs` does not start the server — and they
-write only under the OS temp directory (`farever-bench-checks/`), never into
-`.cache/`.
+They are the UI's tests — `test/run.mjs` does not start the server, and runs
+`check-exchange.mjs` alone of them — and they write only under the OS temp
+directory (`farever-bench-checks/`), never into `.cache/`.

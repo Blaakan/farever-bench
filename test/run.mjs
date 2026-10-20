@@ -68,6 +68,30 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
+import {
+  readCombatLog, captureRows, anonymizeLog, logReportLines, detectLogDialect, CombatLogError, DIFFICULTIES,
+  MAX_LOG_BYTES, MAX_LOG_EVENTS,
+} from '../src/combatlog.mjs';
+import * as sheetLib from '../src/charsheet.mjs';
+import * as combatLogModule from '../src/combatlog.mjs';
+import { sanitizeLoadout as sheetSanitize, buildEnvelope as sheetEnvelope } from '../ui/view.mjs';
+import { infusionIllegalReason as sheetInfusionIllegal } from '../src/loadout.mjs';
+import * as subpub from '../src/submission-public.mjs';
+import * as submitLib from '../src/submit.mjs';
+import { steamBuildId as submitSteamBuildId } from '../src/lib/game.mjs';
+import { createServer as submitCreateServer } from 'node:http';
+import * as submitZlib from 'node:zlib';
+import { createHash as submitHash } from 'node:crypto';
+import { deflateRawSync as subpubDeflateRaw } from 'node:zlib';
+import { spawn as cliSubmitSpawn } from 'node:child_process';
+
+// No test reaches pCloud. A real upload link ships in src/submit.mjs, so
+// every bench this file starts and every send it makes in-process is kept
+// off the network here: a child inherits FAREVER_BENCH_UPLOAD_LINK=none, and
+// a test that means to send points it (or `link`) at a stand-in of its own
+// on 127.0.0.1.
+process.env.FAREVER_BENCH_UPLOAD_LINK = 'none';
 
 let pass = 0;
 const failures = [];
@@ -24681,6 +24705,4944 @@ if (on) try {
     ok(`${name}: ...and the gap reader names the same row`, gap?.amount === x.other && (!loop || gap.fan?.of === loop[2]),
       JSON.stringify(gap ?? null));
   }
+} catch (e) { crashed(e); }
+
+// --- combat logs ---------------------------------------------------------------
+// A combat log some other tool wrote - this repo's farever-combat-log, or the
+// timeline and summary Wink's DPS Meter saves - read into the rows the probe's
+// CSV gives (src/combatlog.mjs, docs/COMBAT-LOG.md). The fixture is a Warrior
+// with a great axe on the training Dummy, built here from ids; the numbers are
+// made up. What these hold the reader to is what every capture reader leans
+// on: the row shape, the one synthetic session row that keeps a third-party
+// log from being dated off a file time, what counts as a press, and the
+// guards a stranger's upload passes through.
+// The accepted build's hlboot.dat sha256 (model/accepted-build.json), as a log's header would name it.
+function combatBoot() { return 'c7173926f28c2419dc71662012e8c8c30acf32b9e7b4dfa351482d9041d57cd4'; }
+function combatLogFixture({ T0 = Date.UTC(2026, 9, 18, 12, 0, 0), wink = false, dummyName = 'Dummy', mutate = null } = {}) {
+  const me = '812';
+  const D = '900';
+  const hit = (seq, time, skill, amount, critical, x = {}) => ({
+    seq, time, kind: 'damage', source: me, target: D, targetKind: 'Dummy', skill, origin: skill, amount, critical,
+    hits: 1, damageType: 'physical', outcome: 'Hit', sourceName: 'Tester', targetName: dummyName, skillName: skill, ...x,
+  });
+  const onMe = { target: me, targetKind: 'Warrior', targetName: 'Tester' };
+  const initial = [{ time: -2, kind: 'status_present', source: me, ...onMe, skill: 'Warrior_BattleShoutStatus',
+    origin: 'Warrior_BattleShout', instance: '5100', stacks: 1, duration: 11.2, statusType: 'buff', sourceName: 'Tester' }];
+  const events = [
+    { seq: 1, time: -0.3, kind: 'skill_use', source: me, target: '', skill: 'GA_Craft_Skill1', origin: 'GA_Craft_Skill1', instance: '5101', outcome: 'Used', sourceName: 'Tester' },
+    { seq: 2, time: -0.3, kind: 'skill_context', source: me, target: D, targetKind: 'Dummy', skill: 'GA_Craft_Skill1', origin: 'GA_Craft_Skill1', instance: '5101', related: 1 },
+    hit(3, 0.0004, 'GA_Craft_Skill1', 952.7, true),
+    hit(4, 0.95, 'GA_Base_Attack', 64.2, false),
+    hit(5, 1.62, 'GA_Base_Attack2', 97.6, true),
+    { seq: 6, time: 2.31, kind: 'skill_use', source: me, target: '', skill: 'GA_Craft_Passive_Proc', origin: 'GA_Craft_Passive', instance: '5105' },
+    hit(7, 2.31, 'GA_Base_Attack3', 64.8, false),
+    hit(8, 3.08, 'GA_Craft_FinalCombo', 131.4, false),
+    { seq: 9, time: 3.08, kind: 'status_applied', source: me, ...onMe, skill: 'GA_Craft_FinalCombo_Status', origin: 'GA_Craft_FinalCombo', instance: '5102', stacks: 1, duration: 8, statusType: 'buff' },
+    { seq: 10, time: 3.5, kind: 'status_stacks', source: me, ...onMe, skill: 'GA_Craft_FinalCombo_Status', instance: '5102', stacks: 2, duration: 7.6 },
+    { seq: 11, time: 3.6, kind: 'avoided', source: me, target: D, targetKind: 'Dummy', skill: 'GA_Base_Attack', amount: 0, critical: false, outcome: 'DamageDodge' },
+    { seq: 12, time: 4.02, kind: 'skill_use', source: me, target: '', skill: 'Warrior_Charge', origin: 'Warrior_Charge', instance: '5103', outcome: 'Used' },
+    { seq: 13, time: 4.02, kind: 'skill_context', source: me, target: D, targetKind: 'Dummy', skill: 'Warrior_Charge', origin: 'Warrior_Charge', instance: '5103', related: 12 },
+    hit(14, 4.36, 'Warrior_Charge', 90.1, false),
+    { seq: 15, time: 4.36, kind: 'status_applied', source: me, target: D, targetKind: 'Dummy', skill: 'Warrior_Charge_DestabilisationStatus', origin: 'Warrior_Charge', instance: '5104', stacks: 1, duration: 3, statusType: 'debuff' },
+    { seq: 16, time: 5.0, kind: 'block_use', source: me, target: '', skill: 'PhysicalBlock', origin: 'PhysicalBlock', instance: '5106' },
+    { seq: 17, time: 5.5, kind: 'status_refreshed', source: me, ...onMe, skill: 'GA_Craft_FinalCombo_Status', instance: '5102', stacks: 2, duration: 8 },
+    hit(18, 6.1, 'GA_Craft_Skill2', 313.5, false, { target: '901' }),
+    { seq: 19, time: 6.5, kind: 'dodge_use', source: me, target: '', skill: 'Dash_Base', instance: '5108' },
+    { seq: 20, time: 7.36, kind: 'status_removed', source: me, target: D, targetKind: 'Dummy', skill: 'Warrior_Charge_DestabilisationStatus', instance: '5104', stacks: 1, outcome: 'Expired' },
+    { seq: 21, time: 8.0, kind: 'status_applied', source: '77', ...onMe, skill: 'Priest_BlessingOfFervor_Status', instance: '5107', stacks: 1, duration: 30, statusType: 'buff', sourceName: 'Healbot' },
+    { seq: 22, time: 9.2, kind: 'status_removed', source: me, ...onMe, skill: 'Warrior_BattleShoutStatus', instance: '5100', stacks: 1, outcome: 'Expired' },
+  ];
+  const header = wink
+    ? { version: 1, me, duration: 9.2, initial, count: events.length, clock: 'client-observed', leadIn: 2 }
+    : { format: 'farever-combat-log', version: 1, source: { exporter: 'fixture', bootSha256: combatBoot() }, startedAt: T0,
+      clock: 'client-observed', me, character: { name: 'Tester', class: 'Warrior', level: 25 },
+      encounter: { bossKind: 'Dummy', difficulty: 0, targetDummy: true, partySize: 1 }, initial, duration: 9.2, count: events.length };
+  if (mutate) mutate(header, events);
+  // Wink's summary: per-skill totals under each hit's origin, two players.
+  const mine = new Map();
+  for (const e of events) {
+    if (e.kind !== 'damage' || e.source !== me) continue;
+    const s = mine.get(e.origin) ?? { id: e.origin, damage: 0, hits: 0, crits: 0, kills: 0, casts: 1 };
+    s.damage += e.amount; s.hits++; if (e.critical) s.crits++;
+    mine.set(e.origin, s);
+  }
+  const skills = [...mine.values()].map((s) => ({ ...s, damageBreakdown: { physical: { damage: s.damage, percent: 100, hits: s.hits, crits: s.crits, critical_damage: 0 } } }));
+  const total = skills.reduce((a, s) => a + s.damage, 0);
+  const summary = {
+    version: 1, gameVersion: 'fixture-1', id: 'fight_20261018_120000_1_1', name: dummyName, startedAt: T0, duration: 9.2,
+    healingReceived: { [me]: 120 }, me, meName: 'Tester', meClass: 'warrior',
+    players: [
+      { uid: me, name: 'Tester', isMe: true, accountId: 'acct-424242', characterId: 'char-171717', className: 'warrior',
+        damage: total, heal: 0, hits: 7, crits: 2, kills: 0, skills, damageBreakdown: { physical: { damage: total, percent: 100, hits: 7, crits: 2, critical_damage: 0 } } },
+      { uid: '77', name: 'Healbot', isMe: false, accountId: 'acct-777777', className: 'cleric', damage: 0, heal: 120, hits: 0, crits: 0, kills: 0, skills: [] },
+    ],
+    categoryVersion: 2, activityId: '', bossKind: 'Dummy', phase: '', gatesClosed: null, difficulty: -1, partySize: 2, outcome: '', targetDummy: true,
+  };
+  const text = [header, ...events].map((o) => JSON.stringify(o)).join('\n') + '\n';
+  return { me, T0, header, events, text, summary, at: (t) => Math.round(T0 + t * 1000) };
+}
+
+group('combat log reader: the dialects, the header and the guards');
+if (on) try {
+  const dummyName = cdb.row('unit', 'Dummy').texts?.name ?? 'Dummy';
+  const fx = combatLogFixture({ dummyName });
+  const wfx = combatLogFixture({ dummyName, wink: true });
+  // The fixture names the game's ids and nothing else.
+  const ids = new Set();
+  for (const e of [...fx.header.initial, ...fx.events]) { if (e.skill) ids.add(e.skill); if (e.origin) ids.add(e.origin); }
+  const strangers = [...ids].filter((id) => !cdb.has('skill', id));
+  ok('every skill and status id the fixture names is a row of the game\'s skill sheet', strangers.length === 0, strangers.join(', '));
+  ok('...and its units are unit rows', cdb.has('unit', 'Dummy') && cdb.has('unit', 'Warrior') && cdb.has('gameBeat', 'DamageDodge'));
+  ok('the difficulty names are the game\'s ActivityDifficulty cases, in their order',
+    JSON.stringify((cdb.customTypes.get('ActivityDifficulty')?.cases ?? []).map((c) => c.name)) === JSON.stringify(DIFFICULTIES),
+    JSON.stringify(DIFFICULTIES));
+
+  ok('the dialect is told by the first object\'s shape',
+    detectLogDialect(fx.header) === 'farever-combat-log' && detectLogDialect(wfx.header) === 'wink-timeline'
+      && detectLogDialect(wfx.summary) === 'wink-summary' && detectLogDialect({ version: 1, kind: 'rift-recap', gate: null, boss: {} }) === 'wink-rift-recap');
+  ok('...and a file of another format is no combat log', detectLogDialect({ format: 'farever-character-sheet', version: 1 }) === null
+    && detectLogDialect([]) === null && detectLogDialect(null) === null);
+
+  const log = readCombatLog({ name: 'fight.jsonl', data: fx.text });
+  ok('a v1 log reads with no problem', log.dialect === 'farever-combat-log' && log.perEvent && log.problems.length === 0, log.problems.join(' | '));
+  ok('...placed in time and owned by the header', log.startedAt === fx.T0 && log.startedAtEstimated === false && log.me === '812' && log.handle === 'Tester');
+  const s = log.stats;
+  ok('...every event counted, and the character\'s damage by skill',
+    s.events === fx.events.length && s.damageEvents === 7 && s.myDamageEvents === 7 && s.skills.length === 7
+      && s.skills[0].skill === 'GA_Craft_Skill1' && s.skills[0].crits === 1, JSON.stringify(s.skills));
+  near('...its totals raw, as written', s.skills.reduce((a, k) => a + k.total, 0), 952.7 + 64.2 + 97.6 + 64.8 + 131.4 + 90.1 + 313.5, 1e-9);
+  ok('...a solo dummy fight on Normal, naming its build by hash',
+    s.solo === true && s.encounter.bossKind === 'Dummy' && s.encounter.difficulty === 0 && s.encounter.targetDummy === true && s.build === combatBoot(),
+    JSON.stringify(s.encounter));
+  ok('...and the players are the character and the healer who only ever buffed it, by uid and without a name',
+    s.players.length === 2 && s.players[0].uid === '812' && s.players[0].isMe && s.players[1].uid === '77' && s.players[1].named
+      && !JSON.stringify(s.players).includes('Healbot'), JSON.stringify(s.players));
+
+  const gz = readCombatLog({ name: 'fight.jsonl.gz', data: gzipSync(Buffer.from(fx.text)) });
+  ok('a gzip file is sniffed by its magic and reads as the same log', JSON.stringify(gz.stats) === JSON.stringify(log.stats));
+  ok('...and so do bytes with a byte-order mark', readCombatLog({ name: 'bom.jsonl', data: Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(fx.text)]) }).stats.events === fx.events.length);
+
+  // What is refused, with the sentence that says why.
+  const refusal = (fn) => { try { fn(); return null; } catch (e) { return e instanceof CombatLogError ? e.message : `not a CombatLogError: ${e?.stack ?? e}`; } };
+  let said = refusal(() => readCombatLog({ name: 'cut.jsonl', data: combatLogFixture({ mutate: (h) => { h.count += 1; } }).text }));
+  ok('a count that does not match the event lines refuses the log', /says 23 events and the file holds 22/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'bare.jsonl', data: combatLogFixture({ mutate: (h) => { delete h.startedAt; delete h.me; } }).text }));
+  ok('a header without startedAt and me names both', /lacks startedAt and me/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'v2.jsonl', data: combatLogFixture({ mutate: (h) => { h.version = 2; } }).text }));
+  ok('a newer version is refused, not guessed at', /version 2; this bench reads version 1/.test(said ?? ''), said);
+  const recap = JSON.stringify({ version: 1, kind: 'rift-recap', id: 'recap_1', name: 'Rift Recap', gate: null, boss: wfx.summary });
+  said = refusal(() => readCombatLog({ name: 'recap_1.json', data: recap }));
+  ok('a Wink rift recap is refused in v1, pointing at the phases Wink also saves as ordinary fights',
+    /rift recap/.test(said ?? '') && /fight_<id>\.json\.timeline/.test(said ?? '') && !/recap_1\.json\.timeline/.test(said ?? ''), said);
+  const recapTimeline = [
+    refusal(() => readCombatLog({ name: 'recap_1.json.timeline', data: wfx.text, mtimeMs: wfx.T0, companion: { name: 'recap_1.json', data: recap } })),
+    refusal(() => readCombatLog({ name: 'recap_1.json', data: recap, companion: { name: 'recap_1.json.timeline', data: wfx.text } })),
+    refusal(() => readCombatLog({ name: 'recap_1.json.timeline', data: wfx.text, mtimeMs: wfx.T0 })),
+  ];
+  ok('...and so is its timeline: beside the recap, given either way round, or alone under the name Wink gives it',
+    recapTimeline.every((m) => /rift recap/.test(m ?? '')) && /timeline of a Wink rift recap \(recap_1\.json beside it says so\)/.test(recapTimeline[0] ?? ''),
+    recapTimeline.join(' | '));
+  said = refusal(() => readCombatLog({ name: 'sheet.json', data: JSON.stringify({ format: 'farever-character-sheet', version: 1 }) }));
+  ok('a character sheet is not a combat log', /"farever-character-sheet" file, not a combat log/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'probe.csv', data: 'ts_ms,event,source,target,skill_id,amount,crit,stacks,max_stacks,extra\n' }));
+  ok('a CSV is not one either', /line 1 is not JSON/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'lone.json.timeline', data: wfx.text }));
+  ok('a Wink timeline with no summary and no file time cannot be placed in time, and asks for its summary',
+    /no start time of its own/.test(said ?? '') && /lone\.json\)/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'renamed.jsonl', data: wfx.text }));
+  ok('...and one renamed does not name itself as its own summary', /\(<id>\.json\)/.test(said ?? ''), said);
+
+  // TIME 0 is epoch milliseconds of a time a fight was fought at.
+  said = refusal(() => readCombatLog({ name: 'secs.jsonl', data: combatLogFixture({ mutate: (h) => { h.startedAt = Math.floor(fx.T0 / 1000); } }).text }));
+  ok('a startedAt in epoch seconds is refused, and called that', /looks like epoch SECONDS/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'far.jsonl', data: combatLogFixture({ mutate: (h) => { h.startedAt = 1e17; } }).text }));
+  ok('...and one past any date with a sentence, not a RangeError', /no epoch-milliseconds time a fight was fought at/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'str.jsonl', data: combatLogFixture({ mutate: (h) => { h.startedAt = String(fx.T0); } }).text }));
+  ok('...and one written as a string', /not a number of epoch milliseconds/.test(said ?? ''), said);
+  const badSummary = readCombatLog({ name: 'fight.json.timeline', data: wfx.text, mtimeMs: wfx.T0 + 9200,
+    companion: { name: 'fight.json', data: JSON.stringify({ ...wfx.summary, startedAt: Math.floor(wfx.T0 / 1000) }) } });
+  ok('a summary whose start is in seconds is not used for the start, and the start is estimated instead',
+    badSummary.startedAt === wfx.T0 && badSummary.startedAtEstimated === true && badSummary.problems.some((p) => /fight\.json's startedAt .* SECONDS.*not used/.test(p)),
+    badSummary.problems.join(' | '));
+  said = refusal(() => readCombatLog({ name: 'old.json.timeline', data: wfx.text, mtimeMs: 5e9 }));
+  ok('...and an estimate that is no time either is refused', /modification time minus the fight's duration/.test(said ?? ''), said);
+  const loneBad = readCombatLog({ name: 'fight.json', data: JSON.stringify({ ...wfx.summary, startedAt: 1e17 }) });
+  ok('a summary alone with no usable start reads as one with none, and its report prints',
+    loneBad.startedAt === null && loneBad.problems.some((p) => /no epoch-milliseconds time.*read as no start time/.test(p))
+      && logReportLines(loneBad).length > 0, loneBad.problems.join(' | '));
+  const far = readCombatLog({ name: 'far-event.jsonl', data: combatLogFixture({ mutate: (h, ev) => { ev[3].time = 1e300; } }).text });
+  ok('an event at a time no fight lasts is skipped and counted, not turned into a ts that is no date',
+    far.events.length === fx.events.length - 1 && far.problems.some((p) => /1 event has a time more than 10,000,000 s/.test(p))
+      && captureRows(far).every((r) => Number.isFinite(new Date(r.ts).getTime())), far.problems.join(' | '));
+
+  // A header that forgot its format is not a Wink timeline that lost its summary.
+  const noFormat = combatLogFixture({ mutate: (h) => { delete h.format; } });
+  said = refusal(() => readCombatLog({ name: 'mine.jsonl', data: noFormat.text, mtimeMs: fx.T0 + 43_200_000 }));
+  ok('a v1 header without its format is refused as that, never read as a Wink timeline dated by its file time',
+    detectLogDialect(noFormat.header) === null && /startedAt and me but no "format"/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'count.jsonl', data: combatLogFixture({ mutate: (h) => { h.count = String(h.count); } }).text }));
+  ok('a count that is not a number says so, and not that the file was cut', /the header's count is "22", not a number of events/.test(said ?? ''), said);
+
+  // THE GUARDS. A stranger's upload is read on the maintainer's machine.
+  const t0 = Date.now();
+  said = refusal(() => readCombatLog({ name: 'bomb.jsonl.gz', data: gzipSync(Buffer.alloc(MAX_LOG_BYTES + 4096, 0x20)) }));
+  ok('a gzip bomb is refused at the inflation limit', /inflates to more than 64 MB/.test(said ?? ''), said);
+  ok('...without inflating it all first', Date.now() - t0 < 20_000, `${Date.now() - t0} ms`);
+  said = refusal(() => readCombatLog({ name: 'flood.jsonl', data: `${JSON.stringify(fx.header)}\n${'{}\n'.repeat(MAX_LOG_EVENTS + 1)}` }));
+  ok('so is a log of more events than any fight holds', /more than 2,000,000 events/.test(said ?? ''), said);
+  said = refusal(() => readCombatLog({ name: 'big.jsonl', data: Buffer.alloc(MAX_LOG_BYTES + 1, 0x20) }));
+  ok('...and plain text past the same 64 MB', /larger than 64 MB/.test(said ?? ''), said);
+} catch (e) { crashed(e); }
+
+group('combat log reader: the rows the capture readers take');
+if (on) try {
+  const { parseSession, isPlayerHandle, parseExtra: px } = await import('../src/capture.mjs');
+  const fx = combatLogFixture();
+  const log = readCombatLog({ name: 'fight.jsonl', data: fx.text });
+  const rows = captureRows(log);
+  const at = fx.at;
+  const keys = 'line,ts,event,source,target,skill,amount,crit,stacks,maxStacks,extra';
+  ok('every row has the capture row\'s shape, ts in whole milliseconds and stacks null when absent',
+    rows.every((r) => Object.keys(r).join(',') === keys && Number.isInteger(r.ts) && Number.isInteger(r.line) && typeof r.extra === 'string'
+      && typeof r.crit === 'boolean' && (r.stacks === null || Number.isFinite(r.stacks)) && r.maxStacks === null),
+    JSON.stringify(rows.find((r) => Object.keys(r).join(',') !== keys) ?? null));
+  ok('rows run in time order', rows.every((r, i) => i === 0 || r.ts >= rows[i - 1].ts));
+
+  // THE SESSION ROW. One, first, and saying boot=unreadable, so that a third
+  // party's log is never dated by a file time.
+  const sess = rows[0];
+  ok('the first row is one synthetic session row at the first row\'s time',
+    sess.event === 'session' && rows.filter((r) => r.event === 'session').length === 1 && sess.ts === at(-2) && sess.skill === 'farever-combat-log',
+    JSON.stringify(sess));
+  ok('...naming the dialect, an unreadable boot, the build its header names and that it records presses',
+    sess.extra === `probe=farever-combat-log;boot=unreadable;build=${combatBoot()};presses=1`, sess.extra);
+  const parsed = parseSession(sess);
+  ok('parseSession reads the build and the presses flag off it',
+    parsed.probe === 'farever-combat-log' && parsed.bootUnreadable === true && parsed.build === combatBoot() && parsed.presses === 1
+      && parsed.bootBytes === null, JSON.stringify(parsed));
+  const probeSession = parseSession({ ts: 1, extra: 'probe=v10;boot_bytes=1;boot_mtime_ms=2' });
+  ok('...and a probe session row parses to the object it always did, neither key added',
+    JSON.stringify(Object.keys(probeSession)) === JSON.stringify(['ts', 'probe', 'bootBytes', 'bootMtimeMs', 'bootUnreadable']), JSON.stringify(probeSession));
+  const spaced = captureRows(readCombatLog({ name: 'v.jsonl', data: combatLogFixture({
+    mutate: (h) => { h.source = { exporter: 'fixture', gameVersion: '1.2.3 (25959898);x\nY' }; },
+  }).text }))[0];
+  ok('a build named by a version string keeps its words; only what would break the row becomes a space',
+    parseSession(spaced).build === '1.2.3 (25959898) x Y', spaced.extra);
+  const quiet = captureRows(readCombatLog({ name: 'hits.jsonl', data: combatLogFixture({
+    mutate: (h, ev) => { for (let i = ev.length - 1; i >= 0; i--) if (/_use$/.test(ev[i].kind)) ev.splice(i, 1); h.count = ev.length; },
+  }).text }));
+  ok('a log with no use of the character\'s says presses=0', /;presses=0$/.test(quiet[0].extra), quiet[0].extra);
+
+  // DAMAGE.
+  const hits = rows.filter((r) => r.event === 'inflict');
+  ok('each damage event is one inflict row, the avoided hit none', hits.length === 7 && rows.filter((r) => r.event === 'avoided').length === 1
+    && rows.find((r) => r.event === 'avoided').amount === 0, hits.map((r) => r.skill).join(','));
+  const first = hits[0];
+  ok('a hit is the character\'s handle on <unit>#<uid>, raw amount and crit',
+    first.source === 'Tester' && first.target === 'Dummy#900' && first.skill === 'GA_Craft_Skill1' && first.amount === 952.7 && first.crit === true,
+    JSON.stringify(first));
+  ok('...with origin, damage type and outcome in extra, and no affinity it was not given',
+    first.extra === 'origin=GA_Craft_Skill1;dtype=physical;outcome=Hit' && !('affinity' in px(first.extra)), first.extra);
+  ok('time is rounded to the millisecond from startedAt', first.ts === at(0.0004) && first.ts === fx.T0 && hits[1].ts === fx.T0 + 950);
+  const added = captureRows(readCombatLog({ name: 'added.jsonl', data: combatLogFixture({
+    mutate: (h, ev) => Object.assign(ev[2], { affinity: 'Physical', targetLevel: 1, targetHp: 1000, targetMaxHp: 1200, targetArmor: 40, targetMagicArmor: 41 }),
+  }).text })).find((r) => r.event === 'inflict');
+  ok('the bench additions reach extra under the probe\'s own keys',
+    added.extra === 'origin=GA_Craft_Skill1;dtype=physical;outcome=Hit;affinity=Physical;tlvl=1;thp=1000;tmax=1200;tarm=40;tmarm=41', added.extra);
+
+  // PRESSES. A use is a press only when it is the character's own start.
+  const presses = rows.filter((r) => r.event === 'press');
+  ok('the character\'s skill and block starts are presses, a child start is not',
+    presses.map((r) => r.skill).join() === 'GA_Craft_Skill1,Warrior_Charge,PhysicalBlock'
+      && rows.some((r) => r.event === 'skill_use' && r.skill === 'GA_Craft_Passive_Proc'), presses.map((r) => r.skill).join());
+  ok('...aimed where its skill_context says, in the form instance following reads',
+    presses[0].target === 'T:Dummy#900' && presses[1].target === 'T:Dummy#900' && presses[2].target === 'T:'
+      && /^T:(.+#\d+)$/.test(presses[0].target), presses.map((r) => r.target).join());
+  ok('...and say they were starts, a block as a block',
+    presses[0].extra === 'kind=GA_Craft_Skill1;via=start' && presses[2].extra === 'kind=PhysicalBlock;via=start;use=block', presses.map((r) => r.extra).join(' | '));
+  ok('a skill_context is folded into its press, a dash is a dodge',
+    !rows.some((r) => r.event === 'skill_context') && rows.some((r) => r.event === 'dodge' && r.skill === 'Dash_Base'));
+  const input = captureRows(readCombatLog({ name: 'input.jsonl', data: combatLogFixture({
+    mutate: (h, ev) => { ev.push({ seq: 23, time: 9.3, kind: 'press', source: '812', target: '900', targetKind: 'Dummy', skill: 'Warrior_Charge' }); h.count = ev.length; },
+  }).text })).filter((r) => r.event === 'press').pop();
+  ok('a press an exporter read off the input path says so', input.target === 'T:Dummy#900' && input.extra === 'kind=Warrior_Charge;via=input', JSON.stringify(input));
+
+  // STATUSES, the ones standing at the start included.
+  const st = rows.filter((r) => r.event.startsWith('status_'));
+  const opened = st[0];
+  ok('a status already up when the recording opened is a status_on at the lead-in',
+    opened.event === 'status_on' && opened.skill === 'Warrior_BattleShoutStatus' && opened.ts === at(-2) && opened.source === 'Tester'
+      && opened.target === 'Tester' && opened.extra === 'ok=1;dur=11.2' && opened.stacks === 1 && opened.line === 1, JSON.stringify(opened));
+  const on = st.find((r) => r.event === 'status_on' && r.skill === 'Warrior_Charge_DestabilisationStatus');
+  ok('a status on the target is worn by <unit>#<uid>', on?.target === 'Dummy#900' && on.source === 'Tester' && on.extra === 'ok=1;dur=3', JSON.stringify(on));
+  ok('stacks, refresh and removal map to the probe\'s three events',
+    st.some((r) => r.event === 'status_stacks' && r.stacks === 2)
+      && st.some((r) => r.event === 'status_refresh' && r.extra === 'refresh_dur=8')
+      && st.some((r) => r.event === 'status_off' && r.skill === 'Warrior_Charge_DestabilisationStatus' && r.extra === 'reason=Expired'),
+    st.map((r) => `${r.event}:${r.extra}`).join(' | '));
+  const healer = st.find((r) => r.skill === 'Priest_BlessingOfFervor_Status');
+  ok('a party member with a name and no unit kind is written under its name, as a player', healer?.source === 'Healbot'
+    && isPlayerHandle(healer.source) && healer.target === 'Tester', JSON.stringify(healer));
+
+  // ORDER. The file's order is not the rows' order.
+  const reversed = combatLogFixture({ mutate: (h, ev) => ev.reverse() });
+  const again = captureRows(readCombatLog({ name: 'reversed.jsonl', data: reversed.text }));
+  const strip = (rs) => rs.map(({ line, ...r }) => JSON.stringify(r)).join('\n');
+  ok('events written out of order give the same rows', strip(again) === strip(rows));
+
+  // WHAT A DAMAGE EVENT MUST CARRY.
+  const holes = readCombatLog({ name: 'holes.jsonl', data: combatLogFixture({
+    mutate: (h, ev) => { delete ev[3].target; delete ev[3].targetKind; delete ev[4].skill; delete ev[6].critical; ev[7].source = 812; delete ev[13].targetKind; },
+  }).text });
+  const holeRows = captureRows(holes).filter((r) => r.event === 'inflict');
+  ok('a hit with no target is read against ?#-1, one with a target and no kind against ?#<uid>, and both are counted',
+    holeRows.some((r) => r.skill === 'GA_Base_Attack' && r.target === '?#-1') && holeRows.some((r) => r.skill === 'Warrior_Charge' && r.target === '?#900')
+      && holes.problems.some((p) => /2 damage events lack a target or its targetKind: read against `\?#-1` with no target, `\?#<uid>` with no targetKind/.test(p)),
+    holes.problems.join(' | '));
+  ok('...one with no skill is not read at all, and counted',
+    holeRows.length === 6 && !holeRows.some((r) => r.skill === 'GA_Base_Attack2') && holes.problems.some((p) => /names no skill/.test(p)));
+  ok('...one that does not say it was critical reads as not critical, and is counted',
+    holeRows.find((r) => r.skill === 'GA_Base_Attack3')?.crit === false && holes.problems.some((p) => /critical: read as not critical/.test(p)));
+  ok('...and a uid written as a number is read as the string it should be, and counted',
+    holeRows.find((r) => r.skill === 'GA_Craft_FinalCombo')?.source === 'Tester' && holes.problems.some((p) => /written as a number/.test(p)),
+    holes.problems.join(' | '));
+  ok('the reader\'s sentences say all of it', logReportLines(holes).filter((l) => l.startsWith('Problem: ')).length === holes.problems.length);
+} catch (e) { crashed(e); }
+
+group('combat log reader: streamCapture, the capture readers and captureEra');
+if (on) try {
+  const {
+    streamCapture, sessions, captureEra, mechanicEvidence, openingState, combatLogOf, parseSession,
+  } = await import('../src/capture.mjs');
+  const dummyName = cdb.row('unit', 'Dummy').texts?.name ?? 'Dummy';
+  const fx = combatLogFixture({ dummyName });
+  const wfx = combatLogFixture({ dummyName, wink: true });
+  const dir = mkdtempSync(join(tmpdir(), 'bench-combatlog-'));
+  const plain = join(dir, 'fight.jsonl');
+  const packed = join(dir, 'fight.jsonl.gz');
+  const base = join(dir, 'fight_20261018_120000_1_1.json');
+  writeFileSync(plain, fx.text);
+  writeFileSync(packed, gzipSync(Buffer.from(fx.text)));
+  writeFileSync(base, JSON.stringify(wfx.summary));
+  writeFileSync(`${base}.timeline`, wfx.text);
+  const want = readCombatLog({ name: 'fight.jsonl', data: fx.text }).stats.skills;
+  for (const [what, p] of [['a plain .jsonl', plain], ['a gzip one', packed], ['a Wink timeline beside its summary', `${base}.timeline`]]) {
+    const got = [];
+    const receipt = await streamCapture(p, (r) => got.push(r));
+    ok(`${what}: streamCapture replays its rows with the CSV path's receipt`,
+      receipt.rows === got.length && receipt.malformed === 0 && receipt.sessionRows.length === 1 && got[0].event === 'session'
+        && typeof receipt.header === 'string' && receipt.lines === wfx.events.length + 1, JSON.stringify({ ...receipt, header: null }));
+    const agg = await aggregate(p, { source: 'Tester' });
+    ok(`${what}: aggregate() reads the character's hits, skill by skill`,
+      agg.matched === 7 && want.every((w) => Math.abs((agg.groups.find((g) => g.key === w.skill)?.total ?? -1) - w.total) < 1e-9),
+      agg.groups.map((g) => `${g.key}:${g.total}`).join(','));
+    const ss = await sessions(p, { source: 'Tester' });
+    ok(`${what}: sessions() finds the one fight`, ss.sessions.length === 1 && ss.sessions[0].hits === 7, JSON.stringify(ss.sessions));
+  }
+  // The Wink pair took its start, its handle and its build from the summary.
+  const pair = combatLogOf(`${base}.timeline`);
+  ok('the summary beside a Wink timeline is found and read: its start, its player name, its game version',
+    pair.log.dialect === 'wink-timeline' && pair.log.startedAt === wfx.T0 && !pair.log.startedAtEstimated && pair.log.handle === 'Tester'
+      && pair.log.companionName === 'fight_20261018_120000_1_1.json' && pair.rows[0].extra.includes('build=fixture-1'), pair.rows[0].extra);
+  ok('...a party of two, so its rows are evidence of totals, and said', pair.log.stats.solo === false
+    && pair.log.notes.some((n) => /party fight/.test(n)) && pair.log.notes.some((n) => /source or its target/.test(n)));
+  ok('...and the timeline folded by origin agrees with the summary', pair.log.notes.some((n) => /agrees with the summary on all 7 skills/.test(n)),
+    pair.log.notes.join(' | '));
+
+  // The readers that need more than hits.
+  const followed = await aggregate(plain, { source: 'Tester', target: 'Dummy', follow: { isBaseAttack: (id) => /^GA_Base_Attack/.test(id) } });
+  ok('a press\'s target is the instance followed: the hit on another dummy is left out',
+    followed.matched === 6 && followed.leftOut.hits === 1 && followed.leftOut.instances[0]?.target === 'Dummy#901', JSON.stringify(followed.leftOut));
+  const mech = await mechanicEvidence(plain, { source: 'Tester', statuses: ['GA_Craft_FinalCombo_Status'], skills: ['GA_Base_Attack'] });
+  ok('mechanicEvidence reads a status\'s stacks on the character and a skill\'s hits',
+    mech.hits.GA_Base_Attack === 1 && mech.statuses.GA_Craft_FinalCombo_Status.events === 2 && mech.statuses.GA_Craft_FinalCombo_Status.perEvent === 1,
+    JSON.stringify(mech));
+  const opening = await openingState(plain, { source: 'Tester', at: fx.at(5), wearers: ['Dummy#900'] });
+  ok('openingState finds the last press before a moment and the status still up on the dummy',
+    opening.lastPress?.skill === 'Warrior_Charge' && opening.standing.some((x) => x.status === 'Warrior_Charge_DestabilisationStatus' && x.wearer === 'Dummy#900')
+      && opening.standing.some((x) => x.status === 'Warrior_BattleShoutStatus' && x.self), JSON.stringify(opening));
+
+  // WHICH BUILD. A sha that matches is this build; anything else cannot be told.
+  const receipt = await streamCapture(plain, () => {});
+  const boot = { bytes: 1, mtimeMs: fx.T0 + 86_400_000 };
+  let era = captureEra({ sessionRows: receipt.sessionRows, from: fx.at(0), to: fx.at(9), boot, bootSha: combatBoot().toUpperCase() });
+  ok('a combat log whose header names the installed hlboot.dat\'s sha is this build\'s', era.onThisBuild === true && era.sessions.length === 1, era.reason);
+  era = captureEra({ sessionRows: receipt.sessionRows, from: fx.at(0), to: fx.at(9), boot, bootSha: 'f'.repeat(64) });
+  ok('...another sha is "cannot tell", naming both - never "another build" off a date',
+    era.onThisBuild === null && era.reason.includes(combatBoot()) && era.reason.includes('ffffffffffff'), era.reason);
+  era = captureEra({ sessionRows: pair.rows.filter((r) => r.event === 'session').map(parseSession), from: wfx.at(0), to: wfx.at(9), boot, bootSha: combatBoot() });
+  ok('...and so is a game version, which no install is checked against', era.onThisBuild === null && /fixture-1/.test(era.reason), era.reason);
+  const anon = join(dir, 'unnamed.jsonl');
+  writeFileSync(anon, combatLogFixture({ mutate: (h) => { delete h.source; } }).text);
+  const bare = await streamCapture(anon, () => {});
+  era = captureEra({ sessionRows: bare.sessionRows, from: fx.at(0), to: fx.at(9), boot: null, bootSha: null });
+  ok('a log that names no build cannot be placed, and says what it lacks', era.onThisBuild === null && /names its build as nothing/.test(era.reason), era.reason);
+  era = captureEra({ sessionRows: bare.sessionRows, from: fx.at(0), to: fx.at(9), boot: { bytes: 1, mtimeMs: fx.T0 + 9e9 } });
+  ok('...even where its rows are older than the installed boot, which would have dated a probe log',
+    era.onThisBuild === null && era.sessions.length === 1, era.reason);
+
+  // A summary on its own has no rows to give.
+  let said = null;
+  try { await streamCapture(base, () => {}); } catch (e) { said = e.message; }
+  ok('a Wink summary alone is refused by streamCapture, pointing at its timeline',
+    /summary-only log: per-skill totals, no per-event rows/.test(said ?? '') && /Its timeline is .*\.timeline/.test(said ?? ''), said);
+
+  // ONE READ PER FILE, not one per pass - and a rewritten file is read again.
+  const a = [];
+  const b = [];
+  await streamCapture(plain, (r) => a.push(r));
+  await streamCapture(plain, (r) => b.push(r));
+  ok('a capture streamed twice is parsed once: the same frozen rows', a.length === b.length && a.every((r, i) => r === b[i]) && Object.isFrozen(a[1]));
+  writeFileSync(plain, combatLogFixture({ mutate: (h, ev) => { ev[2].amount = 1000; } }).text);
+  utimesSync(plain, new Date(), new Date(Date.now() + 5000));
+  const c = [];
+  await streamCapture(plain, (r) => c.push(r));
+  ok('...and a file written again is read again', c.find((r) => r.event === 'inflict')?.amount === 1000);
+
+  // The probe's CSV goes the way it always went.
+  const csv = join(dir, 'probe.csv');
+  writeFileSync(csv, 'ts_ms,event,source,target,skill_id,amount,crit,stacks,max_stacks,extra\n1000,inflict,Tester,Dummy#7,GA_Base_Attack,64,0,,,affinity=Physical\n');
+  const csvRows = [];
+  const csvReceipt = await streamCapture(csv, (r) => csvRows.push(r));
+  ok('a probe CSV beside them still reads as a CSV', csvReceipt.header.startsWith('ts_ms,') && csvRows.length === 1 && csvRows[0].extra === 'affinity=Physical'
+    && combatLogOf(csv) === null);
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+group('combat log reader: the copy a submission sends keeps no name');
+if (on) try {
+  const dummyName = cdb.row('unit', 'Dummy').texts?.name ?? 'Dummy';
+  const wfx = combatLogFixture({ dummyName, wink: true });
+  const log = readCombatLog({
+    name: 'fight.json.timeline', data: wfx.text, companion: { name: 'fight.json', data: JSON.stringify(wfx.summary) },
+  });
+  const swapped = readCombatLog({ name: 'fight.json', data: JSON.stringify(wfx.summary), companion: { name: 'fight.json.timeline', data: wfx.text } });
+  ok('the two Wink files given the other way round are the same log', swapped.dialect === 'wink-timeline'
+    && JSON.stringify(swapped.stats) === JSON.stringify(log.stats));
+  const broken = readCombatLog({
+    name: 'fight.json.timeline', data: wfx.text, mtimeMs: wfx.T0 + 9200, companion: { name: 'fight.json', data: '{"version":1,' },
+  });
+  ok('a summary that cannot be read costs the timeline its summary, not its rows: the start is then estimated, and both are said',
+    broken.events.length === wfx.events.length && broken.startedAt === wfx.T0 && broken.startedAtEstimated === true
+      && broken.problems.some((p) => /could not be read, so it was not used/.test(p)) && broken.notes.some((n) => /ESTIMATED/.test(n)),
+    broken.problems.join(' | '));
+  const an = anonymizeLog(log);
+  const secrets = ['Tester', 'Healbot', 'acct-424242', 'acct-777777', 'char-171717', 'fight_20261018_120000_1_1',
+    ...(dummyName !== 'Dummy' ? [dummyName] : [])];
+  const leaked = secrets.filter((x) => an.text.includes(x) || an.summaryText.includes(x));
+  ok('no player name, account id, fight id or display name survives in either file', leaked.length === 0, leaked.join(', '));
+  ok('...the submitter is "Submitter", the healer who only ever buffed it is nobody',
+    an.handle === 'Submitter' && an.namesRemoved === 2 && an.playerNames.includes('Healbot') && an.playerNames.includes('Tester'), JSON.stringify(an.playerNames));
+  const lines = an.text.trim().split('\n').map((l) => JSON.parse(l));
+  const uids = new Set();
+  for (const e of [...lines[0].initial, ...lines.slice(1)]) for (const k of ['source', 'target', 'instance']) if (e[k]) uids.add(e[k]);
+  ok('every uid is renumbered, the character as "1", in digits',
+    lines[0].me === '1' && lines[0].format === 'farever-combat-log' && [...uids].every((u) => /^\d+$/.test(u) && Number(u) < 100)
+      && !['812', '900', '901', '77', '5100'].some((u) => uids.has(u)), [...uids].join(','));
+  ok('...and only the allowlisted fields are written: no skill or item name, and a player\'s only as "Player <its new uid>"',
+    lines.slice(1).every((e) => !('skillName' in e) && !('itemName' in e)
+      && (!('sourceName' in e) || e.sourceName === `Player ${e.source}`) && (!('targetName' in e) || e.targetName === `Player ${e.target}`)));
+  // The copy still reads its players as players (a party member's hits on
+  // the target are what verify warns about), and its creatures as creatures.
+  const { isPlayerHandle } = await import('../src/capture.mjs');
+  const copyRows = captureRows(readCombatLog({ name: 'copy.jsonl', data: an.text }));
+  const healerUid = lines.slice(1).find((e) => e.sourceName === 'Player 2' || /^Player \d+$/.test(e.sourceName ?? ''))?.source;
+  ok('...the healer, named in the original, is a player in the copy: a handle with no "#", and no name of theirs',
+    healerUid && copyRows.some((r) => r.source === `Player ${healerUid}` && isPlayerHandle(r.source)), JSON.stringify(copyRows.slice(0, 4)));
+  const back = readCombatLog({ name: 'combat-log.jsonl', data: an.text });
+  ok('read back, the character\'s damage is what it was, skill by skill',
+    JSON.stringify(back.stats.skills) === JSON.stringify(log.stats.skills) && back.stats.myDamageEvents === log.stats.myDamageEvents && back.handle === 'Submitter');
+  ok('...as the same rows, but for the names', captureRows(back).filter((r) => r.event === 'inflict').map((r) => `${r.skill}:${r.amount}:${r.crit}`).join()
+    === captureRows(log).filter((r) => r.event === 'inflict').map((r) => `${r.skill}:${r.amount}:${r.crit}`).join());
+  const sum = JSON.parse(an.summaryText);
+  ok('the summary is rebuilt too: no names, no account or character ids, its uids renumbered',
+    !('meName' in sum) && !('name' in sum) && !('id' in sum) && sum.me === '1' && sum.players.every((p) => !('name' in p) && !('accountId' in p) && !('characterId' in p))
+      && sum.players[0].uid === '1' && Object.keys(sum.healingReceived).join() === '1' && sum.players[0].skills.length === 7, an.summaryText.slice(0, 300));
+
+  const kept = anonymizeLog(log, { keepName: true });
+  ok('a player who keeps the name keeps it in one place, the header\'s character',
+    kept.handle === 'Tester' && JSON.parse(kept.text.split('\n')[0]).character?.name === 'Tester' && kept.text.split('Tester').length === 2
+      && !kept.summaryText.includes('Tester') && !kept.text.includes('Healbot'));
+
+  // A v1 log with no summary: the healer is only ever a source, with a name.
+  const v1 = readCombatLog({ name: 'fight.jsonl', data: combatLogFixture({ dummyName }).text });
+  const an1 = anonymizeLog(v1);
+  ok('a healer seen only as the source of a buff is still found and dropped', !an1.text.includes('Healbot') && an1.playerNames.includes('Healbot')
+    && an1.summaryText === null);
+  // FAIL CLOSED: a name in a field the allowlist carries is a refusal.
+  let said = null;
+  try {
+    anonymizeLog(readCombatLog({ name: 'leak.jsonl', data: combatLogFixture({ mutate: (h, ev) => { ev[21].outcome = 'Healbot'; } }).text }));
+  } catch (e) { said = e instanceof CombatLogError ? e.message : String(e); }
+  ok('a player\'s name left in any value refuses the whole log, naming the field',
+    /^refused: someone in this fight is, or could be, named "Healbot", and that is also a value the anonymised copy carries \(events\[\d+\]\.outcome\)/.test(said ?? ''), said);
+  // A name that is also a word of the format: a collision, said as one.
+  said = null;
+  try {
+    anonymizeLog(readCombatLog({ name: 'hit.jsonl', data: combatLogFixture({ mutate: (h, ev) => { ev[20].sourceName = 'Hit'; } }).text }));
+  } catch (e) { said = e instanceof CombatLogError ? e.message : String(e); }
+  ok('...a healer named like the outcome every landed blow writes too: refused, and called a collision rather than a bug',
+    /named "Hit", and that is also a value .*\(events\[\d+\]\.outcome\) - an id or a word the format writes/.test(said ?? '') && !/bug/.test(said ?? ''), said);
+
+  // FAIL CLOSED WITHOUT THE ENGINE. A party member of another class carries
+  // a hero kind the submitter does not share; without the classes' unit ids
+  // it cannot be told from a creature, so its name is searched for anyway
+  // and handed back as a player's.
+  const kingName = cdb.row('unit', 'Ratsar').texts?.name;
+  const party = (outcome) => combatLogFixture({ mutate: (h, ev) => {
+    ev.push({ seq: 23, time: 9.4, kind: 'status_applied', source: '812', target: '4567', targetKind: 'Rogue', targetName: 'Bobbins', skill: 'Warrior_BattleShoutStatus', stacks: 1, duration: 10 });
+    ev.push({ seq: 24, time: 9.5, kind: 'status_removed', source: '812', target: '4567', targetKind: 'Rogue', targetName: 'Bobbins', skill: 'Warrior_BattleShoutStatus', stacks: 1, outcome });
+    ev.push({ seq: 25, time: 9.6, kind: 'damage', source: '812', target: '950', targetKind: 'Ratsar', targetName: kingName, skill: 'GA_Base_Attack', origin: 'GA_Base_Attack', amount: 10, critical: false });
+    h.count = ev.length;
+  } });
+  const partyLog = readCombatLog({ name: 'party.jsonl', data: party('Expired').text });
+  const blind = anonymizeLog(partyLog);
+  ok('without heroKinds, a Rogue the character buffed is a player: dropped and handed back',
+    typeof kingName === 'string' && !blind.text.includes('Bobbins') && blind.playerNames.includes('Bobbins') && blind.playerNames.includes(kingName),
+    JSON.stringify(blind.playerNames));
+  const sighted = anonymizeLog(partyLog, { heroKinds: cat.classes.map((c) => c.unit) });
+  ok('...with them, the Rogue still is, and a boss with a unit kind is not',
+    sighted.playerNames.includes('Bobbins') && !sighted.playerNames.includes(kingName) && sighted.namesRemoved === blind.namesRemoved - 1,
+    JSON.stringify(sighted.playerNames));
+  said = null;
+  try { anonymizeLog(readCombatLog({ name: 'party.jsonl', data: party('Bobbins').text })); } catch (e) { said = e instanceof CombatLogError ? e.message : String(e); }
+  ok('...and that name in a carried field refuses the log, heroKinds or not', /named "Bobbins"/.test(said ?? ''), said);
+
+  // A summary alone travels as totals.
+  const lone = readCombatLog({ name: 'fight.json', data: JSON.stringify(wfx.summary) });
+  ok('a Wink summary alone is a log without events, flagged', lone.dialect === 'wink-summary' && lone.perEvent === false && lone.events.length === 0
+    && lone.stats.skills.length === 7 && lone.notes.some((n) => /summary-only log/.test(n)));
+  const anLone = anonymizeLog(lone);
+  ok('...anonymised to a summary and no log', anLone.text === null && !anLone.summaryText.includes('Tester') && !anLone.summaryText.includes('acct-'));
+  let refusedRows = null;
+  try { captureRows(lone); } catch (e) { refusedRows = e.message; }
+  ok('...and it has no rows to give', /summary-only log/.test(refusedRows ?? ''), refusedRows);
+  ok('...which its report says', logReportLines(lone).some((l) => /totals only/.test(l)));
+
+  // Converted to v1 (the submission's copy, the one writer of v1 left): the
+  // same fight, start and encounter included.
+  const conv = readCombatLog({ name: 'converted.jsonl', data: anonymizeLog(log, { keepName: true }).text });
+  ok('a Wink pair written as v1 reads as the same fight, start and encounter included',
+    conv.dialect === 'farever-combat-log' && conv.startedAt === log.startedAt && JSON.stringify(conv.stats.skills) === JSON.stringify(log.stats.skills)
+      && conv.stats.encounter.partySize === 2 && conv.handle === 'Tester' && conv.problems.length === 0, conv.problems.join(' | '));
+  ok('the converter is not exported any more: the copy a submission sends is the only v1 the bench writes',
+    !('toCombatLogText' in combatLogModule) && !('NAME_FIELDS' in combatLogModule));
+  const report = logReportLines(log);
+  ok('the report names the source, the party and Wink\'s limits',
+    report[0].includes('Wink DPS Meter fight timeline, with its summary fight.json') && report.some((l) => /party fight/.test(l))
+      && report.some((l) => /skill STARTED/.test(l)), report.join('\n'));
+} catch (e) { crashed(e); }
+
+group('combat log reader: the documented example and its schema');
+if (on) try {
+  const docs = (p) => fileURLToPath(new URL(`../docs/${p}`, import.meta.url));
+  const log = readCombatLog({ name: 'combat-log.jsonl', data: readFileSync(docs('examples/combat-log.jsonl')) });
+  ok('docs/examples/combat-log.jsonl reads with no problem', log.problems.length === 0 && log.dialect === 'farever-combat-log' && log.stats.myDamageEvents > 0,
+    log.problems.join(' | '));
+  const strangers = [];
+  for (const e of [...log.initial, ...log.events]) {
+    for (const k of ['skill', 'origin']) if (e[k] && !cdb.has('skill', e[k])) strangers.push(e[k]);
+    if (e.targetKind && !cdb.has('unit', e.targetKind)) strangers.push(e.targetKind);
+    if (e.affinity && !cdb.has('affinity', e.affinity)) strangers.push(e.affinity);
+  }
+  if (!cdb.has('unit', log.header.encounter.bossKind)) strangers.push(log.header.encounter.bossKind);
+  if (!cat.classes.some((c) => c.unit === log.header.character.class)) strangers.push(log.header.character.class);
+  ok('...and every id in it is the game\'s', strangers.length === 0, strangers.join(', '));
+  ok('...and it gives rows', captureRows(log).filter((r) => r.event === 'inflict').length === log.stats.myDamageEvents);
+  const schema = JSON.parse(readFileSync(docs('schema/combat-log.v1.json'), 'utf8'));
+  ok('the schema is JSON Schema 2020-12 at its published address, with a header and an event',
+    schema.$schema === 'https://json-schema.org/draft/2020-12/schema'
+      && schema.$id === 'https://raw.githubusercontent.com/Blaakan/farever-bench/master/docs/schema/combat-log.v1.json'
+      && JSON.stringify(schema.$defs?.header?.required) === JSON.stringify(['format', 'version', 'startedAt', 'me'])
+      && JSON.stringify(schema.$defs?.event?.required) === JSON.stringify(['time', 'kind']));
+  const md = readFileSync(docs('COMBAT-LOG.md'), 'utf8');
+  ok('the spec states the reader\'s own guards', md.includes(`${MAX_LOG_BYTES / 1024 / 1024} MB`) && md.includes(MAX_LOG_EVENTS.toLocaleString('en-US')));
+} catch (e) { crashed(e); }
+
+// --- submission public manifest -------------------------------------------------
+// What of a fight may be seen by anybody is decided by
+// src/submission-public.mjs: the public manifest the manual route's issue
+// title is built from, and the table tools/inbox.mjs prints. These hold it to
+// that: a field nobody allowlisted never reaches the title or the table, a
+// wrong value is named by its field, and the zip reader reads a directory
+// and nothing else.
+group('combat log reader: presses declared, skill starts as state rows, a gauge on a press, players by class, and the report names the character');
+if (on) try {
+  const { parseExtra: px, isPlayerHandle: isPlayer } = await import('../src/capture.mjs');
+  // PRESSES. A log of the held base-attack chain alone writes no press and no
+  // skill_use: whether it records presses is then the exporter's to say.
+  const chainOnly = (declare) => readCombatLog({ name: 'chain.jsonl', data: combatLogFixture({ mutate: (h, ev) => {
+    for (let i = ev.length - 1; i >= 0; i--) if (['skill_use', 'block_use', 'skill_context', 'press'].includes(ev[i].kind)) ev.splice(i, 1);
+    if (declare) h.source.recordsPresses = true;
+    h.count = ev.length;
+  } }).text });
+  const session = (log) => px(captureRows(log)[0].extra);
+  const quiet = chainOnly(false);
+  const said = chainOnly(true);
+  ok('a log with no press of its character, and no word on it, is presses=0 - and its report says verify plays its own rotation',
+    session(quiet).presses === '0' && quiet.stats.presses === false && logReportLines(quiet).some((l) => /^It records no press of the character.*source\.recordsPresses.*plays the model's own rotation/.test(l)),
+    logReportLines(quiet).join('\n'));
+  ok('...one that declares source.recordsPresses is presses=1 with no press row in it, and says so',
+    session(said).presses === '1' && said.stats.presses === true && said.stats.pressesDeclared === true
+      && logReportLines(said).includes('It records the character\'s presses (source.recordsPresses).'), logReportLines(said).join('\n'));
+  const winkChain = readCombatLog({ name: 'w.json.timeline', data: combatLogFixture({ wink: true, mutate: (h, ev) => {
+    for (let i = ev.length - 1; i >= 0; i--) if (['skill_use', 'block_use', 'skill_context'].includes(ev[i].kind)) ev.splice(i, 1);
+    h.count = ev.length;
+  } }).text, mtimeMs: Date.UTC(2026, 9, 18, 12, 0, 9) });
+  ok('...and a Wink timeline always records them: it writes every skill its character starts', session(winkChain).presses === '1');
+  ok('...the copy a submission sends keeps the declaration, so the maintainer\'s verify reads it as the original reads',
+    JSON.parse(anonymizeLog(said).text.split('\n')[0]).source.recordsPresses === true
+      && JSON.parse(anonymizeLog(winkChain).text.split('\n')[0]).source.recordsPresses === true
+      && !('recordsPresses' in (JSON.parse(anonymizeLog(quiet).text.split('\n')[0]).source ?? {})));
+
+  // THE OPENING. Every skill the character starts is a go_state row to Skill
+  // on its handle, as the probe writes one - a child start included - which
+  // is where verify --replay opens the fight.
+  const fx = combatLogFixture();
+  const log = readCombatLog({ name: 'fx.jsonl', data: fx.text });
+  const rows = captureRows(log);
+  const states = rows.filter((r) => r.event === 'go_state');
+  ok('each skill_use and block_use of the character is a go_state row to Skill on the handle, at its own time',
+    states.length === 4 && states.every((r) => r.source === '' && r.target === 'Tester' && px(r.extra).state === 'Skill')
+      && states.map((r) => r.skill).join() === 'GA_Craft_Skill1,GA_Craft_Passive_Proc,Warrior_Charge,PhysicalBlock'
+      && states[0].ts === fx.at(-0.3), JSON.stringify(states));
+  ok('...beside the press of an own use, while a child start (another skill its origin) is a state and no press',
+    rows.filter((r) => r.event === 'press').map((r) => r.skill).join() === 'GA_Craft_Skill1,Warrior_Charge,PhysicalBlock'
+      && rows.some((r) => r.event === 'skill_use' && r.skill === 'GA_Craft_Passive_Proc'));
+
+  // THE GAUGE. A rage or spark value on a press or a skill start rides its
+  // rows as the probe's do, where capture.mjs poolAt reads it.
+  const gauged = readCombatLog({ name: 'g.jsonl', data: combatLogFixture({ mutate: (h, ev) => {
+    Object.assign(ev.find((e) => e.seq === 12), { rage: 40, spark: 35.8 });
+    ev.push({ seq: 30, time: 9.0, kind: 'press', source: '812', target: '900', targetKind: 'Dummy', skill: 'Warrior_Rage_Strike', spark: 12.5 });
+    h.count = ev.length;
+  } }).text });
+  const grows = captureRows(gauged);
+  const charge = grows.filter((r) => r.skill === 'Warrior_Charge' && (r.event === 'press' || r.event === 'go_state'));
+  const typed = grows.find((r) => r.event === 'press' && r.skill === 'Warrior_Rage_Strike');
+  ok('a rage or spark on a press or a skill start is written on its press and its state row, as the probe writes them',
+    charge.length === 2 && charge.every((r) => px(r.extra).rage === '40' && px(r.extra).spark === '35.8')
+      && px(typed.extra).spark === '12.5' && px(typed.extra).via === 'input' && !('rage' in px(typed.extra)), JSON.stringify(charge.concat(typed)));
+  ok('...the stats say which pools the log carries, and its report says it records them', gauged.stats.pools.join() === 'rage,spark'
+    && log.stats.pools.length === 0 && logReportLines(gauged).some((l) => /presses.*and the character's rage and spark on them/.test(l)));
+  const gaugeCopy = JSON.parse(anonymizeLog(gauged).text.split('\n').find((l) => l.includes('"seq":12')));
+  ok('...and the copy a submission sends keeps them', gaugeCopy.rage === 40 && gaugeCopy.spark === 35.8);
+
+  // PLAYERS. A uid of a class's kind is a player - a handle with no '#', by
+  // name, or `player<uid>` with none - and so is a named kindless one, as a
+  // source and as the target of a hit; a kindless hit on a named player is
+  // no problem of the file's.
+  const party = readCombatLog({ name: 'p.jsonl', data: combatLogFixture({ mutate: (h, ev) => {
+    ev.push({ seq: 31, time: 8.1, kind: 'damage', source: '78', sourceKind: 'Rogue', target: '900', targetKind: 'Dummy', skill: 'Daggers_Base_Attack', amount: 50, critical: false });
+    ev.push({ seq: 32, time: 8.2, kind: 'damage', source: '79', sourceName: 'Kestrela', target: '900', targetKind: 'Dummy', skill: 'Staff_Base_Attack', amount: 40, critical: false });
+    ev.push({ seq: 33, time: 8.3, kind: 'damage', source: '900', sourceKind: 'Dummy', target: '79', targetName: 'Kestrela', skill: 'GA_Base_Attack', amount: 5, critical: false });
+    h.count = ev.length;
+  } }).text });
+  const prows = captureRows(party, { heroKinds: cat.classes.map((c) => c.unit) }).filter((r) => r.event === 'inflict');
+  const bySkill = { 31: (r) => r.skill === 'Daggers_Base_Attack', 32: (r) => r.skill === 'Staff_Base_Attack', 33: (r) => r.skill === 'GA_Base_Attack' && r.amount === 5 };
+  const by = (seq) => prows.find(bySkill[seq]);
+  ok('a party member of a class\'s kind, with no name, is player<uid>; one with a name and no kind is its name - both players to the capture readers',
+    by(31)?.source === 'player78' && isPlayer(by(31).source) && by(32)?.source === 'Kestrela' && isPlayer(by(32).source), JSON.stringify([by(31), by(32)]));
+  ok('...a hit on a named, kindless player lands on its name, not on ?#<uid>, and the file is not blamed for it',
+    by(33)?.target === 'Kestrela' && !party.problems.some((p) => /lack a target or its targetKind/.test(p)), `${JSON.stringify(by(33))} ${party.problems.join(' | ')}`);
+  const unnamed = readCombatLog({ name: 'u.jsonl', data: combatLogFixture({ mutate: (h, ev) => {
+    ev.push({ seq: 34, time: 8.3, kind: 'damage', source: '900', sourceKind: 'Dummy', target: '80', skill: 'GA_Base_Attack', amount: 5, critical: false });
+    h.count = ev.length;
+  } }).text });
+  ok('...while a kindless target nobody names is still counted, and read against ?#<uid>',
+    unnamed.problems.some((p) => /1 damage event lacks a target or its targetKind/.test(p))
+      && captureRows(unnamed).some((r) => r.event === 'inflict' && r.target === '?#80'));
+
+  // THE REPORT names the class and the level the header gives.
+  const reportOf = logReportLines(readCombatLog({ name: 'combat-log.jsonl', data: readFileSync(fileURLToPath(new URL('../docs/examples/combat-log.jsonl', import.meta.url))) }));
+  ok('the report names the character\'s class and level, as the log gives them',
+    reportOf.includes('The character is uid 812, written as "Tester" in the rows: a Warrior, level 25.'), reportOf.join('\n'));
+  const wfx = combatLogFixture({ wink: true });
+  const wlog = readCombatLog({ name: 'fight.json.timeline', data: wfx.text, companion: { name: 'fight.json', data: JSON.stringify(wfx.summary) } });
+  ok('...a Wink pair its summary\'s class, as written', logReportLines(wlog).some((l) => /written as "Tester" in the rows: a warrior\.$/.test(l)),
+    logReportLines(wlog).join('\n'));
+  ok('...and every line has a kind, for a reader that colours them', combatLogModule.logReportItems(wlog).every((i) => typeof i.kind === 'string' && i.kind && typeof i.text === 'string')
+    && combatLogModule.logReportItems(wlog).some((i) => i.kind === 'note'));
+  const warnedLog = combatLogModule.logReportItems({ ...wlog, problems: ['a row the reader could not place'] });
+  ok('...a problem, and only a problem, carries `warn: true` - the flag every front end reads, so none keeps a list of kinds',
+    warnedLog.some((i) => i.kind === 'problem' && i.warn === true) && warnedLog.every((i) => (i.warn === true) === (i.kind === 'problem')),
+    JSON.stringify(warnedLog.map((i) => [i.kind, i.warn ?? null])));
+
+  // SHARED PIECES. One list of difficulties, one capped inflate.
+  ok('the difficulties are submission-public.mjs\'s one list', DIFFICULTIES === subpub.DIFFICULTY_NAMES);
+  const big = gzipSync(Buffer.alloc(4096, 0x61));
+  ok('inflateCapped inflates within its cap, and says "too large" past it without holding more',
+    combatLogModule.inflateCapped(big, 8192).data?.length === 4096 && combatLogModule.inflateCapped(big, 1024).tooLarge === true
+      && typeof combatLogModule.inflateCapped(Buffer.from([0x1f, 0x8b, 1, 2]), 1024).error === 'string');
+  // A kind spelled "__proto__" is counted, not lost.
+  const proto = readCombatLog({ name: 'proto.jsonl', data: combatLogFixture({ mutate: (h, ev) => {
+    ev.push({ seq: 35, time: 9.1, kind: '__proto__', source: '812' }); h.count = ev.length;
+  } }).text });
+  ok('an event kind "__proto__" is counted like any other', Object.prototype.hasOwnProperty.call(proto.stats.byKind, '__proto__') && proto.stats.byKind.__proto__ === 1);
+} catch (e) { crashed(e); }
+
+group('submission public manifest: only the allowlisted fields, held strictly');
+if (on) try {
+  const MARK = ['MARK-note', 'MARK-file-name', 'MARK-character', 'MARK-importer-note', 'MARK-encounter-name', 'MARK-activity'];
+  // A full manifest as the bench writes one, carrying everything that must
+  // stay private: the note, a file name, a character name, importer notes.
+  const full = () => ({
+    format: subpub.SUBMISSION_FORMAT, version: subpub.SUBMISSION_VERSION, id: '0123456789abcdef0123456789abcdef',
+    createdAt: '2026-10-19T23:59:58.900Z',
+    bench: { version: '0.6.0', accepted: { cdbSha: 'a'.repeat(64), bootSha: 'b'.repeat(64) } },
+    install: { steamBuild: 25959898, cdbSha: 'a'.repeat(64), bootSha: 'b'.repeat(64) },
+    sheet: { sourceFormat: 'modkit-inventory', class: 'Warrior', level: 25, file: MARK[1], name: MARK[2],
+      dropped: [{ field: 'gear', id: 'x', why: MARK[3] }], notes: [MARK[3]] },
+    log: { sourceDialect: 'wink-timeline', events: 1834, damageEvents: 512, perEvent: true, duration: 94.6, startedAt: 1760730930123,
+      startedAtEstimated: false, clock: 'client-observed', gameVersion: MARK[5], solo: true,
+      encounter: { name: MARK[4], bossKind: 'Ratsar', difficulty: 'heroic', activityId: MARK[5], targetDummy: false, partySize: 1, outcome: 'victory' } },
+    privacy: { namesRemoved: 2, ownNameKept: false }, note: MARK[0], files: [MARK[1]],
+  });
+  ok('the fixture\'s ids are the game\'s: a class unit and a unit', cat.classes.some((c) => c.unit === 'Warrior') && cdb.has('unit', 'Ratsar'));
+  const zip = { zipSha256: 'c'.repeat(64), zipBytes: 4096 };
+  const pub = subpub.publicManifest(full(), zip);
+  const paths = (o, at = '') => Object.entries(o).flatMap(([k, v]) => (v && typeof v === 'object' ? paths(v, `${at}${k}.`) : [`${at}${k}`]));
+  ok('the public manifest has exactly the allowlisted fields', paths(pub).join() === ['format', 'version', 'id', 'createdAt', 'bench.version',
+    'install.steamBuild', 'sheet.class', 'sheet.level', 'log.sourceDialect', 'log.events', 'log.damageEvents', 'log.perEvent', 'log.duration',
+    'log.startedAt', 'log.solo', 'log.encounter.bossKind', 'log.encounter.difficulty', 'log.encounter.outcome', 'log.encounter.targetDummy',
+    'log.encounter.partySize', 'zip.sha256', 'zip.bytes'].join(), paths(pub).join());
+  const leaked = MARK.filter((m) => JSON.stringify(pub).includes(m));
+  ok('...and nothing the manifest carried beyond them: no note, file name, name, importer note or activity', leaked.length === 0, leaked.join());
+  ok('...and it passes its own check', subpub.checkPublicManifest(pub).length === 0, subpub.checkPublicManifest(pub).join(' | '));
+  ok('times are UTC days, the duration whole minutes (in seconds): a day, a boss and a length to the second is one fight on a public ranking site',
+    pub.createdAt === '2026-10-19' && pub.log.startedAt === new Date(1760730930123).toISOString().slice(0, 10)
+    && pub.log.duration === 120, JSON.stringify([pub.createdAt, pub.log.startedAt, pub.log.duration]));
+  ok('...rounded to the nearest minute, a short fight to none', [[29.4, 0], [30, 60], [89, 60], [90, 120], [3599.9, 3600]]
+    .every(([sec, want]) => subpub.publicManifest({ ...full(), log: { ...full().log, duration: sec } }, zip).log.duration === want));
+  ok('a Steam build number becomes its string, a difficulty name its number, an outcome its spelling',
+    pub.install.steamBuild === '25959898' && pub.log.encounter.difficulty === 2 && pub.log.encounter.outcome === 'Victory');
+  ok('the zip is described by what was handed in beside the manifest', pub.zip.sha256 === 'c'.repeat(64) && pub.zip.bytes === 4096);
+  const odd = full();
+  Object.assign(odd.log.encounter, { bossKind: '', outcome: 'Wipe', partySize: 0 });
+  const oddPub = subpub.publicManifest(odd, zip);
+  ok('an empty boss, an outcome the meter never writes and a party of 0 are "not known"',
+    oddPub.log.encounter.bossKind === null && oddPub.log.encounter.outcome === null && oddPub.log.encounter.partySize === null
+      && subpub.checkPublicManifest(oddPub).length === 0, JSON.stringify(oddPub.log.encounter));
+  // The meter writes "Boss" for a fight whose boss had no kind; no unit has
+  // that id, so it would read as a boss nobody fought.
+  const wink = full();
+  wink.log.encounter.bossKind = 'Boss';
+  const winkPub = subpub.publicManifest(wink, zip);
+  ok('the meter\'s stand-in boss "Boss" is "not known" too, and is no unit of the game', !cdb.has('unit', 'Boss')
+    && winkPub.log.encounter.bossKind === null && subpub.issueTitle(winkPub) === 'Data submission: Warrior 25 vs an unnamed fight (01234567)',
+    subpub.issueTitle(winkPub));
+  // The check holds a shape, not a list, so a class a patch adds is taken
+  // without a release: every class unit the data names must fit that shape.
+  const misfit = cat.classes.map((c) => c.unit).filter((u) => !subpub.CLASS_ID_RE.test(u));
+  ok('every class unit of the game fits the class shape a manifest may carry', misfit.length === 0 && cat.classes.length >= 4, misfit.join());
+  ok('...which is a shape and no list: the module keeps none', !('CLASS_UNITS' in subpub));
+  const longIds = cdb.lines('unit').map((u) => u.id).filter((id) => !subpub.GAME_ID_RE.test(id));
+  ok('every unit id of the game fits the boss id\'s shape', longIds.length === 0, longIds.join());
+  const empty = subpub.publicManifest(null);
+  ok('a manifest of nothing gives a subset of nulls that the check refuses, not a throw', paths(empty).length === paths(pub).length
+    && subpub.checkPublicManifest(empty).some((p) => p.startsWith('id ')) && subpub.checkPublicManifest(empty).some((p) => p.startsWith('sheet.class ')));
+} catch (e) { crashed(e); }
+
+if (on) try {
+  const good = () => ({
+    format: 'farever-bench-submission', version: 1, id: '0123456789abcdef0123456789abcdef', createdAt: '2026-10-19',
+    bench: { version: '0.6.0' }, install: { steamBuild: '25959898' }, sheet: { class: 'Warrior', level: 25 },
+    log: { sourceDialect: 'wink-timeline', events: 1834, damageEvents: 512, perEvent: true, duration: 120, startedAt: '2025-10-17', solo: true,
+      encounter: { bossKind: 'Ratsar', difficulty: 2, outcome: 'Victory', targetDummy: false, partySize: 1 } },
+    zip: { sha256: 'c'.repeat(64), bytes: 4096 },
+  });
+  ok('the reference manifest passes', subpub.checkPublicManifest(good()).length === 0, subpub.checkPublicManifest(good()).join(' | '));
+  const set = (o, path, v) => { const ks = path.split('.'); ks.slice(0, -1).reduce((x, k) => x[k], o)[ks.at(-1)] = v; return o; };
+  // Each bad value is named by its own field, and alone.
+  const bad = [
+    ['format', 'farever-character-sheet'], ['version', 2], ['id', 'ABCDEF0123456789ABCDEF0123456789'], ['id', 'abc'],
+    ['createdAt', '2026-02-30'], ['createdAt', 1760730930123], ['bench.version', 'v1'], ['bench.version', '1.2'],
+    ['install.steamBuild', 25959898], ['install.steamBuild', '25959898; drop'], ['sheet.class', 'War rior'], ['sheet.class', 'x'.repeat(81)],
+    ['sheet.class', null], ['sheet.class', 'warrior'], ['sheet.class', 'W'.repeat(25)], ['sheet.class', '@Warrior'],
+    ['sheet.level', 0], ['sheet.level', 25.5], ['sheet.level', '25'],
+    ['log.sourceDialect', 'Wink Timeline'], ['log.sourceDialect', 'a'.repeat(41)], ['log.sourceDialect', 'a-b-c-d-e-f-g'],
+    ['log.events', -1], ['log.events', 2_000_001], ['log.damageEvents', '512'],
+    ['log.perEvent', 'yes'], ['log.duration', 94.6], ['log.duration', 95], ['log.duration', 86_460], ['log.startedAt', '2025-10-17T19:55:30Z'], ['log.solo', 1],
+    ['log.encounter.bossKind', 'King <b>Rat</b>'], ['log.encounter.bossKind', '@everyone'], ['log.encounter.bossKind', 'B'.repeat(41)],
+    ['log.encounter.difficulty', 10],
+    ['log.encounter.outcome', 'Wipe'], ['log.encounter.targetDummy', 'no'], ['log.encounter.partySize', 0],
+    ['zip.sha256', 'g'.repeat(64)], ['zip.bytes', subpub.MAX_ZIP_BYTES + 1], ['zip.bytes', 21],
+  ];
+  const missed = bad.filter(([path, v]) => {
+    const p = subpub.checkPublicManifest(set(good(), path, v));
+    return !(p.length === 1 && p[0].startsWith(`${path} `));
+  }).map(([path, v]) => `${path}=${JSON.stringify(v)}: ${subpub.checkPublicManifest(set(good(), path, v)).join(' | ')}`);
+  ok(`each of ${bad.length} bad values is named by its field, and alone`, missed.length === 0, missed.join(' || '));
+  const named = (o) => subpub.checkPublicManifest(o).join(' | ');
+  ok('a key nobody allowlisted is named, at the top', /^note is not a field of the public manifest$/.test(named({ ...good(), note: 'hi' })));
+  ok('...and inside', /^log\.encounter\.name is not a field/.test(named(set(good(), 'log.encounter.name', 'x'))));
+  ok('...and a __proto__ key from JSON is a key like any other', /^__proto__ is not a field/.test(named(JSON.parse(`{"__proto__":{},${JSON.stringify(good()).slice(1)}`))));
+  const noLevel = good();
+  delete noLevel.sheet.level;
+  ok('a missing field is named', named(noLevel) === 'sheet.level is missing');
+  ok('an object that is not one is named', named({ ...good(), bench: [] }) === 'bench is not an object'
+    && named(null) === 'the manifest is not an object' && named([]) === 'the manifest is not an object');
+  ok('more damage events than events is named', named(set(good(), 'log.damageEvents', 1835)) === 'log.damageEvents is more than log.events');
+  ok('nulls are "not known" where the schema allows them', subpub.checkPublicManifest(set(set(set(set(set(good(), 'log.duration', null),
+    'log.startedAt', null), 'install.steamBuild', null), 'log.encounter.bossKind', null), 'log.encounter.difficulty', -1)).length === 0);
+} catch (e) { crashed(e); }
+
+group('submission public manifest: the title, the table, the widest values, and no upload protocol');
+if (on) try {
+  const pub = {
+    format: 'farever-bench-submission', version: 1, id: '0123456789abcdef0123456789abcdef', createdAt: '2026-10-19',
+    bench: { version: '0.6.0' }, install: { steamBuild: '25959898' }, sheet: { class: 'Warrior', level: 25 },
+    log: { sourceDialect: 'wink-timeline', events: 1834, damageEvents: 512, perEvent: true, duration: 120, startedAt: '2025-10-17', solo: true,
+      encounter: { bossKind: 'Ratsar', difficulty: 2, outcome: 'Victory', targetDummy: false, partySize: 1 } },
+    zip: { sha256: 'c'.repeat(64), bytes: 4096 },
+  };
+  // The widest manifest the schema allows still makes a short title and a
+  // short table: the shapes can refuse junk, never stretch what is printed.
+  // Each free value is at its limit - and one character more is refused, so
+  // the limits used here are the real ones.
+  const widest = JSON.parse(JSON.stringify(pub));
+  const longestClass = cat.classes.map((c) => c.unit).sort((a, b) => b.length - a.length)[0];
+  const dialect40 = ['a'.repeat(6), 'a'.repeat(6), 'a'.repeat(6), 'a'.repeat(6), 'a'.repeat(6), 'a'.repeat(5)].join('-');
+  Object.assign(widest.sheet, { class: longestClass, level: 999 });
+  Object.assign(widest.log, { sourceDialect: dialect40, events: 2_000_000, damageEvents: 2_000_000, duration: 86_400 });
+  Object.assign(widest.log.encounter, { bossKind: 'B'.repeat(40), partySize: 99 });
+  Object.assign(widest, { bench: { version: `9999.9999.9999-${'a'.repeat(24)}` }, install: { steamBuild: '9'.repeat(12) } });
+  ok('the widest values are at their limits', dialect40.length === 40 && subpub.checkPublicManifest(widest).length === 0
+    && subpub.checkPublicManifest({ ...widest, log: { ...widest.log, sourceDialect: `${dialect40}a` } }).length === 1
+    && subpub.checkPublicManifest({ ...widest, log: { ...widest.log, encounter: { ...widest.log.encounter, bossKind: 'B'.repeat(41) } } }).length === 1
+    && subpub.checkPublicManifest({ ...widest, bench: { version: `9999.9999.9999-${'a'.repeat(25)}` } }).length === 1,
+    subpub.checkPublicManifest(widest).join(' | '));
+  const wideTitle = subpub.issueTitle(widest);
+  const wideTable = subpub.issueRows(widest).map(([k, v]) => `${k}: ${v}`).join('\n');
+  ok('...and its title and table stay short: no field can stretch them', wideTitle.length < 120 && wideTable.length < 1000,
+    `${wideTitle.length} / ${wideTable.length}`);
+  ok('the fixed constants', subpub.SUBMISSION_FORMAT === 'farever-bench-submission' && subpub.SUBMISSION_VERSION === 1
+    && subpub.MAX_ZIP_BYTES === 25 * 1024 * 1024
+    && subpub.ZIP_ENTRIES.join() === 'manifest.json,sheet.json,combat-log.jsonl,summary.json,note.txt' && Object.isFrozen(subpub.ZIP_ENTRIES));
+  // What the module is, by its exports: the shapes, the words, the public
+  // manifest with its title and table, and the zip's directory - and nothing
+  // that speaks to a server: Send uploads a file (src/submit.mjs), and no
+  // header, request or issue body is written for it.
+  const exportsWanted = ['CLASS_ID_RE', 'CLOCKS', 'DIFFICULTY_NAMES', 'GAME_ID_RE', 'GAME_VERSION_RE', 'ID_RE', 'MAX_ENTRY_BYTES', 'MAX_ZIP_BYTES',
+    'OUTCOMES', 'SUBMISSION_FORMAT', 'SUBMISSION_VERSION', 'SubmissionError', 'TOKEN_RE', 'VERSION_RE', 'WINK_NO_BOSS', 'ZIP_ENTRIES',
+    'checkPublicManifest', 'difficultyIndex', 'issueRows', 'issueTitle', 'publicManifest', 'readZipDirectory', 'zipEntryProblem'];
+  ok('its exports are that vocabulary, and no upload protocol', Object.keys(subpub).sort().join() === [...exportsWanted].sort().join(),
+    Object.keys(subpub).sort().join());
+} catch (e) { crashed(e); }
+
+if (on) try {
+  const pub = {
+    format: 'farever-bench-submission', version: 1, id: '0123456789abcdef0123456789abcdef', createdAt: '2026-10-19',
+    bench: { version: '0.6.0' }, install: { steamBuild: '25959898' }, sheet: { class: 'Warrior', level: 25 },
+    log: { sourceDialect: 'wink-timeline', events: 1834, damageEvents: 512, perEvent: true, duration: 120, startedAt: '2025-10-17', solo: true,
+      encounter: { bossKind: 'Ratsar', difficulty: 2, outcome: 'Victory', targetDummy: false, partySize: 1 } },
+    zip: { sha256: 'c'.repeat(64), bytes: 4096 },
+  };
+  const title = subpub.issueTitle(pub);
+  ok('the title: class, level, what was fought and the id\'s first eight', title === 'Data submission: Warrior 25 vs Ratsar, Heroic (01234567)', title);
+  const dummy = JSON.parse(JSON.stringify(pub));
+  Object.assign(dummy.log.encounter, { bossKind: null, targetDummy: true, difficulty: -1 });
+  ok('...a target dummy says so', subpub.issueTitle(dummy) === 'Data submission: Warrior 25 vs a target dummy (01234567)', subpub.issueTitle(dummy));
+
+  const rows = subpub.issueRows(pub);
+  const row = (k) => rows.find(([x]) => x === k)?.[1];
+  ok('the table says class, encounter, group, dummy, fight, log, game and sending', rows.map(([k]) => k).join()
+    === 'Character,Encounter,Group,Target dummy,Fight,Log,Installed game when sent,Sent', JSON.stringify(rows));
+  ok('...from the manifest\'s values, the ones with any freedom in them in code spans',
+    row('Character') === '`Warrior`, level 25' && row('Encounter') === '`Ratsar`, difficulty 2 (Heroic), Victory'
+      && row('Fight') === 'about 2 min, on 2025-10-17 (UTC day)' && row('Log') === '`wink-timeline`, 1834 events, 512 of them damage, one line per event'
+      && row('Installed game when sent') === 'Steam build 25959898' && row('Sent') === '2026-10-19 with farever-bench `0.6.0`', JSON.stringify(rows));
+  ok('...a fight under a minute is said so, not to the second', subpub.issueRows({ ...pub, log: { ...pub.log, duration: 0 } })
+    .some(([k, v]) => k === 'Fight' && v.startsWith('under a minute,')));
+  // Everything a row quotes is a value of the manifest - nothing from
+  // anywhere else.
+  const allowed = new Set(['Warrior', 'Ratsar', 'wink-timeline', pub.bench.version]);
+  const quoted = rows.flatMap(([, v]) => [...v.matchAll(/`([^`\n]+)`/g)].map((m) => m[1]));
+  ok('every quoted value in the table is the manifest\'s', quoted.length === 4 && quoted.every((q) => allowed.has(q)), quoted.join(', '));
+  let extra = null;
+  try { subpub.issueRows({ ...pub, note: 'MARK-note' }); } catch (e) { extra = e; }
+  ok('a manifest with a field outside the allowlist is refused, not printed', extra instanceof subpub.SubmissionError && /note is not a field/.test(extra.message));
+  let titled = null;
+  try { subpub.issueTitle({ ...pub, sheet: { class: 'Warrior', level: 25, name: 'MARK-character' } }); } catch (e) { titled = e; }
+  ok('...and so is the title of one', titled instanceof subpub.SubmissionError);
+} catch (e) { crashed(e); }
+
+group('submission public manifest: the zip is read from its directory alone');
+if (on) try {
+  // A stored zip, or one entry deflated; laid out as every writer lays one
+  // out: local headers and data, the central directory, the end record.
+  const zipOf = (entries, { comment = '' } = {}) => {
+    const enc = new TextEncoder();
+    const parts = [], central = [];
+    let offset = 0;
+    for (const [name, text, deflate] of entries) {
+      const raw = enc.encode(text), data = deflate ? subpubDeflateRaw(raw) : raw, nb = enc.encode(name);
+      const lh = Buffer.alloc(30 + nb.length);
+      lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(deflate ? 8 : 0, 8);
+      lh.writeUInt32LE(data.length, 18); lh.writeUInt32LE(raw.length, 22); lh.writeUInt16LE(nb.length, 26); lh.set(nb, 30);
+      const ch = Buffer.alloc(46 + nb.length);
+      ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(deflate ? 8 : 0, 10);
+      ch.writeUInt32LE(data.length, 20); ch.writeUInt32LE(raw.length, 24); ch.writeUInt16LE(nb.length, 28); ch.writeUInt32LE(offset, 42); ch.set(nb, 46);
+      parts.push(lh, data); central.push(ch);
+      offset += lh.length + data.length;
+    }
+    const cd = Buffer.concat(central), c = Buffer.from(comment);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
+    end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16); end.writeUInt16LE(c.length, 20);
+    return Buffer.concat([...parts, cd, end, c]);
+  };
+  const names = ['manifest.json', 'sheet.json', 'combat-log.jsonl', 'note.txt'];
+  const zip = zipOf(names.map((n, i) => [n, `{"n":${i}}`.repeat(50), i === 2]));
+  const dir = subpub.readZipDirectory(zip);
+  ok('the directory lists the entries in order', dir.map((e) => e.name).join() === names.join(), JSON.stringify(dir));
+  const plain = '{"n":2}'.repeat(50).length;
+  ok('...with method and both sizes, a deflated entry included', dir[2].method === 8 && dir[2].size === plain && dir[2].compressedSize < plain
+    && dir[0].method === 0 && dir[0].size === dir[0].compressedSize, JSON.stringify(dir[2]));
+  ok('an ArrayBuffer and an end-of-directory comment are fine', subpub.readZipDirectory(Uint8Array.from(zipOf([['manifest.json', '{}']], { comment: 'made here' })).buffer).length === 1);
+  const refuses = (bytes, re) => { try { subpub.readZipDirectory(bytes); return 'no throw'; } catch (e) { return e instanceof subpub.SubmissionError && re.test(e.message) ? null : e.message; } };
+  const patched = (fn) => { const b = Buffer.from(zip); fn(b, b.readUInt32LE(b.length - 22 + 16)); return b; };
+  const cases = [
+    ['bytes too short to be one', Buffer.from('PK'), /^The zip is not acceptable: it is too short\.$/],
+    ['text', Buffer.from('this is plainly not a zip archive at all'), /does not start with a zip entry/],
+    ['bytes after the end record', Buffer.concat([zip, Buffer.from('trailing')]), /no end-of-directory record at its end/],
+    ['a zip64 marker', patched((b) => { b.writeUInt16LE(0xffff, b.length - 22 + 8); b.writeUInt16LE(0xffff, b.length - 22 + 10); }), /zip64/],
+    ['several disks', patched((b) => b.writeUInt16LE(1, b.length - 22 + 4)), /several disks/],
+    ['an encrypted entry', patched((b, cd) => b.writeUInt16LE(1, cd + 8)), /"manifest\.json" is encrypted/],
+    ['an unknown method', patched((b, cd) => b.writeUInt16LE(12, cd + 10)), /compression method 12/],
+    ['an entry announcing a bomb', patched((b, cd) => b.writeUInt32LE(subpub.MAX_ENTRY_BYTES + 1, cd + 24)), /declares \d+ bytes/],
+    ['a local header that disagrees', patched((b) => { b[30] = 0x4e; }), /does not match its local header/],
+    ['a directory in the wrong place', patched((b) => b.writeUInt32LE(b.readUInt32LE(b.length - 22 + 16) - 1, b.length - 22 + 16)), /does not end where/],
+    ['seventeen entries', zipOf(Array.from({ length: 17 }, (_, i) => [`f${i}`, 'x'])), /17 entries/],
+  ];
+  for (const [what, bytes, re] of cases) {
+    const why = refuses(bytes, re);
+    ok(`refused: ${what}`, why === null, why);
+  }
+  const namesOk = (list) => subpub.zipEntryProblem(list) === null;
+  ok('the fixed entry sets are accepted', namesOk(names) && namesOk(['manifest.json', 'sheet.json', 'summary.json'])
+    && namesOk([...subpub.ZIP_ENTRIES]) && subpub.zipEntryProblem(['sheet.json', 'combat-log.jsonl', 'manifest.json']) === null);
+  const problem = (list) => subpub.zipEntryProblem(list) ?? '';
+  ok('a name outside the set is refused, named', !namesOk([...names, 'farever-inventory-x.json'])
+    && /holds "farever-inventory-x\.json", and a submission may hold only manifest\.json, sheet\.json/.test(problem([...names, 'farever-inventory-x.json'])));
+  ok('...and a path dressed as a name', /holds "\.\.\/sheet\.json"/.test(problem(['manifest.json', '../sheet.json', 'combat-log.jsonl'])));
+  ok('a name twice is refused', /holds sheet\.json twice/.test(problem(['manifest.json', 'sheet.json', 'sheet.json', 'combat-log.jsonl'])));
+  ok('no manifest, no sheet, or no log is refused', /no manifest\.json/.test(problem(['sheet.json', 'combat-log.jsonl']))
+    && /no sheet\.json/.test(problem(['manifest.json', 'combat-log.jsonl'])) && /no log \(combat-log\.jsonl or summary\.json\)/.test(problem(['manifest.json', 'sheet.json'])));
+  ok('a list that is not one is refused', !namesOk(null) && !namesOk('manifest.json') && !('zipEntryNamesOk' in subpub));
+  // Vocabulary every reader of a bundle shares (the bench, its command line,
+  // tools/inbox.mjs): it imports nothing, and reaches nothing.
+  const text = readFileSync(fileURLToPath(new URL('../src/submission-public.mjs', import.meta.url)), 'utf8');
+  ok('src/submission-public.mjs imports nothing and calls nothing over the network', !/^\s*import\b/m.test(text) && !/\brequire\(|\bfetch\(|\bprocess\./.test(text));
+} catch (e) { crashed(e); }
+
+// --- character sheet import (src/charsheet.mjs) ------------------------------
+// Key order means nothing in a loadout, so two are compared by canonical text.
+function sheetCanon(v) { return JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((key) => [key, x[key]])) : x)); }
+// THE GUARANTEE: what readSheet hands out is a build the UI and the CLI take as
+// is - sanitizeLoadout changes nothing in it and the game's two refusals pass.
+function sheetAccepted(engine, r) { return { same: sheetCanon(sheetSanitize(engine, structuredClone(r.loadout))) === sheetCanon(r.loadout), illegal: illegalReason(engine.cat, r.loadout) ?? sheetInfusionIllegal(engine.cat, r.loadout) }; }
+// A JSON Schema 2020-12 reader for exactly the keywords docs/schema uses. A
+// keyword it does not know is a problem of its own, so the schema cannot grow
+// a rule this check silently skips.
+function sheetSchemaProblems(schema, value, at = '$', root = schema) {
+  const out = [];
+  const KNOWN = new Set(['$schema', '$id', 'title', 'description', 'examples', '$defs', '$ref', 'type', 'const', 'enum',
+    'properties', 'required', 'additionalProperties', 'propertyNames', 'items', 'minimum', 'exclusiveMinimum', 'minLength',
+    'pattern', 'oneOf', 'anyOf', 'if', 'then', 'else']);
+  for (const k of Object.keys(schema)) if (!KNOWN.has(k)) out.push(`${at}: the schema says "${k}", which this checker does not read`);
+  const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (schema.$ref) {
+    const target = schema.$ref.replace(/^#\//, '').split('/').reduce((o, k) => o?.[k], root);
+    if (!target) return [...out, `${at}: unresolved $ref ${schema.$ref}`];
+    out.push(...sheetSchemaProblems(target, value, at, root));
+  }
+  const typeOk = (t) => (t === 'null' ? value === null : t === 'array' ? Array.isArray(value) : t === 'object' ? isObject(value)
+    : t === 'integer' ? Number.isInteger(value) : t === 'number' ? typeof value === 'number' && Number.isFinite(value) : typeof value === t);
+  if (schema.type !== undefined && ![].concat(schema.type).some(typeOk)) return [...out, `${at}: ${JSON.stringify(value)} is not ${[].concat(schema.type).join(' or ')}`];
+  if ('const' in schema && value !== schema.const) out.push(`${at}: must be ${JSON.stringify(schema.const)}`);
+  if (schema.enum && !schema.enum.includes(value)) out.push(`${at}: not one of ${schema.enum.join(', ')}`);
+  if (typeof value === 'number' && schema.minimum != null && value < schema.minimum) out.push(`${at}: below ${schema.minimum}`);
+  if (typeof value === 'number' && schema.exclusiveMinimum != null && value <= schema.exclusiveMinimum) out.push(`${at}: not above ${schema.exclusiveMinimum}`);
+  if (typeof value === 'string' && schema.minLength != null && value.length < schema.minLength) out.push(`${at}: shorter than ${schema.minLength}`);
+  if (typeof value === 'string' && schema.pattern && !new RegExp(schema.pattern, 'u').test(value)) out.push(`${at}: does not match ${schema.pattern}`);
+  if (isObject(value)) {
+    for (const r of schema.required ?? []) if (!(r in value)) out.push(`${at}: missing "${r}"`);
+    for (const [k, v] of Object.entries(value)) {
+      if (schema.propertyNames) out.push(...sheetSchemaProblems(schema.propertyNames, k, `${at}.${k} (as a name)`, root));
+      if (schema.properties && k in schema.properties) out.push(...sheetSchemaProblems(schema.properties[k], v, `${at}.${k}`, root));
+      else if (schema.additionalProperties === false) out.push(`${at}: unexpected key "${k}"`);
+      else if (isObject(schema.additionalProperties)) out.push(...sheetSchemaProblems(schema.additionalProperties, v, `${at}.${k}`, root));
+    }
+  }
+  if (Array.isArray(value) && schema.items) value.forEach((v, i) => out.push(...sheetSchemaProblems(schema.items, v, `${at}[${i}]`, root)));
+  if (schema.oneOf) {
+    const hits = schema.oneOf.filter((s) => !sheetSchemaProblems(s, value, at, root).length).length;
+    if (hits !== 1) out.push(`${at}: matches ${hits} of the oneOf branches, not exactly one`);
+  }
+  if (schema.anyOf && !schema.anyOf.some((s) => !sheetSchemaProblems(s, value, at, root).length)) out.push(`${at}: matches no anyOf branch`);
+  if (schema.if) {
+    const holds = !sheetSchemaProblems(schema.if, value, at, root).length;
+    if (holds && schema.then) out.push(...sheetSchemaProblems(schema.then, value, at, root));
+    if (!holds && schema.else) out.push(...sheetSchemaProblems(schema.else, value, at, root));
+  }
+  return out;
+}
+// A level-25 build for a class with nothing searched: the first stat-bearing
+// candidate in every slot, weapons rolled Legendary at full stars, every
+// socket filled with its first augment (a sigil of the class's own), one
+// piece infused, the talent walk's own allocation and the first rune of every
+// pool. It touches every field a sheet carries, which is the point.
+function sheetDefaultBuild(engine, unit) {
+  const { cat, plan, talents } = engine;
+  const cls = cat.classes.find((c) => c.unit === unit);
+  const l = emptyLoadout(cat, unit, 25);
+  // A piece that can carry an infusion where the slot has one (the starter clothes come first in the list), else the first that carries stats.
+  const first = (slot) => { const list = cat.candidates(slot, { aptitude: cls.aptitude, charLevel: 25 }).map((c) => c.item); return list.find((it) => cat.canInfuse(it)) ?? list.find((it) => cat.isCombatGear(it)); };
+  for (const slot of cat.combatSlots().map((s) => s.id)) {
+    if (slot === 'Slot_OffhandWeapon') continue;
+    const it = first(slot);
+    if (!it) continue;
+    const weapon = cat.isWeaponType(it.type);
+    l.gear[slot] = weapon ? { item: it.id, rarity: 'Legendary', stars: cat.maxStars(it, 'Legendary'), level: 25 } : { item: it.id, stars: 0 };
+  }
+  const off = first('Slot_OffhandWeapon');
+  if (off && cat.allowsOffhand(cat.itemById.get(l.gear.Slot_Weapon1?.item))) l.gear.Slot_OffhandWeapon = { item: off.id, rarity: off.rarity, stars: cat.maxStars(off, off.rarity) };
+  if (l.gear.Slot_Head) l.gear.Slot_Head.flawless = true;
+  const tree = talents.treeFor(unit);
+  for (const sock of engine.socketsOf(l)) {
+    const aug = cat.augmentCandidates(sock.type, { includeUnreleased: true })
+      .find((a) => !(a.skills ?? []).some((sk) => cat.classes.some((c) => c.unit !== unit && talents.treeFor(c.unit).byId.has(sk))));
+    if (aug) l.augments[sock.key] = aug.id;
+  }
+  const infused = cat.combatSlots().map((s) => s.id).find((slot) => l.gear[slot] && cat.canInfuse(cat.itemById.get(l.gear[slot].item)));
+  if (infused) {
+    const it = cat.itemById.get(l.gear[infused].item);
+    const inf = [...cat.infusions.values()].find((x) => x.faction === cat.factionOrigin(it)) ?? [...cat.infusions.values()][0];
+    Object.assign(l.gear[infused], { infusion: inf.id, infusionStat: cat.infusionBonusPool(it)[0], prismatic: true });
+  }
+  const granted = new Set();
+  for (const [key, a] of Object.entries(l.augments)) if (key.endsWith('/AugmentDemonSigil')) for (const sk of cat.itemById.get(a)?.skills ?? []) if (tree.byId.has(sk)) granted.add(sk);
+  const sug = talents.suggest(unit, { level: 25, granted });
+  l.talents = Object.fromEntries(Object.entries(sug.ranks).filter(([n]) => !granted.has(n)));
+  plan.pruneSelection(l);
+  for (const p of talents.runePools(l)) l.runes[p.skill] = p.options[0].id;
+  return l;
+}
+// The documented example and a one-line way to change one thing in it.
+function sheetFull() { return JSON.parse(readFileSync(fileURLToPath(new URL('../docs/examples/sheet-full.json', import.meta.url)), 'utf8')); }
+function sheetMinimal() { return JSON.parse(readFileSync(fileURLToPath(new URL('../docs/examples/sheet-minimal.json', import.meta.url)), 'utf8')); }
+
+group('character sheet import: the four dialects, and every sentence it refuses with');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet, detectSheetDialect, SheetError, toSheet } = sheetLib;
+  const full = sheetFull();
+
+  // The documented format.
+  const v1 = readSheet(engine, JSON.stringify(full));
+  ok('a farever-character-sheet is read as one', v1.format === 'farever-character-sheet' && v1.version === 1 && detectSheetDialect(full) === 'farever-character-sheet');
+  ok('...as the class and level it names, the unit id whatever spelling', v1.unit === 'Rogue' && v1.aptitude === 'Assassin' && v1.level === 25 && v1.loadout.class === 'Rogue');
+  ok('...and the aptitude id, in any case, names the same class', readSheet(engine, { ...full, character: { ...full.character, class: 'ASSASSIN' } }).unit === 'Rogue');
+  const g1 = sheetAccepted(engine, v1);
+  ok('...into a loadout sanitizeLoadout leaves as it is, and the game accepts', g1.same && g1.illegal === null, JSON.stringify(g1));
+  ok('a Buffer of the same text reads the same', sheetCanon(readSheet(engine, Buffer.from(JSON.stringify(full))).loadout) === sheetCanon(v1.loadout));
+
+  // The bench's own save, produced through the engine as the UI produces it.
+  const ev = engine.evaluate(v1.loadout, { target: engine.combat.foe('boss', 25), rank: 2 });
+  const env = sheetEnvelope({
+    engine, loadout: structuredClone(v1.loadout), options: { rank: 2, goal: 'dps' }, metrics: { dps: ev.throughput.dps }, ev,
+    pinned: { gear: ['Slot_Weapon1', 'Slot_Chest'], augments: ['Slot_Weapon1/AugmentDemon'], skills: ['class/ClassSkill'], infusions: ['Slot_Chest', 'Slot_Head'] },
+  });
+  // optimize writes a sigil's node into the talents it returns; a saved build carries it.
+  env.build.talents.Rogue_Talent_VenomousFinisher = 1;
+  const re = readSheet(engine, JSON.stringify(env));
+  ok('an optimize --json / Save build envelope is read as one', re.format === 'bench-envelope' && detectSheetDialect(env) === 'bench-envelope');
+  ok('...into the same loadout it saved', sheetCanon(re.loadout) === sheetCanon(v1.loadout), sheetCanon(re.loadout));
+  ok('...the sigil\'s node normalised away with a note, not dropped', re.dropped.length === 0
+    && re.notes.some((n) => /Rogue_Talent_VenomousFinisher is granted by DemonSigil_Rogue_VenomousFinisher, costs no point/.test(n)), JSON.stringify(re.dropped));
+  ok('...holding the pins its run held and no more (an infusion pin only on a held slot)', sheetCanon(re.pins) === sheetCanon({
+    gear: ['Slot_Weapon1', 'Slot_Chest'], augments: ['Slot_Weapon1/AugmentDemon'], skills: ['class/ClassSkill'], runes: [], talents: false, infusions: ['Slot_Chest'],
+  }), sheetCanon(re.pins));
+  ok('...its rank, and its settings handed back without the build or what the run computed', re.rank === 2 && re.envelope?.goal === 'dps' && re.envelope?.rank === 2
+    && !('build' in re.envelope) && !('metrics' in re.envelope) && !('sheet' in re.envelope));
+  ok('...and it says who wrote it', re.source?.exporter === 'farever-bench' && re.source?.bootSha256 === engine.meta.bootSha);
+  const ge = sheetAccepted(engine, re);
+  ok('...a loadout sanitizeLoadout leaves as it is', ge.same && ge.illegal === null, JSON.stringify(ge));
+
+  // A bare loadout, as --build reads one - runes keyed the old dump way.
+  const bare = structuredClone(v1.loadout);
+  bare.runes = Object.fromEntries(Object.values(bare.runes).map((r) => [r, r]));
+  const rb = readSheet(engine, bare);
+  ok('a bare loadout is read as one', rb.format === 'bench-loadout' && detectSheetDialect(bare) === 'bench-loadout');
+  ok('...runes keyed by their own id come out keyed by their host, with a note', sheetCanon(rb.loadout.runes) === sheetCanon(v1.loadout.runes)
+    && rb.notes.some((n) => /keyed by the rune's own id - re-keyed by the skill that hosts it/.test(n)), sheetCanon(rb.loadout.runes));
+  ok('...the same loadout, every field of it recorded and so held', sheetCanon(rb.loadout) === sheetCanon(v1.loadout) && rb.pins.gear.length === 15 && rb.pins.talents === true);
+  ok('...and the one thing a loadout never carries is the one gap', rb.rank === null && rb.gaps.length === 1 && /weapon-skill ranks are not recorded/.test(rb.gaps[0]), JSON.stringify(rb.gaps));
+  const gb = sheetAccepted(engine, rb);
+  ok('...a loadout sanitizeLoadout leaves as it is', gb.same && gb.illegal === null, JSON.stringify(gb));
+
+  // The modkit's login dump, synthetic: built from ids, shaped as the modkit writes.
+  const W = (kind, o = {}) => ({ kind, level: 25, upgrade: 0, rarity: -1, count: 1, class: 'st.item.Armor', infusion: null, infusionStat: null, prismatic: false, flawless: false, ...o });
+  const dump = {
+    character: 'Tester', bankSlots: 0, bank: [], bags: [], equipped: [
+      W('Daggers_Demondash', { upgrade: 3, rarity: 3, class: 'st.item.Weapon' }),
+      W('Daggers_DuplicatePoison', { upgrade: 4, rarity: 4, class: 'st.item.Weapon' }),
+      W('Head_EDemon_AssCle', { flawless: null }),
+      W('Chest_EKobold_AssWiz', { infusion: 'Infusion_Kobold_DPS', infusionStat: 'Strength' }),
+      W('Finger_Z3RCraft_Ap', { level: 0 }),
+      W('Finger_Z3RCraft_Ap', { level: 0 }),
+      W('Finger_Z3RCraft_Cri', { level: 0 }),
+      W('Chest_RBee_Fig'),
+      W('No_Such_Item_Id'),
+      { kind: 'Pickaxe', level: 1, upgrade: 0, rarity: -1, count: 1, class: 'st.item.Gear' },
+      { kind: 'StaleBread', level: 1, upgrade: 0, rarity: -1, count: 3, class: 'st.Item' },
+    ],
+  };
+  const rm = readSheet(engine, dump, { cls: 'rogue' });
+  const mg = rm.loadout.gear;
+  ok('a modkit inventory dump is read as one, the class given beside it', rm.format === 'modkit-inventory' && rm.unit === 'Rogue' && rm.name === 'Tester' && detectSheetDialect(dump) === 'modkit-inventory');
+  ok('...its rarity index read as the modkit writes it (3 Epic, 4 Legendary)', mg.Slot_Weapon1?.rarity === 'Epic' && mg.Slot_Weapon2?.rarity === 'Legendary' && mg.Slot_Weapon2?.stars === 4);
+  ok('...two copies of one ring on the two fingers, level 0 read as the row\'s own', mg.Slot_FingerLeft?.item === 'Finger_Z3RCraft_Ap' && mg.Slot_FingerRight?.item === 'Finger_Z3RCraft_Ap'
+    && !('level' in mg.Slot_FingerLeft));
+  ok('...a third ring named for having no slot left, an unknown kind and a Fighter chest dropped', ['Finger_Z3RCraft_Cri', 'No_Such_Item_Id', 'Chest_RBee_Fig']
+    .every((id) => rm.dropped.some((d) => d.field === 'equipped' && d.id === id)), JSON.stringify(rm.dropped));
+  ok('...a bonus stat that is not a rating dropped with the infusion kept', mg.Slot_Chest?.infusion === 'Infusion_Kobold_DPS' && !mg.Slot_Chest.infusionStat
+    && rm.dropped.some((d) => d.field === 'gear.Slot_Chest.infusionStat' && d.id === 'Strength'));
+  ok('...the non-combat items named and ignored', rm.notes.some((n) => /2 non-combat items in the dump ignored.*Pickaxe, StaleBread/.test(n)), JSON.stringify(rm.notes));
+  ok('...a flag the modkit wrote as null is a note and a gap, never "not Flawless"', rm.notes.some((n) => /Slot_Head\.flawless: a flag is true or false, and null reads as not recorded/.test(n))
+    && rm.gaps.some((x) => /Flawless flag is not recorded on Slot_Head/.test(x)));
+  ok('...the level it cannot hold is assumed and said, and what a dump never carries is a gap', rm.level === 25
+    && rm.gaps.some((x) => /character level is not in a modkit dump - taken as 25/.test(x))
+    && ['sockets are not recorded', 'talents are not recorded', 'runes are not recorded'].every((t) => rm.gaps.some((x) => x.includes(t))), JSON.stringify(rm.gaps));
+  // No_Such_Item_Id is written as st.item.Armor, so any free armour slot may
+  // have held it: those stay open. The Fighter chest's own slot is taken.
+  const armourOpen = ['Slot_Shoulders', 'Slot_Back', 'Slot_Hands', 'Slot_Waist', 'Slot_Legs', 'Slot_Feet'];
+  ok('...every other combat slot held (the dump lists all that is worn), the infusions too, nothing it does not carry', rm.pins.gear.length === 15 - armourOpen.length
+    && armourOpen.every((s) => !rm.pins.gear.includes(s)) && rm.pins.infusions.includes('Slot_Chest')
+    && rm.pins.augments.length === 0 && rm.pins.talents === false && rm.pins.runes.length === 0, JSON.stringify(rm.pins.gear));
+  ok('...and the free armour slots an unread armour entry may have filled are left open, in one gap that says why', rm.gaps.includes(`${armourOpen.length} gear slots are left open rather than held empty (${armourOpen.join(', ')}) - the dump's No_Such_Item_Id, dropped above, may have been worn there`)
+    && !rm.gaps.some((x) => /gear slots? (is|are) not recorded/.test(x)), JSON.stringify(rm.gaps));
+  ok('...a level given beside it replaces the guess', readSheet(engine, dump, { cls: 'Rogue', level: 20 }).level === 20);
+  const gm = sheetAccepted(engine, rm);
+  ok('...a loadout sanitizeLoadout leaves as it is', gm.same && gm.illegal === null, JSON.stringify(gm));
+  ok('the four dialects are the four the module names', sheetCanon(sheetLib.SHEET_DIALECTS) === sheetCanon(['farever-character-sheet', 'bench-envelope', 'bench-loadout', 'modkit-inventory'])
+    && sheetLib.SHEET_FORMAT === 'farever-character-sheet' && sheetLib.SHEET_VERSION === 1);
+  ok('the reference exporter\'s own output is a sheet of the documented format', detectSheetDialect(toSheet(engine, v1.loadout)) === 'farever-character-sheet');
+} catch (e) { crashed(e); }
+
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet, SheetError } = sheetLib;
+  const full = sheetFull();
+  const refused = (input, opts) => { try { readSheet(engine, input, opts); return null; } catch (e) { return e; } };
+  const says = (name, input, re, opts) => {
+    const err = refused(input, opts);
+    ok(`${name}: refused with a SheetError`, err instanceof SheetError && err.name === 'SheetError', String(err));
+    ok(`${name}: ...whose sentence says why`, re.test(err?.message ?? ''), err?.message);
+  };
+  says('text that is not JSON', '{"format": "farever-character-sheet",', /^not a character sheet: the file is not JSON \(/);
+  says('a JSON list', '[1, 2]', /^not a character sheet: it holds a list, and every sheet the bench reads is a JSON object$/);
+  says('a JSON string', '"hello"', /it holds a string/);
+  says('nothing at all', undefined, /it holds nothing/);
+  says('an object of no known shape', { hello: 1 }, /none of the four shapes the bench reads - a farever-character-sheet .*a build the bench saved .*a bare bench loadout .*a modkit inventory dump/);
+  says('a combat log header', { format: 'farever-combat-log', version: 1 }, /^not a character sheet: this is a combat log \(a farever-combat-log\), which goes in as the fight, not the build: "Send a fight" in the app, or `bench verify --capture <file>`/);
+  // A combat log handed in where a build goes is said to be one, in each of
+  // its shapes: the JSON Lines file (no JSON as a whole), a Wink timeline and
+  // a Wink summary (one object, none of the four shapes), gzipped bytes.
+  const docLog = readFileSync(fileURLToPath(new URL('../docs/examples/combat-log.jsonl', import.meta.url)), 'utf8');
+  says('a farever-combat-log file, JSON Lines', docLog, /^not a character sheet: this is a combat log \(a farever-combat-log\)/);
+  ok('...and the refusal carries the dialect as data', refused(docLog)?.combatLog === 'farever-combat-log');
+  says('a Wink timeline', `${JSON.stringify({ version: 1, me: '812', duration: 9, initial: [], count: 1 })}\n{"seq":1,"time":0,"kind":"damage"}\n`,
+    /^not a character sheet: this is a combat log \(a Wink DPS Meter fight timeline\)/);
+  says('a Wink fight summary', { version: 1, startedAt: 1760730930000, meName: 'Tester', players: [] }, /this is a combat log \(a Wink DPS Meter fight summary\)/);
+  says('a gzipped file', gzipSync(Buffer.from(docLog)), /^not a character sheet: the file is gzip-compressed.*likely a combat log/);
+  says('a sheet still broken as JSON', '{"format": "farever-character-sheet",\n"version": 1', /^not a character sheet: the file is not JSON \(/);
+  says('a newer version', { ...full, version: 2 }, /^this character sheet is version 2, and this bench reads version 1 - update the bench/);
+  // A newer version written as text or with a fraction is still newer: read
+  // with version-1 meanings it would be the guess the refusal prevents.
+  says('a newer version written as text', { ...full, version: '2' }, /^this character sheet is version 2, and this bench reads version 1/);
+  says('a newer version with a fraction', { ...full, version: 1.5 }, /^this character sheet is version 1\.5, and this bench reads version 1/);
+  const asText = readSheet(engine, { ...full, version: '1' });
+  ok('...while "1" as text is read as version 1 and named', asText.version === 1 && asText.dropped.some((d) => d.field === 'version' && d.id === '"1"'));
+  says('a level given beside a sheet that has none, and is no level', { ...full, character: { class: 'Rogue' } },
+    /^the sheet has no level of its own, and the level given for it must be a whole number from 1 to 25, not 30$/, { level: 30 });
+  says('an unknown class', { ...full, character: { class: 'Paladin', level: 25 } }, /^unknown class "Paladin" - a sheet names the unit id \(Warrior, Rogue, Mage, Priest\) or the aptitude id \(Fighter, Assassin, Wizard, Cleric\), in any case$/);
+  says('no class', { ...full, character: { level: 25 } }, /^the sheet does not say the character's class - character\.class is required/);
+  says('no level', { ...full, character: { class: 'Rogue' } }, /^the sheet does not say the character's level - character\.level is required, a whole number from 1 to 25$/);
+  for (const bad of [0, 26, 24.5, '25', -1]) {
+    says(`level ${JSON.stringify(bad)}`, { ...full, character: { class: 'Rogue', level: bad } }, /^character\.level must be a whole number from 1 to 25, not /);
+  }
+  says('a saved build whose build has no class', { build: { level: 25, gear: {} } }, /^the saved build does not say the character's class - build\.class is required/);
+  says('a bare loadout with no level', { class: 'Rogue', gear: {} }, /^the loadout does not say the character's level - level is required/);
+  // The modkit's question, with the class its weapons allow as data, for a
+  // caller to offer first; and a dump written before a character loaded -
+  // nothing equipped - is no build at all, whatever class is given.
+  const dagger = { character: 'Tester', equipped: [{ kind: 'Daggers_Demondash', level: 25 }] };
+  says('a modkit dump with no class given', dagger, /^a modkit inventory dump does not say which class "Tester" is - every weapon it lists fits a (Rogue|Mage)|^a modkit inventory dump does not say which class "Tester" is - its weapons fit/);
+  const asked = refused(dagger);
+  ok('...the question carries what it needs, whose dump, and the classes the weapons allow', asked?.needs === 'class' && asked?.character === 'Tester'
+    && Array.isArray(asked?.classes) && asked.classes.length >= 1 && asked.classes.every((c) => engine.cat.classes.some((k) => k.unit === c))
+    && asked.classes.every((c) => engine.cat.usableBy(engine.cat.itemById.get('Daggers_Demondash'), engine.cat.classes.find((k) => k.unit === c).aptitude)),
+  JSON.stringify(asked && { needs: asked.needs, character: asked.character, classes: asked.classes }));
+  says('a modkit dump given a class that is none', dagger, /^unknown class "Paladin"/, { cls: 'Paladin' });
+  for (const nobody of ['0', 'unknown']) {
+    const empty = { character: nobody, bankSlots: 0, bank: [], bankEquipment: [], equipped: [], bags: [] };
+    says(`a modkit dump written before a character loaded ("${nobody}", nothing equipped)`, empty,
+      new RegExp(`^this modkit inventory dump \\("${nobody}"\\) lists nothing equipped - it was written before a character loaded, so it describes no build`));
+    ok(`...("${nobody}") refused with a class given too, and said as data`, refused(empty, { cls: 'Warrior' })?.empty === true);
+  }
+  // What is given beside a sheet fills a hole; it never overrides what the sheet says.
+  const filled = readSheet(engine, { class: 'Rogue', gear: {} }, { level: 12 });
+  ok('a level given beside a sheet that lacks one fills it, and says so', filled.level === 12 && filled.notes.some((n) => /the level is not in the loadout - 12 was given for it/.test(n)));
+  const kept = readSheet(engine, full, { cls: 'Warrior', level: 3 });
+  ok('...and one beside a sheet that names its own is not used, and says so', kept.unit === 'Rogue' && kept.level === 25
+    && kept.notes.some((n) => /names its own class, Rogue/.test(n)) && kept.notes.some((n) => /names its own level, 25/.test(n)));
+  const named = readSheet(engine, full, { name: 'Other' });
+  ok('...the name too', named.name === 'Example' && named.notes.includes('the sheet names the character Example - the name given beside it (Other) is not used'), JSON.stringify(named.notes));
+  ok('...while a name given beside a sheet with none is the name', readSheet(engine, { ...full, character: { class: 'Rogue', level: 25 } }, { name: 'Other' }).name === 'Other');
+  // Nothing else is a refusal: a sheet broken everywhere but class and level still reads.
+  const mangled = { format: 'farever-character-sheet', version: 'one', character: { class: 'rogue', level: 25, name: 7 }, gear: 'none',
+    talents: [], weaponSkills: 5, classSkills: 'x', runes: 7, weaponSkillRanks: [], buffs: {}, stats: [], unreadable: 'all', source: 'me' };
+  const rx = refused(mangled);
+  ok('a sheet malformed in every block but the two that name the character is read, not refused', rx === null, String(rx));
+  const rmg = readSheet(engine, mangled);
+  ok('...every malformed block named in dropped', ['version', 'character.name', 'gear', 'talents', 'weaponSkills', 'classSkills', 'runes', 'weaponSkillRanks', 'buffs', 'stats', 'unreadable', 'source']
+    .every((f) => rmg.dropped.some((d) => d.field === f)), JSON.stringify(rmg.dropped.map((d) => d.field)));
+  const gx = sheetAccepted(engine, rmg);
+  ok('...and what is left is still a build the bench accepts', gx.same && gx.illegal === null, JSON.stringify(gx));
+} catch (e) { crashed(e); }
+
+group('character sheet import: what is dropped, and the sentence that says why');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet } = sheetLib;
+  const base = (gear, more = {}) => ({ format: 'farever-character-sheet', version: 1, character: { class: 'Rogue', level: 25 }, gear, ...more });
+  const dropOf = (r, field, id) => r.dropped.find((d) => d.field === field && (id === undefined || d.id === id));
+  const fixtures = [];
+  const read = (sheet, opts) => { const r = readSheet(engine, sheet, opts); fixtures.push(r); return r; };
+
+  // The piece itself.
+  const p = read(base({
+    Slot_Neck: { item: 'Necklace_No_Such_Row' },
+    Slot_Head: { item: 'Chest_EKobold_AssWiz' },
+    Slot_Chest: { item: 'Chest_RBee_Fig' },
+    Slot_Back: { item: 'Back_EKobold_Ass', rarity: 'Rare' },
+    Slot_Waist: { item: 'Waist_EKobold_Ass', rarity: 'Epic' },
+  }));
+  ok('an item the data does not have is dropped, and its slot is left open', /no item "Necklace_No_Such_Row" in this install's data/.test(dropOf(p, 'gear.Slot_Neck')?.why ?? '')
+    && !p.loadout.gear.Slot_Neck && !p.pins.gear.includes('Slot_Neck'));
+  ok('an item in a slot it does not fit is dropped', /Chest_EKobold_AssWiz goes in Slot_Chest, not Slot_Head/.test(dropOf(p, 'gear.Slot_Head')?.why ?? ''));
+  ok('an item the class cannot use is dropped, naming the class that can and its aptitude',
+    /a Rogue cannot use Chest_RBee_Fig - it needs a Warrior \(aptitude Fighter\)$/.test(dropOf(p, 'gear.Slot_Chest')?.why ?? ''), dropOf(p, 'gear.Slot_Chest')?.why);
+  ok('a rarity on armour other than its row\'s is dropped and the piece kept', /Back_EKobold_Ass is Epic, and only a weapon rolls its rarity/.test(dropOf(p, 'gear.Slot_Back.rarity')?.why ?? '')
+    && p.loadout.gear.Slot_Back?.item === 'Back_EKobold_Ass' && !('rarity' in p.loadout.gear.Slot_Back));
+  ok('...and the row\'s own rarity stated on armour is no drop', !dropOf(p, 'gear.Slot_Waist.rarity') && p.loadout.gear.Slot_Waist?.item === 'Waist_EKobold_Ass');
+  const low = read({ ...base({ Slot_FingerLeft: { item: 'Finger_Z3RCraft_Ap' } }), character: { class: 'Rogue', level: 20 } });
+  ok('an item above the character\'s level is dropped', /Finger_Z3RCraft_Ap needs level 25, and the character is level 20/.test(dropOf(low, 'gear.Slot_FingerLeft')?.why ?? ''));
+
+  // Stars, levels, flags.
+  const s = read(base({
+    Slot_Weapon1: { item: 'Daggers_Demondash', rarity: 'Epic', upgrade: 9 },
+    Slot_Chest: { item: 'Chest_EKobold_AssWiz', upgrade: 2, level: 0, flawless: null },
+    Slot_FingerLeft: { item: 'Finger_Z3RCraft_Ap', level: 0 },
+    Slot_FingerRight: { item: 'Finger_Z3RCraft_Ap', level: 'high', prismatic: 'yes' },
+  }));
+  ok('stars above what the rarity allows are clamped, with a note', s.loadout.gear.Slot_Weapon1?.stars === 4
+    && s.notes.some((n) => /Slot_Weapon1: a Epic Daggers_Demondash holds at most 4 upgrade stars, so 9 reads as 4/.test(n)), JSON.stringify(s.notes));
+  ok('...and stars on a piece that cannot be upgraded read 0, with a note', s.loadout.gear.Slot_Chest?.stars === 0
+    && s.notes.some((n) => /Chest_EKobold_AssWiz cannot be upgraded, so 2 upgrade stars read as 0/.test(n)));
+  ok('instance level 0 - the game\'s "use the row" - is read as absent, silently', !('level' in s.loadout.gear.Slot_FingerLeft) && !('level' in s.loadout.gear.Slot_Chest)
+    && !s.dropped.some((d) => /FingerLeft\.level|Chest\.level/.test(d.field)));
+  ok('a level that is not one is dropped and read as absent', /not a level/.test(dropOf(s, 'gear.Slot_FingerRight.level')?.why ?? '') && !('level' in s.loadout.gear.Slot_FingerRight));
+  ok('a flag that is not true or false is dropped', /a flag is true or false/.test(dropOf(s, 'gear.Slot_FingerRight.prismatic')?.why ?? ''));
+  ok('a null flag is tolerated: a note and a gap, not a drop', !dropOf(s, 'gear.Slot_Chest.flawless') && s.notes.some((n) => /Slot_Chest\.flawless: a flag is true or false, and null reads as not recorded/.test(n))
+    && s.gaps.some((x) => /Flawless flag is not recorded on .*Slot_Chest/.test(x)));
+
+  // The infusion and its bonus stat.
+  const inf = read(base({
+    Slot_Chest: { item: 'Chest_EKobold_AssWiz', infusion: 'Infusion_Kobold_DPS', infusionStat: 'Strength' },
+    Slot_Back: { item: 'Back_EKobold_Ass', infusion: 'Infusion_Kobold_DPS', infusionStat: 'ArmorPenetrationRating' },
+    Slot_Waist: { item: 'Waist_EKobold_Ass', infusion: 'Infusion_No_Such_Row' },
+    Slot_Weapon1: { item: 'Daggers_Demondash', rarity: 'Epic', infusion: 'Infusion_Kobold_DPS' },
+    Slot_Legs: { item: 'Legs_EKobold_AssWiz', infusion: 'Infusion_Kobold_DPS', infusionBonusStat: 'CritChanceRating' },
+  }));
+  ok('a bonus stat that is not an InfusionBonus rating is dropped, the infusion kept', /not an infusion bonus rating - the bonus line is one of CritChanceRating, FervorRating, ArmorPenetrationRating, SpellPenetrationRating/.test(dropOf(inf, 'gear.Slot_Chest.infusionStat', 'Strength')?.why ?? '')
+    && inf.loadout.gear.Slot_Chest?.infusion === 'Infusion_Kobold_DPS' && !inf.loadout.gear.Slot_Chest.infusionStat);
+  const backPool = engine.cat.infusionBonusPool(engine.cat.itemById.get('Back_EKobold_Ass'));
+  ok('a real rating outside the piece\'s pool is KEPT and flagged', !backPool.includes('ArmorPenetrationRating') && inf.loadout.gear.Slot_Back?.infusionStat === 'ArmorPenetrationRating'
+    && inf.notes.some((n) => /Slot_Back: ArmorPenetrationRating is outside the bonus pool the bench computes for Back_EKobold_Ass .* kept/.test(n)), backPool.join());
+  ok('an infusion no pattern names is dropped', /no InfusionPattern item names Infusion_No_Such_Row/.test(dropOf(inf, 'gear.Slot_Waist.infusion')?.why ?? '') && !inf.pins.infusions.includes('Slot_Waist'));
+  ok('an infusion on a piece the game will not infuse is dropped with the catalog\'s reason', dropOf(inf, 'gear.Slot_Weapon1.infusion')?.why === engine.cat.whyNotInfusable(engine.cat.itemById.get('Daggers_Demondash')));
+  ok('the game\'s own infusionBonusStat is read as infusionStat, with a note', inf.loadout.gear.Slot_Legs?.infusionStat === 'CritChanceRating'
+    && inf.notes.some((n) => /infusionBonusStat \(the game's own name\) read as infusionStat on Slot_Legs/.test(n)));
+
+  // Sockets.
+  const so = read(base({
+    Slot_Chest: { item: 'Chest_EKobold_AssWiz', sockets: ['StrongCutAmber', 'ReinforcedCopperPlate', 'HonedCopperPlate', null, 'No_Such_Augment'] },
+    Slot_Head: { item: 'Head_EDemon_AssCle', sockets: ['DemonSigil_War_SurgeOfViolence'] },
+    Slot_Shoulders: { item: 'Shoulders_EBee_Ass', sockets: ['StrongCutAmber'] },
+  }));
+  ok('a socket the host does not have drops its augment', /StrongCutAmber is a AugmentJeweller, and Chest_EKobold_AssWiz has no such socket \(it has AugmentBlacksmith\)/.test(dropOf(so, 'gear.Slot_Chest.sockets', 'StrongCutAmber')?.why ?? ''));
+  ok('...as on a piece with no socket at all', /it has none/.test(dropOf(so, 'gear.Slot_Shoulders.sockets', 'StrongCutAmber')?.why ?? ''));
+  ok('a second augment of one socket type is dropped, the first kept', /a second AugmentBlacksmith on Slot_Chest - ReinforcedCopperPlate is kept/.test(dropOf(so, 'gear.Slot_Chest.sockets', 'HonedCopperPlate')?.why ?? '')
+    && so.loadout.augments['Slot_Chest/AugmentBlacksmith'] === 'ReinforcedCopperPlate');
+  ok('an augment the data does not have is dropped, and a null in the list is no augment at all', !!dropOf(so, 'gear.Slot_Chest.sockets', 'No_Such_Augment')
+    && so.dropped.filter((d) => d.field === 'gear.Slot_Chest.sockets').length === 3);
+  ok('a DemonSigil of another class is dropped', /DemonSigil_War_SurgeOfViolence grants Warrior_Talent_SurgeOfViolence, a Warrior talent - a Rogue cannot use it/.test(dropOf(so, 'gear.Slot_Head.sockets')?.why ?? '')
+    && !so.loadout.augments['Slot_Head/AugmentDemonSigil']);
+  ok('...and the host\'s socket is held empty, since its sockets were recorded', so.pins.augments.includes('Slot_Head/AugmentDemonSigil'));
+
+  // A shield under a two-hander.
+  const two = read({ ...base({ Slot_Weapon1: { item: 'GS_Nova', rarity: 'Rare' }, Slot_OffhandWeapon: { item: 'Shield_Craft', rarity: 'Rare' } }), character: { class: 'Warrior', level: 25 } });
+  ok('an offhand under a two-handed main hand is dropped with the game\'s rule', dropOf(two, 'gear.Slot_OffhandWeapon', 'Shield_Craft')?.why === illegalReason(engine.cat, { gear: { Slot_Weapon1: { item: 'GS_Nova' }, Slot_OffhandWeapon: { item: 'Shield_Craft' } } })
+    && !two.loadout.gear.Slot_OffhandWeapon && !two.pins.gear.includes('Slot_OffhandWeapon'));
+
+  // Talents: one allocation, checked whole, sockets first.
+  const legal = { Rogue_Talent_LethalPoison: 1, Rogue_Talent_AcidicSplatter: 1, Rogue_Talent_NoxiousStrategem: 2, Rogue_Talent_UpTheAnte: 1 };
+  const sig = read(base({ Slot_Head: { item: 'Head_EDemon_AssCle', sockets: ['DemonSigil_Rogue_VirulentMagic'] } }, { talents: { ...legal, Rogue_Talent_VirulentMagic: 1 } }));
+  ok('a node a socketed sigil grants is normalised away with a note, not dropped', sig.dropped.length === 0 && sheetCanon(sig.loadout.talents) === sheetCanon(legal) && sig.pins.talents === true
+    && sig.notes.some((n) => /Rogue_Talent_VirulentMagic is granted by DemonSigil_Rogue_VirulentMagic, costs no point, and is not counted as spent/.test(n)), JSON.stringify(sig.dropped));
+  const sig2 = read(base({ Slot_Head: { item: 'Head_EDemon_AssCle', sockets: ['DemonSigil_Rogue_VirulentMagic'] } }, { talents: { ...legal, Rogue_Talent_VirulentMagic: 2 } }));
+  ok('...and points spent on it drop the block whole', /the talents block is dropped whole/.test(dropOf(sig2, 'talents')?.why ?? '') && sig2.pins.talents === false,
+    dropOf(sig2, 'talents')?.why);
+  const ill = read(base({}, { talents: { Rogue_Talent_LethalPoison: 1, Rogue_Talent_VirulentMagic: 1 } }));
+  ok('an illegal tree is dropped whole, with the tree\'s own sentence, and left open', /is tier 4 and needs 8 points at lower tiers in Center, but only 1 are there - the talents block is dropped whole/.test(dropOf(ill, 'talents')?.why ?? '')
+    && Object.keys(ill.loadout.talents).length === 0 && ill.pins.talents === false);
+  const foreign = read(base({}, { talents: { Warrior_Hemorrhage: 1 } }));
+  ok('...as is a node of another class\'s tree', /Warrior_Hemorrhage is not in the Rogue tree/.test(dropOf(foreign, 'talents')?.why ?? ''));
+
+  // weaponSkills: the arsenal's picks, for the weapon worn in Slot_Weapon2 only.
+  const daggers = { Slot_Weapon1: { item: 'Daggers_Demondash', rarity: 'Epic' }, Slot_Weapon2: { item: 'Daggers_DuplicatePoison', rarity: 'Legendary' } };
+  const dorm = read(base(daggers, { weaponSkills: { Daggers_Demondash: ['Daggers_Demondash_Skill1'], Axe_Boomerang: ['Axe_Boomerang_Skill1'], Spear_Goo: [] } }));
+  ok('the main hand\'s arsenal entry is dormant: ignored with one note, the hand keeps both its skills', dorm.notes.some((n) => /weaponSkills for Daggers_Demondash ignored - the main hand and the offhand grant every skill/.test(n))
+    && sheetCanon(dorm.loadout.skills.Slot_Weapon1) === sheetCanon(['Daggers_Demondash_Skill1', 'Daggers_Demondash_Skill2']), JSON.stringify(dorm.loadout.skills));
+  ok('entries for weapons not worn are ignored and counted in one note', dorm.notes.some((n) => /2 weaponSkills entries for weapons not worn in Slot_Weapon2 ignored: Axe_Boomerang, Spear_Goo/.test(n)) && dorm.dropped.length === 0);
+  ok('...and with no entry for the arsenal its picks are a gap', dorm.gaps.some((x) => /the arsenal picks \(weaponSkills for Slot_Weapon2\) are not recorded/.test(x)) && !dorm.pins.skills.includes('Slot_Weapon2'));
+  const both = read(base({ Slot_Weapon1: { item: 'Daggers_Demondash', rarity: 'Epic' }, Slot_Weapon2: { item: 'Daggers_Demondash', rarity: 'Rare' } },
+    { weaponSkills: { Daggers_Demondash: ['Daggers_Demondash_Skill2', 'Daggers_Demondash_Passive'] } }));
+  ok('one item worn in both hands: an item-keyed entry is the arsenal\'s', sheetCanon(both.loadout.skills.Slot_Weapon2) === sheetCanon(['Daggers_Demondash_Skill2', 'Daggers_Demondash_Passive'])
+    && both.pins.skills.includes('Slot_Weapon2'), JSON.stringify(both.loadout.skills));
+  const clash = read(base(daggers, { weaponSkills: { Slot_Weapon2: ['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill2'], Daggers_DuplicatePoison: ['Daggers_DuplicatePoison_Passive'] } }));
+  ok('a slot key and an item key for the same arsenal: the slot key wins and the clash is named', /Slot_Weapon2 is also given by slot id, and the slot entry wins/.test(dropOf(clash, 'weaponSkills.Daggers_DuplicatePoison')?.why ?? '')
+    && sheetCanon(clash.loadout.skills.Slot_Weapon2) === sheetCanon(['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill2']));
+  const picks = read(base(daggers, { weaponSkills: { Weapon2: ['Daggers_Demondash_Skill1', 'Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill2', 'Daggers_DuplicatePoison_Passive'] } }));
+  ok('a pick the pool does not offer is dropped', /not one of the arsenal skills a level-25 Rogue has here/.test(dropOf(picks, 'weaponSkills.Weapon2', 'Daggers_Demondash_Skill1')?.why ?? ''));
+  ok('...a repeat in a pool that takes each option once is dropped', /already slotted/.test(picks.dropped.find((d) => d.id === 'Daggers_DuplicatePoison_Skill1')?.why ?? ''));
+  ok('...and picks past the pool\'s slots are truncated, each named', /the bench holds 2 arsenal skills at level 25, and this one is past the last slot/.test(dropOf(picks, 'weaponSkills.Weapon2', 'Daggers_DuplicatePoison_Passive')?.why ?? '')
+    && sheetCanon(picks.loadout.skills.Slot_Weapon2) === sheetCanon(['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill2']));
+  ok('...the slot key without its prefix read, with a note', picks.notes.some((n) => /weaponSkills key Weapon2 read as Slot_Weapon2/.test(n)) && picks.pins.skills.includes('Slot_Weapon2'));
+
+  // classSkills, keyed by the game's skill type.
+  const bar = read(base({}, { classSkills: { ClassSkill: ['Rogue_Shadowstep', null, 'Rogue_Darkness', 'Rogue_SmokeBomb', 'Rogue_DeathMark', 'Rogue_KnivesTempest', 'Rogue_UrgeToKill'],
+    MageConduit: ['Mage_Conduit_Projectile'], RoguePoison: ['Rogue_Poison_Deadly'], WarriorShout: [] } }));
+  ok('a class skill not learned at this level is dropped', /not one of the class skills a level-25 Rogue has here/.test(dropOf(bar, 'classSkills.ClassSkill', 'Rogue_Darkness')?.why ?? ''));
+  ok('...the game\'s fifth bar position is past the bench\'s four, and named', /the bench holds 4 class skills at level 25, and this one is past the last slot/.test(dropOf(bar, 'classSkills.ClassSkill', 'Rogue_UrgeToKill')?.why ?? '')
+    && sheetCanon(bar.loadout.skills['class/ClassSkill']) === sheetCanon(['Rogue_Shadowstep', 'Rogue_SmokeBomb', 'Rogue_DeathMark', 'Rogue_KnivesTempest']) && bar.pins.skills.includes('class/ClassSkill'));
+  ok('a mechanic pool the class does not have is dropped', /a level-25 Rogue has no MageConduit pool/.test(dropOf(bar, 'classSkills.MageConduit')?.why ?? ''));
+  ok('RoguePoison is reserved: named and ignored', bar.notes.some((n) => /classSkills\.RoguePoison is reserved - no class has a poison pool on this build/.test(n)) && !dropOf(bar, 'classSkills.RoguePoison'));
+  ok('a skill type that is none is an unknown key', bar.unknownKeys.includes('classSkills.WarriorShout'));
+  const short = read(base({}, { classSkills: { ClassSkill: ['Rogue_Shadowstep', 'Rogue_SmokeBomb', null] } }));
+  ok('a bar with an empty position is kept as it is and not held - the search may fill the slot', sheetCanon(short.loadout.skills['class/ClassSkill']) === sheetCanon(['Rogue_Shadowstep', 'Rogue_SmokeBomb'])
+    && !short.pins.skills.includes('class/ClassSkill') && short.dropped.length === 0);
+
+  // Runes: hosts read from data.
+  const ru = read(base(daggers, { runes: ['Rogue_DeathMark_M2', 'Rogue_DeathMark_M1', 'Warrior_Charge_M1', 'No_Such_Rune', null] }));
+  ok('a rune listed bare is placed on the skill that hosts it', ru.loadout.runes.Rogue_DeathMark === 'Rogue_DeathMark_M2');
+  ok('a second rune on one host is dropped, the first kept', /a second rune on Rogue_DeathMark - Rogue_DeathMark_M2 is kept/.test(dropOf(ru, 'runes', 'Rogue_DeathMark_M1')?.why ?? ''));
+  ok('a rune whose host offers no rune slot in this build is dropped', /Warrior_Charge_M1 is a rune of Warrior_Charge, which offers no rune slot in this build/.test(dropOf(ru, 'runes', 'Warrior_Charge_M1')?.why ?? ''));
+  ok('a rune no skill offers is dropped', /no skill offers a rune "No_Such_Rune"/.test(dropOf(ru, 'runes', 'No_Such_Rune')?.why ?? ''));
+  const rmap = read(base(daggers, { runes: { Rogue_SmokeBomb: 'Rogue_DeathMark_M3', Rogue_KnivesTempest: null } }));
+  ok('a map whose key is not the rune\'s host is read on the real host, with a note', rmap.loadout.runes.Rogue_DeathMark === 'Rogue_DeathMark_M3' && !rmap.loadout.runes.Rogue_SmokeBomb
+    && rmap.notes.some((n) => /runes\.Rogue_SmokeBomb holds Rogue_DeathMark_M3, which is a rune of Rogue_DeathMark - read on Rogue_DeathMark/.test(n)));
+
+  // Weapon-skill ranks -> one global rank.
+  const ranks = (map) => read(base(daggers, { weaponSkills: { Slot_Weapon2: ['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Passive'] }, weaponSkillRanks: map }));
+  const main3 = { Daggers_Demondash_Combo: 3, Daggers_Demondash_Skill1: 3, Daggers_Demondash_Skill2: 3, Daggers_Demondash_Passive: 3 };
+  const mixed = ranks({ ...main3, Daggers_DuplicatePoison_Skill1: { rank: 2 } });
+  ok('mixed ranks: the main hand\'s rank when its skills agree, and a warning naming every skill priced above its own', mixed.rank === 3
+    && mixed.notes.some((n) => /weapon-skill ranks differ .*the bench prices one rank for every skill: 3, the main hand's\. Priced above their real rank: Daggers_DuplicatePoison_Skill1 \(2\), Daggers_DuplicatePoison_Passive \(1\)/.test(n)), JSON.stringify(mixed.notes));
+  const split = ranks({ ...main3, Daggers_Demondash_Skill2: 1, Daggers_DuplicatePoison_Skill1: 3, Daggers_DuplicatePoison_Passive: 3 });
+  ok('...the highest when the main hand disagrees with itself', split.rank === 3 && split.notes.some((n) => /3, the highest\. Priced above their real rank: Daggers_Demondash_Skill2 \(1\)/.test(n)));
+  ok('a held skill missing from the map is rank 1, the game\'s default', ranks({}).rank === 1 && ranks({ Axe_Boomerang_Skill1: 3 }).rank === 1);
+  const all2 = ranks({ ...Object.fromEntries(Object.keys(main3).map((k) => [k, 2])), Daggers_DuplicatePoison_Skill1: 2, Daggers_DuplicatePoison_Passive: 2, Axe_Boomerang_Skill1: 3 });
+  ok('all held at one rank: that rank, and ranks of skills not held are carried, not used', all2.rank === 2 && all2.observed.weaponSkillRanks.Axe_Boomerang_Skill1 === 3
+    && all2.notes.some((n) => /1 weapon-skill rank for skills this build does not hold carried and not used/.test(n)));
+  ok('a rank above the cap reads as the cap, with a note', ranks({ ...main3, Daggers_DuplicatePoison_Skill1: 7, Daggers_DuplicatePoison_Passive: 3 }).rank === 3);
+
+  // Names, aliases, the extension object, and what could not be read.
+  const misc = read(base({ Weapon1: { item: 'Daggers_Demondash', rarity: 'Epic', x: { mine: 1 }, colour: 'red' }, Slot_Mount: { item: 'Mount_Crab_Blue' }, Slot_Feet: null, Pocket: { item: 'Pickaxe' } },
+    { x: { anything: true }, mood: 'calm', character: { class: 'Rogue', level: 25, guild: 'none' }, unreadable: ['gear.Slot_Neck.infusion', 'talents', 'gear.Pocket'], talents: { Rogue_Talent_LethalPoison: 1 } }));
+  ok('an unknown key is named at any depth', ['mood', 'character.guild', 'gear.Slot_Weapon1.colour', 'gear.Pocket'].every((k) => misc.unknownKeys.includes(k)), JSON.stringify(misc.unknownKeys));
+  ok('...and x is carried silently, never an unknown key', !misc.unknownKeys.some((k) => /(^|\.)x$/.test(k)) && misc.x?.top?.anything === true && misc.x?.gear?.Slot_Weapon1?.mine === 1);
+  ok('a slot key without its prefix is read, with a note', misc.loadout.gear.Slot_Weapon1?.item === 'Daggers_Demondash' && misc.notes.some((n) => /gear keys read as slot ids: Weapon1 as Slot_Weapon1/.test(n)));
+  ok('a non-combat slot is named and ignored', misc.notes.some((n) => /1 non-combat slot ignored - the bench scores combat gear only: Slot_Mount/.test(n)));
+  ok('an unreadable path is a gap, and a block it names reads as not recorded even when given', misc.gaps.some((x) => /^gear\.Slot_Neck\.infusion could not be read by the exporter/.test(x))
+    && misc.gaps.some((x) => /^talents could not be read/.test(x)) && misc.pins.talents === false && Object.keys(misc.loadout.talents).length === 0
+    && misc.notes.some((n) => /^the sheet gives talents and also lists it as unreadable - read as not recorded$/.test(n)), JSON.stringify(misc.notes));
+  ok('...and one that names nothing a sheet holds is dropped', /names nothing a version-1 sheet holds/.test(dropOf(misc, 'unreadable', 'gear.Pocket')?.why ?? ''));
+  ok('...the paths it could read are handed back on their own, for --check to count', sheetCanon(misc.unreadable) === sheetCanon(['gear.Slot_Neck.infusion', 'talents']), JSON.stringify(misc.unreadable));
+  const nulls = read(base({ Slot_Mount: null, Slot_Glider: null }));
+  ok('a non-combat slot written null is named too - whatever its value, it is never read', nulls.notes.includes('2 non-combat slots ignored - the bench scores combat gear only: Slot_Mount, Slot_Glider'), JSON.stringify(nulls.notes));
+
+  // classSkills is read bar by bar, so an unreadable path names a bar or the block.
+  const bars = read(base({}, { classSkills: { ClassSkill: ['Rogue_Shadowstep', 'Rogue_SmokeBomb', null, 'Rogue_DeathMark', 'Rogue_KnivesTempest'] },
+    unreadable: ['classSkills.ClassSkill.2', 'classSkills.Bogus'] }));
+  ok('a path into one position of a bar makes the bar unreadable: not read, not held, one gap', sheetCanon(bars.unreadable) === sheetCanon(['classSkills.ClassSkill'])
+    && !bars.pins.skills.includes('class/ClassSkill') && bars.gaps.includes('classSkills.ClassSkill could not be read by the exporter - left open as not recorded')
+    && bars.notes.includes('the sheet gives classSkills.ClassSkill and also lists it as unreadable - read as not recorded'), JSON.stringify({ u: bars.unreadable, g: bars.gaps }));
+  ok('...and a skill type that is none is a path to nothing, dropped', /names nothing a version-1 sheet holds/.test(dropOf(bars, 'unreadable', 'classSkills.Bogus')?.why ?? ''));
+
+  // Two spellings of the arsenal's slot key: the first is read, the second named.
+  const twice = read(base(daggers, { weaponSkills: { Slot_Weapon2: ['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill2'], Weapon2: ['Daggers_DuplicatePoison_Passive'] } }));
+  ok('a second key for the same slot is dropped, never silently lost', dropOf(twice, 'weaponSkills.Weapon2')?.why === 'Weapon2 gives Slot_Weapon2 again - Slot_Weapon2 is kept'
+    && sheetCanon(twice.loadout.skills.Slot_Weapon2) === sheetCanon(['Daggers_DuplicatePoison_Skill1', 'Daggers_DuplicatePoison_Skill2']));
+  ok('...and the spelling that was not read gets no "read as" note', !twice.notes.some((n) => /weaponSkills key Weapon2 read as/.test(n)), JSON.stringify(twice.notes));
+
+  // The bonus stat under both names: a value beats a null either way round.
+  const pair = read(base({
+    Slot_Chest: { item: 'Chest_EKobold_AssWiz', infusion: 'Infusion_Kobold_DPS', infusionStat: null, infusionBonusStat: 'CritChanceRating' },
+    Slot_Legs: { item: 'Legs_EKobold_AssWiz', infusion: 'Infusion_Kobold_DPS', infusionStat: 'FervorRating', infusionBonusStat: null },
+    Slot_Back: { item: 'Back_EKobold_Ass', infusion: 'Infusion_Kobold_DPS', infusionStat: 'FervorRating', infusionBonusStat: 'CritChanceRating' },
+  }));
+  ok('infusionStat null beside a rating under infusionBonusStat: the rating is read, with the alias note', pair.loadout.gear.Slot_Chest?.infusionStat === 'CritChanceRating'
+    && pair.notes.some((n) => /infusionBonusStat \(the game's own name\) read as infusionStat on Slot_Chest/.test(n)));
+  ok('...a null infusionBonusStat beside a rating says nothing more, and drops nothing', pair.loadout.gear.Slot_Legs?.infusionStat === 'FervorRating' && !dropOf(pair, 'gear.Slot_Legs.infusionBonusStat'));
+  ok('...two different ratings: the sheet\'s own name wins and the other is dropped', pair.loadout.gear.Slot_Back?.infusionStat === 'FervorRating'
+    && /differs from infusionStat \(FervorRating\), which is kept/.test(dropOf(pair, 'gear.Slot_Back.infusionBonusStat')?.why ?? ''));
+
+  // Mixed ranks the other way: the main hand agrees below the rest.
+  const below = ranks({ Daggers_Demondash_Combo: 2, Daggers_Demondash_Skill1: 2, Daggers_Demondash_Skill2: 2, Daggers_Demondash_Passive: 2, Daggers_DuplicatePoison_Skill1: 3, Daggers_DuplicatePoison_Passive: 3 });
+  const belowNote = below.notes.find((n) => /weapon-skill ranks differ/.test(n)) ?? '';
+  ok('mixed ranks with nothing priced above its real rank: no empty clause, and the skills priced below theirs named', below.rank === 2
+    && /the bench prices one rank for every skill: 2, the main hand's\. Priced below their real rank: Daggers_DuplicatePoison_Skill1 \(3\), Daggers_DuplicatePoison_Passive \(3\)$/.test(belowNote)
+    && !/Priced above/.test(belowNote), belowNote);
+
+  // THE GUARANTEE, on every fixture above.
+  const broken = fixtures.map((r, i) => ({ i, ...sheetAccepted(engine, r) })).filter((x) => !x.same || x.illegal);
+  ok(`every one of the ${fixtures.length} fixtures above reads to a build sanitizeLoadout leaves as is and the game accepts`, fixtures.length > 20 && broken.length === 0, JSON.stringify(broken));
+} catch (e) { crashed(e); }
+
+group('character sheet import: pins, the round trip, and the report');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet, toSheet, reportLines } = sheetLib;
+  const schema = JSON.parse(readFileSync(fileURLToPath(new URL('../docs/schema/character-sheet.v1.json', import.meta.url)), 'utf8'));
+  // Pins: what was recorded is held, what was not stays open.
+  const r = readSheet(engine, {
+    format: 'farever-character-sheet', version: 1, character: { class: 'Rogue', level: 25 },
+    gear: {
+      Slot_Weapon1: { item: 'Daggers_Demondash', rarity: 'Epic', sockets: ['FormulaWeaponDevote'] },
+      Slot_Weapon2: { item: 'Daggers_DuplicatePoison', rarity: 'Rare' },
+      Slot_Chest: { item: 'Chest_EKobold_AssWiz', infusion: null, sockets: [] },
+      Slot_Back: { item: 'Back_EKobold_Ass', infusion: 'Infusion_Kobold_DPS' },
+      Slot_Trinket: null,
+    },
+    talents: {},
+    weaponSkills: { Slot_Weapon2: ['Daggers_DuplicatePoison_Skill1'] },
+    classSkills: { ClassSkill: ['Rogue_Shadowstep', 'Rogue_SmokeBomb', 'Rogue_DeathMark', 'Rogue_KnivesTempest'] },
+    runes: [],
+  });
+  ok('every recorded slot is held - an item, or null for empty - and an absent one is not', sheetCanon(r.pins.gear) === sheetCanon(['Slot_Weapon1', 'Slot_Weapon2', 'Slot_Chest', 'Slot_Back', 'Slot_Trinket']), JSON.stringify(r.pins.gear));
+  ok('a recorded infusion is held, value or null; an absent one is not', sheetCanon(r.pins.infusions) === sheetCanon(['Slot_Chest', 'Slot_Back']), JSON.stringify(r.pins.infusions));
+  ok('a placed socket is held, and with sockets recorded the host\'s other sockets are held empty', sheetCanon(r.pins.augments) === sheetCanon(['Slot_Weapon1/AugmentEnchantWeapon', 'Slot_Weapon1/AugmentDemon', 'Slot_Chest/AugmentBlacksmith'])
+    && !r.loadout.augments['Slot_Weapon1/AugmentDemon'], JSON.stringify(r.pins.augments));
+  ok('a pool is held only when its picks fill it', sheetCanon(r.pins.skills) === sheetCanon(['class/ClassSkill']) && r.loadout.skills.Slot_Weapon2.length === 1, JSON.stringify(r.pins.skills));
+  ok('runes recorded (even as none) hold every rune pool of the build, set or empty', r.pins.runes.length === engine.talents.runePools(r.loadout).length && r.pins.runes.length > 0
+    && Object.keys(r.loadout.runes).length === 0);
+  ok('talents recorded as {} are held as no point spent', r.pins.talents === true && Object.keys(r.loadout.talents).length === 0);
+  const gp = sheetAccepted(engine, r);
+  ok('...and the build is one sanitizeLoadout leaves as is', gp.same && gp.illegal === null, JSON.stringify(gp));
+
+  // The round trip, for every class.
+  for (const c of engine.cat.classes) {
+    const x = sheetDefaultBuild(engine, c.unit);
+    ok(`${c.unit}: the assembled build is itself what sanitizeLoadout keeps`, sheetCanon(sheetSanitize(engine, structuredClone(x))) === sheetCanon(x));
+    const sheet = toSheet(engine, x, { name: 'Tester', rank: 2, source: { steamBuild: 25959898, writtenAt: '2026-10-19T12:00:00Z' } });
+    const problems = sheetSchemaProblems(schema, sheet);
+    ok(`${c.unit}: toSheet writes a sheet the schema accepts`, problems.length === 0, problems.slice(0, 4).join(' | '));
+    ok(`${c.unit}: ...every combat slot, rarity on every weapon, runes as a list, the unit id`, Object.keys(sheet.gear).length === 15 && sheet.character.class === c.unit
+      && Array.isArray(sheet.runes) && Object.values(sheet.gear).every((g) => !g || !engine.cat.isWeaponType(engine.cat.itemById.get(g.item).type) || g.rarity)
+      && sheet.source.exporter === 'farever-bench' && sheet.source.steamBuild === '25959898');
+    const back = readSheet(engine, JSON.stringify(sheet));
+    ok(`${c.unit}: readSheet(toSheet(x)) is x`, sheetCanon(back.loadout) === sheetCanon(x), `${sheetCanon(back.loadout)}\n  vs ${sheetCanon(x)}`);
+    ok(`${c.unit}: ...with its rank and name, nothing dropped, unknown or left open`, back.rank === 2 && back.name === 'Tester' && back.dropped.length === 0 && back.unknownKeys.length === 0 && back.gaps.length === 0,
+      JSON.stringify({ d: back.dropped, u: back.unknownKeys, g: back.gaps }));
+    ok(`${c.unit}: ...and it touched sockets, an infusion, talents and runes`, Object.keys(x.augments).length > 0 && Object.values(x.gear).some((g) => g.infusion)
+      && Object.keys(x.talents).length > 0 && Object.keys(x.runes).length > 0);
+  }
+  // toSheet writes points SPENT: a sigil's node is the sigil's.
+  const rogue = sheetDefaultBuild(engine, 'Rogue');
+  const sigilNode = (engine.cat.itemById.get(rogue.augments['Slot_Head/AugmentDemonSigil'])?.skills ?? [])[0];
+  const withNode = structuredClone(rogue);
+  withNode.talents[sigilNode] = 1;
+  ok('toSheet leaves a sigil-granted node out of talents', !!sigilNode && !(sigilNode in toSheet(engine, withNode).talents));
+
+  // The report.
+  const full = sheetFull();
+  full.gear.Slot_Chest.iLevel = 999;
+  full.gear.Slot_Neck = { item: 'Necklace_No_Such_Row' };
+  full.mood = 'calm';
+  const rr = readSheet(engine, full);
+  const lines = reportLines(rr);
+  ok('the report is sentences, each closed', lines.length > 5 && lines.every((l) => typeof l === 'string' && /[.!?]$/.test(l)), JSON.stringify(lines));
+  ok('...it says what was read and who the character is', lines[0] === 'Read as a character sheet (farever-character-sheet), version 1.'
+    && lines.includes('Character: Example, Rogue (aptitude Assassin), level 25.') && lines.includes('Weapon-skill rank: 3.'));
+  ok('...every drop with its field, id and why', rr.dropped.every((d) => lines.some((l) => l.startsWith(`Dropped ${d.field} (${d.id})`) && l.includes(d.why))));
+  ok('...every gap and every unknown key', rr.gaps.every((x) => lines.some((l) => l.includes(x))) && lines.some((l) => /^Unknown key, named and not read: mood\.$/.test(l)));
+  ok('...and an item level the game reported that the bench reads differently', lines.some((l) => /^Item level of Slot_Chest \(Chest_EKobold_AssWiz\): 999 in game, 310 as the bench reads the same piece\.$/.test(l)), lines.join(' | '));
+  ok('...while matching ones are summed up in one line', reportLines(readSheet(engine, sheetFull())).includes('Item levels: all 3 the game reported match the bench\'s.'));
+} catch (e) { crashed(e); }
+
+group('character sheet import: the documented examples and the schema');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet } = sheetLib;
+  const doc = (p) => fileURLToPath(new URL(`../docs/${p}`, import.meta.url));
+  const schema = JSON.parse(readFileSync(doc('schema/character-sheet.v1.json'), 'utf8'));
+  ok('the schema is JSON Schema 2020-12 at the published address', schema.$schema === 'https://json-schema.org/draft/2020-12/schema'
+    && schema.$id === 'https://raw.githubusercontent.com/Blaakan/farever-bench/master/docs/schema/character-sheet.v1.json');
+  for (const name of ['sheet-minimal.json', 'sheet-full.json']) {
+    const sheet = JSON.parse(readFileSync(doc(`examples/${name}`), 'utf8'));
+    const problems = sheetSchemaProblems(schema, sheet);
+    ok(`${name}: the schema accepts it`, problems.length === 0, problems.slice(0, 4).join(' | '));
+    const r = readSheet(engine, sheet);
+    ok(`${name}: read with nothing dropped and no unknown key - every id in it is real on this build`, r.dropped.length === 0 && r.unknownKeys.length === 0,
+      JSON.stringify({ d: r.dropped, u: r.unknownKeys }));
+    const g = sheetAccepted(engine, r);
+    ok(`${name}: ...to a build sanitizeLoadout leaves as is and the game accepts`, g.same && g.illegal === null, JSON.stringify(g));
+    ok(`${name}: ...a level-25 character`, r.level === 25);
+  }
+  const full = readSheet(engine, JSON.parse(readFileSync(doc('examples/sheet-full.json'), 'utf8')));
+  ok('sheet-full exercises what it is there to show: sockets, an infusion, talents, runes as a list, arsenal picks, class skills, ranks, a buff with its item, stats, item levels',
+    Object.keys(full.loadout.augments).length >= 5 && Object.values(full.loadout.gear).some((g) => g.infusion && g.infusionStat)
+    && Object.keys(full.loadout.talents).length > 0 && Object.keys(full.loadout.runes).length >= 3 && full.pins.skills.includes('Slot_Weapon2')
+    && full.pins.skills.includes('class/ClassSkill') && full.rank === 3 && full.observed.buffs?.[0]?.item && Object.keys(full.observed.stats ?? {}).length > 0
+    && Object.keys(full.observed.iLevel).length > 0 && full.gaps.length === 0, JSON.stringify(full.gaps));
+  ok('...and every item level in it is the one the bench computes', Object.values(full.observed.iLevel).every((v) => v.game === v.bench), JSON.stringify(full.observed.iLevel));
+  // The schema says no to what is not a clean sheet.
+  const bad = (name, mutate) => {
+    const s = JSON.parse(readFileSync(doc('examples/sheet-full.json'), 'utf8'));
+    mutate(s);
+    ok(`the schema refuses ${name}`, sheetSchemaProblems(schema, s).length > 0);
+  };
+  bad('a missing format', (s) => { delete s.format; });
+  bad('version 2', (s) => { s.version = 2; });
+  bad('a gear entry with no item', (s) => { delete s.gear.Slot_Chest.item; });
+  bad('an unknown top-level key', (s) => { s.mood = 'calm'; });
+  bad('an unknown key in a gear entry', (s) => { s.gear.Slot_Chest.colour = 'red'; });
+  bad('a null flag', (s) => { s.gear.Slot_Chest.flawless = null; });
+  bad('a level of 0 for the character', (s) => { s.character.level = 0; });
+  bad('runes as a number', (s) => { s.runes = 5; });
+  // The prose and the schema describe the same keys.
+  const md = readFileSync(doc('CHARACTER-SHEET.md'), 'utf8');
+  const missing = [...Object.keys(schema.properties), ...Object.keys(schema.$defs.gearEntry.properties)].filter((k) => !md.includes('`' + k + '`'));
+  ok('docs/CHARACTER-SHEET.md names every key the schema has', missing.length === 0, missing.join(', '));
+  ok('...links the schema and both examples, and names the validation command', ['schema/character-sheet.v1.json', 'examples/sheet-minimal.json', 'examples/sheet-full.json', 'bench import', '--check']
+    .every((t) => md.includes(t)));
+  ok('...and lists the 15 combat slots the gear is keyed by', engine.cat.combatSlots().every((s) => md.includes('`' + s.id + '`')));
+  // The annotated example is promised complete: with its comments taken out
+  // it must be sheet-full.json itself, so neither can drift from the other.
+  const block = md.match(/```jsonc\n([\s\S]*?)```/)?.[1] ?? '';
+  let annotated = null;
+  try { annotated = JSON.parse(block.split('\n').map((l) => l.replace(/\s*\/\/.*$/, '')).join('\n')); } catch { annotated = null; }
+  ok('...and its annotated example is the whole of sheet-full.json, key for key', annotated !== null
+    && sheetCanon(annotated) === sheetCanon(JSON.parse(readFileSync(doc('examples/sheet-full.json'), 'utf8'))));
+  bad('an ItemStatus buff without the item that applied it', (s) => { delete s.buffs[0].item; });
+  const nullStars = JSON.parse(readFileSync(doc('examples/sheet-full.json'), 'utf8'));
+  nullStars.gear.Slot_Chest.upgrade = null;
+  ok('the schema takes upgrade null - recorded as none - and the reader prices it at 0 stars', sheetSchemaProblems(schema, nullStars).length === 0
+    && readSheet(engine, nullStars).loadout.gear.Slot_Chest.stars === 0);
+} catch (e) { crashed(e); }
+
+group('character sheet import: open rather than empty, pins that follow their values, and the main hand');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet, toSheet, reportLines } = sheetLib;
+  const { cat, plan } = engine;
+  const results = [];
+  const keep = (r) => { results.push(r); return r; };
+  const v1Sheet = (gear, more = {}) => ({ format: 'farever-character-sheet', version: 1, character: { class: 'Rogue', level: 25 }, gear, ...more });
+
+  // The modkit dump. An entry this install cannot place still sat in some
+  // slot; the slots it may have filled stay open instead of reading "empty".
+  const W = (kind, o = {}) => ({ kind, level: 25, upgrade: 0, rarity: -1, count: 1, class: 'st.item.Armor', infusion: null, infusionStat: null, prismatic: false, flawless: false, ...o });
+  const dagger = W('Daggers_Demondash', { upgrade: 3, rarity: 3, class: 'st.item.Weapon' });
+  const renamed = keep(readSheet(engine, { character: 'Tester', bankSlots: 0, bank: [], bags: [], equipped: [dagger, W('Chest_Renamed_By_A_Patch')] }, { cls: 'Rogue' }));
+  const armour = cat.combatSlots().filter((s) => s.types.some((t) => cat.isArmorType(t))).map((s) => s.id);
+  ok('modkit: a renamed armour piece leaves every free armour slot open - not worn, not held - and one gap says why', armour.length === 8
+    && armour.every((s) => !renamed.loadout.gear[s] && !renamed.pins.gear.includes(s))
+    && renamed.gaps.includes(`8 gear slots are left open rather than held empty (${armour.join(', ')}) - the dump's Chest_Renamed_By_A_Patch, dropped above, may have been worn there`), JSON.stringify(renamed.gaps));
+  ok('...while the slots no armour fits are still recorded empty and held', ['Slot_Weapon2', 'Slot_OffhandWeapon', 'Slot_Neck', 'Slot_FingerLeft', 'Slot_Trinket', 'Slot_FingerRight']
+    .every((s) => renamed.pins.gear.includes(s) && !renamed.loadout.gear[s]) && renamed.pins.gear.includes('Slot_Weapon1') && renamed.pins.gear.length === 7, JSON.stringify(renamed.pins.gear));
+  const asV1 = readSheet(engine, v1Sheet({ Slot_Chest: { item: 'Chest_Renamed_By_A_Patch' } }));
+  ok('...which is what the same unread piece does in a version-1 sheet', !asV1.pins.gear.includes('Slot_Chest') && !renamed.pins.gear.includes('Slot_Chest'));
+  const unusable = keep(readSheet(engine, { character: 'Tester', equipped: [dagger, W('Chest_RBee_Fig')] }, { cls: 'Rogue' }));
+  ok('modkit: a piece the class cannot use leaves open only the slots it fits', !unusable.pins.gear.includes('Slot_Chest') && unusable.pins.gear.length === 14
+    && unusable.gaps.includes('1 gear slot is left open rather than held empty (Slot_Chest) - the dump\'s Chest_RBee_Fig, dropped above, may have been worn there'), JSON.stringify(unusable.gaps));
+  const food = keep(readSheet(engine, { character: 'Tester', equipped: [dagger, { kind: 'Cheese_Renamed_By_A_Patch', level: 1, count: 2, class: 'st.Item' }] }, { cls: 'Rogue' }));
+  ok('modkit: an unknown consumable is dropped and opens nothing', food.pins.gear.length === 15 && !food.gaps.some((x) => /left open rather than held empty/.test(x))
+    && food.dropped.some((d) => d.id === 'Cheese_Renamed_By_A_Patch'));
+  const anything = keep(readSheet(engine, { character: 'Tester', equipped: [dagger, { kind: 'Mystery_Renamed_By_A_Patch', level: 25 }] }, { cls: 'Rogue' }));
+  ok('modkit: an unknown entry with no class may be anything, so every free combat slot stays open', sheetCanon(anything.pins.gear) === sheetCanon(['Slot_Weapon1']), JSON.stringify(anything.pins.gear));
+  const both = keep(readSheet(engine, { character: 'Tester', equipped: [dagger, W('Chest_EKobold_AssWiz', { infusion: 'Infusion_Kobold_DPS', infusionStat: null, infusionBonusStat: 'CritChanceRating' })] }, { cls: 'Rogue' }));
+  ok('modkit: a null infusionStat beside a rating under the game\'s own name reads the rating, as inventory.mjs does', both.loadout.gear.Slot_Chest?.infusionStat === 'CritChanceRating'
+    && both.dropped.length === 0, JSON.stringify(both.dropped));
+
+  // A saved build's pins hold VALUES: a pin outlives normalisation only when
+  // its value came through it unchanged.
+  const full = sheetFull();
+  const v1 = readSheet(engine, full);
+  const ev = engine.evaluate(v1.loadout, { target: engine.combat.foe('boss', 25), rank: 2 });
+  const saved = () => {
+    const env = sheetEnvelope({ engine, loadout: structuredClone(v1.loadout), options: { rank: 2 }, metrics: {}, ev, pinned: {
+      gear: ['Slot_Head', 'Slot_Chest', 'Slot_Neck'], augments: ['Slot_Head/AugmentDemonSigil', 'Slot_Neck/AugmentJeweller'],
+      skills: ['class/ClassSkill', 'Slot_Weapon2'], infusions: ['Slot_Chest'],
+    } });
+    // What lane D's saved-pin block adds beside the four the UI writes today.
+    env.pinned.talents = true;
+    env.pinned.runes = ['Rogue_DeathMark', 'Rogue_Shadowstep'];
+    return env;
+  };
+  const held = keep(readSheet(engine, saved()));
+  ok('envelope: with nothing dropped, every pin of the run is held', sheetCanon(held.pins) === sheetCanon({
+    gear: ['Slot_Head', 'Slot_Chest', 'Slot_Neck'], augments: ['Slot_Head/AugmentDemonSigil', 'Slot_Neck/AugmentJeweller'], skills: ['class/ClassSkill', 'Slot_Weapon2'],
+    runes: ['Rogue_DeathMark', 'Rogue_Shadowstep'], talents: true, infusions: ['Slot_Chest'],
+  }), sheetCanon(held.pins));
+  const env = saved();
+  env.build.augments['Slot_Head/AugmentDemonSigil'] = 'DemonSigil_War_SurgeOfViolence';
+  env.build.augments['Slot_Neck/AugmentJeweller'] = 'Augment_Removed_By_A_Patch';
+  env.build.gear.Slot_Chest.infusion = 'Infusion_Removed_By_A_Patch';
+  env.build.talents = { Rogue_Talent_VirulentMagic: 2 };
+  env.build.runes.Rogue_DeathMark = 'Rune_Removed_By_A_Patch';
+  env.build.skills['class/ClassSkill'] = ['Rogue_Shadowstep', 'Skill_Removed_By_A_Patch', 'Rogue_DeathMark', 'Rogue_KnivesTempest'];
+  const broke = keep(readSheet(engine, env));
+  ok('envelope: a pinned sigil that was dropped is not held as an empty socket, nor a dropped augment', !broke.pins.augments.includes('Slot_Head/AugmentDemonSigil')
+    && !broke.pins.augments.includes('Slot_Neck/AugmentJeweller') && !broke.loadout.augments['Slot_Head/AugmentDemonSigil']
+    && broke.dropped.some((d) => d.id === 'DemonSigil_War_SurgeOfViolence') && broke.dropped.some((d) => d.id === 'Augment_Removed_By_A_Patch'), sheetCanon(broke.pins));
+  ok('...nor a dropped infusion as "not infused", while the piece itself stays held', !broke.pins.infusions.includes('Slot_Chest') && broke.pins.gear.includes('Slot_Chest'));
+  ok('...nor a dropped talents block as no talent spent', broke.pins.talents === false && Object.keys(broke.loadout.talents).length === 0 && broke.dropped.some((d) => d.field === 'build.talents'));
+  ok('...nor a rune slot whose rune was dropped, while the rune that came through stays held', !broke.pins.runes.includes('Rogue_DeathMark') && broke.pins.runes.includes('Rogue_Shadowstep'));
+  ok('...nor a pool that lost a pick, while the untouched pool stays held', !broke.pins.skills.includes('class/ClassSkill') && broke.pins.skills.includes('Slot_Weapon2'));
+
+  // The main hand. One skill slot at level 1, so its pick is a choice there;
+  // from level 2 it holds every skill it carries.
+  for (const c of cat.classes) {
+    const w = cat.items.find((it) => cat.isWeaponType(it.type) && it.slots.includes('Slot_Weapon1') && (it.minLevel ?? 0) <= 1 && cat.usableBy(it, c.aptitude)
+      && (it.skills ?? []).filter((id) => plan.typeOf(id) === 'WeaponSkill').length === 2);
+    if (!w) continue;
+    const x = emptyLoadout(cat, c.unit, 1);
+    x.gear.Slot_Weapon1 = { item: w.id, rarity: w.rarity, stars: 0 };
+    plan.pruneSelection(x);
+    const pool = plan.pools(x).find((p) => p.key === 'Slot_Weapon1');
+    x.skills.Slot_Weapon1 = [pool.options[1]];
+    const sheet = toSheet(engine, x);
+    const back = keep(readSheet(engine, JSON.stringify(sheet)));
+    ok(`${c.unit} level 1: the main hand's one pick is written as weaponSkills.Slot_Weapon1, read back and held`, pool.slots === 1
+      && sheetCanon(sheet.weaponSkills?.Slot_Weapon1) === sheetCanon([pool.options[1]]) && sheetCanon(back.loadout) === sheetCanon(x)
+      && back.pins.skills.includes('Slot_Weapon1') && back.dropped.length === 0, `${sheetCanon(back.loadout)}\n  vs ${sheetCanon(x)}`);
+    const d = structuredClone(x);
+    d.skills.Slot_Weapon1 = [pool.options[0]];
+    const backD = keep(readSheet(engine, toSheet(engine, d)));
+    ok(`${c.unit} level 1: ...the default pick too, so the bench's own sheet leaves no main-hand gap`, sheetCanon(backD.loadout) === sheetCanon(d)
+      && backD.pins.skills.includes('Slot_Weapon1') && !backD.gaps.some((g) => /main-hand pick/.test(g)), JSON.stringify(backD.gaps));
+  }
+  const lv1 = (more) => keep(readSheet(engine, { ...v1Sheet({ Slot_Weapon1: { item: 'Daggers_Start', rarity: 'Common' } }, more), character: { class: 'Rogue', level: 1 } }));
+  ok('level 1 with no main-hand pick: a gap, the default stands, open', lv1({}).gaps.includes('the main-hand pick (weaponSkills for Slot_Weapon1) is not recorded - at level 1 the main hand holds 1 of its 2 skills; the bench\'s default stands, open to the search'));
+  const byWeapon = lv1({ weaponSkills: { Daggers_Start: ['Daggers_Start_Skill2'] } });
+  ok('...and the weapon-keyed arsenal entry of the main-hand weapon is dormant even there, said so', sheetCanon(byWeapon.loadout.skills.Slot_Weapon1) === sheetCanon(['Daggers_Start_Skill1'])
+    && byWeapon.notes.includes('weaponSkills for Daggers_Start ignored - an arsenal entry for the main hand or the offhand is dormant; at level 1 the main hand\'s skill slot is read from weaponSkills.Slot_Weapon1'), JSON.stringify(byWeapon.notes));
+  const x25 = structuredClone(v1.loadout);
+  x25.skills.Slot_Weapon1 = [...x25.skills.Slot_Weapon1].reverse();
+  const s25 = toSheet(engine, x25);
+  ok('level 25: a main-hand order of its own is written, and read back for its order - from a sheet and from a bare loadout', sheetCanon(s25.weaponSkills?.Slot_Weapon1) === sheetCanon(x25.skills.Slot_Weapon1)
+    && sheetCanon(keep(readSheet(engine, s25)).loadout) === sheetCanon(x25) && sheetCanon(keep(readSheet(engine, structuredClone(x25))).loadout) === sheetCanon(x25));
+  ok('...while the default order writes no main-hand entry, as a game exporter writes none', !('Slot_Weapon1' in (toSheet(engine, v1.loadout).weaponSkills ?? {})));
+  const fewer = structuredClone(v1.loadout);
+  fewer.skills.Slot_Weapon1 = ['Daggers_Demondash_Skill2'];
+  const rf = keep(readSheet(engine, fewer));
+  ok('...and a loadout holding fewer main-hand skills than the hand carries reads as all of them, named, not reset in silence', sheetCanon(rf.loadout.skills.Slot_Weapon1) === sheetCanon(['Daggers_Demondash_Skill1', 'Daggers_Demondash_Skill2'])
+    && rf.notes.includes('weaponSkills.Slot_Weapon1 lists Daggers_Demondash_Skill2 - at level 25 the main hand holds every skill Daggers_Demondash carries (Daggers_Demondash_Skill1, Daggers_Demondash_Skill2), so the list is not read'), JSON.stringify(rf.notes));
+
+  // toSheet takes the editor's half-made build without a TypeError.
+  let threw = null;
+  let odd = null;
+  try {
+    odd = toSheet(engine, { class: 'Rogue', level: 25, gear: { Slot_Weapon1: { item: 'Daggers_Demondash', rarity: 7 }, Slot_Head: 'hat' }, augments: null,
+      skills: { 'class/ClassSkill': null, Slot_Weapon2: 'Daggers_DuplicatePoison_Skill1', Slot_Weapon1: 5 }, runes: 'none', talents: [] });
+  } catch (e) { threw = e; }
+  ok('toSheet writes a value that is not of its type as not recorded, and throws nothing', threw === null && odd.gear.Slot_Head === null && !('weaponSkills' in odd)
+    && !('ClassSkill' in odd.classSkills) && sheetCanon(odd.runes) === '[]' && odd.gear.Slot_Weapon1.rarity === 'Rare', String(threw));
+
+  // A byte-order mark, which a Windows editor may write first.
+  ok('a file that opens with a byte-order mark reads as the same sheet', sheetCanon(readSheet(engine, String.fromCharCode(0xfeff) + JSON.stringify(full)).loadout) === sheetCanon(v1.loadout));
+  ok('...and src/charsheet.mjs holds no literal byte-order mark, which a tool could strip unseen', !readFileSync(fileURLToPath(new URL('../src/charsheet.mjs', import.meta.url)), 'utf8').includes(String.fromCharCode(0xfeff)));
+
+  // The report: another build first, the observed blocks said, keys as spelled.
+  const moved = sheetFull();
+  moved.source.bootSha256 = 'a'.repeat(64);
+  moved.gear.Slot_Neck = { item: 'Necklace_Gone_After_A_Patch' };
+  const rmv = readSheet(engine, moved);
+  const lines = reportLines(rmv);
+  const at = (re) => lines.findIndex((l) => re.test(l));
+  ok('report: another game build is said right after who wrote the sheet - before the drops it explains - and once', at(/^The sheet was written on another game build \(hlboot\.dat aaaaaaaaaaaa\)/) === at(/^Written by /) + 1
+    && at(/another game build/) < at(/^Dropped gear\.Slot_Neck/) && lines.filter((l) => /another game build/.test(l)).length === 1 && rmv.notes.includes(rmv.buildMismatch), lines.join(' | '));
+  ok('report: the observed buffs and stats each get a line', lines.includes('Observed buff, carried and not priced in v1: ItemStatus (ElixirOfMinorStrength, 1 stack, 1745 s left).')
+    && lines.includes('Observed stats, carried and not compared in v1: 5 attributes - Vitality 214, Strength 44, Dexterity 166, CritChance 15.202235795182705, ArmorPenetration 26.061343299391655.'), lines.join(' | '));
+  const keyed = reportLines(readSheet(engine, v1Sheet({ Slot_Weapon1: { item: 'Daggers_Demondash', rarity: 'Epic' }, Slot_Legs: { item: 'Legs_EKobold_AssWiz', infusion: 'Infusion_Kobold_DPS', infusionBonusStat: 'CritChanceRating' } },
+    { weaponSkills: { Daggers_Demondash: [] }, classSkills: { RoguePoison: [] } })));
+  ok('report: a note that opens with a key prints the key as it is spelled', ['Note: infusionBonusStat (the game', 'Note: weaponSkills for Daggers_Demondash', 'Note: classSkills.RoguePoison']
+    .every((t) => keyed.some((l) => l.startsWith(t))) && !keyed.some((l) => /^Note: (InfusionBonusStat|WeaponSkills|ClassSkills)/.test(l)), keyed.join(' | '));
+  ok('...and one that opens with a word is a sentence', reportLines(readSheet(engine, full, { cls: 'Warrior' })).some((l) => l.startsWith('Note: The sheet names its own class, Rogue')));
+
+  // THE GUARANTEE, on every result above.
+  const broken = results.map((r, i) => ({ i, ...sheetAccepted(engine, r) })).filter((x) => !x.same || x.illegal);
+  ok(`every one of the ${results.length} results above is a build sanitizeLoadout leaves as is and the game accepts`, results.length > 12 && broken.length === 0, JSON.stringify(broken));
+} catch (e) { crashed(e); }
+
+// --- submission bundle ----------------------------------------------------------
+// What `bench submit` and the UI's "Send a fight" pack and send
+// (src/submit.mjs): one zip of fixed entries, read back by the shared
+// directory reader; nothing in it that names a player, unless the player
+// keeps their own; a public side built from the allowlist alone; and a
+// client that talks to pCloud only through a stand-in on 127.0.0.1 started
+// here - no test reaches the network. The fixtures are the documented
+// examples and the combat-log reader's own, built from ids.
+group('character sheet import: gaps compared by meaning, a stated build written as stated, and keys spelled __proto__');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet, recordedSheet, pinnedSheet, openKeys, reportItems, reportLines, resolveClass, benchVersion } = sheetLib;
+  // GAPS BY MEANING. The order a file writes its keys in is not the order of
+  // a gap's slots: the same pieces left unsaid read as one sentence, in slot
+  // order, and an import written again names it again - no spurious "no
+  // longer names" (it used to compare the two sentences as strings).
+  const infusable = (slot) => [...engine.cat.itemById.values()].find((it) => it.slots.includes(slot) && engine.cat.usableBy(it, 'Fighter')
+    && (it.minLevel ?? 1) <= 25 && engine.cat.canInfuse(it));
+  const infusion = [...engine.cat.infusions.keys()][0];
+  const head = infusable('Slot_Head');
+  const feet = infusable('Slot_Feet');
+  const backwards = { class: 'Warrior', level: 25, gear: { Slot_Feet: { item: feet.id, infusion }, Slot_Head: { item: head.id, infusion } } };
+  const r = readSheet(engine, backwards);
+  ok('a gap names its slots in slot order, whatever order the file wrote them in',
+    r.missing.infusionStat.join() === 'Slot_Head,Slot_Feet' && r.gaps.includes('the infusion bonus stat is not recorded on Slot_Head, Slot_Feet - its bonus line is not priced'),
+    JSON.stringify(r.gaps));
+  const again = recordedSheet(engine, r);
+  ok('...and written again it names the same gaps, by meaning: no problem said', again.problems.length === 0, again.problems.join(' | '));
+  const back = readSheet(engine, again.sheet);
+  ok('...read back, it leaves open exactly what the import left open', sheetCanon([...openKeys(back)].sort()) === sheetCanon([...openKeys(r)].sort())
+    && openKeys(r).has('infusionStat:Slot_Head') && openKeys(r).has('slot:Slot_Weapon1') === false, JSON.stringify([...openKeys(r)]));
+  ok('...missing is the data every gap sentence is written from', ['level', 'openSlots', 'slots', 'rarity', 'upgrade', 'flawless', 'prismatic', 'infusion',
+    'infusionStat', 'sockets', 'talents', 'runes', 'ranks', 'pools'].every((k) => k in r.missing) && Array.isArray(r.missing.pools));
+
+  // A STATED BUILD. The editor's build, or the one typed on the command line,
+  // goes as what was stated: what the pins hold, nothing else.
+  const lo = readSheet(engine, sheetFull()).loadout;
+  const one = pinnedSheet(engine, lo, { gear: ['Slot_Weapon1'], augments: [], skills: new Set(), runes: [], talents: false, infusions: [] });
+  ok('pinnedSheet writes the pinned slot and nothing the pins left alone: no other slot, no talents, runes or picks',
+    Object.keys(one.sheet.gear).join() === 'Slot_Weapon1' && !('talents' in one.sheet) && !('runes' in one.sheet)
+      && !('classSkills' in one.sheet) && !('weaponSkills' in one.sheet), JSON.stringify(one.sheet));
+  const oneBack = readSheet(engine, one.sheet);
+  ok('...read back, each part no pin held is a gap, open to the search', oneBack.missing.slots.length === 14 && oneBack.missing.talents === true
+    && oneBack.pins.gear.join() === 'Slot_Weapon1', JSON.stringify(oneBack.missing));
+  const stated = pinnedSheet(engine, lo, { gear: ['Slot_Weapon1'] }, { pieces: new Map([['Slot_Weapon1', { stars: true }]]) });
+  const w = stated.sheet.gear.Slot_Weapon1;
+  ok('...with `pieces`, a pinned piece carries only the fields marked stated', 'upgrade' in w && !('rarity' in w) && !('flawless' in w) && !('level' in w),
+    JSON.stringify(w));
+  const socketHost = Object.keys(lo.augments).map((k) => k.split('/')[0]).find((slot) => engine.cat.socketsFor(engine.cat.itemById.get(lo.gear[slot]?.item)).length > 1);
+  if (socketHost) {
+    const types = engine.cat.socketsFor(engine.cat.itemById.get(lo.gear[socketHost].item));
+    const partSockets = pinnedSheet(engine, lo, { gear: [socketHost], augments: [`${socketHost}/${types[0]}`] });
+    ok('...a piece\'s sockets are recorded whole, and the ones no pin held are said to go as empty',
+      partSockets.emptied.sockets.some((x) => x.slot === socketHost && x.types.join() === types.slice(1).join()), JSON.stringify(partSockets.emptied));
+  } else {
+    ok('the full example has a piece with two sockets to pin one of', false);
+  }
+  const orphan = pinnedSheet(engine, lo, { gear: [], augments: ['Slot_Head/AugmentDemonSigil'] });
+  ok('...and a socket pinned with no piece pinned under it is not written, and said', orphan.unplaced.join() === 'Slot_Head');
+  // A pinned infusion states its piece's Prismatic flag (review: the CLI
+  // left it unstated and the UI stated it, so one build packed to two
+  // sheets): a `pieces` entry that does not name the flag - the CLI's
+  // typedPieces, the editor's own pieces - leaves it to the infusion's pin.
+  const infused = Object.keys(lo.gear).find((slot) => lo.gear[slot]?.infusion);
+  const withInf = pinnedSheet(engine, lo, { gear: [infused], infusions: [infused] }, { pieces: { [infused]: {} } });
+  const withoutInf = pinnedSheet(engine, lo, { gear: [infused] }, { pieces: { [infused]: {} } });
+  ok('...a pinned infusion is stated with its piece\'s Prismatic flag, so the read-back has no Prismatic gap; an unpinned one states neither',
+    !!infused && withInf.sheet.gear[infused].prismatic === false && !!withInf.sheet.gear[infused].infusion
+      && !readSheet(engine, withInf.sheet).missing.prismatic.length && !('prismatic' in withoutInf.sheet.gear[infused]) && !('infusion' in withoutInf.sheet.gear[infused]),
+    JSON.stringify({ withInf: withInf.sheet.gear[infused], withoutInf: withoutInf.sheet.gear[infused] }));
+  // ...with or without `pieces` (review: with pieces null the flag stayed
+  // on a piece whose infusion was unpinned and written as a gap).
+  const loP = structuredClone(lo);
+  loP.gear[infused].prismatic = true;
+  const prisPinned = pinnedSheet(engine, loP, { gear: [infused], infusions: [infused] }, { pieces: { [infused]: {} } });
+  const prisBare = pinnedSheet(engine, loP, { gear: [infused] });
+  ok('...the flag goes with the infusion\'s pin: true stated with it, nothing stated without it - `pieces` given or not',
+    prisPinned.sheet.gear[infused].prismatic === true && !('prismatic' in prisBare.sheet.gear[infused]) && !('infusion' in prisBare.sheet.gear[infused]),
+    JSON.stringify({ prisPinned: prisPinned.sheet.gear[infused], prisBare: prisBare.sheet.gear[infused] }));
+  // A piece a FILE recorded says what it recorded of the flag
+  // (recordedPieces): the infusion and not the flag, or the flag and not the
+  // infusion - so an import sent from the editor states what the file did.
+  const fileNoFlag = pinnedSheet(engine, loP, { gear: [infused], infusions: [infused] }, { pieces: { [infused]: { prismatic: false } } });
+  const fileFlagOnly = pinnedSheet(engine, loP, { gear: [infused] }, { pieces: { [infused]: { prismatic: true } } });
+  ok('...a file\'s piece states the flag as the file did: not, beside its infusion, when the file left it out; true without its infusion when the file said so',
+    !('prismatic' in fileNoFlag.sheet.gear[infused]) && !!fileNoFlag.sheet.gear[infused].infusion
+      && fileFlagOnly.sheet.gear[infused].prismatic === true && !('infusion' in fileFlagOnly.sheet.gear[infused]),
+    JSON.stringify({ fileNoFlag: fileNoFlag.sheet.gear[infused], fileFlagOnly: fileFlagOnly.sheet.gear[infused] }));
+
+  // AN IMPORT SENT FROM THE EDITOR (review: the editor states the fills of
+  // the loadout - a weapon's row rarity, 0 stars - and drops the flags the
+  // file recorded, so one sheet made two bundles). recordedPieces says what
+  // the file stated of each piece; written with it, the stated build reads
+  // back leaving open exactly what the import left open, piece by piece.
+  const { recordedPieces } = sheetLib;
+  const edgeText = JSON.stringify({
+    format: 'farever-character-sheet', version: 1, character: { class: 'Warrior', level: 25 },
+    gear: {
+      Slot_Weapon1: { item: 'GA_Craft' },
+      Slot_Chest: { item: 'Chest_EManfish_FigWiz', infusion: 'Infusion_Manfish_DPS', infusionStat: null },
+      Slot_Legs: { item: 'Legs_EKobold_Fig', prismatic: true, flawless: true },
+      Slot_Feet: { item: 'Feet_EBee_Fig', upgrade: 1, flawless: false, prismatic: true, infusion: 'Infusion_Kobold_DPS' },
+    },
+  });
+  for (const [what, text] of [['sheet-minimal', JSON.stringify(sheetMinimal())], ['sheet-full', JSON.stringify(sheetFull())], ['a sheet of edge cases', edgeText]]) {
+    const imp = readSheet(engine, text);
+    const viaEditor = pinnedSheet(engine, imp.loadout, imp.pins, { pieces: recordedPieces(imp) }).sheet;
+    const again = readSheet(engine, viaEditor);
+    const pieceKeys = (r) => [...openKeys(r)].filter((k) => /^(rarity|upgrade|flawless|prismatic|infusion|infusionStat):/.test(k)).sort();
+    ok(`recordedPieces: ${what}, imported and written from the editor's loadout with it, leaves open the pieces' fields the file left open`,
+      sheetCanon(pieceKeys(again)) === sheetCanon(pieceKeys(imp)) && sheetCanon(again.loadout.gear) === sheetCanon(imp.loadout.gear),
+      JSON.stringify({ file: pieceKeys(imp), editor: pieceKeys(again) }));
+  }
+  const edge = recordedPieces(readSheet(engine, edgeText));
+  ok('...and says, of each piece, what the file did not state',
+    edge.Slot_Weapon1.rarity === false && edge.Slot_Weapon1.stars === false && edge.Slot_Chest.prismatic === false && edge.Slot_Chest.infusionStat === true
+      && edge.Slot_Legs.flawless === true && edge.Slot_Feet.infusionStat === false, JSON.stringify(edge));
+
+  // THE CLASS A LOG NAMES, one reading for the submission, verify and the UI.
+  const { logClass } = sheetLib;
+  ok('logClass reads the class a read log names its character, in any case, as a unit id - null when it names none or none of the game\'s',
+    logClass(engine.cat, { stats: { className: 'warrior' } }) === 'Warrior' && logClass(engine.cat, { stats: { className: 'Assassin' } }) === 'Rogue'
+      && logClass(engine.cat, { stats: { className: null } }) === null && logClass(engine.cat, { stats: { className: 'Bard' } }) === null
+      && logClass(engine.cat, null) === null);
+
+  // __proto__. A key spelled so is a key: named or dropped with a reason,
+  // never gone in silence.
+  const proto = readSheet(engine, '{"format":"farever-character-sheet","version":1,"character":{"class":"Warrior","level":25},"gear":{},"talents":{"__proto__":1}}');
+  ok('a talent node "__proto__" is a node no tree has: the talents block is dropped, with its reason, and not held as "no point"',
+    proto.pins.talents === false && proto.dropped.some((d) => d.field === 'talents' && /__proto__/.test(d.why)), JSON.stringify(proto.dropped));
+  const protoGear = readSheet(engine, '{"class":"Warrior","level":25,"gear":{"__proto__":{"item":"GS_Nova"}}}');
+  ok('...and a gear key "__proto__" in a bare loadout is named, not lost', protoGear.unknownKeys.includes('gear.__proto__'), JSON.stringify(protoGear.unknownKeys));
+
+  // THE REPORT as kinds; the shared readings.
+  const full = readSheet(engine, { ...sheetFull(), gear: { ...sheetFull().gear, Slot_Head: { item: 'NoSuchItem' } } });
+  const items = reportItems(full);
+  ok('every report line has a kind, a drop is "dropped" and a gap "gap", and reportLines is their text',
+    items.every((i) => typeof i.kind === 'string' && typeof i.text === 'string') && items.some((i) => i.kind === 'dropped' && i.text.startsWith('Dropped gear.Slot_Head'))
+      && sheetCanon(reportLines(full)) === sheetCanon(items.map((i) => i.text)) && items[0].kind === 'read' && items.some((i) => i.kind === 'character'));
+  ok('...and a line the reader warns of carries `warn: true` - another game build, a drop, a gap, a key not understood, an item level - '
+    + 'and no other line does: the one table `bench` colours by and the UI marks by',
+    items.some((i) => i.warn === true) && items.every((i) => (i.warn === true) === ['mismatch', 'dropped', 'gap', 'unknown', 'ilevel'].includes(i.kind))
+      && items.every((i) => i.warn === true || !('warn' in i)), JSON.stringify(items.map((i) => [i.kind, i.warn ?? null])));
+  ok('resolveClass reads a unit or an aptitude id in any case, and nothing else', resolveClass(engine.cat, 'assassin')?.unit === 'Rogue'
+    && resolveClass(engine.cat, 'warrior')?.unit === 'Warrior' && resolveClass(engine.cat, 'Paladin') === null && resolveClass(engine.cat, 7) === null);
+  ok('benchVersion is package.json\'s', benchVersion() === JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).version);
+} catch (e) { crashed(e); }
+
+function submitDocs(p) { return readFileSync(fileURLToPath(new URL(`../docs/${p}`, import.meta.url))); }
+function submitFixed(extra) { return { id: '0123456789abcdef0123456789abcdef', deleteToken: 'fedcba9876543210fedcba9876543210', now: Date.UTC(2026, 9, 19, 12, 0, 0), ...extra }; }
+function submitEntries(sub) { return Object.fromEntries(submitLib.readZip(sub.zip).map((e) => [e.name, e.data.toString('utf8')])); }
+function submitRefusal(fn) { try { fn(); return null; } catch (e) { return e instanceof subpub.SubmissionError ? { status: e.status, message: e.message } : { status: 'not a SubmissionError', message: String(e?.stack ?? e) }; } }
+function submitRejection(p) { return p.then(() => null, (e) => (e instanceof subpub.SubmissionError ? { status: e.status, message: e.message } : { status: 'not a SubmissionError', message: String(e?.stack ?? e) })); }
+// The central directory's own record of each entry, read here without the
+// module's help: CRC, method, flags and the DOS time and date.
+function submitCentral(zip) {
+  const out = [];
+  const end = zip.length - 22;
+  let p = zip.readUInt32LE(end + 16);
+  for (let i = 0; i < zip.readUInt16LE(end + 10); i++) {
+    const n = zip.readUInt16LE(p + 28);
+    out.push({ name: zip.toString('utf8', p + 46, p + 46 + n), flags: zip.readUInt16LE(p + 8), method: zip.readUInt16LE(p + 10),
+      time: zip.readUInt16LE(p + 12), day: zip.readUInt16LE(p + 14), crc: zip.readUInt32LE(p + 16) });
+    p += 46 + n + zip.readUInt16LE(p + 30) + zip.readUInt16LE(p + 32);
+  }
+  return out;
+}
+// What a send threw, itself (for its .receipt, .arrived, .sentTo), or null.
+function submitThrown(p) { return p.then(() => null, (e) => e); }
+// The code the stand-in's link carries, and a link of another folder.
+function pcloudCode() { return 'TestCode1234'; }
+function otherLink() { return 'https://e.pcloud.com/#/puplink?code=OtherCode99'; }
+// A stand-in for pCloud's uploadtolink on 127.0.0.1. Every request is read
+// as the multipart form it is (Response.formData(), as a server reads one)
+// and kept in `seen`: { method, path, query, keys (the query's names, in
+// order), headers, raw, parts, fileName, fileType, bytes }. `answer(record,
+// req)` says what pCloud would: an object, sent as JSON with HTTP 200 (as
+// pCloud answers even a refusal); { status, body } for another status, a
+// string body going as text/html; 'drop' to cut the connection once the
+// body has arrived (an answer lost); or null for no answer at all.
+// `ready` gives the link that points at it, canonical (as uploadLink gives
+// it); close() drops the sockets a request left hanging.
+function pcloudStub(answer = () => ({ result: 0 })) {
+  const seen = [];
+  const sockets = new Set();
+  const server = submitCreateServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', async () => {
+      const raw = Buffer.concat(chunks);
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const record = {
+        method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), keys: [...url.searchParams.keys()],
+        headers: req.headers, raw, parts: [], fileName: null, fileType: null, bytes: null,
+      };
+      try {
+        const form = await new Response(raw, { headers: { 'content-type': req.headers['content-type'] ?? '' } }).formData();
+        for (const [field, value] of form.entries()) {
+          record.parts.push(typeof value === 'string' ? { field, text: value }
+            : { field, name: value.name, type: value.type, bytes: Buffer.from(await value.arrayBuffer()) });
+        }
+      } catch {
+        record.parts = null;
+      }
+      const file = record.parts?.find((p) => p.bytes) ?? null;
+      if (file) Object.assign(record, { fileName: file.name, fileType: file.type, bytes: file.bytes });
+      seen.push(record);
+      let a;
+      try { a = answer(record, req); } catch (e) { a = { status: 500, body: String(e?.message ?? e) }; }
+      if (a === null) return;
+      if (a === 'drop') { req.socket.destroy(); return; }
+      const status = a.status ?? 200;
+      const body = a.status === undefined ? a : a.body;
+      res.writeHead(status, { 'content-type': typeof body === 'string' ? 'text/html' : 'application/json' });
+      res.end(typeof body === 'string' ? body : JSON.stringify(body));
+    });
+  });
+  server.on('connection', (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+  const ready = new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${server.address().port}/#/puplink?code=${pcloudCode()}`)));
+  const close = () => new Promise((resolve) => { for (const s of sockets) s.destroy(); server.close(() => resolve()); });
+  return { seen, ready, close };
+}
+// A port nobody listens on: one opened, and closed again.
+function deadLink() {
+  const dead = submitCreateServer();
+  return new Promise((resolve) => dead.listen(0, '127.0.0.1', () => resolve(dead.address().port)))
+    .then((port) => new Promise((resolve) => dead.close(() => resolve(`http://127.0.0.1:${port}/#/puplink?code=${pcloudCode()}`))));
+}
+
+group('submission bundle: the documented examples and the editor\'s build, packed and read back');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const sheetIn = submitDocs('examples/sheet-full.json');
+  const logIn = submitDocs('examples/combat-log.jsonl');
+  const make = (extra = {}) => submitLib.buildSubmission(engine, submitFixed({
+    sheet: { name: 'sheet-full.json', data: sheetIn }, log: { name: 'combat-log.jsonl', data: logIn }, ...extra,
+  }));
+  const sub = make();
+  ok('the constants the CLI and the UI read', submitLib.UPLOAD_LINK === 'https://e.pcloud.com/#/puplink?code=V437ZV4md8W0ibw8hS71eMJFTR0f2Sq4y'
+    && submitLib.UPLOADER_NAME === 'farever-bench' && submitLib.SEND_TIMEOUT_MS === 600_000 && submitLib.WITHDRAWAL_FORMAT === 'farever-bench-withdrawal'
+    && submitLib.ISSUE_REPO === 'Blaakan/farever-bench' && submitLib.FORM_TEMPLATE === 'data-submission.yml' && submitLib.NOTE_MAX === 2000
+    && submitLib.SHEET_MAX_BYTES === 512 * 1024 && submitLib.LOG_MAX_BYTES === 20 * 1024 * 1024);
+  // The module's API, by name: the one the CLI, the UI and tools/inbox.mjs
+  // are written against.
+  const apiWanted = ['FORM_TEMPLATE', 'ISSUE_REPO', 'LOG_MAX_BYTES', 'NOTE_MAX', 'SEND_TIMEOUT_MS', 'SHEET_MAX_BYTES', 'UPLOADER_NAME', 'UPLOAD_LINK',
+    'WITHDRAWAL_FORMAT', 'buildSubmission', 'deleteSubmission', 'formUrl', 'parseReceipt', 'parseUploadLink', 'pendingReceipt', 'problemsOf', 'readZip',
+    'receiptText', 'reportItems', 'reportLines', 'sendRefusal', 'sendSubmission', 'uploadLink'];
+  ok('...and its exports are the API, and nothing else', Object.keys(submitLib).sort().join() === [...apiWanted].sort().join(), Object.keys(submitLib).sort().join());
+  ok('the documented examples pack into the fixed entries, in their order',
+    JSON.stringify(sub.files.map((f) => f.name)) === JSON.stringify(['manifest.json', 'sheet.json', 'combat-log.jsonl'])
+      && subpub.zipEntryProblem(sub.files.map((f) => f.name)) === null && /^farever-bench-submission-[0-9a-f]{8}\.zip$/.test(sub.zipName), JSON.stringify(sub.files));
+  const dir = subpub.readZipDirectory(sub.zip);
+  ok('...a zip the shared directory reader takes, its sizes the files\'',
+    dir.map((d) => `${d.name}:${d.size}`).join() === sub.files.map((f) => `${f.name}:${f.bytes}`).join() && sub.zipBytes === sub.zip.length && sub.zipBytes <= subpub.MAX_ZIP_BYTES);
+  const entries = submitLib.readZip(sub.zip);
+  ok('...read back, each entry is the file packed', entries.length === 3 && entries.every((e, i) => e.name === sub.files[i].name && e.data.length === sub.files[i].bytes)
+    && JSON.stringify(JSON.parse(entries[0].data.toString('utf8'))) === JSON.stringify(sub.manifest));
+  const central = submitCentral(sub.zip);
+  ok('every entry is deflated, named in UTF-8, dated with the bundle\'s time, its CRC-32 the one node:zlib computes (where this Node has crc32)',
+    central.length === 3 && central.every((c, i) => c.method === 8 && (c.flags & 0x800) !== 0 && c.day === (((2026 - 1980) << 9) | (10 << 5) | 19) && c.time === (12 << 11)
+      && (typeof submitZlib.crc32 !== 'function' || c.crc === submitZlib.crc32(entries[i].data))), JSON.stringify(central));
+  ok('the same inputs, id and time make the same bytes, and another id other bytes', make().zip.equals(sub.zip) && !make({ id: 'f'.repeat(32) }).zip.equals(sub.zip));
+  const free1 = submitLib.buildSubmission(engine, { sheet: { name: 'a', data: sheetIn }, log: { name: 'b', data: logIn } });
+  const free2 = submitLib.buildSubmission(engine, { sheet: { name: 'a', data: sheetIn }, log: { name: 'b', data: logIn } });
+  ok('...without one, each bundle draws its own id and delete token, once, and the manifest and the public side carry that id',
+    subpub.ID_RE.test(free1.id) && subpub.TOKEN_RE.test(free1.deleteToken) && free1.id !== free2.id && free1.deleteToken !== free2.deleteToken && free1.id !== free1.deleteToken
+      && free1.manifest.id === free1.id && free1.pub.id === free1.id
+      && submitLib.readZip(free1.zip).every((e) => !e.data.toString('utf8').includes(free1.deleteToken)));
+  const tokenSha = (t) => submitHash('sha256').update(t, 'ascii').digest('hex');
+  const freeManifest = JSON.parse(submitEntries(free1)['manifest.json']);
+  // (Searched in the files the zip holds, inflated: deflate writes a token
+  // put into one as Huffman-coded bits, not as its letters, so a search of
+  // the zip's own bytes would pass it.)
+  ok('...the manifest in the zip carries the token\'s SHA-256 (deleteTokenSha256), and neither the token nor its hash is public, nor the token in any file of the zip',
+    freeManifest.deleteTokenSha256 === tokenSha(free1.deleteToken) && /^[0-9a-f]{64}$/.test(freeManifest.deleteTokenSha256)
+      && !JSON.stringify(free1.pub).includes(freeManifest.deleteTokenSha256) && !JSON.stringify(free1.pub).includes(free1.deleteToken)
+      && !free1.formUrl.includes(free1.deleteToken)
+      && Object.values(submitEntries(free1)).every((text) => !text.includes(free1.deleteToken)), JSON.stringify(freeManifest.deleteTokenSha256));
+
+  const m = sub.manifest;
+  const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
+  const accepted = JSON.parse(readFileSync(fileURLToPath(new URL('../model/accepted-build.json', import.meta.url)), 'utf8'));
+  ok('the manifest says what the bundle is: format, id, time, the token\'s SHA-256, the bench and the build its model was accepted on',
+    m.format === 'farever-bench-submission' && m.version === 1 && m.id === sub.id && m.createdAt === '2026-10-19T12:00:00.000Z'
+      && m.deleteTokenSha256 === submitHash('sha256').update('fedcba9876543210fedcba9876543210', 'ascii').digest('hex')
+      && JSON.stringify(Object.keys(m).slice(0, 5)) === '["format","version","id","createdAt","deleteTokenSha256"]'
+      && m.bench.version === pkg.version && m.bench.accepted.cdbSha === accepted.cdbSha && m.bench.accepted.bootSha === accepted.bootSha, JSON.stringify(m.bench));
+  ok('...the install: its Steam build from the app manifest, its hashes the engine\'s',
+    m.install.steamBuild === submitSteamBuildId(engine.meta.game) && m.install.cdbSha === engine.meta.cdbSha && m.install.bootSha === engine.meta.bootSha, JSON.stringify(m.install));
+  ok('...the sheet: its dialect, the class as the unit id, the level, the rank, nothing dropped',
+    m.sheet.sourceFormat === 'farever-character-sheet' && m.sheet.class === 'Rogue' && m.sheet.level === 25 && m.sheet.rank === 3 && m.sheet.dropped.length === 0
+      && Array.isArray(m.sheet.notes) && Array.isArray(m.sheet.gaps) && Array.isArray(m.sheet.unknownKeys), JSON.stringify(m.sheet));
+  const log = readCombatLog({ name: 'combat-log.jsonl', data: logIn });
+  ok('...the log: its dialect, counts, span, start, clock, encounter and whether it was solo',
+    m.log.sourceDialect === 'farever-combat-log' && m.log.events === log.stats.events && m.log.damageEvents === log.stats.damageEvents
+      && m.log.myDamageEvents === log.stats.myDamageEvents && m.log.perEvent === true && m.log.withSummary === false && m.log.duration === 9.2
+      && m.log.startedAt === log.startedAt && m.log.startedAtEstimated === false && m.log.clock === 'client-observed' && m.log.solo === true
+      && JSON.stringify(m.log.encounter) === JSON.stringify({ bossKind: 'Dummy', difficulty: 0, activityId: null, targetDummy: true, partySize: 1, outcome: null }), JSON.stringify(m.log));
+  ok('...and what was done for privacy: the sheet\'s name and the log\'s, removed', m.privacy.namesRemoved === 2 && m.privacy.ownNameKept === false
+    && JSON.stringify(sub.privacy) === JSON.stringify(m.privacy));
+
+  const sha = submitHash('sha256').update(sub.zip).digest('hex');
+  ok('the public manifest is the allowlisted part of it, with the zip\'s hash and size, and passes the shared check',
+    subpub.checkPublicManifest(sub.pub).length === 0 && sub.pub.zip.sha256 === sha && sub.zipSha256 === sha && sub.pub.zip.bytes === sub.zip.length
+      && sub.pub.log.startedAt === '2026-10-18' && sub.pub.createdAt === '2026-10-19' && sub.pub.install.steamBuild === m.install.steamBuild);
+  ok('...its title is submission-public.mjs\'s - the manual route\'s - and no issue body is written: Send opens no issue',
+    sub.issueTitle === subpub.issueTitle(sub.pub) && !('issueBody' in sub) && sub.answered === null && sub.sentTo === null);
+  const form = new URL(sub.formUrl);
+  ok('the GitHub form\'s address carries the template and the title, and no data',
+    form.origin === 'https://github.com' && form.pathname === '/Blaakan/farever-bench/issues/new' && [...form.searchParams.keys()].join() === 'template,title'
+      && form.searchParams.get('template') === 'data-submission.yml' && form.searchParams.get('title') === sub.issueTitle
+      && submitLib.formUrl() === 'https://github.com/Blaakan/farever-bench/issues/new?template=data-submission.yml', sub.formUrl);
+
+  const sheetOut = JSON.parse(entries[1].data.toString('utf8'));
+  const original = sheetLib.readSheet(engine, sheetIn);
+  const again = sheetLib.readSheet(engine, sheetOut);
+  ok('sheet.json is the import written again by toSheet - the same build, nothing dropped, the character "Submitter"',
+    sheetCanon(again.loadout) === sheetCanon(original.loadout) && again.dropped.length === 0 && again.rank === original.rank
+      && sheetOut.character.name === 'Submitter' && sheetOut.source.exporter === 'farever-bench' && sheetOut.source.writtenAt === m.createdAt, JSON.stringify(again.dropped));
+  ok('...carrying what the game showed beside the build: the per-skill ranks, the buffs, the stats and the item levels',
+    original.observed.weaponSkillRanks !== null && JSON.stringify(sheetOut.weaponSkillRanks) === JSON.stringify(original.observed.weaponSkillRanks)
+      && JSON.stringify(sheetOut.buffs) === JSON.stringify(original.observed.buffs) && JSON.stringify(sheetOut.stats) === JSON.stringify(original.observed.stats)
+      && Object.keys(original.observed.iLevel).length > 0 && Object.entries(original.observed.iLevel).every(([slot, v]) => sheetOut.gear[slot].iLevel === v.game));
+  ok('a sheet of one class beside a log of another is said, not refused', sub.problems.some((p) => /^the sheet is a Rogue and the log's character a Warrior/.test(p)), sub.problems.join(' | '));
+  const lines = submitLib.reportLines(sub, { link: submitLib.UPLOAD_LINK });
+  ok('the report says where Send puts the zip and that nothing is made public, the files, the names removed, and both readers\' reports',
+    lines[0] === `What Send does: the zip (${sub.zipBytes.toLocaleString('en-US')} bytes) goes to the project's folder on pCloud (pcloud.com), `
+      + 'where only the project\'s maintainer can read it - nothing is made public -'
+      && sub.files.every((f) => lines.some((l) => l.startsWith(`  ${f.name}  `)))
+      && lines.some((l) => /^Names: 2 removed; your character is "Submitter"/.test(l)) && lines.includes('The character sheet:') && lines.includes('The combat log:')
+      && lines.some((l) => /^Problem: the sheet is a Rogue/.test(l)) && lines.some((l) => l.includes(sub.formUrl)), lines.join('\n'));
+  const route = lines.slice(0, lines.findIndex((l) => l.startsWith('Names: ')));
+  ok('...with no title or table of an issue on that route, and never the link itself', route.length >= 5 && !route.some((l) => /^ {2}(Title|Character): /.test(l))
+    && !lines.some((l) => l.includes('V437ZV4md8W0ibw8hS71eMJFTR0f2Sq4y') || /puplink/.test(l)), route.join('\n'));
+
+  const min = submitLib.buildSubmission(engine, submitFixed({ sheet: { name: 'sheet-minimal.json', data: submitDocs('examples/sheet-minimal.json') }, log: { name: 'combat-log.jsonl', data: logIn } }));
+  ok('the minimal sheet packs too, its gaps carried in the manifest so the maintainer knows what the bench filled in',
+    min.manifest.sheet.class === 'Warrior' && min.manifest.sheet.dropped.length === 0 && min.manifest.sheet.gaps.length > 0
+      && !min.problems.some((p) => /^the sheet is a/.test(p)), JSON.stringify(min.manifest.sheet));
+
+  // The editor's build: written as a sheet first, so it takes the file's path.
+  const built = sheetDefaultBuild(engine, 'Warrior');
+  const ed = submitLib.buildSubmission(engine, submitFixed({ sheet: { loadout: built, name: 'Emsey', rank: 2 }, log: { name: 'combat-log.jsonl', data: logIn } }));
+  const edFiles = submitEntries(ed);
+  const viaSheet = sheetLib.readSheet(engine, sheetLib.toSheet(engine, built, { name: 'Emsey', rank: 2 }));
+  ok('the editor\'s build is written as a sheet, read, and written again: the same build',
+    ed.manifest.sheet.sourceFormat === 'bench-editor' && ed.manifest.sheet.class === 'Warrior' && ed.manifest.sheet.rank === 2
+      && sheetCanon(sheetLib.readSheet(engine, JSON.parse(edFiles['sheet.json'])).loadout) === sheetCanon(viaSheet.loadout), JSON.stringify(ed.manifest.sheet));
+  ok('...and the name typed in the editor is nowhere in the zip', Object.values(edFiles).every((t) => !t.includes('Emsey')) && ed.privacy.namesRemoved === 2
+    && JSON.parse(edFiles['sheet.json']).character.name === 'Submitter');
+} catch (e) { crashed(e); }
+
+group('submission bundle: no name reaches the zip, the form\'s title or its address, unless the player keeps their own');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const dummyName = cdb.row('unit', 'Dummy').texts?.name ?? 'Dummy';
+  const wfx = combatLogFixture({ dummyName, wink: true });
+  const sheetText = JSON.stringify(sheetLib.toSheet(engine, sheetDefaultBuild(engine, 'Warrior'), { name: 'Emsey' }));
+  // A sheet file named the way a modkit dump is (after the character), a
+  // Wink pair named by its fight id, a party healer who only ever buffed.
+  const parts = (extra = {}) => submitFixed({
+    sheet: { name: 'farever-inventory-Emsey.json', data: sheetText },
+    log: { name: 'fight_20261018_120000_1_1.json.timeline', data: wfx.text },
+    summary: { name: 'fight_20261018_120000_1_1.json', data: JSON.stringify(wfx.summary) },
+    note: 'MARK-note: the bee buff was up',
+    ...extra,
+  });
+  const sub = submitLib.buildSubmission(engine, parts());
+  const files = submitEntries(sub);
+  const secrets = ['Emsey', 'Tester', 'Healbot', 'acct-424242', 'acct-777777', 'char-171717', 'fight_20261018', 'farever-inventory',
+    ...(dummyName !== 'Dummy' ? [dummyName] : [])];
+  const found = Object.entries(files).flatMap(([n, t]) => secrets.filter((x) => t.includes(x)).map((x) => `${x} in ${n}`));
+  ok('a Wink pair and a named sheet: no player\'s name, account id, fight id or file name in any entry of the zip', found.length === 0, found.join(', '));
+  ok('...the five entries, the note among them as typed', Object.keys(files).join() === 'manifest.json,sheet.json,combat-log.jsonl,summary.json,note.txt'
+    && files['note.txt'] === 'MARK-note: the bee buff was up\n', Object.keys(files).join());
+  const publicText = JSON.stringify(sub.pub) + sub.issueTitle + subpub.issueRows(sub.pub).flat().join('\n') + sub.formUrl;
+  ok('...and none of it, nor the note, in what may be seen: the public manifest, its title and table, the form\'s address',
+    [...secrets, 'MARK'].every((x) => !publicText.includes(x)), [...secrets, 'MARK'].filter((x) => publicText.includes(x)).join(', '));
+  ok('...three names removed: the sheet\'s, the log\'s own and the party healer\'s', sub.privacy.namesRemoved === 3 && sub.privacy.ownNameKept === false, JSON.stringify(sub.privacy));
+  const head = JSON.parse(files['combat-log.jsonl'].split('\n')[0]);
+  ok('...the log converted to v1, its character "Submitter" and uid "1", as the sheet\'s is "Submitter"',
+    head.format === 'farever-combat-log' && head.me === '1' && head.character?.name === 'Submitter' && JSON.parse(files['sheet.json']).character.name === 'Submitter'
+      && sub.manifest.log.sourceDialect === 'wink-timeline' && sub.manifest.log.withSummary === true && sub.manifest.log.solo === false);
+
+  const kept = submitLib.buildSubmission(engine, parts({ keepName: true }));
+  const kf = submitEntries(kept);
+  ok('keepName keeps the sheet\'s name in sheet.json and the log\'s in its header, once each, and nowhere else',
+    JSON.parse(kf['sheet.json']).character.name === 'Emsey' && kf['sheet.json'].split('Emsey').length === 2
+      && JSON.parse(kf['combat-log.jsonl'].split('\n')[0]).character?.name === 'Tester' && kf['combat-log.jsonl'].split('Tester').length === 2
+      && !kf['manifest.json'].includes('Emsey') && !kf['manifest.json'].includes('Tester') && !kf['summary.json'].includes('Tester'));
+  ok('...the healer still goes, and the count is one name removed, the player\'s own kept',
+    Object.values(kf).every((t) => !t.includes('Healbot')) && kept.privacy.namesRemoved === 1 && kept.privacy.ownNameKept === true, JSON.stringify(kept.privacy));
+  ok('...and what is public is the same either way, but for the zip', JSON.stringify({ ...kept.pub, zip: null }) === JSON.stringify({ ...sub.pub, zip: null }));
+
+  // An importer's sentence that quotes a name: carried with the name cut out.
+  const odd = JSON.parse(sheetText);
+  const slot = Object.keys(odd.gear).find((k) => odd.gear[k]);
+  odd.gear[slot].Emsey = 1;
+  const cut = submitLib.buildSubmission(engine, parts({ sheet: { name: 'odd.json', data: JSON.stringify(odd) } }));
+  ok('a name an importer\'s sentence would carry into the manifest is cut out of it', cut.manifest.sheet.unknownKeys.includes(`gear.${slot}.<name removed>`)
+    && Object.values(submitEntries(cut)).every((t) => !t.includes('Emsey')), JSON.stringify(cut.manifest.sheet.unknownKeys));
+
+  // FAIL CLOSED: a name that is also a value the bundle carries.
+  const named = JSON.parse(sheetText);
+  const item = named.gear.Slot_Weapon1.item;
+  named.character.name = item;
+  const r1 = submitRefusal(() => submitLib.buildSubmission(engine, parts({ sheet: { name: 'x.json', data: JSON.stringify(named) } })));
+  ok('a character named like a value the bundle carries is refused, naming the file and the field',
+    r1?.status === 400 && r1.message.startsWith(`A player's name is still in the bundle: "${item}"`) && r1.message.includes('sheet.json (gear.Slot_Weapon1.item)'), JSON.stringify(r1));
+  const clash = combatLogFixture({ dummyName, wink: true, mutate: (h, ev) => { ev[20].sourceName = 'client-observed'; } });
+  const r2 = submitRefusal(() => submitLib.buildSubmission(engine, parts({ log: { name: 'f.json.timeline', data: clash.text } })));
+  ok('...and so is a log whose healer is named like a word the log writes, in the log reader\'s sentence',
+    r2?.status === 400 && r2.message.startsWith('The combat log f.json.timeline cannot be sent: someone in this fight is, or could be, named "client-observed"'), JSON.stringify(r2));
+} catch (e) { crashed(e); }
+
+group('submission bundle: the caps, the note, a summary alone, Wink\'s "Boss" and the Steam build');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const sheet = { name: 'sheet-minimal.json', data: submitDocs('examples/sheet-minimal.json') };
+  const logIn = { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') };
+  const build = (extra) => submitLib.buildSubmission(engine, submitFixed({ sheet, log: logIn, ...extra }));
+  const refused = (extra) => submitRefusal(() => build(extra));
+
+  ok('a note of NOTE_MAX characters is packed as note.txt, as typed', submitEntries(build({ note: 'x'.repeat(submitLib.NOTE_MAX) }))['note.txt'] === `${'x'.repeat(2000)}\n`);
+  const long = refused({ note: 'x'.repeat(submitLib.NOTE_MAX + 1) });
+  ok('...one character more is refused as over a cap (413), with the numbers', long?.status === 413 && long.message === 'The note is 2,001 characters; a note may hold at most 2,000.', JSON.stringify(long));
+  ok('...a note of blanks is no note, and a note that is not text is refused (400)',
+    !('note.txt' in submitEntries(build({ note: ' \n\t ' }))) && refused({ note: 42 })?.status === 400);
+  const bigSheet = refused({ sheet: { name: 'big.json', data: `${' '.repeat(submitLib.SHEET_MAX_BYTES)}{}` } });
+  ok('a sheet over 512 KB is refused unread (413)',
+    bigSheet?.status === 413 && bigSheet.message === 'The character sheet big.json is 524,290 bytes; a sheet may be at most 524,288 (512 KB).', JSON.stringify(bigSheet));
+  const bigLog = refused({ log: { name: 'big.jsonl', data: ' '.repeat(submitLib.LOG_MAX_BYTES + 1) } });
+  ok('a log over 20 MB of text is refused unread (413)',
+    bigLog?.status === 413 && bigLog.message.startsWith('The combat log big.jsonl is 20,971,521 bytes; a submission takes at most 20,971,520 (20 MB) per log'), JSON.stringify(bigLog));
+  const bomb = refused({ log: { name: 'bomb.jsonl.gz', data: gzipSync(Buffer.alloc(submitLib.LOG_MAX_BYTES + 1, 0x20)) } });
+  ok('...and so is a gzip that inflates past it, stopped at the cap', bomb?.status === 413 && /^The combat log bomb\.jsonl\.gz inflates to more than 20,971,520 bytes/.test(bomb.message), JSON.stringify(bomb));
+  ok('...while a gzipped log under it packs as the same fight', build({ log: { name: 'combat-log.jsonl.gz', data: gzipSync(logIn.data) } }).zip.equals(build({}).zip));
+
+  const noSheet = refused({ sheet: null });
+  const noLog = refused({ log: null });
+  const badSheet = refused({ sheet: { name: 'notes.txt', data: 'hello' } });
+  const badLog = refused({ log: { name: 'fight.jsonl', data: '{"format":"farever-character-sheet","version":1}' } });
+  const badId = refused({ id: 'not-an-id' });
+  ok('what cannot be packed is refused (400), in a sentence that opens with what was wrong',
+    noSheet?.status === 400 && noSheet.message.startsWith('No character sheet was given') && noLog?.status === 400 && noLog.message.startsWith('No combat log was given')
+      && badSheet?.status === 400 && badSheet.message.startsWith('The character sheet notes.txt was not read: not a character sheet: the file is not JSON')
+      && badLog?.status === 400 && badLog.message === 'The combat log was not read: fight.jsonl is a "farever-character-sheet" file, not a combat log.'
+      && badId?.status === 400, JSON.stringify([noSheet, noLog, badSheet, badLog, badId]));
+
+  // A Wink summary alone: totals, said to be totals.
+  const dummyName = cdb.row('unit', 'Dummy').texts?.name ?? 'Dummy';
+  const wfx = combatLogFixture({ dummyName, wink: true });
+  const lone = build({ log: { name: 'fight.json', data: JSON.stringify(wfx.summary) } });
+  const lf = submitEntries(lone);
+  ok('a Wink summary alone is taken as totals only: summary.json and no log, the manifest, the table and the problems saying so',
+    Object.keys(lf).join() === 'manifest.json,sheet.json,summary.json' && lone.manifest.log.sourceDialect === 'wink-summary' && lone.manifest.log.perEvent === false
+      && lone.manifest.log.events === 0 && lone.pub.log.perEvent === false
+      && subpub.issueRows(lone.pub).some(([k, v]) => k === 'Log' && /per-skill totals only/.test(v))
+      && lone.problems.some((p) => /^only the fight's summary was given/.test(p)) && !lf['summary.json'].includes('Tester') && !lf['summary.json'].includes('Healbot'),
+    JSON.stringify(lone.problems));
+  ok('...given as the summary with no log, the same bundle', build({ log: null, summary: { name: 'fight.json', data: JSON.stringify(wfx.summary) } }).zip.equals(lone.zip));
+
+  // Wink's "Boss": the meter's word for a boss it had no kind for.
+  const boss = { ...wfx.summary, bossKind: 'Boss', targetDummy: false };
+  const wl = readCombatLog({ name: 'f.json.timeline', data: wfx.text, companion: { name: 'f.json', data: JSON.stringify(boss) } });
+  const v1 = readCombatLog({ name: 'b.jsonl', data: combatLogFixture({ mutate: (h) => { h.encounter.bossKind = 'Boss'; } }).text });
+  ok('Wink\'s "Boss" reads as no boss, in a Wink summary and in a v1 header, and the game has no unit by that id',
+    wl.stats.encounter.bossKind === null && v1.stats.encounter.bossKind === null && !cdb.has('unit', 'Boss'));
+  const bs = build({ log: { name: 'f.json.timeline', data: wfx.text }, summary: { name: 'f.json', data: JSON.stringify(boss) } });
+  const bf = submitEntries(bs);
+  ok('...so the zip and the public manifest agree it is not known: not in the manifest, the log\'s header or summary.json',
+    bs.manifest.log.encounter.bossKind === null && bs.pub.log.encounter.bossKind === null
+      && !('bossKind' in (JSON.parse(bf['combat-log.jsonl'].split('\n')[0]).encounter ?? {})) && !('bossKind' in JSON.parse(bf['summary.json']))
+      && / vs an unnamed fight \(/.test(bs.issueTitle), bs.issueTitle);
+  const real = build({ log: { name: 'f.json.timeline', data: wfx.text }, summary: { name: 'f.json', data: JSON.stringify(wfx.summary) } });
+  ok('...while a real boss kind is carried everywhere', real.manifest.log.encounter.bossKind === 'Dummy' && real.pub.log.encounter.bossKind === 'Dummy'
+    && JSON.parse(submitEntries(real)['summary.json']).bossKind === 'Dummy');
+
+  // The Steam build, read from the app manifest that installed the folder.
+  const root = mkdtempSync(join(tmpdir(), 'fb-steam-'));
+  try {
+    const game = join(root, 'steamapps', 'common', 'Farever Copy');
+    mkdirSync(game, { recursive: true });
+    writeFileSync(join(root, 'steamapps', 'appmanifest_1.acf'), '"AppState"\n{\n\t"appid"\t\t"1"\n\t"installdir"\t\t"Other"\n\t"buildid"\t\t"111"\n}\n');
+    writeFileSync(join(root, 'steamapps', 'appmanifest_3672400.acf'),
+      '"AppState"\n{\n\t"appid"\t\t"3672400"\n\t"name"\t\t"Farever"\n\t"installdir"\t\t"Farever Copy"\n\t"buildid"\t\t"25959898"\n\t"TargetBuildID"\t\t"25959899"\n}\n');
+    ok('the Steam build is the buildid of the app manifest that installed the folder - not another game\'s, not the target\'s',
+      submitSteamBuildId(game) === '25959898' && submitSteamBuildId(join(root, 'steamapps', 'common', 'Nowhere')) === null
+        && submitSteamBuildId(join(root, 'steamapps')) === null && submitSteamBuildId(null) === null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+  const here = submitSteamBuildId(engine.meta.game);
+  ok('...and on this install it is a build number, or null where no app manifest stands above the folder', here === null || /^\d+$/.test(here), String(here));
+} catch (e) { crashed(e); }
+
+group('submission bundle: the upload link, read in every form pCloud writes it, and FAREVER_BENCH_UPLOAD_LINK');
+if (on) try {
+  const read = (v) => { try { return submitLib.parseUploadLink(v); } catch (e) { return { status: e.status, message: e.message }; } };
+  const owner = read(submitLib.UPLOAD_LINK);
+  ok('the project\'s link is in pCloud\'s EU region - its API host eapi.pcloud.com - and is already canonical',
+    owner.api === 'https://eapi.pcloud.com' && owner.code === 'V437ZV4md8W0ibw8hS71eMJFTR0f2Sq4y' && owner.link === submitLib.UPLOAD_LINK, JSON.stringify(owner));
+  const EU = ['https://e.pcloud.com/#/puplink?code=Abcd1234', 'https://eapi.pcloud.com'];
+  const US = ['https://my.pcloud.com/#/puplink?code=Abcd1234', 'https://api.pcloud.com'];
+  const forms = [
+    ['https://e.pcloud.com/#page=puplink&code=Abcd1234', ...EU],
+    ['https://e.pcloud.link/#/puplink?code=Abcd1234', ...EU],
+    ['https://e1.pcloud.link/publink/show?code=Abcd1234', ...EU],
+    ['https://eapi.pcloud.com/uploadtolink?code=Abcd1234&names=x', ...EU],
+    ['https://u.pcloud.link/#/puplink?code=Abcd1234', ...US],
+    ['https://my.pcloud.com/#/puplink?code=Abcd1234', ...US],
+    ['  https://pcloud.com/?code=Abcd1234  ', ...US],
+  ];
+  const wrongForms = forms.filter(([v, link, api]) => { const r = read(v); return r.link !== link || r.api !== api || r.code !== 'Abcd1234'; });
+  ok('every form pCloud writes a link in - the code in the query or in the fragment - reads to its region\'s API host and one canonical link',
+    wrongForms.length === 0, JSON.stringify(wrongForms.map(([v]) => [v, read(v)])));
+  const loop = read('http://127.0.0.1:8787/some/path?x=1#/puplink?code=TestCode1234');
+  ok('a stand-in on this machine may be plain http: its own origin is the API host, and its path and the rest are dropped',
+    loop.api === 'http://127.0.0.1:8787' && loop.link === 'http://127.0.0.1:8787/#/puplink?code=TestCode1234'
+      && read('http://localhost:1/#/puplink?code=TestCode1234').api === 'http://localhost:1' && read('https://[::1]:9/?code=TestCode1234').api === 'https://[::1]:9',
+    JSON.stringify(loop));
+  const bad = [
+    ['not http(s)', 'ftp://e.pcloud.com/#/puplink?code=TestCode1234', /: it is not an http\(s\) address - /],
+    ['plain http to a host off this machine', 'http://e.pcloud.com/#/puplink?code=TestCode1234', /: it is plain http, which is taken only on this machine/],
+    ['a host that is not pCloud', 'https://example.org/#/puplink?code=TestCode1234', /: it is not on pCloud \(pcloud\.com, pcloud\.link\) - /],
+    ['a name that only ends like it', 'https://evilpcloud.com/#/puplink?code=TestCode1234', /: it is not on pCloud/],
+    ['no code', 'https://e.pcloud.com/#/puplink', /: it carries no code/],
+    ['a code too short', 'https://e.pcloud.com/#/puplink?code=abc', /: it carries a code that is not 8 to 64 letters and digits - /],
+    ['a code with other characters', 'https://e.pcloud.com/#/puplink?code=Abcd1234%2F..', /: it carries a code that is not 8 to 64/],
+    ['a user and a password', 'https://user:pw@e.pcloud.com/#/puplink?code=TestCode1234', /: it carries a user or a password/],
+    ['no address at all', 'e.pcloud.com/#/puplink?code=TestCode1234', /: it is not an http\(s\) address/],
+  ];
+  const missed = bad.filter(([, v, re]) => {
+    const r = read(v);
+    return !(r.status === 400 && r.message.startsWith(`The upload link is ${JSON.stringify(v)}: `) && re.test(r.message)
+      && r.message.endsWith('- give the upload link pCloud shows for the folder, https://...pcloud.../#/puplink?code=...'));
+  });
+  ok(`each of ${bad.length} links that are none is refused (400), saying why and what to give`, missed.length === 0,
+    JSON.stringify(missed.map(([w, v]) => [w, read(v)])));
+  ok('...in a sentence that opens with what the caller names it', submitRefusal(() => submitLib.parseUploadLink('nope', 'The thing'))?.message
+    .startsWith('The thing is "nope": it is not an http(s) address'));
+
+  const env = (v) => submitLib.uploadLink(v === undefined ? {} : { FAREVER_BENCH_UPLOAD_LINK: v });
+  ok('with FAREVER_BENCH_UPLOAD_LINK unset, Send goes through the project\'s link, canonical',
+    env() === submitLib.UPLOAD_LINK && submitLib.uploadLink({ FAREVER_BENCH_UPLOAD_LINK: null }) === submitLib.UPLOAD_LINK);
+  ok('...set to nothing, none or off (any case, blanks around), Send is off', ['', '  ', 'none', ' NONE ', 'off', 'Off'].every((v) => env(v) === null));
+  ok('...set to a link, that link, canonical', env('https://e.pcloud.com/#page=puplink&code=Abcd1234') === 'https://e.pcloud.com/#/puplink?code=Abcd1234'
+    && env(' http://127.0.0.1:1/x#/puplink?code=TestCode1234 ') === 'http://127.0.0.1:1/#/puplink?code=TestCode1234');
+  const badEnv = ['ftp://x', 'https://example.org/?code=Abcd1234', 'http://e.pcloud.com/?code=Abcd1234', 'yes'].map((v) => [v, submitRefusal(() => env(v))]);
+  ok('...set to anything else, a 400 that names FAREVER_BENCH_UPLOAD_LINK and what it was given',
+    badEnv.every(([v, r]) => r?.status === 400 && r.message.startsWith(`FAREVER_BENCH_UPLOAD_LINK is ${JSON.stringify(v)}: it `)), JSON.stringify(badEnv));
+  ok('...and this suite runs with it off, so nothing it starts reaches pCloud', process.env.FAREVER_BENCH_UPLOAD_LINK === 'none' && submitLib.uploadLink() === null);
+} catch (e) { crashed(e); }
+
+group('submission bundle: sending, asking for a deletion and the receipt, against a pCloud stand-in on 127.0.0.1');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const sub = submitLib.buildSubmission(engine, {
+    sheet: { name: 's.json', data: submitDocs('examples/sheet-minimal.json') }, log: { name: 'l.jsonl', data: submitDocs('examples/combat-log.jsonl') },
+  });
+  const manifest = JSON.parse(submitEntries(sub)['manifest.json']);
+  // pCloud's refusals by their documented codes (and 2012, seen answering a
+  // code of another region), each with a sentence of the kind it writes.
+  const REFUSALS = {
+    7002: 'This upload link was deleted by its owner.', 7004: 'This upload link has expired.', 2012: 'Invalid \'code\' provided.',
+    7007: 'This link has reached its space limit.', 7008: 'This link has reached its file limit.', 4000: 'Too many login tries from this IP address.',
+    5000: 'Internal error. Try again later.', 2041: 'Connection broken.', 1234: 'Something new.',
+  };
+  let mode = 'ok';
+  const stub = pcloudStub(() => {
+    if (mode === 'ok') return { result: 0 };
+    if (mode === 'hang') return null;
+    if (mode === 'html') return { status: 502, body: '<html><body>Bad gateway</body></html>' };
+    if (mode === 'noresult') return { ok: true };
+    if (mode === 'textresult') return { result: '0' };
+    if (mode === 'http500') return { status: 500, body: { result: 5000, error: REFUSALS[5000] } };
+    return { result: Number(mode), error: REFUSALS[mode] };
+  });
+  const link = await stub.ready;
+  try {
+    const receipt = await submitLib.sendSubmission(sub, { link });
+    const first = stub.seen[0];
+    ok('a send is one POST to /uploadtolink with the link\'s code, the uploader name farever-bench and nopartial=1, and nothing else in the address',
+      stub.seen.length === 1 && first.method === 'POST' && first.path === '/uploadtolink' && first.keys.join() === 'code,names,nopartial'
+        && first.query.code === pcloudCode() && first.query.names === 'farever-bench' && first.query.nopartial === '1', JSON.stringify({ path: first?.path, query: first?.query }));
+    ok('...its body one multipart file part, <id>.zip, application/zip: the bundle, byte for byte',
+      first.parts?.length === 1 && first.parts[0].field === 'file' && first.fileName === `${sub.id}.zip` && first.fileType === 'application/zip'
+        && first.bytes?.equals(sub.zip) && /^multipart\/form-data; ?boundary=/.test(first.headers['content-type'] ?? ''),
+      JSON.stringify(first.parts?.map((p) => [p.field, p.name, p.type])));
+    // The token is looked for in the request as it went - its address, its
+    // headers, the form's names and text, its raw bytes - and in every file
+    // of the zip it carried, inflated (in the zip's own bytes a token would
+    // be deflated, and a search of them would pass it).
+    ok('...with no Authorization header, no header of the bench\'s own, and the delete token nowhere in the request - nor in any file of the zip it carried',
+      first.headers.authorization === undefined && !Object.keys(first.headers).some((h) => /^x-/i.test(h))
+        && !JSON.stringify(first.headers).includes(sub.deleteToken) && !JSON.stringify(first.query).includes(sub.deleteToken)
+        && (first.parts ?? []).every((p) => ![p.field, p.name, p.type, p.text].some((v) => String(v ?? '').includes(sub.deleteToken)))
+        && !first.raw.includes(sub.deleteToken)
+        && submitLib.readZip(first.bytes).every((e) => !e.data.toString('utf8').includes(sub.deleteToken)),
+      Object.keys(first.headers).join());
+    ok('...answered {result: 0}, the receipt completed - the id, the token, the link, when it arrived, the bundle\'s own time and SHA-256 - and the name it went under',
+      Object.keys(receipt).join() === 'id,deleteToken,link,sentAt,createdAt,zipSha256,uploadedAs' && receipt.id === sub.id && receipt.deleteToken === sub.deleteToken
+        && receipt.link === link && !Number.isNaN(Date.parse(receipt.sentAt)) && receipt.createdAt === sub.createdAt && receipt.zipSha256 === sub.zipSha256
+        && receipt.uploadedAs === `${sub.id}.zip`, JSON.stringify(receipt));
+    const twice = await submitLib.sendSubmission(sub, { link });
+    ok('sending the same bundle again sends the same name and the same bytes - pCloud keeps both, the second renamed, and the maintainer drops one',
+      stub.seen.length === 2 && stub.seen[1].fileName === first.fileName && stub.seen[1].bytes?.equals(first.bytes) && twice.id === receipt.id);
+    const prev = process.env.FAREVER_BENCH_UPLOAD_LINK;
+    process.env.FAREVER_BENCH_UPLOAD_LINK = link;
+    let viaEnv = null;
+    try { viaEnv = await submitLib.sendSubmission(sub); } finally { process.env.FAREVER_BENCH_UPLOAD_LINK = prev; }
+    ok('...and with no link given, FAREVER_BENCH_UPLOAD_LINK is the one used', viaEnv?.link === link && stub.seen.length === 3);
+
+    // REFUSED: nothing was kept (nopartial), so no receipt is left to keep.
+    const refused = {};
+    for (const code of Object.keys(REFUSALS)) {
+      mode = code;
+      refused[code] = await submitThrown(submitLib.sendSubmission(sub, { link }));
+    }
+    mode = 'http500';
+    refused.http500 = await submitThrown(submitLib.sendSubmission(sub, { link }));
+    mode = 'ok';
+    const want = { 7002: 503, 7004: 503, 2012: 503, 7007: 507, 7008: 507, 4000: 429, 5000: 502, 2041: 502, 1234: 502, http500: 502 };
+    const off = Object.entries(want).filter(([k, status]) => {
+      const e = refused[k];
+      return !(e instanceof subpub.SubmissionError && e.status === status && e.arrived === false && e.receipt === undefined);
+    });
+    ok('each refusal pCloud answers with is its status - 503 a closed or unknown link, 507 a full folder, 429 this address turned away, 502 the rest - '
+      + 'with arrived: false and no receipt, whatever the HTTP status', off.length === 0,
+    JSON.stringify(off.map(([k]) => [k, refused[k]?.status, refused[k]?.arrived, !!refused[k]?.receipt, refused[k]?.message])));
+    ok('...each in its sentence, pCloud\'s own words in brackets',
+      refused[7002]?.message === `The project's upload link is closed (pCloud: ${REFUSALS[7002]}) - nothing was sent; save the .zip and attach it to a new issue: ${sub.formUrl}`
+        && refused[2012]?.message === `pCloud does not know this copy's upload link (pCloud: ${REFUSALS[2012]}) - nothing was sent; save the .zip and attach it to a new issue: ${sub.formUrl}`
+        && refused[7008]?.message === `The project's pCloud folder is full (pCloud: ${REFUSALS[7008]}) - nothing was kept; try again another day, or save the .zip and attach it to a new issue: ${sub.formUrl}`
+        && refused[4000]?.message === `pCloud turns this address away for now (pCloud: ${REFUSALS[4000]}) - nothing was kept; try again later.`
+        && refused[5000]?.message === `pCloud could not store the zip (pCloud: ${REFUSALS[5000]}) - nothing was kept; send it again later.`
+        && refused[1234]?.message === `pCloud refused the upload (result 1234: ${REFUSALS[1234]}) - nothing was kept.`,
+      JSON.stringify(Object.fromEntries(Object.entries(refused).map(([k, e]) => [k, e?.message]))));
+
+    // NOT pCloud's API: whether it arrived cannot be told, so the receipt stays.
+    const pending = submitLib.pendingReceipt(sub, { link });
+    const odd = {};
+    for (const m of ['html', 'noresult', 'textresult']) {
+      mode = m;
+      odd[m] = await submitThrown(submitLib.sendSubmission(sub, { link }));
+    }
+    mode = 'ok';
+    ok('an answer that is not pCloud\'s API - an HTML page, JSON with no result, a result that is no number - is a 502 that carries the pending receipt',
+      Object.values(odd).every((e) => e?.status === 502 && JSON.stringify(e.receipt) === JSON.stringify(pending) && e.arrived === undefined)
+        && odd.html.message.startsWith('pCloud answered 502 but not as its API does - whether the fight arrived cannot be told from here. Keep this bundle\'s receipt')
+        && odd.noresult.message.startsWith('pCloud answered 200 but not as its API does'), JSON.stringify(Object.values(odd).map((e) => e?.message)));
+    mode = 'hang';
+    const t0 = Date.now();
+    const hung = await submitThrown(submitLib.sendSubmission(sub, { link, timeoutMs: 400 }));
+    mode = 'ok';
+    ok('pCloud not answering is given up on at the timeout (502), with the pending receipt and the advice: keep it, a resend stores at most a duplicate, or the manual route',
+      hung?.status === 502 && JSON.stringify(hung.receipt) === JSON.stringify(pending)
+        && hung.message.startsWith('The upload to the project\'s pCloud folder did not answer within 400 ms - the fight may or may not have arrived. '
+          + 'Keep this bundle\'s receipt: sending the same bundle again stores at most a duplicate the maintainer drops, and Delete with it asks for '
+          + 'the fight\'s deletion if it did arrive. Or save the .zip and attach it to a new issue instead: ')
+        && hung.message.endsWith(sub.formUrl) && Date.now() - t0 < 10_000, String(hung?.message));
+    const gone = await submitThrown(submitLib.sendSubmission(sub, { link: await deadLink(), front: 'cli' }));
+    ok('...a port nobody listens on is unreachable (502), the advice in the command line\'s words', gone?.status === 502 && !!gone.receipt
+      && /^The upload to the project's pCloud folder could not be reached/.test(gone.message) && gone.message.includes('sending the same bundle again (--receipt <file>)')
+      && gone.message.includes('bench submit --delete <file> asks for the fight\'s deletion'), String(gone?.message));
+
+    const n = stub.seen.length;
+    const none = await submitThrown(submitLib.sendSubmission(sub, { link: null }));
+    ok('with no link, Send refuses (503) with the sentence that points at the form', none?.status === 503
+      && none.message === `Send is off in this copy of the bench (no upload link is set) - save the .zip and attach it to a new issue: ${sub.formUrl}`, String(none?.message));
+    const stray = await submitRejection(submitLib.sendSubmission({ id: 'x' }, { link }));
+    const older = await submitRejection(submitLib.sendSubmission(sub, { link, benchVersion: '0.0.1' }));
+    const badLink = await submitRejection(submitLib.sendSubmission(sub, { link: 'https://example.org/?code=Abcd1234' }));
+    ok('...and what is not a bundle, a bundle another version built, or a link that is none, is not sent at all',
+      stray?.status === 400 && older?.status === 400 && badLink?.status === 400 && stub.seen.length === n, `${stub.seen.length - n} requests`);
+    let init = null;
+    const standIn = async (url, i) => { init = { url, ...i }; return new Response('{"result":0}'); };
+    const viaStandIn = await submitLib.sendSubmission(sub, { link: submitLib.UPLOAD_LINK, fetchImpl: standIn });
+    const part = init?.body instanceof FormData ? init.body.get('file') : null;
+    ok('fetch can be stood in for: the project\'s link goes to eapi.pcloud.com, never asked to follow a redirect or to wait without end, and with no header',
+      init?.url === 'https://eapi.pcloud.com/uploadtolink?code=V437ZV4md8W0ibw8hS71eMJFTR0f2Sq4y&names=farever-bench&nopartial=1'
+        && init.method === 'POST' && init.redirect === 'error' && init.signal instanceof AbortSignal && init.headers === undefined
+        && part?.name === `${sub.id}.zip` && part.type === 'application/zip' && viaStandIn.link === submitLib.UPLOAD_LINK,
+      JSON.stringify({ url: init?.url, redirect: init?.redirect, headers: init?.headers }));
+
+    // THE RECEIPT, as a file.
+    const text = submitLib.receiptText(receipt);
+    const parsed = submitLib.parseReceipt(text);
+    const { uploadedAs: _as, ...six } = receipt;
+    const file = JSON.parse(text);
+    ok('the receipt saved as a file reads back as its six fields, marked as a receipt and saying what its token asks for',
+      JSON.stringify(parsed) === JSON.stringify(six) && Object.keys(file).join() === 'format,version,about,id,deleteToken,link,sentAt,createdAt,zipSha256'
+        && file.format === 'farever-bench-receipt' && file.about.startsWith('A fight you sent to farever-bench\'s folder on pCloud. The deleteToken below asks for its deletion: ')
+        && file.about.includes('the maintainer deletes it when they next read the folder') && file.about.endsWith('Anyone holding this file can ask that, and do nothing else with it.')
+        && JSON.stringify(submitLib.parseReceipt(Buffer.from(text))) === JSON.stringify(six), text);
+    ok('...its link read as any upload link is, and carried canonical',
+      submitLib.parseReceipt({ ...six, link: 'https://e.pcloud.com/#page=puplink&code=Abcd1234' }).link === 'https://e.pcloud.com/#/puplink?code=Abcd1234');
+    const notReceipts = [
+      ['not JSON', 'nope'], ['an empty object', '{}'], ['a short token', JSON.stringify({ ...six, deleteToken: 'abc' })],
+      ['another format', JSON.stringify({ ...six, format: 'farever-character-sheet' })],
+      ['a link to a host off this machine over http', JSON.stringify({ ...six, link: 'http://example.org/#/puplink?code=TestCode1234' })],
+      ['a link that is not pCloud', JSON.stringify({ ...six, link: 'https://example.org/#/puplink?code=TestCode1234' })],
+      ['an older shape, naming a service and no link', JSON.stringify({ id: six.id, deleteToken: six.deleteToken, relay: 'https://upload.example.org', sentAt: null, createdAt: six.createdAt })],
+    ].map(([what, t]) => [what, submitRefusal(() => submitLib.parseReceipt(t))]);
+    ok('...and what is not one is refused (400) - a receipt that names no upload link among them', notReceipts.every(([, r]) => r?.status === 400)
+      && notReceipts.at(-1)[1]?.message === 'That is not a receipt of a sent fight: it names no upload link.', JSON.stringify(notReceipts));
+
+    // ASKING FOR A DELETION: a file uploaded the same way.
+    const before = stub.seen.length;
+    const asked = await submitLib.deleteSubmission(parsed, { link });
+    const last = stub.seen.at(-1);
+    const request = last?.bytes ? JSON.parse(last.bytes.toString('utf8')) : {};
+    ok('asking for a deletion is one upload, to the same address, of <id>.withdraw.json (application/json)',
+      stub.seen.length === before + 1 && last.method === 'POST' && last.path === '/uploadtolink' && last.keys.join() === 'code,names,nopartial'
+        && last.query.code === pcloudCode() && last.query.names === 'farever-bench' && last.query.nopartial === '1' && last.parts?.length === 1
+        && last.fileName === `${sub.id}.withdraw.json` && last.fileType === 'application/json' && last.headers.authorization === undefined,
+      JSON.stringify({ name: last?.fileName, type: last?.fileType, query: last?.query }));
+    ok('...the request names the submission and carries its token, whose SHA-256 is the deleteTokenSha256 of the zip\'s manifest',
+      Object.keys(request).join() === 'format,version,about,id,deleteToken,zipSha256,requestedAt' && request.format === 'farever-bench-withdrawal' && request.version === 1
+        && request.id === sub.id && request.deleteToken === sub.deleteToken && request.zipSha256 === sub.zipSha256 && !Number.isNaN(Date.parse(request.requestedAt))
+        && submitHash('sha256').update(request.deleteToken, 'ascii').digest('hex') === manifest.deleteTokenSha256
+        && request.about === `The sender of submission ${sub.id} asks for it to be deleted. The SHA-256 of deleteToken is the deleteTokenSha256 in that submission's manifest.json.`
+        && last.bytes.toString('utf8').endsWith('}\n'), last?.bytes?.toString('utf8'));
+    ok('...and says it was asked', JSON.stringify(asked) === JSON.stringify({ ok: true, status: 200, id: sub.id, requested: true }), JSON.stringify(asked));
+    const n2 = stub.seen.length;
+    const elsewhere = await submitThrown(submitLib.deleteSubmission({ ...parsed, link: otherLink() }, { link }));
+    ok('a receipt written for another upload link is refused (400) before anything leaves, the way to ask there in FAREVER_BENCH_UPLOAD_LINK',
+      elsewhere?.status === 400 && elsewhere.sentTo === otherLink() && stub.seen.length === n2
+        && elsewhere.message === `This receipt is of submission ${sub.id.slice(0, 8)}, sent to another upload link than this copy's: a deletion is asked only `
+          + `through this copy's own link. If you sent that fight yourself through that link, FAREVER_BENCH_UPLOAD_LINK=${otherLink()} asks there.`, String(elsewhere?.message));
+    const offHere = await submitThrown(submitLib.deleteSubmission(parsed, { link: null }));
+    ok('...with no link, no deletion is asked (503)', offHere?.status === 503
+      && offHere.message.startsWith('Send is off in this copy of the bench (no upload link is set), so no deletion can be asked from it') && stub.seen.length === n2,
+    String(offHere?.message));
+    mode = '7002';
+    const closed = await submitThrown(submitLib.deleteSubmission(parsed, { link }));
+    mode = '4000';
+    const busy = await submitThrown(submitLib.deleteSubmission(parsed, { link }));
+    mode = 'ok';
+    const dead = await deadLink();
+    const unreached = await submitThrown(submitLib.deleteSubmission({ ...parsed, link: dead }, { link: dead }));
+    ok('...pCloud\'s refusals are said as for a send, "nothing was asked", arrived: false; unreached, a 502 that says asking again is harmless',
+      closed?.status === 503 && closed.arrived === false && closed.message === `The project's upload link is closed (pCloud: ${REFUSALS[7002]}) - nothing was asked.`
+        && busy?.status === 429 && busy.message === `pCloud turns this address away for now (pCloud: ${REFUSALS[4000]}) - nothing was asked; try again later.`
+        && unreached?.status === 502 && /^The upload to the project's pCloud folder could not be reached/.test(unreached.message)
+        && unreached.message.endsWith('the request may or may not have arrived; asking again with the same receipt is harmless (the maintainer reads one request per id).'),
+      JSON.stringify([closed?.message, busy?.message, unreached?.message]));
+  } finally {
+    await stub.close();
+  }
+} catch (e) { crashed(e); }
+
+// --- --import on every command, and `bench import` -----------------------------
+// A character sheet (src/charsheet.mjs) is a BUILD SOURCE beside --build: it
+// reaches commonSetup as the object a --build file does, with the reader's
+// result beside it, and applyPins merges what the file recorded with what is
+// typed. Held here through the command line itself: every shape the reader
+// takes gives the sheet the same loadout read in-process gives through --build,
+// a typed pin wins for its slot and takes what was held of the piece it
+// replaced with it, the two other build sources are refused beside it, and a
+// sigil's free talent node no longer kills a command (applyPins checked every
+// tree against no grant at all).
+group('cli import: --import is a build source on every command, held as recorded and merged with what is typed');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet } = sheetLib;
+  const BENCH = fileURLToPath(new URL('../bin/bench.mjs', import.meta.url));
+  const bench = (...a) => spawnSync(process.execPath, [BENCH, ...a], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' }, timeout: 180_000 });
+  const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
+  // The priced part of a sheet: the gear table, and the stat sheet down to the fight line.
+  const priced = (out) => {
+    const lines = out.split(/\r?\n/);
+    const g = lines.findIndex((l) => /^SLOT\s+ITEM/.test(l));
+    const gear = g < 0 ? [] : lines.slice(g, lines.indexOf('', g));
+    const p = lines.indexOf('Primary');
+    const end = lines.findIndex((l, i) => i > p && /^fight\s/.test(l));
+    return p < 0 || end < 0 ? '' : [...gear, ...lines.slice(p, end + 1)].join('\n');
+  };
+  const dir = mkdtempSync(join(tmpdir(), 'bench-cli-import-'));
+  const file = (name, obj) => { const p = join(dir, name); writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)); return p; };
+  const full = fileURLToPath(new URL('../docs/examples/sheet-full.json', import.meta.url));
+  const minimal = fileURLToPath(new URL('../docs/examples/sheet-minimal.json', import.meta.url));
+
+  // EVERY SHAPE: the documented sheet (both examples), a saved envelope, a bare
+  // loadout and a modkit dump - each through --import against the same loadout
+  // read in-process and handed over as a bare --build file.
+  const priest = sheetDefaultBuild(engine, 'Priest');
+  const envelope = {
+    version: '0.5.0', cdbSha: engine.meta.cdbSha, bootSha: engine.meta.bootSha, goal: 'dps', rank: 3, level: 25,
+    pinned: { gear: engine.cat.combatSlots().map((s) => s.id), augments: [], skills: [], infusions: [] },
+    build: priest,
+  };
+  const W = (kind, o = {}) => ({ kind, level: 25, upgrade: 0, rarity: -1, count: 1, class: 'st.item.Armor', infusion: null, infusionStat: null, prismatic: false, flawless: false, ...o });
+  const dump = {
+    character: 'Tester', bankSlots: 0, bank: [], bags: [], equipped: [
+      W('Daggers_Demondash', { upgrade: 3, rarity: 3, class: 'st.item.Weapon' }),
+      W('Daggers_DuplicatePoison', { upgrade: 4, rarity: 4, class: 'st.item.Weapon' }),
+      W('Head_EDemon_AssCle'), W('Chest_EKobold_AssWiz'), W('Finger_Z3RCraft_Ap', { level: 0 }),
+    ],
+  };
+  ok('premise: every id the shapes below name is in the data', ['Daggers_Demondash', 'Daggers_DuplicatePoison', 'Head_EDemon_AssCle', 'Chest_EKobold_AssWiz',
+    'Finger_Z3RCraft_Ap', 'Chest_EKobold_FigAss', 'DemonSigil_Rogue_VenomousFinisher'].every((id) => engine.cat.itemById.has(id))
+    && engine.talents.treeFor('Rogue').byId.has('Rogue_Talent_VenomousFinisher'));
+  const shapes = [
+    { name: 'a farever-character-sheet', path: full, extra: [] },
+    { name: 'the minimal example', path: minimal, extra: [] },
+    { name: 'a saved envelope', path: file('envelope.json', envelope), extra: [] },
+    { name: 'a bare loadout', path: file('loadout.json', sheetDefaultBuild(engine, 'Mage')), extra: [] },
+    { name: 'a modkit inventory dump', path: file('farever-inventory-Tester.json', dump), extra: ['--class', 'Rogue'] },
+  ];
+  for (const s of shapes) {
+    const r = readSheet(engine, readFileSync(s.path), s.extra.length ? { cls: s.extra[1] } : {});
+    const bare = file(`direct-${shapes.indexOf(s)}.json`, r.loadout);
+    const via = bench('sheet', '--import', s.path, ...s.extra);
+    const direct = bench('sheet', '--build', bare);
+    ok(`${s.name}: bench sheet --import runs`, via.status === 0, tail(via));
+    ok(`${s.name}: ...and prices the build the reader read, as --build prices that loadout`, priced(via.stdout) !== '' && priced(via.stdout) === priced(direct.stdout),
+      `${priced(via.stdout).split('\n').find((l, i) => l !== priced(direct.stdout).split('\n')[i]) ?? ''}`);
+    ok(`${s.name}: ...what was read is printed before the command's own output`, via.stdout.indexOf(`--import ${s.path}`) === 0
+      && via.stdout.indexOf('Read as') > 0 && via.stdout.indexOf('Read as') < via.stdout.indexOf('farever-bench '));
+  }
+
+  // A TYPED PIN WINS for its slot, and the import holds everything else. The
+  // chest it replaces was infused and socketed: that was the replaced piece's,
+  // and is left to the search; every other socket, the pools, the rune slots
+  // and the talent tree stay held. The file holds a Demon sigil and a tree
+  // with four tier-4 nodes, so this run is also the sigil build optimizing.
+  const out = join(dir, 'typed.json');
+  const typed = bench('optimize', '--import', full, '--pin', 'chest=Chest_EKobold_FigAss', '--restarts', '1', '--json', out);
+  ok('a sigil build imports and optimizes, with a typed --pin beside it', typed.status === 0, tail(typed));
+  const j = existsSync(out) ? JSON.parse(readFileSync(out, 'utf8')) : null;
+  const want = readSheet(engine, readFileSync(full));
+  const others = Object.keys(want.loadout.gear).filter((slot) => slot !== 'Slot_Chest');
+  ok('...the typed pin wins for its slot', j?.build?.gear?.Slot_Chest?.item === 'Chest_EKobold_FigAss', JSON.stringify(j?.build?.gear?.Slot_Chest));
+  ok('...and every other slot is the imported piece, held', others.every((slot) => j?.build?.gear?.[slot]?.item === want.loadout.gear[slot].item)
+    && engine.cat.combatSlots().every((s) => j?.pinned?.gear?.includes(s.id)), JSON.stringify(j?.pinned?.gear));
+  ok('...the replaced piece\'s infusion and socket are no longer held, every other one is',
+    !j?.pinned?.infusions?.includes('Slot_Chest') && j?.pinned?.infusions?.includes('Slot_Weapon1')
+      && !j?.pinned?.augments?.some((k) => k.startsWith('Slot_Chest/')) && j?.pinned?.augments?.includes('Slot_Head/AugmentDemonSigil')
+      && j?.build?.augments?.['Slot_Head/AugmentDemonSigil'] === 'DemonSigil_Rogue_VenomousFinisher', JSON.stringify(j?.pinned));
+  ok('...the pools, the rune slots and the talent tree the file recorded are held, and written so --build holds them again',
+    ['Slot_Weapon2', 'class/ClassSkill'].every((k) => j?.pinned?.skills?.includes(k)) && j?.pinned?.talents === true
+      && want.pins.runes.every((h) => j?.pinned?.runes?.includes(h))
+      && Object.entries(want.loadout.talents).every(([n, rank]) => j?.build?.talents?.[n] === rank), JSON.stringify(j?.pinned));
+  ok('...its weapon-skill rank is the run\'s', j?.rank === 3);
+  // The envelope that run wrote holds the sigil's node in its talents
+  // (optimize writes it there) and says the tree was held: --build reads it
+  // back, the tree checked with the sigil's grant.
+  const back = existsSync(out) ? bench('sheet', '--build', out) : { status: -1, stderr: 'no envelope' };
+  ok('...and --build of that envelope, its tree held with the sigil\'s node in it, runs', back.status === 0, tail(back));
+  // The --talent path, which a questlog link takes too: a sigil's node at
+  // rank 1 is free, as the game has it. It used to die as "tier 4 and needs 8
+  // points".
+  const viaTalent = bench('sheet', '--class', 'Rogue', '--pin', 'weapon1=Daggers_Demondash', '--pin', 'head=Head_EDemon_AssCle',
+    '--pin', 'head/demonsigil=DemonSigil_Rogue_VenomousFinisher', '--talent', 'Rogue_Talent_VenomousFinisher=1');
+  ok('--talent naming the node a socketed sigil grants is taken as the free node it is', viaTalent.status === 0, tail(viaTalent));
+
+  // The rank the file records is the default --rank, and a typed one wins.
+  const twos = { ...sheetFull(), weaponSkillRanks: Object.fromEntries(Object.keys(sheetFull().weaponSkillRanks).map((k) => [k, 2])) };
+  const ranked = file('rank2.json', twos);
+  const r2 = bench('optimize', '--import', ranked, '--restarts', '1', '--json', join(dir, 'r2.json'));
+  const r1 = bench('optimize', '--import', ranked, '--restarts', '1', '--rank', '1', '--json', join(dir, 'r1.json'));
+  const rankOf = (p) => (existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')).rank : null);
+  ok('the weapon-skill rank a sheet records is the run\'s rank', r2.status === 0 && rankOf(join(dir, 'r2.json')) === 2, tail(r2));
+  ok('...and a typed --rank wins over it', r1.status === 0 && rankOf(join(dir, 'r1.json')) === 1, tail(r1));
+
+  // The two other build sources are refused beside it, before anything is
+  // read or fetched. The link case runs with fetch replaced by a throw, so a
+  // regression fails here instead of reaching questlog.gg.
+  const both = bench('sheet', '--import', full, '--build', join(dir, 'loadout.json'));
+  ok('--import with --build is refused, naming both', both.status !== 0 && /--import and --build/.test(both.stderr), tail(both));
+  // fetch is replaced by a preloaded CommonJS file: node's --require takes
+  // one on every Node the bench supports (>=18), where --import <data: URL>
+  // exists only from 18.18 and 20.6 and failed the line below on older 18s.
+  const noNet = file('no-network.cjs', 'globalThis.fetch = async () => { throw new Error("the suite does not reach the network"); };\n');
+  const link = spawnSync(process.execPath, ['--require', noNet, BENCH, 'sheet', '--import', full, 'https://questlog.gg/farever/en/character-builder/abc'],
+    { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' }, timeout: 120_000 });
+  ok('--import with a questlog link is refused before the link is fetched', link.status !== 0 && /--import and a questlog link/.test(link.stderr)
+    && !/does not reach the network/.test(link.stderr + link.stdout), tail(link));
+  const bad = bench('sheet', '--import', file('not-a-sheet.json', { hello: 1 }));
+  ok('a file that is no sheet is refused with the reader\'s sentence', bad.status !== 0 && /--import .*not-a-sheet\.json: not a character sheet/.test(bad.stderr), tail(bad));
+  // A typed --level re-levels the import as it re-levels a --build file, and says so.
+  const relevel = bench('sheet', '--import', full, '--level', '20');
+  ok('a typed --level re-levels the imported build, and the report says the file\'s own level', relevel.status === 0
+    && /--level 20 re-levels the imported build, which the file records at level 25/.test(relevel.stdout), tail(relevel));
+
+  // A tree the re-levelled build cannot hold is not held - and the sentence
+  // says what becomes of it: sheet prices it as recorded (it searches
+  // nothing), optimize searches another. It used to say "not held" on a
+  // page that still priced it.
+  const low = bench('sheet', '--import', full, '--level', '1');
+  ok('a recorded tree the build cannot hold: sheet says it is priced as recorded', low.status === 0
+    && /talents .*sheet-full\.json recorded are priced as recorded, although this build cannot hold them as they are: talents unlock at level 10/.test(low.stderr)
+    && !/are not held/.test(low.stderr), tail(low));
+  const lowOpt = bench('optimize', '--import', full, '--level', '1', '--restarts', '1');
+  ok('...and optimize says the search chooses the tree', lowOpt.status === 0
+    && /recorded are not held - this build cannot hold them as they are \(talents unlock at level 10\); the search chooses the tree/.test(lowOpt.stderr), tail(lowOpt));
+
+  // The commands that build nothing refuse it, rather than validate the file
+  // and print its report above a listing that never read it.
+  for (const cmd of ['talents', 'classes']) {
+    const r = bench(cmd, '--import', full);
+    ok(`bench ${cmd} --import is refused: it builds nothing from one`, r.status === 1
+      && new RegExp(`--import is a build to start from, and \`bench ${cmd}\` builds nothing from one`).test(r.stderr) && !/Read as/.test(r.stdout), tail(r));
+  }
+
+  // A file far past any sheet is refused on its size, before a byte is read
+  // (a 1.8 GB probe capture died on V8's string limit).
+  const big = join(dir, 'capture.csv');
+  writeFileSync(big, Buffer.alloc(65 * 1024 * 1024));
+  const huge = bench('sheet', '--import', big);
+  ok('--import of a file past 64 MB is refused with a sentence, naming verify for a capture', huge.status === 1
+    && /--import .*capture\.csv is 65 MB, and no character sheet, saved build or one fight's combat log is near that/.test(huge.stderr)
+    && /bench verify --capture/.test(huge.stderr), tail(huge));
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+// `bench import <file>` is the exporter author's check: it reads a sheet in
+// any shape or a combat log in any dialect, told apart by the file, says what
+// was kept and dropped, and with --check exits 1 on anything dropped, not
+// understood or unreadable (a sheet) or any problem (a log).
+group('cli import: bench import says what a sheet or a combat log holds, and --check fails what an exporter got wrong');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { readSheet } = sheetLib;
+  const BENCH = fileURLToPath(new URL('../bin/bench.mjs', import.meta.url));
+  const bench = (...a) => spawnSync(process.execPath, [BENCH, ...a], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' }, timeout: 120_000 });
+  const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
+  const example = (name) => fileURLToPath(new URL(`../docs/examples/${name}`, import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), 'bench-cli-import-cmd-'));
+  const file = (name, obj) => { const p = join(dir, name); writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)); return p; };
+
+  for (const name of ['sheet-full.json', 'sheet-minimal.json', 'combat-log.jsonl']) {
+    const r = bench('import', example(name), '--check');
+    ok(`bench import --check passes the documented ${name}`, r.status === 0, tail(r));
+  }
+  // --check takes no value, and the parser hands a flag the next word: the
+  // natural order `bench import --check <file>` read the file as the flag's
+  // value and said no file was given.
+  const checkFirst = bench('import', '--check', example('sheet-full.json'));
+  ok('bench import --check <file> reads the file, in that order too', checkFirst.status === 0 && /Read as a character sheet/.test(checkFirst.stdout), tail(checkFirst));
+  const checkTwo = bench('import', example('sheet-full.json'), '--check', example('sheet-minimal.json'));
+  ok('...and a word after --check beside a file is refused as one', checkTwo.status === 1 && /--check takes no value/.test(checkTwo.stderr), tail(checkTwo));
+  const jsonOnly = bench('import', '--json', example('sheet-full.json'));
+  ok('bench import --json <file> with no file to read says --json took it as where to write', jsonOnly.status === 1
+    && /--json took ".*sheet-full\.json" as the file its report is written to/.test(jsonOnly.stderr), tail(jsonOnly));
+  const fullRun = bench('import', example('sheet-full.json'));
+  ok('...and says what it read and kept', /Read as a character sheet \(farever-character-sheet\), version 1\./.test(fullRun.stdout)
+    && /Character: Example, Rogue \(aptitude Assassin\), level 25\./.test(fullRun.stdout) && /^Kept: /m.test(fullRun.stdout.replace(/^ {2}/gm, '')));
+
+  // What an exporter gets wrong: an item the game does not have, a key the
+  // format does not hold, a path it could not read.
+  const broken = sheetFull();
+  broken.gear.Slot_Trinket = { ...broken.gear.Slot_Trinket, item: 'Trinket_No_Such_Row' };
+  broken.mood = 'cheerful';
+  const brokenPath = file('broken.json', broken);
+  const plain = bench('import', brokenPath);
+  const checked = bench('import', brokenPath, '--check');
+  ok('a sheet with a drop and an unknown key is read, exit 0, naming both', plain.status === 0 && /Dropped gear\.Slot_Trinket.*Trinket_No_Such_Row/.test(plain.stdout)
+    && /Unknown key, named and not read: mood/.test(plain.stdout), tail(plain));
+  ok('...and --check fails it', checked.status === 1 && /--check fails/.test(checked.stdout), `exit ${checked.status}`);
+  const unread = file('unreadable.json', { ...sheetFull(), unreadable: ['talents'] });
+  ok('...as it fails a path the exporter listed unreadable', bench('import', unread, '--check').status === 1);
+  const unreadJson = bench('import', unread, '--json');
+  let uj = null;
+  try { uj = JSON.parse(unreadJson.stdout); } catch { uj = null; }
+  ok('...and its --json sheet keeps the path listed and the field out, so it reads back unread', sheetCanon(uj?.sheet?.unreadable) === sheetCanon(['talents'])
+    && !('talents' in (uj?.sheet ?? {})) && sheetCanon(readSheet(engine, uj.sheet).unreadable) === sheetCanon(['talents'])
+    && readSheet(engine, uj.sheet).pins.talents === false, JSON.stringify(uj?.sheet?.unreadable));
+  const neither = bench('import', file('neither.json', { hello: 1 }));
+  ok('a file that is neither is refused with both readers\' sentences', neither.status === 1
+    && /neither a character sheet nor a combat log/.test(neither.stderr) && /As a character sheet: not a character sheet/.test(neither.stderr)
+    && /As a combat log: /.test(neither.stderr), tail(neither));
+  const csv = bench('import', file('probe.csv', 'ts_ms,event,source,target,skill_id,amount,crit,stacks,max_stacks,extra\n'));
+  ok('...and so is a file that is not JSON at all', csv.status === 1 && /not JSON/.test(csv.stderr), tail(csv));
+  ok('bench import reads one file', bench('import', example('sheet-full.json'), example('sheet-minimal.json')).status === 1);
+
+  // --json: for a sheet, the normalised version-1 sheet beside the report;
+  // it reads back to the loadout the file gave.
+  const out = join(dir, 'report.json');
+  const wrote = bench('import', example('sheet-full.json'), '--json', out);
+  const j = existsSync(out) ? JSON.parse(readFileSync(out, 'utf8')) : null;
+  ok('--json writes a sheet\'s report as {kind, sourceFormat, sheet, report}', wrote.status === 0 && sheetCanon(Object.keys(j ?? {})) === sheetCanon(['kind', 'sourceFormat', 'sheet', 'report'])
+    && j.kind === 'sheet' && j.sourceFormat === 'farever-character-sheet', JSON.stringify(Object.keys(j ?? {})));
+  // The wrapper is no sheet itself (a top-level `format` made it pass for
+  // one, refused as a sheet with no class), and given back it is read as the
+  // sheet it holds - by bench import and by --import.
+  ok('...the wrapper does not pass for a sheet of its own', sheetLib.detectSheetDialect(j) === null);
+  const again = bench('import', out, '--check');
+  const againSheet = bench('sheet', '--import', out);
+  ok('...and given back, bench import and --import read the sheet under "sheet", saying so', again.status === 0 && /Read as a character sheet/.test(again.stdout)
+    && /the sheet under its "sheet" key is read/.test(again.stdout) && againSheet.status === 0 && /the sheet under its "sheet" key is read/.test(againSheet.stdout),
+  `${tail(again)} | ${tail(againSheet)}`);
+  ok('...the report holding what was dropped, noted, left open, not understood and unreadable',
+    sheetCanon(Object.keys(j?.report ?? {}).sort()) === sheetCanon(['buildMismatch', 'dropped', 'gaps', 'notes', 'unknownKeys', 'unreadable']), JSON.stringify(Object.keys(j?.report ?? {})));
+  ok('...and the sheet is the bench\'s own version 1, which reads back to the same loadout', j?.sheet?.format === 'farever-character-sheet' && j.sheet.version === 1
+    && j.sheet.source?.exporter === 'farever-bench'
+    && sheetCanon(readSheet(engine, j.sheet).loadout) === sheetCanon(readSheet(engine, readFileSync(example('sheet-full.json'))).loadout));
+  const stdout = bench('import', example('sheet-minimal.json'), '--json');
+  let sj = null;
+  try { sj = JSON.parse(stdout.stdout); } catch { sj = null; }
+  ok('a bare --json prints the same report to stdout and nothing else', stdout.status === 0 && sj?.kind === 'sheet' && sj.report.gaps.length > 0);
+  // The sheet it writes leaves out what the file left out: read back, the
+  // minimal example's one weapon is still one weapon and fourteen OPEN slots,
+  // its sockets, tree and runes still open - the same pins and loadout as the
+  // file itself (it came back as fourteen slots held empty and no talent).
+  const minR = readSheet(engine, readFileSync(example('sheet-minimal.json')));
+  const backR = sj?.sheet ? readSheet(engine, sj.sheet) : null;
+  ok('...and its sheet, read back, holds what the file held and leaves open what it left open', !!backR
+    && sheetCanon(backR.pins) === sheetCanon(minR.pins) && sheetCanon(backR.loadout) === sheetCanon(minR.loadout)
+    && Object.keys(sj.sheet.gear).length === 1 && !('talents' in sj.sheet) && !('runes' in sj.sheet) && !('sockets' in sj.sheet.gear.Slot_Weapon1)
+    && backR.gaps.some((g) => /14 gear slots are not recorded/.test(g)) && backR.gaps.some((g) => /talents are not recorded/.test(g)),
+  JSON.stringify({ pins: backR?.pins, gear: Object.keys(sj?.sheet?.gear ?? {}) }));
+  // ...and its source carries the build the FILE was written on, not this
+  // install's: a sheet from another build read back still says so.
+  const other = sheetFull();
+  other.source.bootSha256 = 'ab'.repeat(32);
+  const otherRun = bench('import', file('other-build.json', other), '--json');
+  let oj = null;
+  try { oj = JSON.parse(otherRun.stdout); } catch { oj = null; }
+  ok('...its source names the file\'s own hlboot.dat, so another build read back is still another build', oj?.sheet?.source?.bootSha256 === 'ab'.repeat(32)
+    && oj.sheet.source.exporter === 'farever-bench' && !!oj.report.buildMismatch && !!readSheet(engine, oj.sheet).buildMismatch, JSON.stringify(oj?.sheet?.source));
+  ok('...and a file that names none is written naming none', sj?.sheet && !('bootSha256' in sj.sheet.source));
+  // A sheet recorded in part comes back as the import read it - a flag left
+  // out stays out, a class bar with a hole holds the picks slotted, the runes
+  // stay open - because --json writes the one cut a submission's sheet.json
+  // is too (charsheet.mjs recordedSheet), with the file's own source.
+  const partly = sheetFull();
+  delete partly.gear.Slot_Weapon1.upgrade;
+  const cbar = partly.classSkills.ClassSkill;
+  partly.classSkills.ClassSkill = [cbar[0], null, cbar[2]];
+  delete partly.runes;
+  const partRun = bench('import', file('partly.json', partly), '--json');
+  let pj = null;
+  try { pj = JSON.parse(partRun.stdout); } catch { pj = null; }
+  const partR = readSheet(engine, partly);
+  const partBack = pj?.sheet ? readSheet(engine, pj.sheet) : null;
+  const pinsSorted = (r) => sheetCanon(Object.fromEntries(Object.entries(r.pins).map(([k, v]) => [k, Array.isArray(v) ? [...v].sort() : v])));
+  ok('a sheet recorded in part comes back through --json with the same build, pins and gaps, and nothing said on stderr', !!partBack
+    && sheetCanon(partBack.loadout) === sheetCanon(partR.loadout) && pinsSorted(partBack) === pinsSorted(partR)
+    && partBack.gaps.length === partR.gaps.length && partR.gaps.every((g) => partBack.gaps.includes(g))
+    && !('upgrade' in pj.sheet.gear.Slot_Weapon1) && sheetCanon(pj.sheet.classSkills?.ClassSkill) === sheetCanon([cbar[0], cbar[2]]) && !('runes' in pj.sheet)
+    && partRun.stderr === '', JSON.stringify({ lost: partR.gaps.filter((g) => !partBack?.gaps.includes(g)), bar: pj?.sheet?.classSkills, stderr: partRun.stderr }));
+  const { source: cutSource, ...cutRest } = sheetLib.recordedSheet(engine, partR).sheet;
+  const { source: wroteSource, ...wroteRest } = pj?.sheet ?? {};
+  ok('...it is the sheet charsheet.mjs recordedSheet writes, the source naming the file\'s build', sheetCanon(cutRest) === sheetCanon(wroteRest)
+    && wroteSource?.bootSha256 === partly.source.bootSha256 && cutSource.bootSha256 === partly.source.bootSha256, JSON.stringify({ wroteSource, cutSource }));
+  const logOut = bench('import', example('combat-log.jsonl'), '--json');
+  let lj = null;
+  try { lj = JSON.parse(logOut.stdout); } catch { lj = null; }
+  ok('a log\'s report is {kind, dialect, stats, problems, notes}', sheetCanon(Object.keys(lj ?? {})) === sheetCanon(['kind', 'dialect', 'stats', 'problems', 'notes'])
+    && lj.kind === 'log' && lj.dialect === 'farever-combat-log' && lj.stats.events === 14 && lj.stats.handle === 'Tester' && lj.problems.length === 0, logOut.stdout.slice(0, 200));
+
+  // A modkit dump names no class: --class gives it, and without it the reader's sentence says so.
+  const dump = file('farever-inventory-Tester.json', { character: 'Tester', bankSlots: 0, bank: [], bags: [], equipped: [
+    { kind: 'Daggers_Demondash', level: 25, upgrade: 3, rarity: 3, count: 1, class: 'st.item.Weapon', infusion: null, infusionStat: null, prismatic: false, flawless: false },
+  ] });
+  const noClass = bench('import', dump);
+  ok('a modkit dump without --class is refused, saying to pass it', noClass.status === 1 && /does not say which class "Tester" is.*--class/.test(noClass.stderr), tail(noClass));
+  const withClass = bench('import', dump, '--class', 'Rogue', '--level', '25');
+  ok('...and read with it', withClass.status === 0 && /Read as a modkit inventory dump/.test(withClass.stdout) && /Rogue \(aptitude Assassin\), level 25/.test(withClass.stdout), tail(withClass));
+  // The commands it suggests carry the --class and --level the read needed:
+  // without them the suggestion died on "pass --class".
+  ok('...and the commands it suggests carry the --class and --level it needed', withClass.stdout.includes(`bench sheet --import ${dump} --class Rogue --level 25`)
+    && withClass.stdout.includes(`bench optimize --import ${dump} --class Rogue --level 25`), withClass.stdout.split('\n').filter((x) => /--import/.test(x)).join(' | '));
+  ok('...where a sheet that names its own needs neither', /bench sheet --import \S+sheet-full\.json, /.test(fullRun.stdout));
+  // A log's hint names the build it needs: a log carries none.
+  const logRun = bench('import', example('combat-log.jsonl'));
+  ok('a combat log\'s closing line says verify needs the build it was fought in', logRun.status === 0
+    && /bench verify --capture \S+combat-log\.jsonl --import <character sheet> holds the model against it/.test(logRun.stdout), tail(logRun));
+  // A file far past any sheet or log is refused on its size, unread.
+  const big = join(dir, 'capture.csv');
+  writeFileSync(big, Buffer.alloc(65 * 1024 * 1024));
+  const huge = bench('import', big);
+  ok('a file past 64 MB is refused with a sentence before it is read', huge.status === 1
+    && /capture\.csv is 65 MB, and no character sheet, saved build or one fight's combat log is near that/.test(huge.stderr), tail(huge));
+
+  // A log problem fails --check: a damage event that does not say whether it was critical.
+  const lines = readFileSync(example('combat-log.jsonl'), 'utf8').trim().split('\n');
+  const loose = lines.map((l, i) => (i === 4 ? JSON.stringify((({ critical, ...rest }) => rest)(JSON.parse(l))) : l)).join('\n') + '\n';
+  ok('premise: the line edited is a damage event', JSON.parse(lines[4]).kind === 'damage');
+  const looseRun = bench('import', file('loose.jsonl', loose), '--check');
+  ok('a log the reader names a problem in fails --check', looseRun.status === 1 && /Problem: /.test(looseRun.stdout), tail(looseRun));
+  // A log the reader refuses is named once, by the path typed: the reader's
+  // sentence opens with the file's base name, and the path went before it.
+  const miscount = file('count-wrong.jsonl', [JSON.stringify({ ...JSON.parse(lines[0]), count: 99 }), ...lines.slice(1)].join('\n') + '\n');
+  const refusedLog = bench('import', miscount, '--check');
+  ok('a log the reader refuses is named once, by its path', refusedLog.status === 1
+    && refusedLog.stderr.trim().startsWith(`${miscount}: the header says 99 events and the file holds`)
+    && refusedLog.stderr.split('count-wrong.jsonl').length === 2, refusedLog.stderr.trim());
+
+  // A Wink timeline is read with its summary, the <id>.json beside it, which
+  // carries the fight's real start.
+  const head = JSON.parse(lines[0]);
+  const events = lines.slice(1).map((l) => JSON.parse(l));
+  const tl = file('fight_1.json.timeline', [JSON.stringify({ version: 1, me: head.me, duration: head.duration, initial: head.initial, count: events.length, clock: 'client-observed', leadIn: 2 }),
+    ...events.map((e) => JSON.stringify(e))].join('\n') + '\n');
+  file('fight_1.json', { version: 1, startedAt: head.startedAt, meName: 'Tester', me: head.me, duration: head.duration, bossKind: 'Dummy', difficulty: 0,
+    players: [{ uid: head.me, name: 'Tester', isMe: true, skills: [] }] });
+  const wink = bench('import', tl, '--json');
+  let wj = null;
+  try { wj = JSON.parse(wink.stdout); } catch { wj = null; }
+  ok('a Wink timeline is read with the summary beside it, and takes its start from it', wink.status === 0 && wj?.dialect === 'wink-timeline'
+    && wj.stats.startedAt === head.startedAt && wj.stats.startedAtEstimated === false, tail(wink));
+  // A folder named like the summary is no summary: the timeline is read
+  // alone, its start estimated - it died on "EISDIR: illegal operation".
+  const tl2 = file('fight_2.json.timeline', readFileSync(tl, 'utf8'));
+  mkdirSync(join(dir, 'fight_2.json'));
+  const folder = bench('import', tl2, '--json');
+  let fj = null;
+  try { fj = JSON.parse(folder.stdout); } catch { fj = null; }
+  ok('...and a folder named like its summary is passed over: read alone, the start estimated', folder.status === 0 && fj?.dialect === 'wink-timeline'
+    && fj.stats.startedAtEstimated === true && !/EISDIR/.test(folder.stderr + folder.stdout), tail(folder));
+
+  // On a terminal a report line is coloured by the reader's own `warn`
+  // (charsheet.mjs reportItems, carried by submit.mjs onto sheet:<kind>),
+  // the flag the UI's Import and Send dialogs mark by: a sheet written on
+  // another game build - the line that explains every drop under it - is
+  // warned as the drops are, in bench import and in bench submit
+  // (sheet:mismatch). It printed uncoloured while the UI marked it, when
+  // each kept its own list of kinds.
+  const otherBuild = sheetFull();
+  otherBuild.source = { exporter: 'x', bootSha256: 'ab'.repeat(32) };
+  otherBuild.gear.Slot_Trinket = { ...otherBuild.gear.Slot_Trinket, item: 'Trinket_No_Such_Row' };
+  const otherPath = file('other-build.json', otherBuild);
+  const { NO_COLOR: _noColour, ...colourEnv } = process.env;
+  const onTerminal = (...a) => spawnSync(process.execPath, ['--input-type=module', '-e',
+    `process.stdout.isTTY = true; process.argv = [process.argv[0], ${JSON.stringify(BENCH)}, ...${JSON.stringify(a)}]; `
+      + `await import(${JSON.stringify(new URL('../bin/bench.mjs', import.meta.url).href)});`],
+  { encoding: 'utf8', cwd: dir, env: { ...colourEnv, FAREVER_BENCH_UPLOAD_LINK: 'none', FAREVER_BENCH_CACHE: join(dir, '.cache') }, timeout: 120_000 });
+  const colourOf = (out, re) => { const line = out.split('\n').find((l) => re.test(l)); return line == null ? null : (/^\x1b\[[0-9;]*m/.exec(line)?.[0] ?? ''); };
+  for (const [what, r] of [['bench import', onTerminal('import', otherPath)],
+    ['bench submit', onTerminal('submit', '--log', example('combat-log.jsonl'), '--import', otherPath)]]) {
+    const mismatch = colourOf(r.stdout, /another game build/);
+    const dropped = colourOf(r.stdout, /Dropped gear\.Slot_Trinket/);
+    ok(`${what} on a terminal warns the "another game build" line as it warns a Dropped line`, r.status === 0
+      && dropped !== null && dropped !== '' && mismatch === dropped, `${r.status} ${JSON.stringify([mismatch, dropped])} ${tail(r)}`);
+  }
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+// --- verify reads a combat log ---------------------------------------------------
+// A combat log another program wrote (src/combatlog.mjs, through capture.mjs
+// combatLogOf) is one fight: with no window asked for, its span is the window
+// and it is treated as a given one; its own character is the default
+// --character; a Wink summary alone holds no row and is refused; a header that
+// names the difficulty prices the model on it. And an imported sheet is the
+// build, no snapshot chosen. Two cross-lane rules are held here: a log that
+// writes no press (presses=0 on its session row) does not read as "nothing was
+// pressed", and a log naming the installed hlboot.dat by hash is on this build.
+group('cli verify reads a combat log: its own span, its character, the difficulty it names, and the imported sheet');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const { toSheet } = sheetLib;
+  const BENCH = fileURLToPath(new URL('../bin/bench.mjs', import.meta.url));
+  const LOG = fileURLToPath(new URL('../docs/examples/combat-log.jsonl', import.meta.url));
+  const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
+  const verify = (...a) => spawnSync(process.execPath, [BENCH, 'verify', ...a], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' }, timeout: 180_000 });
+  const asJson = (r) => { try { return JSON.parse(r.stdout); } catch { return null; } };
+  const dir = mkdtempSync(join(tmpdir(), 'bench-cli-verify-log-'));
+  const file = (name, text) => { const p = join(dir, name); writeFileSync(p, text); return p; };
+
+  // The example log is a Warrior swinging GA_Craft: the sheet is that, built
+  // from ids and written by the reference exporter.
+  const lines = readFileSync(LOG, 'utf8').trim().split('\n');
+  const head = JSON.parse(lines[0]);
+  const events = lines.slice(1).map((l) => JSON.parse(l));
+  const axe = engine.cat.itemById.get('GA_Craft');
+  ok('premise: the weapon the example log swings is in the data, a Warrior\'s', !!axe && engine.cat.usableBy(axe, engine.cat.classes.find((c) => c.unit === 'Warrior').aptitude));
+  const l = emptyLoadout(engine.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: axe.rarity, stars: 0 };
+  engine.plan.pruneSelection(l);
+  const sheet = join(dir, 'warrior.json');
+  writeFileSync(sheet, JSON.stringify(toSheet(engine, l, { name: 'Tester', rank: 3 }), null, 2));
+
+  const run = verify('--capture', LOG, '--import', sheet);
+  ok('verify on the example log and an imported sheet runs end to end', run.status === 0, tail(run));
+  ok('...the header names the imported sheet as the build', run.stdout.includes(`Tester - Warrior 25  1 slots from the imported sheet ${sheet}`), run.stdout.split('\n').find((x) => /slots from/.test(x)) ?? '');
+  ok('...the window is the log\'s own span, and the ledger says so', /window: .* - the combat log's own span, first row to last/.test(run.stdout));
+  ok('...and the log is placed on this build by the hash its header names', /capture: recorded on this build \(the farever-combat-log header names the installed hlboot\.dat/.test(run.stdout), tail(run));
+  const j = asJson(verify('--capture', LOG, '--import', sheet, '--json'));
+  const damage = events.filter((e) => e.kind === 'damage');
+  ok('--json: the character is the log\'s own, the build the import, no snapshot chosen', j?.character === 'Tester' && j.build?.from === 'import' && j.build.file === sheet
+    && j.snapshot === null && j.window?.fromLog === true && j.combatLog?.dialect === 'farever-combat-log', JSON.stringify({ c: j?.character, b: j?.build, w: j?.window }));
+  ok('...the window from the first row to the last, lead-in included', j?.windows?.[0]?.from === head.startedAt + Math.min(...[...head.initial, ...events].map((e) => e.time)) * 1000
+    && j.windows[0].to === head.startedAt + Math.max(...events.map((e) => e.time)) * 1000, JSON.stringify(j?.windows));
+  ok('...it reads the rows the log holds: every damage skill, the uses as presses', sheetCanon(j?.rows?.filter((r) => r.liveHits > 0).map((r) => r.id).sort() ?? [])
+    === sheetCanon([...new Set(damage.map((e) => e.skill))].sort()) && sheetCanon([...(j?.pressed ?? [])].sort()) === sheetCanon(['GA_Craft_Skill1', 'Warrior_Charge']),
+    JSON.stringify({ rows: j?.rows?.map((r) => r.id), pressed: j?.pressed }));
+  ok('...on this build, by the hash', j?.captureEra?.onThisBuild === true && j.captureEra.sessions.length === 1 && j.captureEra.sessions[0].build === engine.meta.bootSha);
+
+  // A log that never writes a press is not a window in which nothing was pressed.
+  const noPress = events.filter((e) => e.kind !== 'skill_use' && e.kind !== 'skill_context');
+  const quiet = file('nopress.jsonl', [JSON.stringify({ ...head, count: noPress.length }), ...noPress.map((e) => JSON.stringify(e))].join('\n') + '\n');
+  const q = asJson(verify('--capture', quiet, '--import', sheet, '--json'));
+  ok('a log with no press or use of its character (presses=0) does not read as "nothing was pressed"', q?.nothingPressed === false && q.pressed.length === 0
+    && q.captureEra.sessions[0].presses === 0 && q.holdChain === false, JSON.stringify({ np: q?.nothingPressed, s: q?.captureEra?.sessions }));
+  ok('...where the same log with its uses names them pressed', j?.nothingPressed === false && j.pressed.length === 2);
+
+  // The difficulty the header names prices the model; --price-as still wins.
+  const boss = 'Ratsar';
+  ok('premise: the boss the variant names is a unit with a heroic mode', engine.cdb.byId('unit').has(boss) && !!engine.combat.foe(`${boss}@heroic`, 25));
+  const onBoss = (difficulty) => [JSON.stringify({ ...head, encounter: { bossKind: boss, difficulty, targetDummy: false, partySize: 1 } }),
+    ...events.map((e) => JSON.stringify(e.targetKind === 'Dummy' ? { ...e, targetKind: boss, targetLevel: 25 } : e))].join('\n') + '\n';
+  const heroic = file('heroic.jsonl', onBoss(2));
+  const h = asJson(verify('--capture', heroic, '--import', sheet, '--json'));
+  ok('a log that says Heroic is priced as its boss @heroic, and says the log decided it', h?.target?.pricedAs === `${boss}@heroic` && h.combatLog?.pricedByLog === true
+    && /the log says the fight was Heroic: the model is priced as Ratsar@heroic/.test(h.target.note ?? ''), JSON.stringify({ t: h?.target?.pricedAs, n: h?.target?.note }));
+  const veteran = asJson(verify('--capture', file('veteran.jsonl', onBoss(1)), '--import', sheet, '--target', boss, '--json'));
+  ok('...Veteran as @veteran, on the unit --target names', veteran?.target?.pricedAs === `${boss}@veteran` && veteran.target.filter === boss);
+  const typed = asJson(verify('--capture', heroic, '--import', sheet, '--price-as', boss, '--json'));
+  ok('...and a typed --price-as wins', typed?.target?.pricedAs === boss && typed.combatLog?.pricedByLog === false);
+  const unknown = asJson(verify('--capture', file('unknown.jsonl', onBoss(-1)), '--import', sheet, '--json'));
+  ok('a log that does not say the difficulty is noted and priced as before', unknown?.combatLog?.pricedByLog === false
+    && /does not say which difficulty/.test(unknown.combatLog.note ?? '') && unknown.target.pricedAs === null);
+  // A mode typed on --target is a typed pricing, as --price-as is: the log
+  // does not decide over it, and where the two disagree the line says so.
+  const vetPath = join(dir, 'veteran.jsonl');
+  const typedMode = asJson(verify('--capture', vetPath, '--import', sheet, '--target', `${boss}@heroic`, '--json'));
+  ok('a mode typed on --target wins over the difficulty the log names, and the line says they disagree', typedMode?.target?.pricedAs === `${boss}@heroic`
+    && typedMode.combatLog?.pricedByLog === false
+    && /the log says the fight was Veteran; --target Ratsar@heroic prices it @heroic, as typed/.test(typedMode.combatLog.note ?? ''),
+  JSON.stringify({ p: typedMode?.target?.pricedAs, c: typedMode?.combatLog }));
+  const typedInstance = asJson(verify('--capture', heroic, '--import', sheet, '--target', `${boss}#900@veteran`, '--json'));
+  ok('...an instance with a mode as well', typedInstance?.target?.pricedAs === `${boss}@veteran` && typedInstance.combatLog?.pricedByLog === false
+    && /the log says the fight was Heroic; --target Ratsar#900@veteran prices it @veteran, as typed/.test(typedInstance.combatLog.note ?? ''));
+  const agreeing = asJson(verify('--capture', heroic, '--import', sheet, '--target', `${boss}@heroic`, '--json'));
+  ok('...and one that agrees with the log is priced as typed, with nothing to say', agreeing?.target?.pricedAs === `${boss}@heroic` && agreeing.combatLog?.note === null);
+  // A log with no encounter block, all on the training Dummy (logged at its
+  // row's level 1): no target of it could have stood in Veteran or Heroic.
+  const noEnc = asJson(verify('--capture', file('noenc.jsonl', [JSON.stringify((({ encounter, ...rest }) => rest)(head)), ...events.map((e) => JSON.stringify(e))].join('\n') + '\n'),
+    '--import', sheet, '--json'));
+  ok('a log with no encounter, all on the Dummy, gets no line about the difficulty', noEnc?.combatLog?.difficulty === null && noEnc.combatLog.note === null,
+    JSON.stringify(noEnc?.combatLog));
+
+  // verify --json <anything> prints its ledger to stdout, so the import's
+  // report goes to stderr then too (it broke the JSON with a value given).
+  const valued = verify('--capture', LOG, '--import', sheet, '--json', join(dir, 'unused.json'));
+  ok('verify --json <value> keeps stdout the ledger alone, the import\'s report on stderr', asJson(valued)?.build?.from === 'import'
+    && /--import .*warrior\.json/.test(valued.stderr) && !/Read as/.test(valued.stdout), valued.stdout.slice(0, 120));
+
+  // The character the log names, against the build: another class is
+  // refused (a Rogue sheet against the Warrior log gave a ledger at exit 0),
+  // unless --class names the build's own; another level is said.
+  const rogue = fileURLToPath(new URL('../docs/examples/sheet-full.json', import.meta.url));
+  const wrongClass = verify('--capture', LOG, '--import', rogue);
+  ok('a log whose header names another class than the imported build is refused', wrongClass.status === 1
+    && /says its character Tester is a Warrior, and the build .*sheet-full\.json is a Rogue/.test(wrongClass.stderr), tail(wrongClass));
+  const insisted = verify('--capture', LOG, '--import', rogue, '--class', 'Rogue', '--json');
+  ok('...unless --class names the build\'s own class', insisted.status === 0 && asJson(insisted)?.unit === 'Rogue', tail(insisted));
+  const at24 = file('level24.jsonl', [JSON.stringify({ ...head, character: { ...head.character, level: 24 } }), ...events.map((e) => JSON.stringify(e))].join('\n') + '\n');
+  const lv = asJson(verify('--capture', at24, '--import', sheet, '--json'));
+  ok('a log whose character is another level than the build says so', /the log says its character was level 24, and the build is priced at level 25 - --level 24 prices it at the log's/.test(lv?.combatLog?.levelNote ?? ''),
+    JSON.stringify(lv?.combatLog));
+  const lv24 = asJson(verify('--capture', at24, '--import', sheet, '--level', '24', '--json'));
+  ok('...and --level at the log\'s says nothing', lv24?.level === 24 && lv24.combatLog?.levelNote === null);
+
+  // With no sheet and no dump, the sentence names the way out: a log
+  // carries no build. (No install holds a dump for the example's "Tester".)
+  const noBuild = verify('--capture', LOG);
+  ok('a combat log with no --import and no dump names --import <character sheet>', noBuild.status === 1
+    && /no inventory dump for "Tester"/.test(noBuild.stderr) && /A combat log carries no build: give the one it was fought in with --import <character sheet>/.test(noBuild.stderr), tail(noBuild));
+
+  // A Wink summary alone holds totals and no row.
+  const summary = file('fight_2.json', JSON.stringify({ version: 1, startedAt: head.startedAt, meName: 'Tester', me: head.me, duration: 9.2, bossKind: 'Dummy', difficulty: 0,
+    players: [{ uid: head.me, name: 'Tester', isMe: true, skills: [{ id: 'GA_Craft_Skill1', damage: 952.7, hits: 1, crits: 1 }] }] }));
+  const refused = verify('--capture', summary, '--import', sheet);
+  ok('a Wink summary alone is refused with the reader\'s sentence', refused.status !== 0 && refused.stderr.includes('summary-only log: per-skill totals, no per-event rows'), tail(refused));
+
+  // A Wink timeline, read with its summary beside it.
+  const tl = file('fight_3.json.timeline', [JSON.stringify({ version: 1, me: head.me, duration: head.duration, initial: head.initial, count: events.length, clock: 'client-observed', leadIn: 2 }),
+    ...events.map((e) => JSON.stringify(e))].join('\n') + '\n');
+  file('fight_3.json', JSON.stringify({ version: 1, startedAt: head.startedAt, meName: 'Tester', me: head.me, duration: head.duration, bossKind: 'Dummy', difficulty: 0,
+    players: [{ uid: head.me, name: 'Tester', isMe: true, skills: [] }] }));
+  const w = asJson(verify('--capture', tl, '--import', sheet, '--json'));
+  ok('a Wink timeline with its summary is verified on its own span, as its summary\'s character', w?.character === 'Tester' && w.window?.fromLog === true
+    && w.combatLog?.dialect === 'wink-timeline' && w.rows?.some((r) => r.id === 'GA_Craft_Skill1' && r.liveHits === 1), JSON.stringify({ c: w?.character, d: w?.combatLog }));
+
+  // bin/capture.mjs info names the log's build, not a probe boot of unknown size.
+  const info = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/capture.mjs', import.meta.url)), 'info', '--file', LOG], { encoding: 'utf8' });
+  ok('capture.mjs info calls the log\'s session row the build it names', info.status === 0
+    && info.stdout.includes(`a farever-combat-log file, naming its build as ${engine.meta.bootSha}; \`bench verify\` says whether that is the installed one`)
+    && !/\? bytes/.test(info.stdout), tail(info));
+  // ...and a log that names none is not sent to verify to ask.
+  const nameless = file('nameless.jsonl', [JSON.stringify((({ source, ...rest }) => rest)(head)), ...events.map((e) => JSON.stringify(e))].join('\n') + '\n');
+  const infoNone = spawnSync(process.execPath, [fileURLToPath(new URL('../bin/capture.mjs', import.meta.url)), 'info', '--file', nameless], { encoding: 'utf8' });
+  ok('...and one that names no build says no reader can place it', infoNone.status === 0
+    && infoNone.stdout.includes('a farever-combat-log file, naming no build (no bootSha256, steamBuild or game version in its header), so no reader can place it on a build')
+    && !/bench verify/.test(infoNone.stdout), tail(infoNone));
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+// What the review of the combat-log path through verify found, held: a modkit
+// dump given by --import beside a log of its own character was refused for
+// want of a class the log names; a header that says Heroic over the training
+// dummy at level 1 priced the model at Dummy@heroic, level 25, and dropped the
+// logged level's own line; and what the log reader says about the file - rows
+// it could not place, a recorder's gap, an estimated start, hits with no
+// affinity - was said by `bench import` alone, never by the ledger built on
+// those rows.
+group('cli verify reads a combat log: a modkit dump takes the log\'s class, a header that cannot be right is not followed, and what the reader said is said');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const BENCH = fileURLToPath(new URL('../bin/bench.mjs', import.meta.url));
+  const LOG = fileURLToPath(new URL('../docs/examples/combat-log.jsonl', import.meta.url));
+  const run = (...a) => spawnSync(process.execPath, [BENCH, ...a], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1', FAREVER_BENCH_UPLOAD_LINK: 'none' }, timeout: 180_000 });
+  const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
+  const asJson = (r) => { try { return JSON.parse(r.stdout); } catch { return null; } };
+  const dir = mkdtempSync(join(tmpdir(), 'bench-cli-verify-log2-'));
+  const file = (name, text) => { const p = join(dir, name); writeFileSync(p, typeof text === 'string' ? text : JSON.stringify(text)); return p; };
+  const lines = readFileSync(LOG, 'utf8').trim().split('\n');
+  const head = JSON.parse(lines[0]);
+  const events = lines.slice(1).map((l) => JSON.parse(l));
+  const logOf = (h, evs) => [JSON.stringify(h), ...evs.map((e) => JSON.stringify(e))].join('\n') + '\n';
+  ok('premise: the example log is a Warrior named Tester, on the Dummy at level 1, every hit with an affinity and a target level',
+    head.character?.class === 'Warrior' && head.character.name === 'Tester'
+      && events.filter((e) => e.kind === 'damage').every((e) => e.targetKind === 'Dummy' && e.targetLevel === 1 && typeof e.affinity === 'string'));
+
+  // A MODKIT DUMP OF THE LOG'S OWN CHARACTER takes the class the log names.
+  const W = (kind, o = {}) => ({ kind, level: 25, upgrade: 0, rarity: -1, count: 1, class: 'st.item.Weapon', infusion: null, infusionStat: null, prismatic: false, flawless: false, ...o });
+  const dump = file('farever-inventory-Tester.json', { character: 'Tester', bankSlots: 0, bank: [], bags: [], equipped: [W('GA_Craft')] });
+  const viaDump = run('verify', '--capture', LOG, '--import', dump, '--json');
+  const dj = asJson(viaDump);
+  ok('verify --import <a modkit dump> beside a log of its character runs, in the class the log names', viaDump.status === 0 && dj?.unit === 'Warrior'
+    && dj.build?.from === 'import' && /The class: a modkit dump names no class: it is read as a Warrior, the class .*combat-log\.jsonl gives its character Tester/.test(viaDump.stderr), tail(viaDump));
+  const typed = run('verify', '--capture', LOG, '--import', dump, '--class', 'Warrior', '--json');
+  ok('...a typed --class is the class, and nothing is taken from the log then', typed.status === 0 && asJson(typed)?.unit === 'Warrior'
+    && !/The class: a modkit dump/.test(typed.stderr), tail(typed));
+  const other = file('farever-inventory-Someone.json', { character: 'Someone', bankSlots: 0, bank: [], bags: [], equipped: [W('GA_Craft')] });
+  const otherRun = run('verify', '--capture', LOG, '--import', other);
+  ok('...and the dump of another character takes nothing from the log: refused for want of a class, as before', otherRun.status === 1
+    && /does not say which class "Someone" is.*--class/.test(otherRun.stderr), tail(otherRun));
+  const zipPath = join(dir, 'dump.zip');
+  const packed = run('submit', '--log', LOG, '--import', dump, '--zip', zipPath);
+  const manifest = existsSync(zipPath) ? JSON.parse(Object.fromEntries(submitLib.readZip(readFileSync(zipPath)).map((e) => [e.name, e.data.toString('utf8')]))['manifest.json']) : null;
+  ok('bench submit --log <log> --import <that dump> packs it in the log\'s class, and says so (src/submit.mjs, the rule the UI\'s Send reads it by)',
+    packed.status === 0 && manifest?.sheet?.class === 'Warrior'
+    && /Problem: a modkit dump names no class: it is read as a Warrior - the class the fight's log gives the dump's own character/.test(packed.stdout), tail(packed));
+  // ...but only in a class its weapons fit (review: a Warrior's log beside a
+  // dump of daggers read it as a Warrior with both daggers dropped, and that
+  // gutted sheet was sent - where the app asked for the class). Asked, then,
+  // by verify and submit alike, with why the log's was not taken.
+  const daggers = [...engine.cat.itemById.values()].find((it) => engine.cat.isWeaponType(it.type) && !it.isAugment
+    && engine.cat.usableBy(it, 'Assassin') && !engine.cat.usableBy(it, 'Fighter') && (it.minLevel ?? 1) <= 25 && (it.slots ?? []).includes('Slot_Weapon1'));
+  const rogueDump = file('farever-inventory-Tester-rogue.json', { character: 'Tester', bankSlots: 0, bank: [], bags: [], equipped: [W(daggers?.id ?? 'none')] });
+  const unfit = run('submit', '--log', LOG, '--import', rogueDump);
+  ok('bench submit: a dump of the log\'s character whose weapons do not fit the log\'s class is asked its class, and told why the log\'s was not taken',
+    !!daggers && unfit.status === 1 && /does not say which class "Tester" is - every weapon it lists fits a Rogue/.test(unfit.stderr)
+      && /The fight's log names its character a Warrior, a class the dump's weapons do not fit, so the dump is not read as one\./.test(unfit.stderr), tail(unfit));
+  const unfitVerify = run('verify', '--capture', LOG, '--import', rogueDump);
+  ok('...and bench verify asks it the same way', unfitVerify.status === 1 && /does not say which class "Tester" is.*--class/.test(unfitVerify.stderr), tail(unfitVerify));
+  // VERIFY VOUCHES BY SUBMIT'S RULE (charsheet.mjs classVouch): a --class
+  // confirms a file that names its own class against a log of another, and
+  // never a dump read as that very class (review: verify priced the Rogue
+  // dump against the Warrior's log at 0.0 dps, exit 0, where submit refused).
+  const dumpAsRogue = run('verify', '--capture', LOG, '--import', rogueDump, '--class', 'Rogue');
+  ok('bench verify: a dump read as --class Rogue beside a Warrior\'s log is refused - that --class is the build\'s only word on its class',
+    dumpAsRogue.status === 1 && /is a Warrior, and the build .* is a Rogue: its rows cannot be priced as this build/.test(dumpAsRogue.stderr)
+      && /--class Rogue is the build's only word on its class - .* names none - so it cannot say the log's header is the one that is wrong/.test(dumpAsRogue.stderr)
+      && !/or --class Rogue if the log's header/.test(dumpAsRogue.stderr), tail(dumpAsRogue));
+  const SHEET_FULL = fileURLToPath(new URL('../docs/examples/sheet-full.json', import.meta.url));
+  const fileRefused = run('verify', '--capture', LOG, '--import', SHEET_FULL);
+  const fileVouched = run('verify', '--capture', LOG, '--import', SHEET_FULL, '--class', 'Rogue', '--json');
+  ok('...while a sheet that names Rogue itself is refused without --class, offered it, and priced with it',
+    fileRefused.status === 1 && /or --class Rogue if the log's header is the one that is wrong/.test(fileRefused.stderr)
+      && fileVouched.status === 0 && asJson(fileVouched)?.unit === 'Rogue', `${tail(fileRefused)} || ${tail(fileVouched)}`);
+
+  // A HEADER THAT CANNOT BE RIGHT: Heroic over the training dummy at level 1.
+  const sheet = join(dir, 'warrior.json');
+  const axe = engine.cat.itemById.get('GA_Craft');
+  const l = emptyLoadout(engine.cat, 'Warrior', 25);
+  l.gear.Slot_Weapon1 = { item: 'GA_Craft', rarity: axe.rarity, stars: 0 };
+  engine.plan.pruneSelection(l);
+  writeFileSync(sheet, JSON.stringify(sheetLib.toSheet(engine, l, { name: 'Tester', rank: 3 }), null, 2));
+  const normal = asJson(run('verify', '--capture', LOG, '--import', sheet, '--target', 'Dummy', '--json'));
+  const heroicDummy = file('heroic-dummy.jsonl', logOf({ ...head, encounter: { ...head.encounter, difficulty: 2, targetDummy: true } }, events));
+  const hd = asJson(run('verify', '--capture', heroicDummy, '--import', sheet, '--target', 'Dummy', '--json'));
+  ok('a header saying Heroic over a target dummy is not followed: priced at the logged level, as the same log at Normal, and said',
+    hd?.combatLog?.pricedByLog === false && hd.target.pricedAs === normal?.target?.pricedAs && hd.target.level === normal.target.level && hd.target.level === 1
+      && /the log says the fight was Heroic, but its header says the target was a training dummy, so it was not one/.test(hd.combatLog.note ?? '')
+      && hd.target.levelNote === normal.target.levelNote && !!hd.target.levelNote,
+    JSON.stringify({ t: hd?.target?.pricedAs, lvl: hd?.target?.level, c: hd?.combatLog?.note, n: normal?.target?.pricedAs }));
+  const heroicNoFlag = asJson(run('verify', '--capture', file('heroic-nodummy.jsonl', logOf({ ...head, encounter: { bossKind: 'Dummy', difficulty: 2, partySize: 1 } }, events)),
+    '--import', sheet, '--target', 'Dummy', '--json'));
+  ok('...and so is one whose hits are all on the Dummy, with no word about a dummy in the header', heroicNoFlag?.combatLog?.pricedByLog === false
+    && /but Dummy is the training dummy, so it was not one/.test(heroicNoFlag.combatLog.note ?? '') && heroicNoFlag.target.level === 1, JSON.stringify(heroicNoFlag?.combatLog));
+  const lowBoss = asJson(run('verify', '--capture', file('heroic-low.jsonl', logOf({ ...head, encounter: { bossKind: 'Ratsar', difficulty: 2, targetDummy: false, partySize: 1 } },
+    events.map((e) => (e.targetKind === 'Dummy' ? { ...e, targetKind: 'Ratsar', targetLevel: 20 } : e)))), '--import', sheet, '--json'));
+  ok('...nor one whose hits on its boss were logged below MaxLevel', lowBoss?.combatLog?.pricedByLog === false
+    && /but the hits on Ratsar were logged at level 20, below MaxLevel 25, so it was not one/.test(lowBoss.combatLog.note ?? ''), JSON.stringify(lowBoss?.combatLog));
+
+  // WHAT THE READER SAID: problems and notes, in the ledger and in --json.
+  const damageAt = events.findIndex((e) => e.kind === 'damage');
+  const loose = events.map((e, i) => {
+    if (e.kind !== 'damage') return e;
+    const { affinity, ...rest } = e;
+    return i === damageAt ? (({ targetKind, ...r }) => r)(rest) : rest;
+  });
+  const looseLog = file('loose.jsonl', logOf(head, loose));
+  const lj = asJson(run('verify', '--capture', looseLog, '--import', sheet, '--json'));
+  const lt = run('verify', '--capture', looseLog, '--import', sheet);
+  const mine = events.filter((e) => e.kind === 'damage' && e.source === head.me).length;
+  ok('the reader\'s problems are the ledger\'s: a hit with no targetKind is said, in --json and in the ledger', (lj?.combatLog?.problems ?? []).some((p) => /1 damage event lacks a target or its targetKind/.test(p))
+    && /^log: 1 damage event lacks a target or its targetKind/m.test(lt.stdout), JSON.stringify(lj?.combatLog?.problems));
+  ok('...and hits with no affinity are said, which a skill under two affinities is then compared as one row', (lj?.combatLog?.notes ?? []).some((n) => n === `none of Tester's ${mine} hits carry an affinity: a skill logged under two affinities is compared as one row`)
+    && /^log: none of Tester's \d+ hits carry an affinity/m.test(lt.stdout), JSON.stringify(lj?.combatLog?.notes));
+  const clean = asJson(run('verify', '--capture', LOG, '--import', sheet, '--json'));
+  ok('...where the documented example has nothing to say', sheetCanon(clean?.combatLog?.problems) === '[]' && sheetCanon(clean?.combatLog?.notes) === '[]', JSON.stringify(clean?.combatLog));
+  // A Wink timeline alone: its start is the file's time, and the ledger says so.
+  const tl = file('fight_9.json.timeline', logOf({ version: 1, me: head.me, duration: head.duration, initial: head.initial, count: events.length, clock: 'client-observed', leadIn: 2 }, events));
+  const wj = asJson(run('verify', '--capture', tl, '--import', sheet, '--json'));
+  ok('a Wink timeline with no summary beside it: the estimated start and what Wink cannot hold are in --json', (wj?.combatLog?.notes ?? []).some((n) => /start time is ESTIMATED/.test(n))
+    && wj.combatLog.notes.some((n) => /Wink writes no target level and no affinity/.test(n)) && !wj.combatLog.notes.some((n) => /difficulty is unknown/.test(n)),
+  JSON.stringify(wj?.combatLog?.notes));
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+// Where a combat log leaves the fight to the model, said by the ledger: a log
+// that records no press of its character played the model's own rotation in
+// silence, its NOT-PRESSED rows read as evidence; a log of presses alone
+// replayed from its first second, where the recorded fight stood until the
+// first press (the review's Rogue window: 404.7 model dps against the
+// probe's 386.9); and a Mage's log that carries no Spark opened the model's
+// fight on a full gauge without a word.
+group('cli verify reads a combat log: no press recorded, a --replay opening from presses alone, and a gauge the log does not carry, each said');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const BENCH = fileURLToPath(new URL('../bin/bench.mjs', import.meta.url));
+  const LOG = fileURLToPath(new URL('../docs/examples/combat-log.jsonl', import.meta.url));
+  const verify = (...a) => spawnSync(process.execPath, [BENCH, 'verify', ...a], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' }, timeout: 180_000 });
+  const tail = (r) => (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | ');
+  const asJson = (r) => { try { return JSON.parse(r.stdout); } catch { return null; } };
+  const dir = mkdtempSync(join(tmpdir(), 'bench-cli-verify-log3-'));
+  const file = (name, text) => { const p = join(dir, name); writeFileSync(p, text); return p; };
+  const lines = readFileSync(LOG, 'utf8').trim().split('\n');
+  const head = JSON.parse(lines[0]);
+  const events = lines.slice(1).map((l) => JSON.parse(l));
+  const logOf = (h, evs) => [JSON.stringify({ ...h, count: evs.length }), ...evs.map((e) => JSON.stringify(e))].join('\n') + '\n';
+  const sheetOf = (cls, weapon) => {
+    const l = emptyLoadout(engine.cat, cls, 25);
+    l.gear.Slot_Weapon1 = { item: weapon, rarity: engine.cat.itemById.get(weapon).rarity, stars: 0 };
+    engine.plan.pruneSelection(l);
+    return { loadout: l, path: file(`${cls}.json`, JSON.stringify(sheetLib.toSheet(engine, l, { name: 'Tester', rank: 3 }))) };
+  };
+  const warrior = sheetOf('Warrior', 'GA_Craft').path;
+  const uses = events.filter((e) => e.kind === 'skill_use' && e.source === head.me);
+  ok('premise: the example log is a Warrior who starts two skills of their own and writes no press', head.character?.class === 'Warrior'
+    && uses.length === 2 && uses.every((e) => e.origin === e.skill) && !events.some((e) => e.kind === 'press' || e.kind === 'block_use'));
+
+  // NO PRESS RECORDED: the model plays its own rotation, and says so.
+  const noPress = events.filter((e) => e.kind !== 'skill_use' && e.kind !== 'skill_context');
+  const quiet = file('nopress.jsonl', logOf(head, noPress));
+  const qText = verify('--capture', quiet, '--import', warrior);
+  const q = asJson(verify('--capture', quiet, '--import', warrior, '--json'));
+  ok('a log that records no press of its character says the model plays its own rotation, and that its choice is not evidence', qText.status === 0
+    && /^presses: the log records none of Tester's, and does not say it records them \(source\.recordsPresses\) - the model plays its own rotation, and what it presses that the log has no row of is its choice, not evidence$/m.test(qText.stdout),
+  tail(qText));
+  ok('...and --json carries it: no presses, none declared, no pool', q?.combatLog?.presses === false && q.combatLog.pressesDeclared === false
+    && JSON.stringify(q.combatLog.pools) === '[]' && q.nothingPressed === false, JSON.stringify(q?.combatLog));
+  const declared = verify('--capture', file('declared.jsonl', logOf({ ...head, source: { ...head.source, recordsPresses: true } }, noPress)), '--import', warrior, '--json');
+  const d = asJson(declared);
+  ok('...one that declares it records presses (source.recordsPresses) and holds none was pressed nothing: the chain alone, and no such line',
+    d?.combatLog?.presses === true && d.combatLog.pressesDeclared === true && d.nothingPressed === true
+      && !/the model plays its own rotation/.test(declared.stderr + declared.stdout), JSON.stringify(d?.combatLog));
+  const full = asJson(verify('--capture', LOG, '--import', warrior, '--replay', '--json'));
+  ok('the example log as it is: presses seen (not declared), and --replay opens where its first skill start does', full?.combatLog?.presses === true
+    && full.combatLog.pressesDeclared === false && full.replay?.opensFrom === 'state' && Math.abs(full.replay.opens - 1.7) < 0.002, JSON.stringify(full?.replay));
+
+  // A LOG OF PRESSES ALONE: --replay opens at the first press, and says so.
+  const pressOnly = events.filter((e) => e.kind !== 'skill_context').map((e) => (e.kind === 'skill_use' ? { ...e, kind: 'press' } : e));
+  const pressLog = file('pressonly.jsonl', logOf(head, pressOnly));
+  const pText = verify('--capture', pressLog, '--import', warrior, '--replay');
+  const p = asJson(verify('--capture', pressLog, '--import', warrior, '--replay', '--json'));
+  const firstPress = Math.min(...uses.map((e) => e.time));
+  const expected = (head.startedAt + firstPress * 1000 - (p?.windows?.[0]?.from ?? NaN)) / 1000;
+  ok('a log of presses alone (no skill start): --replay opens at the character\'s first press, as the one with skill starts does', p?.replay?.opensFrom === 'press'
+    && Math.abs(p.replay.opens - expected) < 0.002 && Math.abs(p.replay.opens - full?.replay?.opens) < 0.002 && p.replay.replayed === 2,
+  JSON.stringify({ r: p?.replay, expected }));
+  ok('...and the replay line says the press stands in for the skill start', pText.status === 0
+    && /^replay: 2\/2 presses replayed over [\d.]+s, opening 1\.70s in at Tester's first press \(the log writes no skill start\)/m.test(pText.stdout), tail(pText));
+
+  // A GAUGE THE LOG DOES NOT CARRY: a Mage's fight opens on a full Spark.
+  const mage = sheetOf('Mage', 'Staff_SummonDemon');
+  let gauge = null;
+  try { gauge = engine.plan.resolve(mage.loadout, 3).sparkGauge?.atb ?? null; } catch { gauge = null; }
+  ok('premise: a Mage with Staff_SummonDemon fights on the Spark gauge', gauge === 'Spark');
+  const asMage = { ...head, character: { ...head.character, class: 'Mage' } };
+  const bare = verify('--capture', file('mage.jsonl', logOf(asMage, events)), '--import', mage.path, '--json');
+  const b = asJson(bare);
+  ok('a Mage\'s log that carries no Spark says the model\'s fight opens on a full gauge', bare.status === 0 && b?.poolStart === null
+    && /^Spark: the log carries no spark value on Tester's presses or skill starts \(the field `spark`\), so the model's fight opens on a full gauge$/.test(b.combatLog?.gaugeNote ?? ''),
+  `${tail(bare)} ${JSON.stringify(b?.combatLog)}`);
+  const sparked = asJson(verify('--capture', file('mage-spark.jsonl', logOf(asMage, events.map((e) => (e.kind === 'skill_use' ? { ...e, spark: 42.5 } : e)))),
+    '--import', mage.path, '--json'));
+  ok('...and one with Spark on its skill starts opens there, with nothing to say', sparked?.poolStart?.Spark === 42.5 && sparked.combatLog?.gaugeNote === null
+    && JSON.stringify(sparked.combatLog.pools) === '["spark"]', JSON.stringify({ ps: sparked?.poolStart, c: sparked?.combatLog }));
+  ok('...where a Warrior, who fights on no gauge verify opens a fight at, gets no gauge line', q?.combatLog?.gaugeNote === null);
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+// A combat log's initial[] is what stood when its recording opened; the
+// windows over a whole log, or cut from its start, open exactly there, and
+// openingState read nothing at or after an opening - so an initial[] written
+// without a time (the documented default) stood nowhere. The Wink summary
+// beside a timeline is found by one helper for every reader, and a captureEra
+// sentence names the file that named the build.
+group('capture: a combat log\'s initial[] stands when a window opens on it, the summary beside a timeline is a file or nothing, and the build is named by the file that names it');
+if (on) try {
+  const { openingState, combatLogOf, winkCompanion, isInitialRow, captureEra, parseSession, streamCapture } = await import('../src/capture.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'bench-capture-initial-'));
+  const fx = combatLogFixture({ mutate: (h) => { delete h.initial[0].time; } });
+  const timeless = join(dir, 'timeless.jsonl');
+  writeFileSync(timeless, fx.text);
+  const rows = combatLogOf(timeless).rows;
+  const tagged = rows.filter(isInitialRow);
+  ok('the row of initial[] is tagged initial=1, and no other', tagged.length === 1 && tagged[0].skill === 'Warrior_BattleShoutStatus'
+    && rows.filter((r) => /(^|;)initial=1(;|$)/.test(r.extra ?? '')).length === 1, JSON.stringify(tagged));
+  const first = rows.find((r) => r.event !== 'session').ts;
+  ok('premise: a timeless initial[] entry stands at the log\'s first row', tagged[0]?.ts === first && first === fx.at(-0.3), `${tagged[0]?.ts} vs ${first}`);
+  const at = await openingState(timeless, { source: 'Tester', at: first });
+  const shout = at.standing.find((x) => x.status === 'Warrior_BattleShoutStatus');
+  ok('a window opening at the log\'s first row has the initial[] status standing, marked as standing since before the log', !!shout && shout.self && shout.initial === true, JSON.stringify(at.standing));
+  const before = await openingState(timeless, { source: 'Tester', at: fx.at(-5) });
+  ok('...and one opening before the log starts too', before.standing.some((x) => x.status === 'Warrior_BattleShoutStatus' && x.initial), JSON.stringify(before.standing));
+  const after = await openingState(timeless, { source: 'Tester', at: fx.at(9.5) });
+  ok('...while one opening after it was removed has it no more', !after.standing.some((x) => x.status === 'Warrior_BattleShoutStatus'), JSON.stringify(after.standing));
+  const timed = join(dir, 'timed.jsonl');
+  writeFileSync(timed, combatLogFixture().text);
+  const atTimed = await openingState(timed, { source: 'Tester', at: fx.at(-2) });
+  ok('an initial[] entry with its own time stands at an opening exactly there', atTimed.standing.some((x) => x.status === 'Warrior_BattleShoutStatus' && x.initial), JSON.stringify(atTimed.standing));
+  const later = await openingState(timed, { source: 'Tester', at: fx.at(5) });
+  ok('...and a status applied in the log is no initial one', later.standing.some((x) => x.status === 'GA_Craft_FinalCombo_Status' && !x.initial), JSON.stringify(later.standing));
+
+  // The summary beside a timeline: a file, or nothing.
+  const wfx = combatLogFixture({ wink: true });
+  const base = join(dir, 'fight_1.json');
+  writeFileSync(`${base}.timeline`, wfx.text);
+  ok('winkCompanion: nothing beside the timeline is null, and so is a path that is no timeline', winkCompanion(`${base}.timeline`) === null && winkCompanion(timed) === null);
+  mkdirSync(base);
+  ok('...a folder named like the summary is no summary', winkCompanion(`${base}.timeline`) === null);
+  let read = null;
+  let threw = null;
+  try { read = combatLogOf(`${base}.timeline`); } catch (e) { threw = e.message; }
+  ok('...and the timeline is read alone, its start estimated - not refused with the folder\'s read error', !threw && read?.log.startedAtEstimated === true, threw ?? '');
+  rmSync(base, { recursive: true, force: true });
+  writeFileSync(base, JSON.stringify(wfx.summary));
+  const side = winkCompanion(`${base}.timeline`);
+  ok('...a file is read, with its name and bytes', side?.name === 'fight_1.json' && side.data?.length > 0 && side.why === null);
+
+  // Which file named the build: a Wink timeline's header names none.
+  const receipt = await streamCapture(`${base}.timeline`, () => {});
+  const era = captureEra({ sessionRows: receipt.sessionRows, from: wfx.at(0), to: wfx.at(9), boot: null, bootSha: combatBoot() });
+  ok('a Wink timeline\'s build is named as its summary\'s game version, not its header\'s', era.onThisBuild === null
+    && era.reason.startsWith('its Wink summary names the game version fixture-1, and the installed hlboot.dat is') && !/header/.test(era.reason), era.reason);
+  const alone = join(dir, 'fight_3.json.timeline');
+  writeFileSync(alone, wfx.text);
+  // (Read alone its start is the file's time, so the window is left open.)
+  const aloneEra = captureEra({ sessionRows: (await streamCapture(alone, () => {})).sessionRows, from: null, to: null, boot: null, bootSha: combatBoot() });
+  ok('...and one with no summary says neither names a build', aloneEra.reason.startsWith('the Wink timeline names no build, and no summary beside it names a game version'), aloneEra.reason);
+  const plainEra = captureEra({ sessionRows: (await streamCapture(timed, () => {})).sessionRows.map((s) => ({ ...s, build: 'ab'.repeat(32) })), from: fx.at(0), to: fx.at(9), boot: null, bootSha: combatBoot() });
+  ok('...where a farever-combat-log is still named by its header', plainEra.reason.startsWith('the farever-combat-log header names its build as abab'), plainEra.reason);
+  const CAPTURE = fileURLToPath(new URL('../bin/capture.mjs', import.meta.url));
+  const infoPair = spawnSync(process.execPath, [CAPTURE, 'info', '--file', `${base}.timeline`], { encoding: 'utf8' });
+  const infoAlone = spawnSync(process.execPath, [CAPTURE, 'info', '--file', alone], { encoding: 'utf8' });
+  ok('capture.mjs info says the same: the Wink summary names the game version, or nothing does', infoPair.status === 0
+    && infoPair.stdout.includes('a wink-timeline file, whose Wink summary names the game version fixture-1')
+    && infoAlone.stdout.includes('a wink-timeline file, naming no build (a Wink timeline carries none, and no summary beside it names a game version)'),
+  `${infoPair.stdout} | ${infoAlone.stdout}`);
+  ok('premise: parseSession reads the build a session row names', parseSession({ ts: 1, extra: 'probe=x;build=y;presses=1' }).build === 'y');
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+// A party member of a class the log never names - a Priest's hits, with no
+// name and no class in the header or a summary - read as a monster's
+// ("Priest#78") where the engine knows Priest is a class: combatLogOf takes
+// the game's classes from a caller with an engine at hand (bench verify),
+// and every reader after it in the run reads those same rows.
+group('capture: a combat log read with the game\'s classes names a party member of any class as a player, for every reader after it');
+if (on) try {
+  const { combatLogOf } = await import('../src/capture.mjs');
+  const engine = createEngine({ quiet: true });
+  const dir = mkdtempSync(join(tmpdir(), 'bench-capture-herokinds-'));
+  const path = join(dir, 'party.jsonl');
+  writeFileSync(path, combatLogFixture({ mutate: (h, evs) => {
+    evs.push({ seq: 23, time: 9.2, kind: 'damage', source: '78', sourceKind: 'Priest', target: '900', targetKind: 'Dummy', skill: 'GA_Base_Attack',
+      origin: 'GA_Base_Attack', amount: 40, critical: false, hits: 1, damageType: 'physical', outcome: 'Hit' });
+    h.count = evs.length;
+  } }).text);
+  const by78 = (entry) => entry.rows.find((r) => r.event === 'inflict' && /78$/.test(r.source))?.source ?? null;
+  const classes = engine.cat.classes.map((c) => c.unit);
+  ok('premise: Priest is a class of the game, and the log names no Priest', classes.includes('Priest'));
+  const alone = by78(combatLogOf(path));
+  const known = by78(combatLogOf(path, { heroKinds: classes }));
+  const after = by78(combatLogOf(path));
+  ok('read from the log alone, the Priest is a unit of its kind; read with the game\'s classes, a player', alone === 'Priest#78' && known === 'player78', `${alone} / ${known}`);
+  ok('...and a reader after it with no engine at hand (streamCapture\'s) takes those same rows', after === 'player78', String(after));
+  rmSync(dir, { recursive: true, force: true });
+} catch (e) { crashed(e); }
+
+// --- what reaches the network ----------------------------------------------------
+// The bench reaches the network in two cases, each one the user asked for in
+// so many words: a questlog.gg link (bin/bench.mjs applyQuestlog, and
+// tools/questlog-import.mjs, which shows its translation), and a fight sent
+// to the project (src/submit.mjs, on `bench submit --send` or the UI's Send
+// button). The UI server LISTENS with node:http on this machine and calls
+// nothing. This holds src/, bin/, tools/ and ui/*.mjs to exactly that: a new
+// fetch, an http(s).request, a node:net or a WebSocket anywhere else fails
+// here, by file and line, and so does a node:http import that calls out - and
+// so does a call of src/submit.mjs's two senders from anywhere but `bench
+// submit` and the UI's send and delete routes.
+group('network call sites: only the questlog link and a fight sent to the project reach the network, and the UI server only listens');
+if (on) try {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const files = [];
+  const walk = (rel) => {
+    for (const e of readdirSync(join(root, rel), { withFileTypes: true })) {
+      const at = `${rel}/${e.name}`;
+      if (e.isDirectory()) walk(at);
+      else if (/\.(mjs|cjs|js)$/.test(e.name)) files.push(at);
+    }
+  };
+  for (const d of ['src', 'bin', 'tools']) walk(d);
+  for (const e of readdirSync(join(root, 'ui'), { withFileTypes: true })) if (e.isFile() && /\.mjs$/.test(e.name)) files.push(`ui/${e.name}`);
+  // The modules that open a connection, as a specifier anywhere (import,
+  // dynamic import, require, a side-effect import); a server is built from
+  // the first two only.
+  const NET_MODULE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s*)['"`](?:node:)?(https?|http2|net|tls|dgram|undici)['"`]/;
+  const CALLS = [
+    ['fetch', /(?<![\w$.])fetch\s*\(|\bglobalThis\.fetch\b|(?<![\w$.])fetch\.(?:call|apply)\b/],
+    ['http client', /\b(?:https?|http2|net|tls|dgram)\.(?:request|get|connect|createConnection|Socket|Agent)\b/],
+    ['browser client', /\bnew\s+WebSocket\b|\bXMLHttpRequest\b|\bsendBeacon\b|\bnew\s+EventSource\b/],
+  ];
+  // What a server may use of node:http: the server and its constants.
+  const SERVE = new Set(['createServer', 'Server', 'STATUS_CODES', 'METHODS', 'IncomingMessage', 'ServerResponse', 'maxHeaderSize']);
+  const scan = (text) => {
+    const hits = [];
+    text.split(/\r?\n/).forEach((line, i) => {
+      const t = line.trim();
+      if (t.startsWith('//') || t.startsWith('/*') || t.startsWith('*')) return;
+      const m = NET_MODULE.exec(line);
+      if (m) hits.push({ line: i + 1, kind: 'module', what: m[1] });
+      for (const [kind, re] of CALLS) if (re.test(line)) hits.push({ line: i + 1, kind, what: t.slice(0, 80) });
+    });
+    return hits;
+  };
+  // The scan itself, on lines written here: each is one way to call out.
+  const drill = ['await fetch(url)', 'https.request(opts)', "import net from 'node:net';", "const h = await import('https');", 'const x = require("http");',
+    'http.get(u, cb)', 'globalThis.fetch(u)', 'const ws = new WebSocket(u);'];
+  ok('the scan sees every way to call out it is written for', drill.every((d) => scan(d).length > 0), drill.filter((d) => !scan(d).length).join(' / '));
+  ok('...and not a comment, nor a word that only contains one', scan('// fetch(x) and https.request(o)\n * await fetch(u)\nconst fetched = refetch(x); r.fetch(x);').length === 0);
+
+  const text = (rel) => readFileSync(join(root, rel), 'utf8');
+  const enclosing = (lines, at) => { for (let i = at - 1; i >= 0; i--) { const m = /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/.exec(lines[i]); if (m) return m[1]; } return null; };
+  const wrong = [];
+  for (const rel of files) {
+    const src = text(rel);
+    const hits = scan(src);
+    if (!hits.length) continue;
+    if (rel === 'src/submit.mjs') continue;                    // a fight sent to the project, on the user's own action
+    if (rel === 'tools/questlog-import.mjs' && hits.every((h) => h.kind === 'fetch')) continue;   // the questlog translation, shown
+    if (rel === 'bin/bench.mjs') {
+      const lines = src.split(/\r?\n/);
+      for (const h of hits) if (!(h.kind === 'fetch' && enclosing(lines, h.line - 1) === 'getJson')) wrong.push(`${rel}:${h.line} ${h.kind} ${h.what}`);
+      // ...and getJson is called by the questlog link alone.
+      lines.forEach((line, i) => {
+        if (!/(?<![\w$.])getJson\s*\(/.test(line) || /function getJson/.test(line) || /^\s*(\/\/|\*)/.test(line)) return;
+        if (enclosing(lines, i) !== 'applyQuestlog') wrong.push(`${rel}:${i + 1} getJson outside applyQuestlog`);
+      });
+      continue;
+    }
+    if (rel === 'ui/server.mjs') {
+      for (const h of hits) if (!(h.kind === 'module' && h.what === 'http')) wrong.push(`${rel}:${h.line} ${h.kind} ${h.what}`);
+      const code = src.split(/\r?\n/).filter((x) => !/^\s*(\/\/|\/\*|\*)/.test(x)).join('\n');
+      const bound = [...code.matchAll(/import\s+(?:\*\s+as\s+)?(\w+)\s+from\s*['"]node:http['"]/g)].map((m) => m[1]);
+      const named = [...code.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"]node:http['"]/g)].flatMap((m) => m[1].split(',').map((x) => x.trim().split(/\s+as\s+/)[0]).filter(Boolean));
+      const used = bound.flatMap((b) => [...code.matchAll(new RegExp(`(?<![\\w$.])${b}\\.(\\w+)`, 'g'))].map((m) => m[1]));
+      const calls = [...used, ...named].filter((u) => !SERVE.has(u));
+      if (calls.length) wrong.push(`${rel}: node:http used to call out (${[...new Set(calls)].join(', ')})`);
+      if (!used.includes('createServer') && !named.includes('createServer')) wrong.push(`${rel}: imports node:http and serves nothing`);
+      continue;
+    }
+    for (const h of hits) wrong.push(`${rel}:${h.line} ${h.kind} ${h.what}`);
+  }
+  ok(`nothing in src/, bin/, tools/ or ui/*.mjs reaches the network but the questlog link, src/submit.mjs and the UI server's listening (${files.length} files)`,
+    files.length > 30 && wrong.length === 0, wrong.join('; '));
+  // Premise: the scan finds the call sites it allows, so a regex gone blind cannot pass the line above.
+  const benchLines = text('bin/bench.mjs').split(/\r?\n/);
+  const fetches = scan(text('bin/bench.mjs')).filter((h) => h.kind === 'fetch');
+  ok('premise: the questlog link\'s one fetch is found, in getJson', fetches.length === 1 && enclosing(benchLines, fetches[0].line - 1) === 'getJson', JSON.stringify(fetches));
+  ok('premise: tools/questlog-import.mjs fetches, and ui/server.mjs imports node:http', scan(text('tools/questlog-import.mjs')).some((h) => h.kind === 'fetch')
+    && scan(text('ui/server.mjs')).some((h) => h.kind === 'module' && h.what === 'http'));
+  ok('premise: tools/inbox.mjs, which reads the project\'s pCloud folder from disk, is scanned like every other file and reaches nothing',
+    files.includes('tools/inbox.mjs') && scan(text('tools/inbox.mjs')).length === 0, JSON.stringify(scan(text('tools/inbox.mjs'))));
+
+  // WHO SENDS. src/submit.mjs is allowed its network use above as a whole;
+  // what keeps a send on the user's own action is who calls its two sending
+  // functions. sendSubmission (upload a fight) and deleteSubmission (upload a
+  // request for one's deletion) may be called only from bench.mjs's `submit` command
+  // (its --send and --delete) and from ui/api.mjs's handlers of
+  // /api/submit/send and /api/submit/delete - never from a preview, from
+  // anything else in the tree, or from inside src/submit.mjs itself. A call
+  // is followed up through the function it sits in to whatever calls that,
+  // so a helper the command calls is fine and one the preview route calls
+  // is not.
+  const SENDERS = { sendSubmission: '/api/submit/send', deleteSubmission: '/api/submit/delete' };
+  const isComment = (line) => /^\s*(\/\/|\/\*|\*)/.test(line);
+  const callRe = (name) => new RegExp(`(?<![\\w$])${name}\\s*\\(`);
+  // The named function, method or arrow a line sits in (the line itself
+  // included), nearest first.
+  const ownerOf = (lines, at) => {
+    for (let i = at; i >= 0; i--) {
+      if (isComment(lines[i])) continue;
+      const m = /^\s*(?:export\s+)?(?:async\s+)?function\s*\*?\s*([\w$]+)\s*\(/.exec(lines[i])
+        ?? /^\s*(?:async\s+)?([\w$]+)\s*\([^)]*\)\s*\{\s*$/.exec(lines[i])
+        ?? /^\s*(?:export\s+)?(?:const|let)\s+([\w$]+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[\w$]+)\s*=>/.exec(lines[i]);
+      if (m && !['if', 'for', 'while', 'switch', 'catch', 'with'].includes(m[1])) return { name: m[1], line: i };
+    }
+    return null;
+  };
+  // The lines of a `case '<route>':` block, up to the next case or the end of the switch.
+  const caseBlock = (lines, route) => {
+    const c = lines.findIndex((l) => !isComment(l) && new RegExp(`^\\s*case\\s+['"\`]${route.replace(/\//g, '\\/')}['"\`]\\s*:`).test(l));
+    if (c < 0) return null;
+    const indent = (l) => l.length - l.trimStart().length;
+    let end = c + 1;
+    while (end < lines.length && !(lines[end].trim() !== '' && (indent(lines[end]) < indent(lines[c]) || /^\s*(case\s|default\s*:)/.test(lines[end])))) end++;
+    return [c, end];
+  };
+  // Whether line `at` is reached only from an allowed entry: inside the
+  // route's case block, or in the `submit` command, or in a function every
+  // call of which is.
+  const reached = (lines, at, entry, depth = 0) => {
+    if (entry.block && at >= entry.block[0] && at < entry.block[1]) return true;
+    const o = ownerOf(lines, at);
+    if (!o || depth > 5) return false;
+    if (entry.command && o.name === entry.command && new RegExp(`^  (?:async\\s+)?${entry.command}\\s*\\(`).test(lines[o.line])) return true;
+    const sites = [];
+    lines.forEach((l, i) => { if (i !== o.line && !isComment(l) && callRe(o.name).test(l)) sites.push(i); });
+    return sites.length > 0 && sites.every((i) => reached(lines, i, entry, depth + 1));
+  };
+  const senders = (rel, src) => {
+    const bad = [];
+    const lines = src.split(/\r?\n/);
+    for (const [fn, route] of Object.entries(SENDERS)) {
+      lines.forEach((line, i) => {
+        if (isComment(line)) return;
+        if (rel !== 'src/submit.mjs' && new RegExp(`\\b${fn}\\s+as\\s|\\b${fn}\\s*:`).test(line)) bad.push(`${rel}:${i + 1} ${fn} taken under another name`);
+        if (!callRe(fn).test(line)) return;
+        if (rel === 'src/submit.mjs' && new RegExp(`function\\s+${fn}\\s*\\(`).test(line)) return;
+        const entry = rel === 'bin/bench.mjs' ? { command: 'submit' }
+          : rel === 'ui/api.mjs' ? { block: caseBlock(lines, route) } : null;
+        if (!entry || !reached(lines, i, entry)) bad.push(`${rel}:${i + 1} ${fn} called outside ${rel === 'ui/api.mjs' ? `the ${route} route` : rel === 'bin/bench.mjs' ? 'bench submit' : 'bench submit and the UI\'s send and delete routes'}`);
+      });
+    }
+    return bad;
+  };
+  // The check, on code written here: what a command, a helper and the two
+  // routes may do, and what a preview, another command and submit.mjs may not.
+  const benchLike = ['const commands = {', '  async submit(args) {', '    if (args.flags.send) await sendSubmission(sub);', '    if (args.flags.delete) await post(r);', '  },',
+    '  sheet(args) {', '    const x = 1;', '    deleteSubmission(r);', '  },', '};', 'async function post(r) {', '  return deleteSubmission(r);', '}'].join('\n');
+  ok('the sender check allows the submit command and a helper only it calls, and refuses another command', sheetCanon(senders('bin/bench.mjs', benchLike))
+    === sheetCanon(['bin/bench.mjs:8 deleteSubmission called outside bench submit']), JSON.stringify(senders('bin/bench.mjs', benchLike)));
+  const apiLike = ['    switch (pathname) {', "      case '/api/submit/preview': json(200, await preview(body)); return true;",
+    "      case '/api/submit/send': json(201, await submitSend(body)); return true;", "      case '/api/submit/delete': {", '        json(200, await deleteSubmission(body.receipt));',
+    '        return true;', '      }', '    }', '    async function preview(body) {', '      return sendSubmission(build(body));', '    }',
+    '    const submitSend = async (body) => {', '      return sendSubmission(build(body));', '    };'].join('\n');
+  ok('...the send and delete routes, and refuses a preview that sends', sheetCanon(senders('ui/api.mjs', apiLike))
+    === sheetCanon(['ui/api.mjs:10 sendSubmission called outside the /api/submit/send route']), JSON.stringify(senders('ui/api.mjs', apiLike)));
+  ok('...and refuses a call anywhere else, a renamed import, and submit.mjs calling its own sender',
+    senders('src/other.mjs', 'await sendSubmission(s);').length === 1 && senders('ui/api.mjs', "import { sendSubmission as send } from '../src/submit.mjs';").length === 1
+      && senders('src/submit.mjs', 'export async function sendSubmission(sub) {\n}\nexport function preview(s) {\n  return sendSubmission(s);\n}').length === 1);
+  const sendWrong = files.flatMap((rel) => senders(rel, text(rel)));
+  ok('sendSubmission and deleteSubmission are called only by bench submit and the UI\'s send and delete routes', sendWrong.length === 0, sendWrong.join('; '));
+  ok('premise: src/submit.mjs, where it exists, defines both senders', !existsSync(join(root, 'src/submit.mjs'))
+    || ['sendSubmission', 'deleteSubmission'].every((fn) => new RegExp(`export\\s+async\\s+function\\s+${fn}\\s*\\(`).test(text('src/submit.mjs'))));
+} catch (e) { crashed(e); }
+
+// --- submission bundle: what the review of src/submit.mjs found -------------------
+// sheet.json is a character sheet like any other, so it keeps the presence
+// rule: what the import did not record stays absent, read back as the same
+// pins and the same gaps. The manifest carries no free text from the log. A
+// send whose answer is lost leaves the player a receipt that asks for its
+// deletion, and the same bundle to send again. The report says where the
+// zip goes on the route this copy actually offers. Fixtures: the documented
+// examples and the combat-log reader's own, built from ids.
+group('submission bundle: sheet.json records what the import recorded, no free text in the manifest, a lost answer whose deletion can still be asked for');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const logIn = { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') };
+  const pinsOf = (r) => sheetCanon(Object.fromEntries(Object.entries(r.pins).map(([k, v]) => [k, Array.isArray(v) ? [...v].sort() : v])));
+  const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+  const pack = (sheet, extra = {}) => submitLib.buildSubmission(engine, submitFixed({ sheet, log: logIn, ...extra }));
+  const sheetOf = (sub) => JSON.parse(submitEntries(sub)['sheet.json']);
+  const roundTrip = (data, opts = {}) => {
+    const sub = pack({ name: 'in.json', data: typeof data === 'string' ? data : JSON.stringify(data) }, opts.sheetOptions ? { sheetOptions: opts.sheetOptions } : {});
+    const want = sheetLib.readSheet(engine, data, opts.sheetOptions ?? {});
+    const out = sheetOf(sub);
+    return { sub, want, out, back: sheetLib.readSheet(engine, out) };
+  };
+
+  // THE MINIMAL EXAMPLE: one weapon, nothing else recorded.
+  const minText = submitDocs('examples/sheet-minimal.json').toString('utf8');
+  const min = roundTrip(minText);
+  ok('the minimal example comes back as itself: one weapon, the item alone, and no slot, flag, talent, rune or pool it did not record',
+    sheetCanon(min.out.gear) === sheetCanon(JSON.parse(minText).gear) && !['talents', 'runes', 'classSkills', 'weaponSkills', 'weaponSkillRanks'].some((k) => k in min.out)
+      && !('name' in min.out.character), JSON.stringify(min.out));
+  ok('...read back: the same build, the same pins and the same gaps as the import',
+    sheetCanon(min.back.loadout) === sheetCanon(min.want.loadout) && pinsOf(min.back) === pinsOf(min.want) && sameSet(min.back.gaps, min.want.gaps) && min.want.gaps.length > 5
+      && !min.sub.problems.some((p) => p.startsWith('sheet.json')), JSON.stringify({ back: min.back.gaps, want: min.want.gaps, problems: min.sub.problems }));
+
+  // A PARTLY RECORDED SHEET: flags missing on some pieces, a bar with a hole,
+  // runes not recorded, two unreadable paths, a bonus stat rolled none.
+  const full = () => JSON.parse(submitDocs('examples/sheet-full.json').toString('utf8'));
+  const part = full();
+  delete part.gear.Slot_Weapon1.upgrade;
+  delete part.gear.Slot_Head.flawless;
+  delete part.gear.Slot_Weapon2.rarity;
+  const bar = part.classSkills.ClassSkill;
+  part.classSkills.ClassSkill = [bar[0], null, bar[2]];
+  part.gear.Slot_Chest.infusionStat = null;
+  delete part.runes;
+  part.unreadable = ['gear.Slot_Neck.prismatic', 'weaponSkillRanks'];
+  const p = roundTrip(part);
+  ok('a partly recorded sheet comes back with the same build, pins and gaps - every gap named again, none added',
+    sheetCanon(p.back.loadout) === sheetCanon(p.want.loadout) && pinsOf(p.back) === pinsOf(p.want) && sameSet(p.back.gaps, p.want.gaps) && p.want.gaps.length >= 6
+      && !p.sub.problems.some((x) => x.startsWith('sheet.json')), JSON.stringify({ back: p.back.gaps, want: p.want.gaps, problems: p.sub.problems }));
+  ok('...each piece keeps the flags it had and loses the ones it lacked, the bar holds the two picks slotted, the stat rolled none stays null',
+    !('upgrade' in p.out.gear.Slot_Weapon1) && p.out.gear.Slot_Weapon1.rarity === part.gear.Slot_Weapon1.rarity && !('flawless' in p.out.gear.Slot_Head)
+      && !('rarity' in p.out.gear.Slot_Weapon2) && p.out.gear.Slot_Weapon2.upgrade === p.want.loadout.gear.Slot_Weapon2.stars
+      && sheetCanon(p.out.classSkills.ClassSkill) === sheetCanon([bar[0], bar[2]]) && p.out.gear.Slot_Chest.infusionStat === null && !('runes' in p.out),
+    JSON.stringify({ w1: p.out.gear.Slot_Weapon1, w2: p.out.gear.Slot_Weapon2, cs: p.out.classSkills }));
+  ok('...and what the exporter could not read is listed as unreadable again, and not written',
+    sheetCanon(p.out.unreadable) === sheetCanon(['gear.Slot_Neck.prismatic', 'weaponSkillRanks']) && !('prismatic' in p.out.gear.Slot_Neck) && !('weaponSkillRanks' in p.out)
+      && p.back.notes.every((n) => !/also lists it as unreadable/.test(n)), JSON.stringify(p.out.unreadable));
+  const noStat = full();
+  delete noStat.gear.Slot_Chest.infusionStat;
+  const ns = roundTrip(noStat);
+  ok('an infusion\'s bonus stat not recorded stays not recorded, the gap named again', !('infusionStat' in ns.out.gear.Slot_Chest)
+    && sameSet(ns.back.gaps, ns.want.gaps) && ns.want.gaps.some((g) => g.includes('Slot_Chest')), JSON.stringify(ns.back.gaps));
+
+  // A MODKIT DUMP: every slot it lists is recorded, a flag it wrote null is not.
+  const W = (kind, o = {}) => ({ kind, level: 25, upgrade: 0, rarity: -1, count: 1, class: 'st.item.Armor', infusion: null, infusionStat: null, prismatic: false, flawless: false, ...o });
+  const dump = { character: 'Tester', bankSlots: 0, bank: [], bags: [], equipped: [
+    W('Daggers_Demondash', { upgrade: 3, rarity: 3, class: 'st.item.Weapon' }), W('Daggers_DuplicatePoison', { upgrade: 4, rarity: 4, class: 'st.item.Weapon', flawless: null }),
+    W('Head_EDemon_AssCle'), W('Chest_EKobold_AssWiz'), W('Finger_Z3RCraft_Ap', { level: 0 }),
+  ] };
+  ok('premise: every item the dump names is in the data', dump.equipped.every((e) => engine.cat.itemById.has(e.kind)));
+  const md = roundTrip(dump, { sheetOptions: { cls: 'Rogue', level: 25 } });
+  ok('a modkit dump comes back with the same build, pins and gaps, its flag written null still not recorded',
+    sheetCanon(md.back.loadout) === sheetCanon(md.want.loadout) && pinsOf(md.back) === pinsOf(md.want) && sameSet(md.back.gaps, md.want.gaps)
+      && md.want.gaps.some((g) => /Flawless/.test(g)) && !md.sub.problems.some((x) => x.startsWith('sheet.json')), JSON.stringify({ back: md.back.gaps, want: md.want.gaps }));
+  const mg = roundTrip(dump, { sheetOptions: { cls: 'Rogue' } });
+  ok('...its guessed level is written (the format needs one), the gap carried in the manifest, and nothing said wrong',
+    mg.out.character.level === mg.want.level && mg.sub.manifest.sheet.gaps.some((g) => /level is not in a modkit dump/.test(g))
+      && !mg.sub.problems.some((x) => x.startsWith('sheet.json')), JSON.stringify(mg.sub.problems));
+
+  // A SAVED ENVELOPE: fully explicit, so its whole build is recorded.
+  const env = { version: '0.5.0', cdbSha: engine.meta.cdbSha, goal: 'dps', rank: 3, level: 25,
+    pinned: { gear: ['Slot_Weapon1'], augments: [], skills: [], infusions: [] }, build: sheetLib.readSheet(engine, full()).loadout };
+  const ev = roundTrip(env);
+  ok('a saved envelope is recorded whole - its every slot, the talents and the runes - and reads back as the same build',
+    engine.cat.combatSlots().every((s) => s.id in ev.out.gear) && 'talents' in ev.out && 'runes' in ev.out
+      && sheetCanon(ev.back.loadout) === sheetCanon(ev.want.loadout) && !ev.sub.problems.some((x) => x.startsWith('sheet.json')), JSON.stringify(ev.sub.problems));
+
+  // THE MANIFEST HOLDS NO FREE TEXT from the log.
+  const named = full();
+  named.character.name = 'Emsey';
+  const withHeader = (f) => {
+    const lines = logIn.data.toString('utf8').trimEnd().split('\n');
+    const h = JSON.parse(lines[0]);
+    f(h);
+    lines[0] = JSON.stringify(h);
+    return `${lines.join('\n')}\n`;
+  };
+  const prose = pack({ name: 'n.json', data: JSON.stringify(named) }, { log: { name: 'l.jsonl', data: withHeader((h) => {
+    h.clock = 'Emsey clock'; h.source.gameVersion = 'v1 by Emsey'; h.encounter.activityId = 'run by Emsey'; h.encounter.outcome = 'Emsey won';
+  }) } });
+  const pm = submitEntries(prose)['manifest.json'];
+  ok('a clock, a game version, an activity id and an outcome that are prose with a name in them are sent as not known, and said',
+    prose.manifest.log.clock === null && prose.manifest.log.gameVersion === null && prose.manifest.log.encounter.activityId === null && prose.manifest.log.encounter.outcome === null
+      && !pm.includes('Emsey') && ['clock', 'game version', 'activity id', 'outcome'].every((w) => prose.problems.some((x) => x.startsWith(`the log's ${w} is not `))),
+    JSON.stringify({ log: prose.manifest.log, problems: prose.problems }));
+  const plain = pack({ name: 'n.json', data: JSON.stringify(named) }, { log: { name: 'l.jsonl', data: withHeader((h) => {
+    h.clock = 'server'; h.source.gameVersion = '0.9.3'; h.encounter.outcome = 'victory';
+  }) } });
+  ok('...while ones of their shape are carried: a clock of the two, a version, an outcome as the word Wink writes',
+    plain.manifest.log.clock === 'server' && plain.manifest.log.gameVersion === '0.9.3' && plain.manifest.log.encounter.outcome === 'Victory'
+      && !plain.problems.some((x) => x.startsWith('the log\'s ')), JSON.stringify(plain.manifest.log));
+
+  // A BOSS THAT IS NO UNIT ID: not known in the zip as in the issue.
+  const display = 'a boss by its display name';
+  ok('premise: that boss is no unit of the game', !cdb.has('unit', display));
+  const shown = pack({ name: 'm.json', data: minText }, { log: { name: 'l.jsonl', data: withHeader((h) => { h.encounter.bossKind = display; }) } });
+  const shownLog = submitEntries(shown)['combat-log.jsonl'];
+  ok('a boss kind that is no unit id is not known in the manifest, the issue and the log\'s header alike', shown.manifest.log.encounter.bossKind === null
+    && shown.pub.log.encounter.bossKind === null && !('bossKind' in (JSON.parse(shownLog.split('\n')[0]).encounter ?? {})) && !shownLog.includes(display), shownLog.split('\n')[0]);
+  const dfx = combatLogFixture({ wink: true });
+  const dlog = readCombatLog({ name: 'f.json.timeline', data: dfx.text, companion: { name: 'f.json', data: JSON.stringify({ ...dfx.summary, bossKind: display }) } });
+  const heroKinds = engine.cat.classes.map((c) => c.unit);
+  const anonWith = anonymizeLog(dlog, { heroKinds, isUnit: (k) => cdb.has('unit', k) });
+  const anonWithout = anonymizeLog(dlog, { heroKinds });
+  ok('anonymizeLog with isUnit leaves such a kind out of the header and the summary; without it, a display name still goes - it is no id',
+    !('bossKind' in (JSON.parse(anonWith.text.split('\n')[0]).encounter ?? {})) && !('bossKind' in JSON.parse(anonWith.summaryText))
+      && !('bossKind' in JSON.parse(anonWithout.summaryText)));
+  const idLike = readCombatLog({ name: 'f.json.timeline', data: dfx.text, companion: { name: 'f.json', data: JSON.stringify({ ...dfx.summary, bossKind: 'NoSuchUnit_Z9' }) } });
+  ok('...while a kind shaped like an id goes only with isUnit, which knows it is no unit',
+    JSON.parse(anonymizeLog(idLike, { heroKinds }).summaryText).bossKind === 'NoSuchUnit_Z9'
+      && !('bossKind' in JSON.parse(anonymizeLog(idLike, { heroKinds, isUnit: (k) => cdb.has('unit', k) }).summaryText)));
+
+  // A SUMMARY THAT IS NOT PACKED is said.
+  const dropped = pack({ name: 'm.json', data: minText }, { summary: { name: 's.json', data: JSON.stringify(dfx.summary) } });
+  ok('a Wink summary given beside a farever-combat-log is not packed, and the problems say so',
+    !('summary.json' in submitEntries(dropped)) && dropped.manifest.log.withSummary === false
+      && dropped.problems.some((x) => x.startsWith('the summary s.json is not in the bundle: a Wink summary goes beside a Wink timeline only')), JSON.stringify(dropped.problems));
+
+  // THE KEPT NAME is said where it stands.
+  const kept1 = pack({ name: 'm.json', data: minText }, { keepName: true });
+  ok('keepName with a sheet that names nobody: the log\'s header keeps the log\'s name, sheet.json has none, and the report says so',
+    sheetCanon(kept1.keptNameIn) === '["combat-log.jsonl"]' && !('name' in sheetOf(kept1).character) && kept1.privacy.ownNameKept === true
+      && submitLib.reportLines(kept1, { link: null }).includes('Names: 0 removed; your character\'s name is kept in the log\'s header, as you asked.'),
+    JSON.stringify(kept1.keptNameIn));
+  const kept2 = pack({ name: 'n.json', data: JSON.stringify(named) }, { keepName: true });
+  ok('...with two different names, both files keep their own, and the player is told',
+    sheetCanon(kept2.keptNameIn) === '["sheet.json","combat-log.jsonl"]' && kept2.problems.some((x) => /name the character differently/.test(x)), JSON.stringify(kept2.problems));
+  ok('...and without keepName a sheet that names nobody still names nobody', !('name' in sheetOf(pack({ name: 'm.json', data: minText })).character));
+
+  // THE REPORT says where the zip goes on the route this copy offers.
+  const none = submitLib.reportLines(min.sub, { link: null });
+  const live = submitLib.reportLines(min.sub, { link: submitLib.UPLOAD_LINK });
+  ok('with no upload link the report calls nothing private: the zip goes on a public issue, the note and the start time with it, the form\'s title shown',
+    none[0].startsWith('Send is not available in this copy of the bench: no upload link is set. The route is Save .zip, then the GitHub form, its title filled in: ')
+      && none.includes(`  Title: ${min.sub.issueTitle}`) && none.some((l) => /every file in it is public - your note and the fight's start time/.test(l))
+      && !none.some((l) => /private|pCloud/.test(l)) && min.sub.files.every((f) => none.some((l) => l.startsWith(`  ${f.name}  `))), none.join('\n'));
+  ok('...with one, the zip goes to the project\'s folder on pCloud and nothing is made public, and the manual route is said to be public',
+    live[0].startsWith('What Send does: the zip (') && live[0].endsWith('goes to the project\'s folder on pCloud (pcloud.com), where only the project\'s maintainer can read it - nothing is made public -')
+      && live.some((l) => l.startsWith('On the manual route instead') && /every file in it is public/.test(l)), live.join('\n'));
+  ok('...and by default it asks uploadLink', JSON.stringify(submitLib.reportLines(min.sub)) === JSON.stringify(submitLib.uploadLink() === null ? none : live));
+  // A LINK SET THAT IS NONE is said as what it is - uploadLink()'s sentence,
+  // warned of, first - and never as "no upload link is set": asked by
+  // default (FAREVER_BENCH_UPLOAD_LINK set to something it refuses), or
+  // given by the caller (uploadProblem, as the UI and the CLI pass it).
+  const linkWas = process.env.FAREVER_BENCH_UPLOAD_LINK;
+  let byEnv = [];
+  process.env.FAREVER_BENCH_UPLOAD_LINK = 'https://example.org/#/puplink?code=TestCode1234';
+  try { byEnv = submitLib.reportItems(min.sub); } finally { process.env.FAREVER_BENCH_UPLOAD_LINK = linkWas; }
+  const givenWhy = submitLib.reportItems(min.sub, { link: null, front: 'cli', uploadProblem: 'FAREVER_BENCH_UPLOAD_LINK is "ftp://x": it is not an http(s) address' });
+  ok('a FAREVER_BENCH_UPLOAD_LINK that is no upload link: the report opens on a warned Problem line with uploadLink()\'s sentence, then the manual route, and never says no link is set',
+    byEnv[0]?.kind === 'problem' && byEnv[0].warn === true
+      && byEnv[0].text.startsWith('Problem: Send is off: FAREVER_BENCH_UPLOAD_LINK is "https://example.org/#/puplink?code=TestCode1234": it is not on pCloud')
+      && byEnv[1]?.kind === 'manual' && byEnv[1].text.startsWith('Send is off in this copy of the bench until that link is set right. The route meanwhile is Save .zip, '
+        + 'then the GitHub form, its title filled in: ')
+      && byEnv.some((i) => i.kind === 'title') && !byEnv.some((i) => /no upload link is set/.test(i.text))
+      && givenWhy[0]?.text === 'Problem: --send is off: FAREVER_BENCH_UPLOAD_LINK is "ftp://x": it is not an http(s) address.' && givenWhy[0].warn === true
+      && givenWhy[1]?.text.startsWith('--send is off in this copy of the bench until that link is set right. The route meanwhile is --zip, then the GitHub form')
+      && !givenWhy.some((i) => /no upload link is set/.test(i.text)), JSON.stringify([byEnv.slice(0, 2), givenWhy.slice(0, 2)]));
+  const doc = submitDocs('SUBMITTING.md').toString('utf8');
+  ok('docs/SUBMITTING.md says the manual route makes the note and the start time public, never that the zip is never public',
+    /includes your note \(`note\.txt`\), the moment the fight started to the\s+millisecond/.test(doc) && !/is never\s+public\. Do not/.test(doc));
+  ok('...and that Send uploads to pCloud, to eapi.pcloud.com, under the uploader name "farever-bench"',
+    doc.includes('pCloud') && doc.includes('eapi.pcloud.com') && doc.includes('"farever-bench"'));
+
+  // A LOG WITH NO NAME is said as "the combat log", once.
+  const clash = combatLogFixture({ mutate: (h, evs) => { evs[20].sourceName = 'client-observed'; } });
+  const unnamed = submitRefusal(() => pack({ name: 'm.json', data: minText }, { log: { data: clash.text } }));
+  ok('a refusal for a log given without a name names it once', unnamed?.status === 400 && unnamed.message.startsWith('The combat log cannot be sent: ')
+    && !/the combat log the combat log/i.test(unnamed.message), JSON.stringify(unnamed));
+  ok('src/submit.mjs holds no literal byte-order mark', !readFileSync(fileURLToPath(new URL('../src/submit.mjs', import.meta.url)), 'utf8').includes(String.fromCharCode(0xfeff)));
+
+  // A LOST ANSWER: the receipt is there before the send, and asks for its
+  // deletion all the same.
+  const sub = pack({ name: 'm.json', data: minText });
+  const caught = (pr) => pr.then(() => null, (e) => e);
+  let mode = 'hang';
+  const stub = pcloudStub(() => (mode === 'hang' ? null : mode === 'html' ? { status: 502, body: '<html>Bad gateway</html>' } : { result: 0 }));
+  const link = await stub.ready;
+  try {
+    const pending = submitLib.pendingReceipt(sub, { link });
+    ok('pendingReceipt is the receipt before the send: the id, the token, the link, no send time, the bundle\'s time and SHA-256 - six fields, in that order',
+      JSON.stringify(pending) === JSON.stringify({ id: sub.id, deleteToken: sub.deleteToken, link, sentAt: null, createdAt: sub.createdAt, zipSha256: sub.zipSha256 }),
+      JSON.stringify(pending));
+    const ptext = submitLib.receiptText(pending);
+    const about = JSON.parse(ptext).about;
+    ok('...saved as a file it reads back as itself, saying the send\'s answer was not known and that a request then may delete nothing',
+      JSON.stringify(submitLib.parseReceipt(ptext)) === JSON.stringify(pending)
+        && about.startsWith('A fight you were sending to farever-bench, saved before pCloud answered: it may or may not have arrived. ')
+        && about.endsWith('If it never arrived, the request deletes nothing.')
+        && JSON.stringify(submitLib.parseReceipt(String.fromCharCode(0xfeff) + ptext)) === JSON.stringify(pending), about);
+    const lost = await caught(submitLib.sendSubmission(sub, { link, timeoutMs: 300 }));
+    ok('a send whose answer never comes is a 502 that carries the pending receipt', lost instanceof subpub.SubmissionError && lost.status === 502
+      && JSON.stringify(lost.receipt) === JSON.stringify(pending), String(lost?.message));
+    mode = 'ok';
+    const del = await submitLib.deleteSubmission(submitLib.parseReceipt(ptext), { link });
+    const last = stub.seen.at(-1);
+    ok('...and that receipt asks for its deletion: <id>.withdraw.json, with the token, no send time needed', del.requested === true
+      && last.fileName === `${sub.id}.withdraw.json` && JSON.parse(last.bytes.toString('utf8')).deleteToken === sub.deleteToken, JSON.stringify(del));
+    mode = 'html';
+    const odd = await caught(submitLib.sendSubmission(sub, { link }));
+    mode = 'ok';
+    ok('an answer that is not pCloud\'s carries the pending receipt too', odd?.status === 502 && JSON.stringify(odd.receipt) === JSON.stringify(pending), String(odd?.message));
+    const again = submitLib.buildSubmission(engine, { sheet: { name: 'm.json', data: minText }, log: logIn, id: pending.id, deleteToken: pending.deleteToken, now: pending.createdAt });
+    ok('the same files built again with the receipt\'s id, token and createdAt are the same bundle, byte for byte', again.zip.equals(sub.zip) && again.id === sub.id);
+    const done = await submitLib.sendSubmission(again, { link });
+    const zips = stub.seen.filter((r) => r.fileName === `${sub.id}.zip`);
+    ok('...so sending it again puts the same bytes under the same name - at most a duplicate - and the receipt that comes back is the pending one completed',
+      zips.length === 3 && zips.every((r) => r.bytes?.equals(sub.zip)) && done.id === pending.id && done.createdAt === pending.createdAt
+        && done.zipSha256 === pending.zipSha256 && done.sentAt !== null, `${zips.length} uploads of the zip`);
+    const noLink = submitRefusal(() => submitLib.pendingReceipt(sub, { link: null }));
+    ok('with no link there is no pending receipt either (503)', noLink?.status === 503
+      && noLink.message === `Send is off in this copy of the bench (no upload link is set) - save the .zip and attach it to a new issue: ${sub.formUrl}`, JSON.stringify(noLink));
+  } finally {
+    await stub.close();
+  }
+} catch (e) { crashed(e); }
+
+group('submission bundle: a name inside a value or where a kind goes, a class the log contradicts, a receipt held to its bundle, a stated build, and nothing arrived');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const minimal = { name: 'sheet-minimal.json', data: submitDocs('examples/sheet-minimal.json') };
+  // The documented log, changed: its header and events as objects.
+  const docLogWith = (mutate) => {
+    const [h, ...ev] = submitDocs('examples/combat-log.jsonl').toString('utf8').trim().split('\n').map((l) => JSON.parse(l));
+    mutate(h, ev);
+    h.count = ev.length;
+    return { name: 'combat-log.jsonl', data: [h, ...ev].map((o) => JSON.stringify(o)).join('\n') + '\n' };
+  };
+  const build = (log, extra = {}) => submitLib.buildSubmission(engine, submitFixed({ sheet: minimal, log, ...extra }));
+  const allText = (sub) => Object.entries(submitEntries(sub)).filter(([n]) => n !== 'note.txt').map(([, t]) => t).join('\n');
+
+  // A NAME WHERE A UNIT KIND GOES (review T2): a player's display name written
+  // as sourceKind/targetKind is no unit of the game, so it is not a word the
+  // check passes over, it is not written into the copy, and it is counted.
+  const t2 = build(docLogWith((h, ev) => {
+    h.character.name = 'Zorbalina'; h.encounter.partySize = 2;
+    ev.push({ seq: 15, time: 9.0, kind: 'damage', source: '77', sourceName: 'Kestrela', sourceKind: 'Kestrela', target: '900', targetKind: 'Dummy',
+      skill: 'GA_Base_Attack', amount: 10, critical: false, damageType: 'physical' });
+    ev.push({ seq: 16, time: 9.1, kind: 'status_applied', source: '812', target: '77', targetName: 'Kestrela', targetKind: 'Kestrela',
+      skill: 'Warrior_BattleShoutStatus', stacks: 1, duration: 10 });
+  }));
+  const t2log = submitEntries(t2)['combat-log.jsonl'];
+  ok('a player\'s name written where a unit kind goes is not carried into the copy, and is counted as removed',
+    !/Kestrela/i.test(allText(t2)) && !/"(?:source|target)Kind":"Kestrela"/.test(t2log) && t2.privacy.namesRemoved >= 2, `${t2.privacy.namesRemoved} ${t2log}`);
+  ok('...the player is still a player in the copy, under no name of theirs', /"sourceName":"Player \d+"/.test(t2log));
+
+  // TEXT FACTS WITH A NAME INSIDE (review T1): the header's clock, exporter,
+  // outcome and activity are held to their shapes and left out with a name in
+  // them - in the copy as in the manifest.
+  const t1 = build(docLogWith((h) => {
+    h.character.name = 'Zorbalina'; h.clock = 'Zorbalina-PC clock'; h.source.exporter = 'Zorbalina\'s logger';
+    h.encounter.outcome = 'Zorbalina wiped the group'; h.encounter.activityId = 'Zorbalina_run';
+  }));
+  const t1head = JSON.parse(submitEntries(t1)['combat-log.jsonl'].split('\n')[0]);
+  ok('a clock, an exporter, an outcome and an activity with a name inside reach neither the copy nor the manifest',
+    !/Zorbalina/i.test(allText(t1)) && !('clock' in t1head) && !('exporter' in (t1head.source ?? {})) && !('outcome' in (t1head.encounter ?? {}))
+      && !('activityId' in (t1head.encounter ?? {})) && t1.manifest.log.encounter.activityId === null && t1.manifest.log.clock === null, JSON.stringify(t1head));
+  const sameId = build(docLogWith((h) => { h.encounter.activityId = 'Dungeon_Run_2'; }));
+  ok('...while an activity id with no name in it is kept in both', sameId.manifest.log.encounter.activityId === 'Dungeon_Run_2'
+    && JSON.parse(submitEntries(sameId)['combat-log.jsonl'].split('\n')[0]).encounter.activityId === 'Dungeon_Run_2');
+
+  // A NAME INSIDE AN ID THE COPY MUST CARRY (review T3b, T3c): refused, in any
+  // case and with a lookalike letter; a damage type that is none of the four
+  // is not carried at all.
+  const withHealer = (x) => docLogWith((h, ev) => {
+    h.encounter.partySize = 2;
+    ev.push({ seq: 15, time: 9.0, kind: 'status_applied', source: '77', sourceName: 'Kestrela', target: '812', targetKind: 'Warrior',
+      skill: 'Warrior_BattleShoutStatus', stacks: 1, duration: 10, ...x });
+  });
+  for (const [what, x] of [['a skill id', { skill: 'Heal_by_Kestrela' }], ['an item', { item: 'Kestrela\'s flask' }],
+    ['a step id with a Cyrillic e', { stepId: 'Kеstrela' }], ['a status type in capitals', { statusType: 'KESTRELA' }]]) {
+    const no = submitRefusal(() => build(withHealer(x)));
+    ok(`a player's name inside ${what} the copy carries refuses the bundle, naming the file and the field`,
+      no?.status === 400 && /A player's name is still in the bundle: "Kestrela" .*stands inside a value of combat-log\.jsonl/.test(no.message), JSON.stringify(no));
+  }
+  const dtype = build(withHealer({ damageType: 'Kestrela ' }));
+  ok('...and a damage type that is none of the four is not carried', !/Kestrela/i.test(allText(dtype)));
+
+  // A WINK SUMMARY'S TEXT (review T4b): no phase, and a category, outcome or
+  // activity with a name inside is left out of summary.json and the manifest.
+  const wfx = combatLogFixture({ wink: true });
+  const t4 = submitLib.buildSubmission(engine, submitFixed({
+    sheet: minimal, log: { name: 'fight.json.timeline', data: wfx.text },
+    summary: { name: 'fight.json', data: JSON.stringify({ ...wfx.summary, phase: 'Healbot\'s phase', category: 'Healbot group', outcome: 'Healbot wiped', activityId: 'Healbot_pull' }) },
+  }));
+  const t4sum = JSON.parse(submitEntries(t4)['summary.json']);
+  ok('a summary\'s phase, and a category, outcome or activity with a name inside, reach neither summary.json nor the manifest',
+    !/Healbot/i.test(allText(t4)) && !('phase' in t4sum) && !('category' in t4sum) && !('outcome' in t4sum) && !('activityId' in t4sum)
+      && t4.manifest.log.encounter.activityId === null, JSON.stringify(t4sum).slice(0, 300));
+
+  // THE IMPORTER'S SENTENCES (review T6): a name inside a dropped id or an
+  // unknown key is cut out, wherever it stands.
+  const t6sheet = { name: 's.json', data: JSON.stringify({ format: 'farever-character-sheet', version: 1, character: { class: 'Warrior', level: 25, name: 'Zorbalina' },
+    gear: { Slot_Weapon1: { item: 'GS_Nova' }, Slot_Head: { item: 'Zorbalina_hat' } }, notes_for_Zorbalina: 1 }) };
+  const t6 = submitLib.buildSubmission(engine, submitFixed({ sheet: t6sheet, log: { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') } }));
+  ok('a name inside an id the import dropped, or inside an unknown key, is cut from the manifest',
+    !/Zorbalina/i.test(allText(t6)) && t6.manifest.sheet.dropped.some((d) => d.id === '<name removed>_hat')
+      && t6.manifest.sheet.unknownKeys.includes('notes_for_<name removed>'), JSON.stringify(t6.manifest.sheet));
+
+  // THE DOCUMENTED EXAMPLES still go together: the sheet's name "Example"
+  // stands inside the log's exporter "example", which the copy leaves out.
+  const docs = submitLib.buildSubmission(engine, submitFixed({ sheet: { name: 'sheet-full.json', data: submitDocs('examples/sheet-full.json') },
+    log: { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') } }));
+  ok('the documented examples pack, the log\'s exporter left out of the copy for holding the sheet\'s name',
+    !('exporter' in (JSON.parse(submitEntries(docs)['combat-log.jsonl'].split('\n')[0]).source ?? {})) && !/Example/i.test(allText(docs)));
+
+  // A CLASS THE LOG CONTRADICTS is not sent, from either front end, unless
+  // the bundle was vouched for: decided by the module from what was given
+  // beside the file, never by the caller.
+  ok('a Rogue sheet with a Warrior\'s log is a class mismatch, as data',
+    sheetCanon(docs.classMismatch) === sheetCanon({ sheet: 'Rogue', log: 'Warrior', vouched: false, vouchable: true })
+    && docs.logClass === 'Warrior' && t1.classMismatch === null, JSON.stringify(docs.classMismatch));
+  const refusal = submitLib.sendRefusal(docs);
+  ok('...sendRefusal says why it is not sent', refusal?.status === 400 && /^The sheet is a Rogue and the fight's log names its character a Warrior, so it is not sent/.test(refusal.message)
+    && submitLib.sendRefusal(t1) === null);
+  ok('...a caller cannot vouch for it: the old classVouched option has no say', submitLib.sendRefusal(docs, { classVouched: true })?.status === 400);
+  ok('...on the command line the remedy names the flags, and that --class naming the sheet\'s own class sends it',
+    / --import <the Warrior's sheet>, or --class Warrior with its pins\. If the log's header is the one that is wrong, --class Rogue beside the sheet says so, and it is sent\.$/
+      .test(submitLib.sendRefusal(docs, { front: 'cli' })?.message ?? ''), submitLib.sendRefusal(docs, { front: 'cli' })?.message);
+  ok('...and in the app the same remedy is the class chosen beside the sheet file, with no flag named',
+    / the Warrior's sheet, or that build in the editor\. If the log's header is the one that is wrong, choosing Rogue as the class beside the sheet file says so, and it is sent\.$/
+      .test(refusal?.message ?? '') && !/--/.test(refusal?.message ?? ''), refusal?.message);
+  ok('...and the problem the report carries says it is not sent', docs.problems.some((p) => /^the sheet is a Rogue and the log's character a Warrior - .*a bundle that pairs the two is not sent$/.test(p)));
+  const docsLog = { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') };
+  const vouchedDocs = submitLib.buildSubmission(engine, submitFixed({ sheet: { name: 'sheet-full.json', data: submitDocs('examples/sheet-full.json') },
+    sheetOptions: { cls: 'assassin' }, log: docsLog }));
+  ok('the class given beside a sheet that names its own (the aptitude, in any case) vouches for it: sent, and its problem says so, not "is not sent"',
+    vouchedDocs.classMismatch?.vouched === true && submitLib.sendRefusal(vouchedDocs) === null
+      && vouchedDocs.problems.some((p) => /^the sheet is a Rogue and the log's character a Warrior - the class given beside the sheet names the sheet's own, .*so the pair is sent all the same$/.test(p))
+      && !vouchedDocs.problems.some((p) => /is not sent/.test(p)), JSON.stringify(vouchedDocs.problems));
+  const otherGiven = submitLib.buildSubmission(engine, submitFixed({ sheet: { name: 'sheet-full.json', data: submitDocs('examples/sheet-full.json') },
+    sheetOptions: { cls: 'Mage' }, log: docsLog }));
+  ok('...a class given that is not the sheet\'s own vouches for nothing', otherGiven.classMismatch?.vouched === false && submitLib.sendRefusal(otherGiven)?.status === 400);
+  // A modkit dump names no class: the one given is the one it is read as,
+  // and cannot confirm itself (review: the UI's preselected class sent a
+  // Rogue's dump with a Warrior's fight).
+  const rogueDump = { name: 'farever-inventory-Someone.json', data: JSON.stringify({ character: 'Someone', bankSlots: 0, bank: [], bags: [], equipped: [
+    { kind: 'Daggers_Demondash', level: 25, upgrade: 3, rarity: 3, count: 1, class: 'st.item.Weapon', infusion: null, infusionStat: null, prismatic: false, flawless: false },
+  ] }) };
+  const dumpPair = submitLib.buildSubmission(engine, submitFixed({ sheet: rogueDump, sheetOptions: { cls: 'Rogue' }, log: docsLog }));
+  const dumpNo = submitLib.sendRefusal(dumpPair, { front: 'cli' });
+  ok('a modkit dump read as a Rogue with a Warrior\'s log is refused: the class it was read as vouches for nothing',
+    sheetCanon(dumpPair.classMismatch) === sheetCanon({ sheet: 'Rogue', log: 'Warrior', vouched: false, vouchable: false }) && dumpNo?.status === 400
+      && /A modkit dump names no class, so the class given for it \(--class Rogue\) is the sheet's only word on it/.test(dumpNo.message)
+      && !/--class Rogue beside the sheet says so/.test(dumpNo.message), dumpNo?.message);
+  const sheetNoClass = JSON.parse(submitDocs('examples/sheet-full.json'));
+  delete sheetNoClass.character.class;
+  const noClassPair = submitLib.buildSubmission(engine, submitFixed({ sheet: { name: 'nc.json', data: JSON.stringify(sheetNoClass) }, sheetOptions: { cls: 'Rogue' }, log: docsLog }));
+  ok('...as with a sheet that names no class of its own', noClassPair.classMismatch?.vouchable === false && submitLib.sendRefusal(noClassPair)?.status === 400);
+  const editorPair = submitLib.buildSubmission(engine, submitFixed({ sheet: { loadout: sheetLib.readSheet(engine, sheetFull()).loadout }, sheetOptions: { cls: 'Rogue' }, log: docsLog }));
+  ok('...and the editor\'s build: the class it was stated as is its only word on it, whatever sheetOptions says',
+    editorPair.classMismatch?.vouchable === false && editorPair.classMismatch.vouched === false && submitLib.sendRefusal(editorPair)?.status === 400);
+  // THE CLASS QUESTION carries the log's class, for a caller to offer first.
+  const caught = (fn) => { try { fn(); return null; } catch (e) { return e instanceof subpub.SubmissionError ? e : { status: String(e?.stack ?? e) }; } };
+  const asked = caught(() => submitLib.buildSubmission(engine, submitFixed({ sheet: rogueDump, log: docsLog })));
+  ok('a dump with no class given: the question carries the class the log names its character, beside the importer\'s facts',
+    asked?.status === 400 && asked.needs === 'class' && asked.character === 'Someone' && asked.classes?.includes('Rogue') && asked.logClass === 'Warrior',
+    JSON.stringify(asked));
+  const askedNoLog = caught(() => submitLib.buildSubmission(engine, submitFixed({ sheet: rogueDump, log: { name: 'x.jsonl', data: 'not a log' } })));
+  ok('...null when the log cannot be read, and the question is still the importer\'s', askedNoLog?.needs === 'class' && askedNoLog.logClass === null
+    && /does not say which class/.test(askedNoLog.message), JSON.stringify(askedNoLog));
+  const stub = pcloudStub(() => ({ result: 4000, error: 'Too many login tries from this IP address.' }));
+  const link = await stub.ready;
+  try {
+    const mismatch = await submitRejection(submitLib.sendSubmission(docs, { link }));
+    ok('...and sendSubmission refuses it before a byte leaves', mismatch?.status === 400 && /so it is not sent/.test(mismatch.message) && stub.seen.length === 0, JSON.stringify(mismatch));
+    // NOTHING ARRIVED: a refusal from pCloud keeps nothing of the upload
+    // (nopartial), so it carries no receipt to keep, and says so.
+    let said = null;
+    try { await submitLib.sendSubmission(t1, { link }); } catch (e) { said = e; }
+    ok('a refusal from pCloud is its sentence, arrived: false, and no receipt - there is nothing to ask back',
+      said?.status === 429 && said.arrived === false && said.receipt === undefined && /^pCloud turns this address away for now \(pCloud: Too many login tries/.test(said.message)
+        && /nothing was kept/.test(said.message) && stub.seen.length === 1, String(said?.message));
+  } finally {
+    await stub.close();
+  }
+
+  // A RECEIPT HELD TO ITS BUNDLE: a bundle built again under a receipt's id
+  // must be that bundle.
+  const STUB9 = `http://127.0.0.1:9/#/puplink?code=${pcloudCode()}`;
+  const first = build({ name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') }, { note: 'first note' });
+  const kept = submitLib.parseReceipt(submitLib.receiptText(submitLib.pendingReceipt(first, { link: STUB9 })));
+  ok('a receipt names its bundle\'s SHA-256, and reads back with it', kept.zipSha256 === first.zipSha256 && /"zipSha256": "[0-9a-f]{64}"/.test(submitLib.receiptText(kept)));
+  const again = (note, sha = kept.zipSha256) => submitRefusal(() => submitLib.buildSubmission(engine, {
+    sheet: minimal, log: { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') }, note,
+    id: kept.id, deleteToken: kept.deleteToken, now: kept.createdAt, zipSha256: sha,
+  }));
+  const changed = again('a DIFFERENT note');
+  ok('...built again with a changed note under its id, it is refused before anything is sent: an id names one bundle', changed?.status === 400
+    && /^These files make another bundle than the one submission 01234567 was sent as \(SHA-256 [0-9a-f]{12}\.\.\. where its receipt says [0-9a-f]{12}\.\.\.\): an id names one bundle, /.test(changed.message),
+  JSON.stringify(changed));
+  // The same files after an update of the game or of the bench make another
+  // bundle too (the manifest names both): the sentence names both causes and
+  // the way on that works, and never promises that the same files build it
+  // again. A receipt's SHA-256 of another bundle of these very files stands
+  // in for the update.
+  const updated = again('first note', '0'.repeat(64));
+  ok('...as are the very same files after an update: the sentence names the files, the note or the choices, the game build and the bench version, '
+    + 'and says to ask for the first one\'s deletion and send this one anew - never "send the same files"',
+    updated?.status === 400 && [changed, updated].every((r) => r.message.includes('an id names one bundle, and what went into it has changed since that receipt '
+      + 'was written - the files, the note or what was chosen with them, or this install\'s game build or the bench\'s version. ')
+      && r.message.endsWith('Ask for the first one\'s deletion with that receipt - it may have arrived - and send this one as a new submission.')
+      && !/same files|build it again/i.test(r.message)), `${changed?.message} | ${updated?.message}`);
+  ok('...built again from the same files, it is that bundle', again('first note') === null);
+  const old = submitLib.parseReceipt({ id: kept.id, deleteToken: kept.deleteToken, link: kept.link, sentAt: null, createdAt: kept.createdAt });
+  const fromOld = submitLib.buildSubmission(engine, { sheet: minimal, log: { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') },
+    note: 'a DIFFERENT note', id: old.id, deleteToken: old.deleteToken, now: old.createdAt, zipSha256: old.zipSha256 });
+  ok('...a receipt from before receipts named their bundle reads with none, checks nothing, and its new receipt names none either',
+    old.zipSha256 === null && fromOld.receiptSha256 === null && submitLib.pendingReceipt(fromOld, { link: STUB9 }).zipSha256 === null);
+  ok('...and a SHA-256 that is none is refused', submitRefusal(() => submitLib.parseReceipt({ ...kept, zipSha256: 'abc' }))?.status === 400);
+
+  // A RECEIPT WHOSE FIGHT ARRIVED: its sentAt goes in with its id, the
+  // bundle is built (the same zip, for --zip and Save .zip), and sendRefusal
+  // - the one rule both front ends ask - refuses to send it, first, in each
+  // front end's words; sendSubmission refuses it before a byte leaves.
+  const SENT_AT = '2026-10-19T12:05:00.000Z';
+  const sameLog = { name: 'combat-log.jsonl', data: submitDocs('examples/combat-log.jsonl') };
+  const answered = submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, note: 'first note',
+    id: kept.id, deleteToken: kept.deleteToken, now: kept.createdAt, zipSha256: kept.zipSha256, sentAt: SENT_AT });
+  const answeredApp = submitLib.sendRefusal(answered);
+  const answeredCli = submitLib.sendRefusal(answered, { front: 'cli' });
+  ok('a bundle built again from a receipt whose fight arrived is that bundle, and says so (answered)',
+    answered.zip.equals(first.zip) && sheetCanon(answered.answered) === sheetCanon({ sentAt: SENT_AT }) && first.answered === null);
+  ok('...sendRefusal refuses it in one sentence - a second send would only store a second copy - the remedy in each front end\'s words',
+    answeredApp?.status === 400 && sheetCanon(answeredApp.answered) === sheetCanon({ sentAt: SENT_AT })
+      && answeredApp.message === `The receipt this bundle is built again from is of submission 01234567, whose fight arrived (${SENT_AT}): sending it again would only `
+        + 'store a second copy beside the first. A changed bundle goes as a new submission - preview it without the receipt - and Delete, with that receipt, '
+        + 'asks for the first one\'s deletion.'
+      && answeredCli?.message.startsWith(`The receipt this bundle is built again from (--receipt) is of submission 01234567, whose fight arrived (${SENT_AT}): `)
+      && answeredCli.message.endsWith('- leave --receipt out - and bench submit --delete <that receipt> asks for the first one\'s deletion.'), `${answeredApp?.message} | ${answeredCli?.message}`);
+  const answeredOtherClass = submitLib.buildSubmission(engine, { sheet: { name: 'sheet-full.json', data: submitDocs('examples/sheet-full.json') }, log: sameLog,
+    id: kept.id, deleteToken: kept.deleteToken, now: kept.createdAt, sentAt: SENT_AT });
+  ok('...said before a class the log contradicts, when both hold', answeredOtherClass.classMismatch !== null
+    && submitLib.sendRefusal(answeredOtherClass)?.answered?.sentAt === SENT_AT && !submitLib.sendRefusal(answeredOtherClass).classMismatch);
+  const answeredChanged = submitRefusal(() => submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, note: 'a DIFFERENT note',
+    id: kept.id, deleteToken: kept.deleteToken, now: kept.createdAt, zipSha256: kept.zipSha256, sentAt: SENT_AT }));
+  ok('...other files under it are refused saying that one arrived - not "send the same files", which would go nowhere either',
+    answeredChanged?.status === 400 && answeredChanged.message.includes(`That one arrived (${SENT_AT}), so nothing more goes under its id: send this one as a new submission `
+      + '(the old receipt still asks for the first one\'s deletion).') && !/Send the same files/.test(answeredChanged.message), answeredChanged?.message);
+  ok('...a sentAt with no id, or one that is no time, is refused',
+    submitRefusal(() => submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, sentAt: SENT_AT }))?.status === 400
+      && submitRefusal(() => submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, id: kept.id, sentAt: 'yesterday' }))?.status === 400);
+  const answeredStub = pcloudStub();
+  const answeredLink = await answeredStub.ready;
+  try {
+    const no = await submitRejection(submitLib.sendSubmission(answered, { link: answeredLink }));
+    ok('...and sendSubmission refuses it before a byte leaves', no?.status === 400 && /whose fight arrived/.test(no.message) && answeredStub.seen.length === 0, JSON.stringify(no));
+  } finally {
+    await answeredStub.close();
+  }
+
+  // THE STATED BUILD is "the build" in the module's sentences: the CLI's
+  // typed build goes as the editor's does, and neither prints the other's word.
+  const notLoadout = submitRefusal(() => submitLib.buildSubmission(engine, { sheet: { loadout: 'nope' }, log: sameLog }));
+  ok('a stated build\'s refusal says "the build", not "the editor" - the CLI gives its typed build this way too',
+    notLoadout?.status === 400 && notLoadout.message === 'The build is not a loadout.', notLoadout?.message);
+
+  // A RECEIPT GIVEN WHOLE (buildSubmission's `receipt`, what both front ends
+  // give): it stands for its id, token, time, SHA-256 and sentAt - the same
+  // bundle as those given one by one - and names its link (sentTo).
+  const receiptOf = (over = {}) => ({ ...kept, ...over });
+  const viaReceipt = submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, note: 'first note', receipt: receiptOf() });
+  ok('a receipt given whole builds the bundle its fields build, and names the upload link it was written for (sentTo)',
+    viaReceipt.zip.equals(first.zip) && viaReceipt.sentTo === kept.link && viaReceipt.answered === null && first.sentTo === null,
+    `${viaReceipt.sentTo} ${viaReceipt.zipSha256 === first.zipSha256}`);
+  const sentWhole = submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, note: 'first note', receipt: receiptOf({ sentAt: SENT_AT }) });
+  ok('...its sentAt, when it has one, as answered', sheetCanon(sentWhole.answered) === sheetCanon({ sentAt: SENT_AT }) && submitLib.sendRefusal(sentWhole, { link: kept.link })?.answered?.sentAt === SENT_AT);
+  const both = caught(() => submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, receipt: receiptOf(), id: kept.id }));
+  const undated = caught(() => submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, receipt: receiptOf({ createdAt: null }) }));
+  const noReceipt = caught(() => submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, receipt: { id: 'nope' } }));
+  ok('...given beside its own fields, with no createdAt, or not a receipt at all, it is refused - the last two marked as the receipt\'s (`receipt`)',
+    both?.status === 400 && /^A receipt stands for the id of the bundle it names/.test(both.message) && both.receipt !== true
+      && undated?.status === 400 && undated.receipt === true
+      && /^The receipt of submission 01234567 does not say when its bundle was made \(createdAt\), so that bundle cannot be built again byte for byte - the receipt still asks for the deletion of what it sent\.$/.test(undated.message)
+      && noReceipt?.status === 400 && noReceipt.receipt === true && /^That is not a receipt of a sent fight: /.test(noReceipt.message),
+    `${both?.message} | ${undated?.message} | ${noReceipt?.message}`);
+  // A RECEIPT OF ANOTHER UPLOAD LINK: built (--zip, Save .zip), and sent
+  // there or nowhere - sendRefusal's rule, in each front end's words, asked
+  // against the link this copy would send through (none counts as another).
+  // Its remedy is the one sentence that prints a link.
+  const elsewhere = submitLib.buildSubmission(engine, { sheet: minimal, log: sameLog, note: 'first note', receipt: receiptOf({ link: otherLink() }) });
+  const elseApp = submitLib.sendRefusal(elsewhere, { link: STUB9 });
+  const elseCli = submitLib.sendRefusal(elsewhere, { front: 'cli', link: null });
+  ok('a bundle built again from a receipt of another upload link is that bundle, and sendRefusal refuses to send it anywhere but there',
+    elsewhere.zip.equals(first.zip) && elseApp?.status === 400 && elseApp.sentTo === otherLink()
+      && elseApp.message === 'The receipt this bundle is built again from is of submission 01234567, written for another upload link than this copy\'s: '
+        + 'a bundle is sent again where it may already be, or not at all - sent elsewhere, the fight would be kept twice, and a request for its deletion '
+        + `would go to the wrong folder. The bench started with FAREVER_BENCH_UPLOAD_LINK=${otherLink()} sends it there; Save .zip keeps this copy of it meanwhile.`
+      && /^The receipt this bundle is built again from \(--receipt\) is of submission 01234567, written for an upload link, and this copy has none: /.test(elseCli?.message ?? '')
+      && elseCli.message.endsWith(`The same command run with FAREVER_BENCH_UPLOAD_LINK=${otherLink()} sends it there.`)
+      && submitLib.sendRefusal(elsewhere, { link: otherLink() }) === null
+      && submitLib.sendRefusal(viaReceipt, { link: kept.link }) === null, `${elseApp?.message} | ${elseCli?.message}`);
+  ok('...links are compared by their canonical form: another spelling of the same link is the same link, and only the remedy prints it',
+    submitLib.sendRefusal(elsewhere, { link: 'https://e.pcloud.com/#page=puplink&code=OtherCode99' }) === null
+      && !elseApp.message.split('FAREVER_BENCH_UPLOAD_LINK=')[0].includes('OtherCode99') && !elseApp.message.includes(pcloudCode()));
+  const elseStub = pcloudStub();
+  const elseLink = await elseStub.ready;
+  try {
+    const no = await submitLib.sendSubmission(elsewhere, { link: elseLink }).then(() => null, (e) => e);
+    ok('...and sendSubmission refuses it before a byte leaves', no?.status === 400 && no.sentTo === otherLink()
+      && /written for another upload link than this copy's/.test(no.message) && elseStub.seen.length === 0, String(no?.message));
+  } finally {
+    await elseStub.close();
+  }
+
+  // WHAT A STATED BUILD IS TOLD (statedFindings): the module's, worded by
+  // problemsOf for the front end that says it - the app's editor build and
+  // the CLI's typed build alike (review: only the app was told).
+  const bareWarrior = { class: 'Warrior', level: 25, gear: {}, augments: {}, talents: {}, runes: {}, skills: {} };
+  const noPins = { gear: [], augments: [], skills: [], runes: [], talents: false, infusions: [] };
+  const naked = submitLib.buildSubmission(engine, { sheet: { loadout: bareWarrior, pins: noPins }, log: sameLog });
+  const nakedApp = submitLib.problemsOf(naked);
+  const nakedCli = submitLib.problemsOf(naked, { front: 'cli' });
+  ok('a stated build that wears nothing is told so, first, in each front end\'s words - and a file is told nothing of the kind',
+    /^the build in the editor wears nothing - is it the build this fight was fought in\? Put that build in the editor/.test(nakedApp[0] ?? '')
+      && /^the build as typed wears nothing - is it the build this fight was fought in\? --pin what the character wore/.test(nakedCli[0] ?? '')
+      && submitLib.reportItems(naked, { front: 'cli' }).some((i) => i.kind === 'problem' && i.warn === true && i.text === `Problem: ${nakedCli[0]}.`)
+      && !nakedCli.some((t) => /editor/.test(t)) && submitLib.problemsOf(first).every((t) => !/^the build /.test(t)),
+    `${nakedApp[0]} | ${nakedCli[0]}`);
+  const otherAxe = [...engine.cat.itemById.values()].find((it) => it.id !== 'GA_Craft' && engine.cat.isWeaponType(it.type) && !it.isAugment
+    && engine.cat.usableBy(it, 'Fighter') && (it.slots ?? []).includes('Slot_Weapon1') && !(it.skills ?? []).some((s) => /^GA_Craft/.test(s)));
+  const wrongWeapon = submitLib.buildSubmission(engine, { sheet: { loadout: { ...bareWarrior, gear: { Slot_Weapon1: { item: otherAxe?.id } } }, pins: { ...noPins, gear: ['Slot_Weapon1'] } }, log: sameLog });
+  ok('...and one wearing none of the weapons whose skills the log\'s character used is told which',
+    !!otherAxe && /^the log's character used .+ - skills? of .*\bGA_Craft\b.* - and no weapon the build as typed wears grants (it|them): is it the build this fight was fought in\? --pin /.test(submitLib.problemsOf(wrongWeapon, { front: 'cli' })[0] ?? ''),
+    submitLib.problemsOf(wrongWeapon, { front: 'cli' })[0]);
+
+  // WHAT A READER WARNS OF is said by the reader, as `warn: true`: the CLI
+  // colours by it and the UI marks by it, and neither keeps a list of kinds.
+  const flags = (items) => items.map((i) => `${i.kind}${i.warn === true ? '!' : ''}`);
+  const subItems = submitLib.reportItems(docs, { link: STUB9 });
+  ok('the bundle\'s report flags every problem, and carries the readers\' own flags onto the lines it nests - nothing else',
+    subItems.filter((i) => i.kind === 'problem').length > 0 && subItems.filter((i) => i.kind === 'problem').every((i) => i.warn === true)
+      && subItems.filter((i) => /^(sheet|log):/.test(i.kind)).every((i) => (i.warn === true) === (/^(sheet:(mismatch|dropped|gap|unknown|ilevel)|log:problem)$/.test(i.kind)))
+      && subItems.filter((i) => !/^(sheet|log):/.test(i.kind) && i.kind !== 'problem').every((i) => i.warn === undefined), flags(subItems).join(' '));
+
+  // A STATED BUILD: the editor's build with its pins goes as what was
+  // pinned, the rest open; without pins, all of it goes as recorded.
+  const lo = sheetLib.readSheet(engine, sheetFull()).loadout;
+  const rogueLog = docLogWith((h) => { h.character.class = 'Rogue'; });
+  const pinned = submitLib.buildSubmission(engine, submitFixed({ sheet: { loadout: lo, pins: { gear: ['Slot_Weapon1'], augments: [], skills: [], runes: [], talents: false, infusions: [] } }, log: rogueLog }));
+  const pinnedSheetOut = JSON.parse(submitEntries(pinned)['sheet.json']);
+  ok('the editor\'s build with pins sends what they hold: one slot, no tree, no runes, every other slot a gap',
+    Object.keys(pinnedSheetOut.gear).join() === 'Slot_Weapon1' && !('talents' in pinnedSheetOut) && !('runes' in pinnedSheetOut)
+      && pinned.manifest.sheet.gaps.some((g) => /^14 gear slots are not recorded/.test(g)), JSON.stringify(pinnedSheetOut).slice(0, 300));
+  const whole = submitLib.buildSubmission(engine, submitFixed({ sheet: { loadout: lo }, log: rogueLog }));
+  ok('...without pins, the whole loadout goes as recorded, as before', Object.keys(JSON.parse(submitEntries(whole)['sheet.json']).gear).length === 15);
+
+  // WHO SENDS IT decides how sending is named.
+  const cliLines = submitLib.reportLines(t1, { link: STUB9, front: 'cli' });
+  const appLines = submitLib.reportLines(t1, { link: STUB9 });
+  ok('the report says "--send" and "--zip" on the command line, "Send" and "Save .zip" in the app',
+    cliLines[0].startsWith('What --send does: the zip (') && cliLines.some((l) => l.startsWith('On the manual route instead (--zip, then the GitHub form'))
+      && appLines[0].startsWith('What Send does: the zip (') && appLines.some((l) => l.startsWith('On the manual route instead (Save .zip, then the GitHub form'))
+      && !cliLines.some((l) => /click Send|Save \.zip/.test(l)), cliLines.join('\n'));
+  ok('...with no link, "--send is not available" on the command line', submitLib.reportLines(t1, { link: null, front: 'cli' })[0]
+    .startsWith('--send is not available in this copy of the bench: no upload link is set. The route is --zip, then the GitHub form, its title filled in: '));
+  const items = submitLib.reportItems(t1, { link: STUB9 });
+  const kinds = new Set(items.map((i) => i.kind));
+  ok('...on the Send route the zip\'s files follow its heading, no issue title or row is printed, and every line has a kind',
+    items[0].kind === 'private' && items.filter((i) => i.kind === 'file').length === t1.files.length && !kinds.has('title') && !kinds.has('row') && !kinds.has('public')
+      && items.every((i) => typeof i.kind === 'string' && i.kind && typeof i.text === 'string')
+      && kinds.has('sheet:gap') && kinds.has('log:character'), JSON.stringify(items.map((i) => i.kind)));
+  const manualItems = submitLib.reportItems(t1, { link: null });
+  ok('...while with no link the form\'s title is printed, as the one route\'s', manualItems.some((i) => i.kind === 'title' && i.text === `  Title: ${t1.issueTitle}`)
+    && !manualItems.some((i) => i.kind === 'private'), JSON.stringify(manualItems.slice(0, 4)));
+} catch (e) { crashed(e); }
+
+// --- bench submit, from the command line ----------------------------------------
+// The command around src/submit.mjs: a dry run that prints what the zip
+// holds and where it would go and touches nothing, --zip, --send with its
+// receipt written first, --receipt to send the same bundle again, --delete
+// to ask for a deletion. Held through bin/bench.mjs itself, in child
+// processes started without blocking, so that a pCloud stand-in on
+// 127.0.0.1 in this process can answer them; every run is given
+// FAREVER_BENCH_UPLOAD_LINK (the stand-in, or `none`), so none can reach
+// pCloud whatever UPLOAD_LINK says. The fixtures are the documented examples
+// and the combat-log reader's own Wink pair, built from ids.
+// (FAREVER_BENCH_CACHE is the run's own folder's .cache: a send with no --zip
+// keeps its receipt in the bench's receipts folder, never in the repository.)
+function cliSubmitRun(argv, { cwd, link = 'none', env = {} } = {}) {
+  return new Promise((resolve) => {
+    const child = cliSubmitSpawn(process.execPath, [fileURLToPath(new URL('../bin/bench.mjs', import.meta.url)), ...argv],
+      { cwd, env: { ...process.env, NO_COLOR: '1', FAREVER_BENCH_UPLOAD_LINK: link, FAREVER_BENCH_CACHE: join(cwd ?? tmpdir(), '.cache'), ...env } });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    const timer = setTimeout(() => child.kill(), 180_000);
+    child.on('close', (status) => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+  });
+}
+// The part of a dry run's report that says where the zip goes: the lines above "Names:".
+function cliSubmitPublic(stdout) { const lines = stdout.split(/\r?\n/); const at = lines.findIndex((l) => l.startsWith('Names: ')); return lines.slice(0, at < 0 ? lines.length : at).join('\n'); }
+function cliSubmitEntries(buf) { return Object.fromEntries(submitLib.readZip(buf).map((e) => [e.name, e.data.toString('utf8')])); }
+function cliSubmitExample(name) { return fileURLToPath(new URL(`../docs/examples/${name}`, import.meta.url)); }
+function cliSubmitLast(text) { return String(text).trim().split(/\r?\n/).pop(); }
+
+group('cli submit: a dry run says what the zip holds and where it would go, and sends and writes nothing');
+if (on) try {
+  const ex = cliSubmitExample;
+  const dir = mkdtempSync(join(tmpdir(), 'fb-cli-submit-'));
+  try {
+    const base = ['submit', '--log', ex('combat-log.jsonl'), '--import', ex('sheet-full.json')];
+    // A link to a port nobody listens on: Send is on, and a dry run reaches nothing.
+    const [dry, withLink, withLinkSent, kept] = await Promise.all([
+      cliSubmitRun(base, { cwd: dir }),
+      cliSubmitRun(base, { cwd: dir, link: await deadLink() }),
+      cliSubmitRun(['submit', '--log', ex('combat-log.jsonl'), '--import', ex('sheet-minimal.json')], { cwd: dir, link: await deadLink() }),
+      cliSubmitRun([...base, '--keep-name'], { cwd: dir }),
+    ]);
+    const pub = cliSubmitPublic(dry.stdout);
+    ok('a dry run of the documented examples with Send off exits 0 and prints the GitHub form\'s title', dry.status === 0
+      && /^ {2}Title: Data submission: Rogue 25 vs Dummy, Normal \([0-9a-f]{8}\)$/m.test(pub), `${dry.status}: ${dry.stderr}`);
+    // (In the command line's words - --send, --zip - not the app's: submit.mjs reportItems, front 'cli'.)
+    ok('...that --send is not offered, and the GitHub form, its title filled in, is the route',
+      /^--send is not available in this copy of the bench: no upload link is set\. The route is --zip, then the GitHub form, its title filled in: https:\/\/github\.com\/Blaakan\/farever-bench\/issues\/new\?template=data-submission\.yml&title=/m.test(pub)
+        && !/click Send|Save \.zip/.test(dry.stdout), pub);
+    ok('...the files the zip would hold, by their fixed names and sizes', ['manifest\\.json', 'sheet\\.json', 'combat-log\\.jsonl'].every((n) => new RegExp(`^ {2}${n} {2}[\\d,]+ bytes$`, 'm').test(pub)), pub);
+    ok('...and no name: neither the sheet\'s character, nor the log\'s, nor the sheet\'s file name is in what would be published',
+      !/Example|Tester|sheet-full/.test(pub), pub);
+    ok('...the names line says the character is "Submitter" in the files', /^Names: 2 removed; your character is "Submitter" wherever a file names it\.$/m.test(dry.stdout), dry.stdout);
+    const lines = dry.stdout.split(/\r?\n/);
+    const below = lines.findIndex((l) => l.startsWith('Below, what the bench read in your own files, for you to check. It is not sent as written'));
+    ok('the readers\' own reports follow, under a line saying they are the player\'s files and not the bundle', below > 0 && lines[below + 1] === 'The character sheet:'
+      && lines.includes('The combat log:') && lines.some((l) => /^Problem: the sheet is a Rogue and the log's character a Warrior/.test(l)), lines.slice(below, below + 3).join(' | '));
+    ok('...and nothing is sent or written: the closing line says so, and that --send is not available here, and the folder is empty',
+      /^Nothing was saved or sent\. --zip \[<file>\] saves this bundle \(each run packs it anew, under a new id\); --send is not available in this copy \(no upload link is set\) - the route is --zip, then the GitHub form: https:\/\/github\.com\//m.test(dry.stdout)
+        && readdirSync(dir).length === 0, `${cliSubmitLast(dry.stdout)} | ${readdirSync(dir).join()}`);
+    const wp = cliSubmitPublic(withLink.stdout);
+    ok('with a link set, it says what --send does - the zip to the project\'s folder on pCloud, nothing made public - with no name and no issue title',
+      withLink.status === 0 && withLinkSent.status === 0
+        && /^What --send does: the zip \([\d,]+ bytes\) goes to the project's folder on pCloud \(pcloud\.com\), where only the project's maintainer can read it - nothing is made public -$/m.test(wp)
+        && !/^ {2}(Title|Character): /m.test(wp) && !/Example|Tester|sheet-full/.test(wp)
+        && cliSubmitLast(withLinkSent.stdout) === 'Nothing was saved or sent. --zip [<file>] saves this bundle; --send sends it. Each run packs it anew, under a new id.'
+        && /^On the manual route instead \(--zip, then the GitHub form: /m.test(withLink.stdout) && !/click Send|Save \.zip/.test(withLink.stdout), wp);
+    // A pair --send refuses (a Rogue's sheet, a Warrior's log) is said to
+    // be refused, first, as the app's preview says it: src's sendRefusal,
+    // asked in a dry run too - and the closing line does not offer --send.
+    ok('...and of a pair --send refuses, the refusal first, and a closing line that says --send refuses it rather than that it sends it',
+      wp.split(/\r?\n/).find((l) => l.startsWith('Problem: '))?.startsWith('Problem: The sheet is a Rogue and the fight\'s log names its character a Warrior, so it is not sent')
+        && cliSubmitLast(withLink.stdout) === 'Nothing was saved or sent. --zip [<file>] saves this bundle; --send refuses it - the first Problem line above says why. '
+          + 'Each run packs it anew, under a new id.', `${wp.split(/\r?\n/).find((l) => l.startsWith('Problem: '))} | ${cliSubmitLast(withLink.stdout)}`);
+    ok('...and never prints the link itself', !withLink.stdout.includes(pcloudCode()) && !/puplink/.test(withLink.stdout));
+    // A LINK SET THAT IS NONE: a dry run names it as what it is - the
+    // sentence that begins FAREVER_BENCH_UPLOAD_LINK is "...", warned of,
+    // first in the report as the app's preview has it - and never says that
+    // no link is set; --send dies with that sentence.
+    const notALink = 'https://example.org/#/puplink?code=TestCode1234';
+    const [badLink, badLinkSend] = await Promise.all([
+      cliSubmitRun(base, { cwd: dir, link: notALink }),
+      cliSubmitRun([...base, '--send'], { cwd: dir, link: notALink }),
+    ]);
+    const linkSaid = `FAREVER_BENCH_UPLOAD_LINK is ${JSON.stringify(notALink)}: it is not on pCloud (pcloud.com, pcloud.link) - give the upload link pCloud `
+      + 'shows for the folder, https://...pcloud.../#/puplink?code=...';
+    const badPub = cliSubmitPublic(badLink.stdout).split(/\r?\n/).filter((l) => l.trim());
+    ok('a FAREVER_BENCH_UPLOAD_LINK that is no upload link: the dry run opens its report on that sentence, says --send is off until it is set right, '
+      + 'and never that no link is set; --send dies with the sentence, writing nothing',
+      badLink.status === 0 && badPub.some((l, i) => l === `Problem: --send is off: ${linkSaid}`
+        && badPub[i + 1]?.startsWith('--send is off in this copy of the bench until that link is set right. The route meanwhile is --zip, then the GitHub form'))
+        && cliSubmitLast(badLink.stdout).startsWith('Nothing was saved or sent. --zip [<file>] saves this bundle (each run packs it anew, under a new id); '
+          + '--send is off until the upload link is set right (the first Problem line above says what is wrong with it) - the route meanwhile is --zip, '
+          + 'then the GitHub form: https://github.com/')
+        && !/no upload link is set/.test(badLink.stdout)
+        && badLinkSend.status === 1 && cliSubmitLast(badLinkSend.stderr) === linkSaid && !/no upload link is set/.test(badLinkSend.stdout),
+      `${badLink.status} ${badPub.slice(0, 3).join(' | ')} | ${cliSubmitLast(badLink.stdout)} | ${badLinkSend.status}: ${badLinkSend.stderr.trim()}`);
+    ok('--keep-name: the names line says where the character\'s name is kept, and the public part still names nobody', kept.status === 0
+      && /^Names: \d+ removed; your character's name is kept in sheet\.json and the log's header, as you asked\.$/m.test(kept.stdout)
+      && !/Example|Tester/.test(cliSubmitPublic(kept.stdout)), kept.stdout.split(/\r?\n/).filter((l) => /^Names/.test(l)).join());
+
+    const [noLog, noBuild, pinned, stray, valued, elsewhere, verifyLog, deleteWith] = await Promise.all([
+      cliSubmitRun(['submit', '--import', ex('sheet-full.json')], { cwd: dir }),
+      cliSubmitRun(['submit', '--log', ex('combat-log.jsonl')], { cwd: dir }),
+      cliSubmitRun([...base, '--pin', 'weapon1=GS_Nova'], { cwd: dir }),
+      cliSubmitRun(['submit', ex('combat-log.jsonl')], { cwd: dir }),
+      cliSubmitRun([...base, '--send', 'yes'], { cwd: dir }),
+      cliSubmitRun(['sheet', '--class', 'Warrior', '--send'], { cwd: dir }),
+      cliSubmitRun(['verify', '--log', ex('combat-log.jsonl')], { cwd: dir }),
+      cliSubmitRun(['submit', '--delete', 'some.receipt.json', '--log', ex('combat-log.jsonl')], { cwd: dir }),
+    ]);
+    const said = (r) => `${r.status}: ${r.stderr.trim()}`;
+    ok('no fight is refused (exit 1), saying what --log takes', noLog.status === 1 && /^bench submit needs the fight: --log <file>/.test(noLog.stderr), said(noLog));
+    ok('no build is refused, with the two ways to give one', noBuild.status === 1 && /^bench submit needs the build the fight was fought in: --import <character sheet>/.test(noBuild.stderr), said(noBuild));
+    ok('a pin typed beside --import is refused: it would send another build than the one the file recorded', pinned.status === 1
+      && /is the build the fight was fought in, as the file recorded it, and --pin would send another/.test(pinned.stderr), said(pinned));
+    ok('a file given without its flag is refused, naming it', stray.status === 1 && stray.stderr.startsWith('bench submit takes its files by flag, and "'), said(stray));
+    ok('--send with a word after it is refused, not taken as a file', valued.status === 1 && valued.stderr.startsWith('--send takes no value, and "yes" was given after it'), said(valued));
+    ok('a flag of bench submit on another command is refused, and verify --log names --capture', elsewhere.status === 1
+      && elsewhere.stderr.startsWith('--send is read by `bench submit` only, and `bench sheet` would ignore it')
+      && verifyLog.status === 1 && /bench verify reads a combat log with --capture <file>/.test(verifyLog.stderr), `${said(elsewhere)} | ${said(verifyLog)}`);
+    ok('--delete builds nothing, and a fight given beside it is refused', deleteWith.status === 1
+      && deleteWith.stderr.startsWith('--delete asks for the deletion of a fight sent earlier and builds nothing, so --log has nothing to do beside it'), said(deleteWith));
+    ok('...and none of them wrote a file', readdirSync(dir).length === 0, readdirSync(dir).join());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+} catch (e) { crashed(e); }
+
+group('cli submit: --zip writes the bundle under its fixed names, from a sheet, from the build flags and from a Wink pair');
+if (on) try {
+  const ex = cliSubmitExample;
+  const dir = mkdtempSync(join(tmpdir(), 'fb-cli-submit-'));
+  try {
+    const bareDir = join(dir, 'bare');
+    mkdirSync(bareDir);
+    const dummyName = cdb.row('unit', 'Dummy').texts?.name ?? 'Dummy';
+    const wfx = combatLogFixture({ dummyName, wink: true });
+    const timeline = join(dir, 'fight_20261018_120000_1_1.json.timeline');
+    const summary = join(dir, 'fight_20261018_120000_1_1.json');
+    writeFileSync(timeline, wfx.text);
+    writeFileSync(summary, JSON.stringify(wfx.summary));
+    const out = join(dir, 'fight.zip');
+    const flagsZip = join(dir, 'flags.zip');
+    const winkZip = join(dir, 'wink.zip');
+    const [r, bare, byFlags, wink, lone] = await Promise.all([
+      cliSubmitRun(['submit', '--log', ex('combat-log.jsonl'), '--import', ex('sheet-full.json'), '--zip', out, '--note', 'the bee buff was up'], { cwd: dir }),
+      cliSubmitRun(['submit', '--log', ex('combat-log.jsonl'), '--import', ex('sheet-minimal.json'), '--zip'], { cwd: bareDir }),
+      cliSubmitRun(['submit', '--log', ex('combat-log.jsonl'), '--class', 'Warrior', '--pin', 'weapon1=GS_Nova', '--zip', flagsZip], { cwd: dir }),
+      cliSubmitRun(['submit', '--log', timeline, '--import', ex('sheet-minimal.json'), '--zip', winkZip], { cwd: dir }),
+      cliSubmitRun(['submit', '--log', summary, '--import', ex('sheet-minimal.json')], { cwd: dir }),
+    ]);
+    const zipAt = (p) => (existsSync(p) ? readFileSync(p) : Buffer.alloc(0));
+    const zip = zipAt(out);
+    const files = zip.length ? cliSubmitEntries(zip) : {};
+    ok('--zip <file> writes the bundle: exit 0, its entries the fixed names, the note among them as typed', r.status === 0
+      && Object.keys(files).join() === 'manifest.json,sheet.json,combat-log.jsonl,note.txt' && files['note.txt'] === 'the bee buff was up\n', `${r.status}: ${r.stderr} ${Object.keys(files).join()}`);
+    ok('...a zip the shared directory reader takes', zip.length > 0 && subpub.zipEntryProblem(subpub.readZipDirectory(zip).map((d) => d.name)) === null);
+    ok('...holding no name of a player and no name of the player\'s files', Object.values(files).every((t) => !/Example|Tester|sheet-full/.test(t)));
+    const m = files['manifest.json'] ? JSON.parse(files['manifest.json']) : {};
+    ok('...its manifest naming the sheet\'s own dialect, and the line printed naming the file, its size and its SHA-256',
+      m.sheet?.sourceFormat === 'farever-character-sheet' && m.sheet.class === 'Rogue'
+        && r.stdout.includes(`Saved ${out}: ${zip.length.toLocaleString('en-US')} bytes, SHA-256 ${submitHash('sha256').update(zip).digest('hex')}.`), r.stdout.slice(-400));
+
+    const named = readdirSync(bareDir);
+    const bareId = named.length === 1 ? JSON.parse(cliSubmitEntries(readFileSync(join(bareDir, named[0])))['manifest.json']).id : null;
+    ok('a bare --zip saves it under the bundle\'s own name, which says nothing of the player', bare.status === 0 && named.length === 1
+      && /^farever-bench-submission-[0-9a-f]{8}\.zip$/.test(named[0]) && bareId?.startsWith(named[0].slice(25, 33)), `${bare.status}: ${bare.stderr} ${named.join()}`);
+
+    const ff = zipAt(flagsZip).length ? cliSubmitEntries(zipAt(flagsZip)) : {};
+    const fm = ff['manifest.json'] ? JSON.parse(ff['manifest.json']) : {};
+    const flagSheet = ff['sheet.json'] ? JSON.parse(ff['sheet.json']) : {};
+    ok('with no --import, the build typed by flags is sent as typed: the one piece pinned, its item alone, and no tree, rune, pool or rank nobody typed',
+      byFlags.status === 0 && fm.sheet?.class === 'Warrior'
+        && JSON.stringify(flagSheet.gear) === JSON.stringify({ Slot_Weapon1: { item: 'GS_Nova' } })
+        && ['talents', 'runes', 'weaponSkills', 'classSkills', 'weaponSkillRanks'].every((k) => !(k in flagSheet)),
+      `${byFlags.status}: ${byFlags.stderr} ${JSON.stringify(flagSheet.gear)}`);
+    // A stated build is labelled as one, as the UI's editor build is: the
+    // flags go as buildSubmission's editor input, never as a sheet file, so
+    // the maintainer can tell a typed build from a sheet an exporter wrote.
+    ok('...and labelled a stated build in the manifest, as the build in the UI\'s editor is (bench-editor), not as a sheet an exporter wrote',
+      fm.sheet?.sourceFormat === 'bench-editor', JSON.stringify(fm.sheet?.sourceFormat));
+    ok('...what no flag stated is named as a gap in the manifest, and the level nobody typed is said',
+      (fm.sheet?.gaps ?? []).some((g) => g.startsWith('14 gear slots are not recorded')) && fm.sheet.gaps.some((g) => /upgrade stars are not recorded on Slot_Weapon1/.test(g))
+        && byFlags.stdout.includes('note: --level was not given, and a sheet names one: it says 25'), JSON.stringify(fm.sheet?.gaps));
+
+    const wf = zipAt(winkZip).length ? cliSubmitEntries(zipAt(winkZip)) : {};
+    const wm = wf['manifest.json'] ? JSON.parse(wf['manifest.json']) : {};
+    ok('a Wink timeline brings the summary beside it, and says so', wink.status === 0
+      && wink.stdout.includes(`--summary ${summary}: Wink's summary beside the timeline, read with it`)
+      && Object.keys(wf).join() === 'manifest.json,sheet.json,combat-log.jsonl,summary.json' && wm.log?.sourceDialect === 'wink-timeline'
+      && wm.log.withSummary === true && wm.log.startedAtEstimated === false, `${wink.status}: ${wink.stderr} ${Object.keys(wf).join()}`);
+    ok('...and nothing in that zip names a player, an account or the fight\'s file', Object.keys(wf).length > 0
+      && Object.values(wf).every((t) => !/Tester|Healbot|acct-|char-171717|fight_2026/.test(t)));
+    ok('a Wink summary given alone, its timeline beside it, is packed as totals and the timeline is named', lone.status === 0
+      && lone.stdout.includes(`Its timeline is beside it: --log ${summary}.timeline sends every hit`), `${lone.status}: ${lone.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+} catch (e) { crashed(e); }
+
+group('cli submit: --send to a pCloud stand-in on 127.0.0.1 saves the receipt first, a lost answer keeps it, --receipt sends the same bundle again, --delete asks for its deletion');
+if (on) try {
+  const ex = cliSubmitExample;
+  const dir = mkdtempSync(join(tmpdir(), 'fb-cli-submit-'));
+  let mode = 'ok';
+  // The receipts the folder held each time a zip arrived, and what each
+  // said of the send: the receipt is written first.
+  const atUpload = [];
+  const stub = pcloudStub((record) => {
+    if (record.fileName?.endsWith('.zip')) {
+      atUpload.push(readdirSync(dir).filter((n) => n.endsWith('.receipt.json')).map((n) => {
+        try { return [n, submitLib.parseReceipt(readFileSync(join(dir, n))).sentAt]; } catch { return [n, 'unreadable']; }
+      }));
+    }
+    // A dropped connection once the zip has arrived: the answer is lost.
+    if (mode === 'drop') return 'drop';
+    if (mode === 'closed') return { result: 7002, error: 'This upload link was deleted by its owner.' };
+    return { result: 0 };
+  });
+  const link = await stub.ready;
+  try {
+    const base = ['submit', '--log', ex('combat-log.jsonl'), '--import', ex('sheet-minimal.json')];
+    const zipOf = (name) => (existsSync(join(dir, name)) ? readFileSync(join(dir, name)) : Buffer.alloc(0));
+    const idOf = (zip) => (zip.length ? JSON.parse(cliSubmitEntries(zip)['manifest.json']).id : null);
+    const manifestOf = (zip) => (zip.length ? JSON.parse(cliSubmitEntries(zip)['manifest.json']) : {});
+    const receiptAt = (name) => { try { return submitLib.parseReceipt(readFileSync(join(dir, name))); } catch { return null; } };
+    const said = (r) => `${r.status}: ${r.stderr.trim()}`;
+    const sha = (b) => submitHash('sha256').update(b).digest('hex');
+    const tokenSha = (t) => submitHash('sha256').update(String(t), 'ascii').digest('hex');
+
+    // No link: refused with the sentence, nothing written, nothing sent.
+    const none = await cliSubmitRun([...base, '--send'], { cwd: dir, link: 'none' });
+    const form = /its title filled in: (\S+)$/m.exec(none.stdout)?.[1] ?? '(no form address)';
+    ok('with no upload link, --send is refused (exit 1) with the sentence that points at the form', none.status === 1
+      && cliSubmitLast(none.stderr) === `Send is off in this copy of the bench (no upload link is set) - save the .zip (--zip <file>) and attach it to a new issue: ${form}`
+      && form.startsWith('https://github.com/Blaakan/farever-bench/issues/new?template=data-submission.yml&title='), said(none));
+    ok('...writing nothing and reaching nothing', readdirSync(dir).length === 0 && stub.seen.length === 0, readdirSync(dir).join());
+
+    // Sent, and answered.
+    const sent = await cliSubmitRun([...base, '--zip', 'fight.zip', '--send'], { cwd: dir, link });
+    const fight = zipOf('fight.zip');
+    const id = idOf(fight) ?? '';
+    const r1 = receiptAt('fight.receipt.json');
+    const up = stub.seen[0];
+    ok('--send uploads the zip it saved, once, as <id>.zip, and says where it is and that nothing was made public', sent.status === 0 && stub.seen.length === 1
+      && up?.path === '/uploadtolink' && up.query.code === pcloudCode() && up.query.names === 'farever-bench' && up.query.nopartial === '1'
+      && up.fileName === `${id}.zip` && up.fileType === 'application/zip' && fight.length > 0 && up.bytes?.equals(fight) && up.headers.authorization === undefined
+      && sent.stdout.includes(`Sent: submission ${id.slice(0, 8)} is in the project's pCloud folder as ${id}.zip (${fight.length.toLocaleString('en-US')} bytes, `
+        + `SHA-256 ${sha(fight)}). Only the maintainer can read it; nothing was made public.`), `${said(sent)} ${sent.stdout.slice(-700)}`);
+    ok('...the receipt on disk, pending, when the zip reached pCloud', JSON.stringify(atUpload[0]) === JSON.stringify([['fight.receipt.json', null]]), JSON.stringify(atUpload));
+    ok('...saying first where the receipt is saved, and never printing the link', sent.stdout.includes('Sending to the project\'s pCloud folder - the receipt fight.receipt.json is saved first.')
+      && !sent.stdout.includes(pcloudCode()) && !sent.stderr.includes(pcloudCode()) && !/puplink/.test(sent.stdout));
+    const r1File = existsSync(join(dir, 'fight.receipt.json')) ? JSON.parse(readFileSync(join(dir, 'fight.receipt.json'), 'utf8')) : {};
+    ok('...and writes the receipt beside the zip: the bundle\'s id and token, the link, when it arrived, its time and SHA-256, and how to ask for its deletion',
+      r1?.id === id && r1.link === link && !Number.isNaN(Date.parse(r1.sentAt)) && r1.zipSha256 === sha(fight)
+        && Object.keys(r1File).join() === 'format,version,about,id,deleteToken,link,sentAt,createdAt,zipSha256'
+        && tokenSha(r1.deleteToken) === manifestOf(fight).deleteTokenSha256
+        && sent.stdout.includes('Receipt: fight.receipt.json - keep it. bench submit --delete fight.receipt.json asks for this fight\'s deletion; '
+          + 'anyone holding the file can do that, and nothing else with it.'), JSON.stringify(r1File));
+    // A receipt asks for a deletion: its owner's alone, where the system keeps modes (on Windows the folder's ACL does).
+    const { statSync: receiptStat } = await import('node:fs');
+    const receiptMode = existsSync(join(dir, 'fight.receipt.json')) ? receiptStat(join(dir, 'fight.receipt.json')).mode & 0o777 : null;
+    ok('...readable and writable by its owner alone (0600)', receiptMode !== null && (process.platform === 'win32' || receiptMode === 0o600), String(receiptMode?.toString(8)));
+
+    // Its deletion asked for - through this copy's own link, and no other: a
+    // receipt is a file anyone can write, naming any link.
+    const seenBefore = stub.seen.length;
+    const offHere = await cliSubmitRun(['submit', '--delete', 'fight.receipt.json'], { cwd: dir, link: 'none' });
+    const otherHere = await cliSubmitRun(['submit', '--delete', 'fight.receipt.json'], { cwd: dir, link: `${new URL(link).origin}/#/puplink?code=OtherCode99` });
+    ok('--delete with Send off here, or with a receipt of another link than this copy\'s, is refused - the latter with the way to ask there - and nothing is sent',
+      offHere.status === 1 && offHere.stderr.startsWith('Send is off in this copy of the bench (no upload link is set), so no deletion can be asked from it')
+        && otherHere.status === 1 && otherHere.stderr.startsWith(`This receipt is of submission ${id.slice(0, 8)}, sent to another upload link than this copy's`)
+        && otherHere.stderr.trim().endsWith(`FAREVER_BENCH_UPLOAD_LINK=${link} asks there.`) && stub.seen.length === seenBefore, `${said(offHere)} | ${said(otherHere)}`);
+    const del = await cliSubmitRun(['submit', '--delete', 'fight.receipt.json'], { cwd: dir, link });
+    const last = stub.seen.at(-1);
+    const request = last?.bytes ? JSON.parse(last.bytes.toString('utf8')) : {};
+    ok('--delete <receipt> uploads <id>.withdraw.json - the id, and the token whose SHA-256 the zip\'s manifest holds - and says it was asked',
+      del.status === 0 && stub.seen.length === seenBefore + 1 && last.fileName === `${id}.withdraw.json` && last.fileType === 'application/json'
+        && request.format === 'farever-bench-withdrawal' && request.id === id && request.deleteToken === r1?.deleteToken
+        && tokenSha(request.deleteToken) === manifestOf(fight).deleteTokenSha256
+        && cliSubmitLast(del.stdout) === `Asked: the project's pCloud folder now holds a request to delete submission ${id.slice(0, 8)}. The maintainer deletes the fight `
+          + 'and the request when they next read the folder; nothing of it was ever public. Asking again with the same receipt is harmless.', `${said(del)} | ${del.stdout}`);
+    mode = 'closed';
+    const denied = await cliSubmitRun(['submit', '--delete', 'fight.receipt.json'], { cwd: dir, link });
+    mode = 'ok';
+    ok('...pCloud\'s refusal is said in the bench\'s sentence, exit 1', denied.status === 1
+      && cliSubmitLast(denied.stderr) === 'The project\'s upload link is closed (pCloud: This upload link was deleted by its owner.) - nothing was asked.', said(denied));
+
+    // An answer lost: the receipt saved before the send is what is left.
+    mode = 'drop';
+    const lost = await cliSubmitRun([...base, '--zip', 'lost.zip', '--send'], { cwd: dir, link });
+    mode = 'ok';
+    const pending = receiptAt('lost.receipt.json');
+    const dropped = stub.seen.at(-1);
+    ok('an answer lost: exit 1, pCloud unanswered, and the receipt saved before the send kept - it asks for the fight\'s deletion if it arrived', lost.status === 1
+      && /^The upload to the project's pCloud folder could not be reached/m.test(lost.stderr) && /the fight may or may not have arrived/.test(lost.stderr)
+      && lost.stderr.includes('The receipt is lost.receipt.json (saved before sending): the same command with --receipt lost.receipt.json sends the same bundle again, '
+        + 'and bench submit --delete lost.receipt.json asks for the fight\'s deletion.')
+      && pending?.sentAt === null && pending.id === idOf(zipOf('lost.zip')) && dropped?.fileName === `${pending?.id}.zip`, said(lost));
+
+    // ...and sent again as itself.
+    const again = await cliSubmitRun([...base, '--zip', 'again.zip', '--send', '--receipt', 'lost.receipt.json'], { cwd: dir, link });
+    const repeat = stub.seen.at(-1);
+    const done = receiptAt('lost.receipt.json');
+    ok('--receipt builds the same bundle byte for byte, and uploads it under the same name: at most a duplicate the maintainer drops',
+      again.status === 0 && zipOf('again.zip').length > 0 && zipOf('again.zip').equals(zipOf('lost.zip')) && repeat.fileName === dropped.fileName
+        && repeat.bytes?.equals(dropped.bytes), said(again));
+    ok('...and its receipt is now completed, of the same submission', done?.id === pending?.id && done.sentAt !== null && done.createdAt === pending.createdAt
+      && done.deleteToken === pending.deleteToken, JSON.stringify(done));
+
+    // A receipt of another submission is never written over.
+    const before = zipOf('fight.zip');
+    const n = stub.seen.length;
+    const clash = await cliSubmitRun([...base, '--zip', 'fight.zip', '--send'], { cwd: dir, link });
+    ok('a receipt of another submission where this one\'s would go is not written over: refused before the zip is saved or anything sent',
+      clash.status === 1 && clash.stderr.startsWith('fight.receipt.json is the receipt of another submission') && zipOf('fight.zip').equals(before)
+        && receiptAt('fight.receipt.json')?.id === r1?.id && stub.seen.length === n, said(clash));
+
+    // With no --zip the receipt - which asks for a deletion - is not written
+    // into the current folder, which is the repository when the bench runs
+    // from its clone (`git add -A` published it): it goes where the UI keeps
+    // its own.
+    const cwdOnly = join(dir, 'cwd');
+    const cache = join(dir, 'cache');
+    mkdirSync(cwdOnly);
+    const bare = await cliSubmitRun([...base, '--send'], { cwd: cwdOnly, link, env: { FAREVER_BENCH_CACHE: cache } });
+    const keptDir = join(cache, 'submit-receipts');
+    const kept = existsSync(keptDir) ? readdirSync(keptDir) : [];
+    const keptReceipt = kept.length === 1 ? submitLib.parseReceipt(readFileSync(join(keptDir, kept[0]))) : null;
+    ok('--send with no --zip writes its receipt in the bench\'s receipts folder, under the id the UI names it by, and nothing in the current folder',
+      bare.status === 0 && readdirSync(cwdOnly).length === 0 && kept.length === 1 && kept[0] === `farever-bench-receipt-${keptReceipt?.id}.json`
+        && keptReceipt.sentAt !== null && bare.stdout.includes(`Receipt: ${join(keptDir, kept[0])} - keep it.`), `${said(bare)} ${kept.join()}`);
+  } finally {
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+} catch (e) { crashed(e); }
+
+// What the review of `bench submit` found, held: the build typed by flags
+// went as a whole character of defaults; --receipt sent a changed bundle
+// under the old id, which would put two different fights under one id;
+// --zip wrote over the player's log and over a receipt; a refusal that left
+// nothing behind kept a receipt and advised a resend; a sheet and a log of
+// two classes were sent; --json and --check were ignored; the Wink summary
+// beside a timeline was said read when it was not. The stand-in below keeps
+// every upload, as pCloud does.
+group('cli submit: what no flag typed is not sent, a receipt rebuilds only its own bundle, --zip writes over nothing it must not, and a refusal says whether anything arrived');
+if (on) try {
+  const ex = cliSubmitExample;
+  const dir = mkdtempSync(join(tmpdir(), 'fb-cli-submit-'));
+  let mode = 'ok';
+  const stub = pcloudStub(() => {
+    if (mode === 'drop') return 'drop';
+    if (mode === 'full') return { result: 7008, error: 'This link has reached its file limit.' };
+    if (mode === 'busy') return { result: 4000, error: 'Too many login tries from this IP address.' };
+    return { result: 0 };
+  });
+  const link = await stub.ready;
+  try {
+    const at = (name) => join(dir, name);
+    const bytesOf = (name) => (existsSync(at(name)) ? readFileSync(at(name)) : Buffer.alloc(0));
+    const filesOf = (name) => (bytesOf(name).length ? cliSubmitEntries(bytesOf(name)) : {});
+    const said = (r) => `${r.status}: ${r.stderr.trim()}`;
+    const posts = () => stub.seen.length;
+    const sha = (b) => submitHash('sha256').update(b).digest('hex');
+    ok('premise: every id typed below is one of this game build', cat.itemById.has('GS_Nova') && cat.itemById.has('FormulaWeaponZealot')
+      && cat.socketsFor(cat.itemById.get('GS_Nova')).join() === 'AugmentEnchantWeapon,AugmentDemon'
+      && (cdb.row('skill', 'Warrior_Charge').mastery ?? []).some((m) => m.id === 'Warrior_Charge_M1'));
+
+    // --- runs that need no link, side by side
+    const dummyName = cdb.row('unit', 'Dummy').texts?.name ?? 'Dummy';
+    const wfx = combatLogFixture({ dummyName, wink: true });
+    writeFileSync(at('bad.json.timeline'), wfx.text);
+    writeFileSync(at('bad.json'), '{not json');
+    writeFileSync(at('dir.json.timeline'), wfx.text);
+    mkdirSync(at('dir.json'));
+    writeFileSync(at('alone.json.timeline'), wfx.text);
+    writeFileSync(at('alone.json'), JSON.stringify(wfx.summary));
+    writeFileSync(at('env.json'), JSON.stringify({ build: { class: 'Warrior', level: 25, gear: { Slot_Weapon1: { item: 'GS_Nova', rarity: 'Epic', stars: 3 } }, augments: {}, skills: {}, runes: {}, talents: {} } }));
+    writeFileSync(at('mylog.jsonl'), readFileSync(ex('combat-log.jsonl')));
+    writeFileSync(at('notes.txt'), 'my own notes\n');
+    const log = ['--log', ex('combat-log.jsonl')];
+    const [typed, byBuild, byImport, buildPinned, json, check, target, deleteWith, overLog, overText, badSibling, dirSibling, alone] = await Promise.all([
+      cliSubmitRun(['submit', ...log, '--class', 'Warrior', '--level', '25', '--rank', '2', '--pin', 'weapon1=GS_Nova@Epic*3',
+        '--pin', 'weapon1/enchantweapon=FormulaWeaponZealot', '--pin', 'trinket=none', '--rune', 'Warrior_Charge=Warrior_Charge_M1', '--zip', 'typed.zip'], { cwd: dir }),
+      cliSubmitRun(['submit', ...log, '--build', 'env.json', '--zip', 'build.zip'], { cwd: dir }),
+      cliSubmitRun(['submit', ...log, '--import', 'env.json', '--zip', 'import.zip'], { cwd: dir }),
+      cliSubmitRun(['submit', ...log, '--build', 'env.json', '--pin', 'trinket=none'], { cwd: dir }),
+      cliSubmitRun(['submit', ...log, '--import', ex('sheet-minimal.json'), '--json', 'out.json'], { cwd: dir }),
+      cliSubmitRun(['submit', ...log, '--import', ex('sheet-minimal.json'), '--check'], { cwd: dir }),
+      cliSubmitRun(['submit', ...log, '--class', 'Warrior', '--pin', 'weapon1=GS_Nova', '--target', 'Ratsar'], { cwd: dir }),
+      cliSubmitRun(['submit', '--delete', 'some.receipt.json', '--class', 'Warrior'], { cwd: dir }),
+      cliSubmitRun(['submit', '--log', 'mylog.jsonl', '--import', ex('sheet-minimal.json'), '--zip', 'mylog.jsonl'], { cwd: dir }),
+      cliSubmitRun(['submit', ...log, '--import', ex('sheet-minimal.json'), '--zip', 'notes.txt'], { cwd: dir }),
+      cliSubmitRun(['submit', '--log', 'bad.json.timeline', '--import', ex('sheet-minimal.json')], { cwd: dir }),
+      cliSubmitRun(['submit', '--log', 'dir.json.timeline', '--import', ex('sheet-minimal.json')], { cwd: dir }),
+      cliSubmitRun(['submit', '--summary', 'alone.json', '--import', ex('sheet-minimal.json')], { cwd: dir }),
+    ]);
+
+    const ts = filesOf('typed.zip')['sheet.json'] ? JSON.parse(filesOf('typed.zip')['sheet.json']) : {};
+    ok('the build by flags: each piece carries what its --pin wrote (@rarity, *stars, a socket), a slot pinned none is recorded empty, the rest of the gear is left out',
+      typed.status === 0 && JSON.stringify(ts.gear) === JSON.stringify({ Slot_Weapon1: { item: 'GS_Nova', upgrade: 3, rarity: 'Epic', sockets: ['FormulaWeaponZealot'] }, Slot_Trinket: null }),
+      `${said(typed)} ${JSON.stringify(ts.gear)}`);
+    ok('...the rune typed is sent, the rank typed is every held skill\'s, the level typed is the sheet\'s, and no tree or pool nobody typed',
+      JSON.stringify(ts.runes) === JSON.stringify(['Warrior_Charge_M1']) && Object.values(ts.weaponSkillRanks ?? {}).length > 0
+        && Object.values(ts.weaponSkillRanks).every((r) => r === 2) && ts.character?.level === 25 && !('talents' in ts) && !('classSkills' in ts),
+      JSON.stringify(ts));
+    // Said by src, in the words the UI's Send dialog shows (its Problem
+    // lines), and the CLI adds only the flag that names each part.
+    ok('...and what a sheet records whole is said: the other socket and the other rune slots go as empty, with the flag that names them',
+      typed.stdout.includes('Problem: Slot_Weapon1: a sheet records a piece\'s sockets whole, so AugmentDemon, which no pin held, is sent as empty.')
+        && /^Problem: a sheet records the rune slots whole, so the \d+ no pin held \(/im.test(typed.stdout)
+        && typed.stdout.includes('--pin weapon1/<socket>=<augment> names what a socket of Slot_Weapon1 held.')
+        && typed.stdout.includes('--rune <skill>=<rune> names what a rune slot held.')
+        && !/^note: .*(no --pin named|no --rune named)/m.test(typed.stdout) && !typed.stdout.includes('--level was not given'), typed.stdout.slice(-1500));
+    ok('...and the typed build is labelled as stated, as the editor\'s is', filesOf('typed.zip')['manifest.json'] != null
+      && JSON.parse(filesOf('typed.zip')['manifest.json']).sheet.sourceFormat === 'bench-editor');
+    const sheetOf = (name) => { const s = filesOf(name)['sheet.json'] ? JSON.parse(filesOf(name)['sheet.json']) : null; if (s) delete s.source; return s; };
+    ok('--build <saved build> is read as --import reads it: the same sheet.json, from the same dialect', byBuild.status === 0 && byImport.status === 0
+      && sheetOf('build.zip') !== null && JSON.stringify(sheetOf('build.zip')) === JSON.stringify(sheetOf('import.zip'))
+      && JSON.parse(filesOf('build.zip')['manifest.json']).sheet.sourceFormat === 'bench-envelope', `${said(byBuild)} | ${said(byImport)}`);
+    ok('...and a pin beside it is refused, as beside --import', buildPinned.status === 1
+      && buildPinned.stderr.startsWith('--build env.json is the build the fight was fought in, as the file recorded it, and --pin would send another'), said(buildPinned));
+
+    ok('a flag bench submit does not read is refused, not ignored: --json, --check, a pricing flag, and anything beside --delete',
+      json.status === 1 && json.stderr.startsWith('--json is not read by `bench submit`, which would ignore it')
+        && check.status === 1 && check.stderr.startsWith('--check is not read by `bench submit`')
+        && target.status === 1 && target.stderr.startsWith('--target is not read by `bench submit`')
+        && deleteWith.status === 1 && deleteWith.stderr.startsWith('--delete asks for the deletion of a fight sent earlier and builds nothing, so --class has nothing to do beside it'),
+      [json, check, target, deleteWith].map(said).join(' | '));
+    ok('--zip is never written over the log it was built from, nor over a file that is not a bundle - each left as it was',
+      overLog.status === 1 && overLog.stderr.startsWith('--zip mylog.jsonl is the fight\'s log (--log), and the bundle is not saved over it')
+        && bytesOf('mylog.jsonl').equals(readFileSync(ex('combat-log.jsonl')))
+        && overText.status === 1 && overText.stderr.startsWith('notes.txt is already there and is not a bundle the bench saved, so it is not written over')
+        && bytesOf('notes.txt').toString() === 'my own notes\n' && !existsSync(at('out.json')), `${said(overLog)} | ${said(overText)}`);
+
+    ok('a Wink summary beside the timeline that the reader did not take is not said "read with it": it is said not taken, and why',
+      badSibling.status === 0 && badSibling.stdout.includes('bad.json is beside the timeline and was not taken as its summary')
+        && !badSibling.stdout.includes('Wink\'s summary beside the timeline, read with it'), badSibling.stdout.slice(0, 700));
+    ok('...a folder named like the summary is passed over, not read as a --summary nobody typed', dirSibling.status === 0 && !/EISDIR|--summary/.test(dirSibling.stderr), said(dirSibling));
+    ok('...and a summary given by --summary alone names the timeline beside it', alone.status === 0
+      && alone.stdout.includes('Its timeline is beside it: --log alone.json.timeline sends every hit'), said(alone));
+
+    // --- runs against the stand-in, one after another
+    const base = ['submit', ...log, '--import', ex('sheet-minimal.json')];
+    const sent = await cliSubmitRun([...base, '--zip', 's.zip', '--send', '--note', 'first'], { cwd: dir, link });
+    const sReceipt = existsSync(at('s.receipt.json')) ? JSON.parse(bytesOf('s.receipt.json').toString()) : {};
+    ok('a receipt the bench saves carries the SHA-256 of the bundle it was written for and when it arrived, and still reads as a receipt',
+      sent.status === 0 && sReceipt.zipSha256 === sha(bytesOf('s.zip')) && !Number.isNaN(Date.parse(sReceipt.sentAt))
+        && submitLib.parseReceipt(bytesOf('s.receipt.json')).sentAt === sReceipt.sentAt, said(sent));
+    let n = posts();
+    // (The rule is src/submit.mjs sendRefusal's - the receipt's sentAt goes
+    // in as buildSubmission's sentAt - said as it is, in the command line's words.)
+    const answered = await cliSubmitRun([...base, '--zip', 's2.zip', '--send', '--note', 'first', '--receipt', 's.receipt.json'], { cwd: dir, link });
+    ok('--receipt of a fight that arrived, with --send: the same bundle is built again, and refused before anything is written - a second copy would only be stored beside the first',
+      answered.status === 1
+        && answered.stderr.startsWith(`The receipt this bundle is built again from (--receipt) is of submission ${String(sReceipt.id).slice(0, 8)}, whose fight arrived `
+          + `(${sReceipt.sentAt}): sending it again would only store a second copy beside the first. `)
+        && answered.stderr.includes('- leave --receipt out - and bench submit --delete <that receipt> asks for the first one\'s deletion.')
+        && posts() === n && !existsSync(at('s2.zip')), said(answered));
+    const answeredZip = await cliSubmitRun([...base, '--zip', 's2.zip', '--note', 'first', '--receipt', 's.receipt.json'], { cwd: dir, link });
+    const answeredChanged = await cliSubmitRun([...base, '--zip', 's3.zip', '--send', '--note', 'a different note', '--receipt', 's.receipt.json'], { cwd: dir, link });
+    ok('...without --send it is saved, the same zip; and other files under it are refused saying that one arrived, not "send the same files"',
+      answeredZip.status === 0 && existsSync(at('s2.zip')) && bytesOf('s2.zip').equals(bytesOf('s.zip'))
+        && answeredChanged.status === 1 && answeredChanged.stderr.startsWith('--receipt s.receipt.json: These files make another bundle than the one submission')
+        && answeredChanged.stderr.includes(`That one arrived (${sReceipt.sentAt}), so nothing more goes under its id`)
+        && !answeredChanged.stderr.includes('Send the same files') && posts() === n && !existsSync(at('s3.zip')), `${said(answeredZip)} | ${said(answeredChanged)}`);
+
+    mode = 'drop';
+    const lost = await cliSubmitRun([...base, '--zip', 'p.zip', '--send', '--note', 'first'], { cwd: dir, link });
+    mode = 'ok';
+    n = posts();
+    const changed = await cliSubmitRun([...base, '--zip', 'p2.zip', '--send', '--note', 'a different note', '--receipt', 'p.receipt.json'], { cwd: dir, link });
+    // (The refusal is buildSubmission's - the receipt's zipSha256 holds the
+    // bundle built again - said with the flags that act on it.)
+    ok('--receipt with a changed note: another bundle under the old id, which an id does not name - refused, nothing saved or sent',
+      lost.status === 1 && changed.status === 1
+        && /^--receipt p\.receipt\.json: These files make another bundle than the one submission [0-9a-f]{8} was sent as \(SHA-256 [0-9a-f]{12}\.\.\. where its receipt says [0-9a-f]{12}\.\.\.\): an id names one bundle/.test(changed.stderr)
+        && changed.stderr.includes('bench submit --delete p.receipt.json asks for the first one\'s deletion, and the same command without --receipt packs these '
+          + 'as a new submission.')
+        && !/same files|build it again/i.test(changed.stderr) && !existsSync(at('p2.zip')) && posts() === n, `${said(lost)} | ${said(changed)}`);
+    const same = await cliSubmitRun([...base, '--zip', 'p3.zip', '--send', '--note', 'first', '--receipt', 'p.receipt.json'], { cwd: dir, link });
+    ok('...the same files and note: the same zip, said so, and sent', same.status === 0 && bytesOf('p3.zip').equals(bytesOf('p.zip'))
+      && same.stdout.includes(`the same zip, byte for byte, as the one the receipt was written for (SHA-256 ${sha(bytesOf('p.zip'))})`)
+      && /^Sent: submission [0-9a-f]{8} is in the project's pCloud folder as [0-9a-f]{32}\.zip \(/m.test(same.stdout), said(same));
+    // A RECEIPT OF ANOTHER UPLOAD LINK: built again, saved by --zip, and sent
+    // there or nowhere - src/submit.mjs sendRefusal's rule (the receipt goes
+    // to buildSubmission whole), the one the app's Send asks; with a link
+    // set here, and with none.
+    writeFileSync(at('other.receipt.json'), JSON.stringify({ ...JSON.parse(bytesOf('p.receipt.json').toString()), sentAt: null, link: otherLink() }));
+    n = posts();
+    const otherSend = await cliSubmitRun([...base, '--zip', 'o.zip', '--send', '--note', 'first', '--receipt', 'other.receipt.json'], { cwd: dir, link });
+    const otherZip = await cliSubmitRun([...base, '--zip', 'o2.zip', '--note', 'first', '--receipt', 'other.receipt.json'], { cwd: dir });
+    const otherNone = await cliSubmitRun([...base, '--send', '--note', 'first', '--receipt', 'other.receipt.json'], { cwd: dir });
+    ok('--receipt written for another upload link: --send is refused in src\'s sentence, with or without a link here; --zip saves the same zip',
+      otherSend.status === 1 && /^The receipt this bundle is built again from \(--receipt\) is of submission [0-9a-f]{8}, written for another upload link than this copy's: a bundle is sent again where it may already be, or not at all/.test(otherSend.stderr)
+        && otherSend.stderr.trim().endsWith(`The same command run with FAREVER_BENCH_UPLOAD_LINK=${otherLink()} sends it there.`) && !existsSync(at('o.zip'))
+        && otherZip.status === 0 && bytesOf('o2.zip').equals(bytesOf('p.zip'))
+        && otherNone.status === 1 && /written for an upload link, and this copy has none: /.test(otherNone.stderr)
+        && posts() === n, `${said(otherSend)} | ${said(otherZip)} | ${said(otherNone)}`);
+    // A DRY RUN OF A RECEIPT --send REFUSES says so first, as the app's
+    // preview does (src's sendRefusal, asked with or without --send), and
+    // its closing line neither offers --send nor says the bundle is packed
+    // under a new id: it is the receipt's submission.
+    const [answeredDry, otherDry] = await Promise.all([
+      cliSubmitRun([...base, '--note', 'first', '--receipt', 's.receipt.json'], { cwd: dir, link }),
+      cliSubmitRun([...base, '--note', 'first', '--receipt', 'other.receipt.json'], { cwd: dir, link }),
+    ]);
+    const firstProblem = (r) => r.stdout.split(/\r?\n/).find((l) => l.startsWith('Problem: ')) ?? '';
+    const closing = (receipt, id) => `Nothing was saved or sent. --zip [<file>] saves this bundle; --send refuses it - the first Problem line above says why. `
+      + `It is submission ${String(id).slice(0, 8)}, built again under the id --receipt ${receipt} names (without --receipt, a run packs it anew, under a new id).`;
+    ok('a dry run with a --receipt that --send refuses - its fight arrived, or another upload link - says why first, and does not offer --send or a new id',
+      answeredDry.status === 0 && otherDry.status === 0
+        && firstProblem(answeredDry).startsWith(`Problem: The receipt this bundle is built again from (--receipt) is of submission ${String(sReceipt.id).slice(0, 8)}, whose fight arrived`)
+        && /^Problem: The receipt this bundle is built again from \(--receipt\) is of submission [0-9a-f]{8}, written for another upload link than this copy's/.test(firstProblem(otherDry))
+        && cliSubmitLast(answeredDry.stdout) === closing('s.receipt.json', sReceipt.id)
+        && cliSubmitLast(otherDry.stdout) === closing('other.receipt.json', JSON.parse(bytesOf('other.receipt.json').toString()).id)
+        && [answeredDry, otherDry].every((r) => !r.stdout.includes('--send sends it') && !/Each run packs it anew/.test(r.stdout)) && posts() === n,
+      `${firstProblem(answeredDry)} | ${cliSubmitLast(answeredDry.stdout)} | ${firstProblem(otherDry)} | ${cliSubmitLast(otherDry.stdout)}`);
+    writeFileSync(at('undated.receipt.json'), JSON.stringify({ ...JSON.parse(bytesOf('p.receipt.json').toString()), createdAt: null }));
+    const undated = await cliSubmitRun([...base, '--zip', 'u.zip', '--note', 'first', '--receipt', 'undated.receipt.json'], { cwd: dir });
+    ok('...and one that does not say when its bundle was made is refused by src, named by its flag, with the way to ask for the deletion of what it sent',
+      undated.status === 1 && /^--receipt undated\.receipt\.json: The receipt of submission [0-9a-f]{8} does not say when its bundle was made \(createdAt\)/.test(undated.stderr)
+        && undated.stderr.includes('bench submit --delete undated.receipt.json asks for the deletion of what it sent.') && !existsSync(at('u.zip')), said(undated));
+
+    mode = 'full';
+    const full = await cliSubmitRun([...base, '--zip', 'e.zip', '--send'], { cwd: dir, link });
+    mode = 'busy';
+    const busy = await cliSubmitRun([...base, '--zip', 'd.zip', '--send'], { cwd: dir, link });
+    const busyKept = existsSync(at('d.receipt.json'));
+    mode = 'ok';
+    const later = await cliSubmitRun([...base, '--zip', 'd.zip', '--send'], { cwd: dir, link });
+    ok('a refusal from pCloud says nothing was kept, removes the receipt that would ask for nothing, and gives no resend advice',
+      full.status === 1 && full.stderr.startsWith('The project\'s pCloud folder is full (pCloud: This link has reached its file limit.) - nothing was kept; try again another day')
+        && full.stderr.includes('The receipt saved before sending is removed: no fight arrived under its id.')
+        && !existsSync(at('e.receipt.json')) && !full.stderr.includes('--receipt'), said(full));
+    ok('...turned away for now, the same command later sends', busy.status === 1 && !busyKept
+      && busy.stderr.startsWith('pCloud turns this address away for now (pCloud: Too many login tries from this IP address.) - nothing was kept; try again later.')
+      && later.status === 0 && /^Sent: /m.test(later.stdout), `${said(busy)} | ${said(later)}`);
+
+    mode = 'drop';
+    await cliSubmitRun([...base, '--zip', 'q.zip', '--send'], { cwd: dir, link });
+    const rerun = await cliSubmitRun([...base, '--zip', 'q.zip', '--send'], { cwd: dir, link });
+    mode = 'ok';
+    ok('a receipt saved before a lost answer stands where the next run\'s would go: the refusal offers --receipt, to send that bundle as itself',
+      rerun.status === 1 && rerun.stderr.startsWith('q.receipt.json is the receipt of another submission')
+        && rerun.stderr.includes('the same command with --receipt q.receipt.json sends that bundle again as itself'), said(rerun));
+
+    n = posts();
+    const mixed = ['submit', ...log, '--import', ex('sheet-full.json'), '--send'];
+    const [wrongClass, vouched] = [await cliSubmitRun(mixed, { cwd: dir, link }), await cliSubmitRun([...mixed, '--class', 'Rogue'], { cwd: dir, link })];
+    ok('a Rogue\'s sheet with a Warrior\'s log is not sent; a --class naming the sheet\'s own class says the log is the one that is wrong, and sends it',
+      wrongClass.status === 1 && wrongClass.stderr.startsWith('The sheet is a Rogue and the fight\'s log names its character a Warrior, so it is not sent')
+        && wrongClass.stderr.includes('If the log\'s header is the one that is wrong, --class Rogue beside the sheet says so, and it is sent.')
+        && !/editor/.test(wrongClass.stderr) && vouched.status === 0 && posts() === n + 1, `${said(wrongClass)} | ${said(vouched)}`);
+    // (The sentence is src/submit.mjs sendRefusal's, front 'cli'; the command
+    // keeps no rule of its own.) A modkit dump names no class: the --class it
+    // is read as is its only word on it, and vouches for nothing.
+    writeFileSync(at('farever-inventory-Someone.json'), JSON.stringify({ character: 'Someone', bankSlots: 0, bank: [], bags: [], equipped: [
+      { kind: 'Daggers_Demondash', level: 25, upgrade: 3, rarity: 3, count: 1, class: 'st.item.Weapon', infusion: null, infusionStat: null, prismatic: false, flawless: false },
+    ] }));
+    n = posts();
+    const dumpSend = await cliSubmitRun(['submit', ...log, '--import', 'farever-inventory-Someone.json', '--class', 'Rogue', '--send'], { cwd: dir, link });
+    ok('...while a modkit dump read as the Rogue --class names, with a Warrior\'s log, is not sent: the class it was read as vouches for nothing',
+      dumpSend.status === 1 && dumpSend.stderr.startsWith('The sheet is a Rogue and the fight\'s log names its character a Warrior, so it is not sent')
+        && dumpSend.stderr.includes('A modkit dump names no class, so the class given for it (--class Rogue) is the sheet\'s only word on it')
+        && posts() === n, said(dumpSend));
+
+    const overBundle = await cliSubmitRun([...base, '--zip', 's.zip'], { cwd: dir });
+    const receiptBefore = bytesOf('s.receipt.json');
+    const overReceipt = await cliSubmitRun([...base, '--zip', 's.receipt.json'], { cwd: dir });
+    ok('--zip replaces a bundle saved before, and never a receipt', overBundle.status === 0 && overReceipt.status === 1
+      && overReceipt.stderr.startsWith('s.receipt.json is the receipt of submission') && bytesOf('s.receipt.json').equals(receiptBefore), `${said(overBundle)} | ${said(overReceipt)}`);
+
+    const help = await cliSubmitRun(['--help'], { cwd: dir });
+    ok('the help says where the receipt goes: beside the zip, or the folder the UI keeps receipts in, never the current folder',
+      /beside the zip \(<name>\.receipt\.json\), or\s+with no --zip in the folder the UI keeps its\s+receipts in \(\.cache\/submit-receipts\), never the\s+current folder/.test(help.stdout)
+      && !help.stdout.includes('farever-bench-submission-<id>.receipt.json'));
+    // ...and that --delete reaches the network too: "nothing leaves without
+    // --send" was the rule it stated, and a request carries the receipt's id
+    // and token.
+    ok('the help\'s network sentences name the request for a deletion beside the send, and the variable that points them elsewhere',
+      /Nothing leaves this machine without --send \(or --delete, which\s+asks for the deletion of a fight you sent\)/.test(help.stdout)
+        && /sending a fight to the project, or asking for its deletion, when\s+you do it yourself \(bench submit --send or --delete, or the UI's Send and\s+Delete\), are the only things in the tool that touch the network/.test(help.stdout)
+        && /Asked only through this copy's\s+own upload link; a receipt of another is refused,\s+unless FAREVER_BENCH_UPLOAD_LINK names that one/.test(help.stdout)
+        && help.stdout.includes('FAREVER_BENCH_UPLOAD_LINK, when set, is the upload link sending goes')
+        && !help.stdout.includes(`FAREVER_BENCH_${'RELAY'}`) && !/upload service|withdraw/i.test(help.stdout), help.stdout.split('Sending a fight to the project')[1]?.slice(0, 600));
+  } finally {
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+} catch (e) { crashed(e); }
+
+// --- tools/inbox.mjs: the maintainer's reading of the project's pCloud folder ---
+// What arrives in the folder - zips, copies pCloud renamed, requests for a
+// deletion, and whatever else someone uploaded - read from a local copy of
+// it, and nothing changed. The files below are made the way the bench makes
+// them: the bundles by buildSubmission, the requests by deleteSubmission,
+// taken from the stand-in that received them. What cannot be made from real
+// files here - a folder that will not open, a folder flooded with more
+// entries than one call takes as arguments - is the folder as readdirSync
+// sees it, in the tool's own process: a preloaded module (--require) that
+// patches that one function, and nothing else.
+group('tools/inbox.mjs: a copy of the pCloud folder read as data - what to keep, drop, look at and delete - and nothing changed');
+if (on) try {
+  const engine = createEngine({ quiet: true });
+  const INBOX = fileURLToPath(new URL('../tools/inbox.mjs', import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), 'fb-inbox-'));
+  const aside = mkdtempSync(join(tmpdir(), 'fb-inbox-aside-'));
+  const stub = pcloudStub();
+  const link = await stub.ready;
+  try {
+    const make = (extra = {}) => submitLib.buildSubmission(engine, { sheet: { name: 's.json', data: submitDocs('examples/sheet-minimal.json') },
+      log: { name: 'l.jsonl', data: submitDocs('examples/combat-log.jsonl') }, ...extra });
+    // A request exactly as deleteSubmission uploads it: what the stand-in received.
+    const requestOf = async (sub) => {
+      await submitLib.deleteSubmission(submitLib.pendingReceipt(sub, { link }), { link });
+      const r = stub.seen.at(-1);
+      return { name: r.fileName, bytes: r.bytes };
+    };
+    const tokenSha = (t) => submitHash('sha256').update(t, 'ascii').digest('hex');
+    // A zip of the fixed entries, stored, its CRC-32s right: one the bench
+    // did not write.
+    const crc32 = (buf) => { let c = ~0; for (const x of buf) { c ^= x; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1)); } return ~c >>> 0; };
+    const storedZip = (entries) => {
+      const locals = [];
+      const centrals = [];
+      let offset = 0;
+      for (const { name, data } of entries) {
+        const nb = Buffer.from(name);
+        const crc = crc32(data);
+        const lh = Buffer.alloc(30);
+        lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt32LE(crc, 14);
+        lh.writeUInt32LE(data.length, 18); lh.writeUInt32LE(data.length, 22); lh.writeUInt16LE(nb.length, 26);
+        const ch = Buffer.alloc(46);
+        ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt32LE(crc, 16);
+        ch.writeUInt32LE(data.length, 20); ch.writeUInt32LE(data.length, 24); ch.writeUInt16LE(nb.length, 28); ch.writeUInt32LE(offset, 42);
+        locals.push(lh, nb, data);
+        centrals.push(ch, nb);
+        offset += 30 + nb.length + data.length;
+      }
+      const cd = Buffer.concat(centrals);
+      const end = Buffer.alloc(22);
+      end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
+      end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16);
+      return Buffer.concat([...locals, cd, end]);
+    };
+    const kept = make();                                   // sent twice: pCloud renamed the second copy
+    const asked = make();                                  // sent twice too, then its deletion asked for
+    const forged = make();                                 // a request whose token is not its own
+    const twoOf = make({ id: 'c'.repeat(32), note: 'one' });
+    const twoOfB = make({ id: 'c'.repeat(32), note: 'two' });
+    const mine = make({ id: 'd'.repeat(32), note: 'mine' });            // withdrawn by its sender...
+    const claims = make({ id: 'd'.repeat(32), note: 'claims its id' }); // ...beside another bundle under its id
+    const truncated = make({ id: 'e'.repeat(32) });        // in the folder cut short: no bundle, its name its id
+    const unwritten = make({ id: 'a'.repeat(32) });        // its manifest at a version no bench writes, under another name
+    mkdirSync(join(dir, 'later'));
+    writeFileSync(join(dir, `${kept.id}.zip`), kept.zip);
+    writeFileSync(join(dir, `${kept.id} (1).zip`), kept.zip);
+    writeFileSync(join(dir, `${asked.id}.zip`), asked.zip);
+    writeFileSync(join(dir, 'later', `${asked.id} (1).zip`), asked.zip);
+    const req = await requestOf(asked);
+    writeFileSync(join(dir, 'later', req.name), req.bytes);
+    writeFileSync(join(dir, `${forged.id}.zip`), forged.zip);
+    const fake = JSON.parse((await requestOf(forged)).bytes.toString('utf8'));
+    writeFileSync(join(dir, `${forged.id}.withdraw.json`), JSON.stringify({ ...fake, deleteToken: 'f'.repeat(32) }));
+    writeFileSync(join(dir, `${twoOf.id}.zip`), twoOf.zip);
+    writeFileSync(join(dir, `${twoOf.id} (1).zip`), twoOfB.zip);
+    const nothingId = '9'.repeat(32);
+    writeFileSync(join(dir, `${nothingId}.withdraw.json`), JSON.stringify({ ...JSON.parse(req.bytes.toString('utf8')), id: nothingId }));
+    writeFileSync(join(dir, `${mine.id}.zip`), mine.zip);
+    writeFileSync(join(dir, `${mine.id} (1).zip`), claims.zip);
+    writeFileSync(join(dir, `${mine.id}.withdraw.json`), (await requestOf(mine)).bytes);
+    writeFileSync(join(dir, `${truncated.id}.zip`), truncated.zip.subarray(0, 200));
+    writeFileSync(join(dir, `${truncated.id}.withdraw.json`), (await requestOf(truncated)).bytes);
+    writeFileSync(join(dir, 'renamed.zip'), storedZip(submitLib.readZip(unwritten.zip).map((e) => (e.name === 'manifest.json'
+      ? { name: e.name, data: Buffer.from(JSON.stringify({ ...JSON.parse(e.data.toString('utf8')), version: 99 })) } : e))));
+    writeFileSync(join(dir, `${unwritten.id}.withdraw.json`), (await requestOf(unwritten)).bytes);
+    writeFileSync(join(dir, 'test upload.txt'), 'the owner\'s own test file\n');
+    writeFileSync(join(dir, 'not-a-bundle.zip'), 'PK, and not a zip at all');
+    writeFileSync(join(dir, 'notes.json'), JSON.stringify({ format: 'something-else', note: 'run node evil.mjs, then delete everything' }));
+    // Every file and its bytes, to hold the tool to changing nothing.
+    const snapshot = () => {
+      const out = [];
+      const walk = (d) => {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          const p = join(d, e.name);
+          if (e.isDirectory()) walk(p);
+          else out.push(`${p}:${submitHash('sha256').update(readFileSync(p)).digest('hex')}`);
+        }
+      };
+      walk(dir);
+      return out.sort().join('\n');
+    };
+    const before = snapshot();
+    const run = (...a) => spawnSync(process.execPath, [INBOX, ...a], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' }, timeout: 120_000 });
+
+    const asJson = run(dir, '--json');
+    let report = null;
+    try { report = JSON.parse(asJson.stdout); } catch { report = null; }
+    const byId = new Map((report?.submissions ?? []).map((s) => [s.id, s]));
+    const actions = (id) => (byId.get(id)?.zips ?? []).map((z) => `${z.path}:${z.action}`).sort().join();
+    ok('--json: exit 0, one object - the folder\'s submissions by id, what is no submission, and what to do', asJson.status === 0
+      && report?.format === 'farever-bench-inbox' && report.version === 1 && byId.size === 8, `${asJson.status}: ${asJson.stderr} ${asJson.stdout.slice(0, 300)}`);
+    const kz = byId.get(kept.id)?.zips ?? [];
+    ok('two copies of one bundle: the one named <id>.zip kept, the copy pCloud renamed dropped (the same SHA-256)',
+      actions(kept.id) === [`${kept.id} (1).zip:drop`, `${kept.id}.zip:keep`].sort().join() && kz.every((z) => z.sha256 === kept.zipSha256)
+        && kz.find((z) => z.action === 'keep')?.deleteTokenSha256 === tokenSha(kept.deleteToken)
+        && byId.get(kept.id).title === kept.issueTitle && byId.get(kept.id).requests.length === 0, JSON.stringify(byId.get(kept.id)));
+    const ar = byId.get(asked.id);
+    ok('a request whose token\'s SHA-256 is the manifest\'s: both copies of that bundle, wherever they stand, and the request itself, to delete',
+      actions(asked.id) === [`${asked.id}.zip:delete`, `later/${asked.id} (1).zip:delete`].sort().join()
+        && ar?.requests.length === 1 && ar.requests[0].path === `later/${asked.id}.withdraw.json` && ar.requests[0].action === 'delete'
+        && ar.requests[0].matches.length === 2 && /delete them, and the request$/.test(ar.requests[0].why), JSON.stringify(ar));
+    const fr = byId.get(forged.id);
+    ok('a request whose token matches no zip of its id: the zip kept, the request ignored and deleted', actions(forged.id) === `${forged.id}.zip:keep`
+      && fr?.requests[0]?.action === 'delete' && fr.requests[0].matches.length === 0 && /ignore it, and delete the request$/.test(fr.requests[0].why), JSON.stringify(fr));
+    ok('two different bundles under one id: both kept, and looked at', actions(twoOf.id) === [`${twoOf.id} (1).zip:look`, `${twoOf.id}.zip:look`].sort().join(),
+      JSON.stringify(byId.get(twoOf.id)));
+    // The conflict is counted over every zip of the id, the one withdrawn
+    // included: a bundle of another SHA-256 that claims the id of one whose
+    // sender asked for its deletion is not that player's to keep.
+    const mr = byId.get(mine.id);
+    ok('a request that matches one of two different bundles under its id: that one to delete, the other still looked at - not kept as the id\'s',
+      actions(mine.id) === [`${mine.id} (1).zip:look`, `${mine.id}.zip:delete`].sort().join() && mr?.requests[0]?.action === 'delete'
+        && /another bundle \(another SHA-256\)$/.test(mr.zips.find((z) => z.action === 'look')?.why ?? ''), JSON.stringify(mr));
+    const nr = byId.get(nothingId);
+    ok('a request for an id no zip has: nothing arrived under it, and the request is to delete', nr?.zips.length === 0 && nr.requests[0]?.action === 'delete'
+      && /^no zip of this id is here/.test(nr.requests[0].why), JSON.stringify(nr));
+    // A zip of the id that could not be read as a bundle - cut short, its id
+    // in its name; or another bench's, its id in its manifest - keeps the
+    // request: it may be the very fight the player asked about.
+    const unsettled = [truncated.id, unwritten.id].map((id) => byId.get(id));
+    ok('a request whose id names a zip here that was not read as a bundle - by its name, or by its manifest - is kept, and looked at, never deleted',
+      unsettled.every((u) => u?.zips.length === 0 && u.requests[0]?.action === 'look'
+        && u.requests[0].why === 'a zip of this id, or a folder, could not be read - keep the request until it is'), JSON.stringify(unsettled));
+    ok('what is no submission is listed as such, with why: a stray file, a .zip that is none or no bundle, a .json that is no request',
+      (report?.other ?? []).map((o) => o.path).sort().join() === ['not-a-bundle.zip', 'notes.json', 'test upload.txt', `${truncated.id}.zip`, 'renamed.zip'].sort().join()
+        && (report?.other ?? []).every((o) => typeof o.why === 'string' && o.why), JSON.stringify(report?.other));
+    ok('...a request\'s token is never written out, only its SHA-256', !asJson.stdout.includes(asked.deleteToken) && !asJson.stdout.includes('f'.repeat(32))
+      && asJson.stdout.includes(tokenSha(asked.deleteToken)));
+    ok('...and the to-do: keep 2, look at 5 (three zips and two requests), drop 1, delete 7 (three zips and four requests)',
+      JSON.stringify(report?.todo) === JSON.stringify({ keep: 2, look: 5, drop: 1, delete: 7 }), JSON.stringify(report?.todo));
+
+    const text = run(dir);
+    ok('the report as text: each id with its fight\'s title and table, a line per file with what to do, and the to-do', text.status === 0
+      && text.stdout.includes(`\n${kept.id}  ${kept.issueTitle}\n`) && text.stdout.includes('\n    Character: Warrior, level 25\n')
+      && new RegExp(`^ {2}keep {4}${kept.id}\\.zip +the zip to keep - `, 'm').test(text.stdout)
+      && new RegExp(`^ {2}drop {4}${kept.id} \\(1\\)\\.zip +the same bundle as ${kept.id}\\.zip \\(the same SHA-256\\)$`, 'm').test(text.stdout)
+      && new RegExp(`^${truncated.id} {2}\\(a zip of this id is here, and was not read as a bundle - see Not submissions\\)$`, 'm').test(text.stdout)
+      && /^ {2}other {3}test upload\.txt +neither a zip nor a request for a deletion/m.test(text.stdout)
+      && /^To do: keep 2, look at 5, drop 1, delete 7, and see to 5 entries that are no submission\.$/m.test(text.stdout)
+      && /Nothing was changed; every file was read as data\./.test(text.stdout), text.stdout.slice(0, 2000));
+    ok('nothing in the folder was changed, moved or deleted', snapshot() === before);
+    const noFolder = run(join(dir, 'missing'));
+    const noArg = run();
+    ok('a folder that is not there, or none given, is exit 1 with how to run it', noFolder.status === 1
+      && /is not a folder - node tools\/inbox\.mjs <folder> \[--json\]/.test(noFolder.stderr)
+      && noArg.status === 1 && /node tools\/inbox\.mjs <folder> \[--json\]/.test(noArg.stderr), `${noFolder.stderr} | ${noArg.stderr}`);
+
+    // THE FOLDER AS READDIRSYNC SEES IT on a bad day (see above): a folder
+    // whose name ends in "locked" will not open (EACCES), and the folder
+    // INBOX_FLOOD names holds INBOX_FLOOD_COUNT more files than it does.
+    const patch = join(aside, 'readdir-patch.cjs');
+    writeFileSync(patch, [
+      'const fs = require(\'node:fs\');',
+      'const { syncBuiltinESMExports } = require(\'node:module\');',
+      'const real = fs.readdirSync;',
+      'const flood = process.env.INBOX_FLOOD || null;',
+      'const count = Number(process.env.INBOX_FLOOD_COUNT || 0);',
+      'fs.readdirSync = function readdirSync(p, o) {',
+      '  if (/locked$/.test(String(p))) throw Object.assign(new Error(`EACCES: permission denied, scandir \'${p}\'`), { code: \'EACCES\' });',
+      '  const out = real.call(this, p, o);',
+      '  if (flood && String(p) === flood) for (let i = 0; i < count; i++) out.push({ name: `flood-${i}.txt`, isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true });',
+      '  return out;',
+      '};',
+      'syncBuiltinESMExports();',
+    ].join('\n'));
+    const patched = (env, ...a) => spawnSync(process.execPath, ['--require', patch, INBOX, ...a],
+      { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1', ...env }, timeout: 120_000, maxBuffer: 256 * 1024 * 1024 });
+    // A folder that will not open may hold any zip: no request is settled
+    // while one is unread - not one with no zip read, not one whose zip was.
+    const blindDir = join(aside, 'blind');
+    mkdirSync(join(blindDir, 'locked'), { recursive: true });
+    const lone = make();
+    const pair = make();
+    writeFileSync(join(blindDir, `${lone.id}.withdraw.json`), (await requestOf(lone)).bytes);
+    writeFileSync(join(blindDir, `${pair.id}.zip`), pair.zip);
+    writeFileSync(join(blindDir, `${pair.id}.withdraw.json`), (await requestOf(pair)).bytes);
+    const blind = patched({}, blindDir, '--json');
+    let blindReport = null;
+    try { blindReport = JSON.parse(blind.stdout); } catch { blindReport = null; }
+    const blindOf = (id) => (blindReport?.submissions ?? []).find((s) => s.id === id);
+    ok('a folder that could not be read: listed, and every request kept and looked at - the one with no zip read, and the one whose zip is to delete',
+      blind.status === 0 && (blindReport?.other ?? []).some((o) => o.path === 'locked' && /^a folder that could not be read \(EACCES\)$/.test(o.why))
+        && blindOf(lone.id)?.requests[0]?.action === 'look' && blindOf(lone.id).requests[0].why === 'a zip of this id, or a folder, could not be read - keep the request until it is'
+        && blindOf(pair.id)?.zips[0]?.action === 'delete' && blindOf(pair.id).requests[0]?.action === 'look'
+        && /delete it, and keep the request: a zip of this id, or a folder, could not be read/.test(blindOf(pair.id).requests[0].why)
+        && JSON.stringify(blindReport.todo) === JSON.stringify({ keep: 0, look: 2, drop: 0, delete: 1 }), `${blind.status}: ${blind.stderr} ${blind.stdout.slice(0, 600)}`);
+    // A flooded folder: the link has no file limit, and its code ships in
+    // every copy. More entries than one call takes as arguments still print.
+    const floodDir = join(aside, 'flood');
+    mkdirSync(floodDir);
+    const flood = patched({ INBOX_FLOOD: floodDir, INBOX_FLOOD_COUNT: '200000' }, floodDir);
+    ok('a folder of 200,000 entries is read and reported as text to its last line, exit 0',
+      flood.status === 0 && /: 200,000 entries - /.test(flood.stdout) && !/RangeError/.test(flood.stderr)
+        && /^To do: keep 0, look at 0, drop 0, delete 0, and see to 200,000 entries that are no submission\.$/m.test(flood.stdout),
+      `${flood.status}: ${String(flood.stderr).slice(0, 300)} ${String(flood.error ?? '')}`);
+    // A name that turns its own text around, or hides a part of it: every
+    // direction control Unicode has (Bidi_Control - U+061C, the Arabic letter
+    // mark, among them), each in a file name, is printed as '?'.
+    const namesDir = join(aside, 'names');
+    mkdirSync(namesDir);
+    const BIDI = /\p{Bidi_Control}/u;
+    const marks = [];
+    for (let cp = 0; cp <= 0xffff; cp++) if (BIDI.test(String.fromCodePoint(cp))) marks.push(cp);
+    for (const cp of marks) writeFileSync(join(namesDir, `bidi-${cp.toString(16)}-a${String.fromCodePoint(cp)}b.txt`), 'x\n');
+    const named = run(namesDir, '--json');
+    const namedText = run(namesDir);
+    let namedReport = null;
+    try { namedReport = JSON.parse(named.stdout); } catch { namedReport = null; }
+    const shownAs = (namedReport?.other ?? []).map((o) => o.path).sort().join();
+    ok(`every direction control in a file name (${marks.length} of them, U+061C among them) is printed as '?', in --json and in the text`,
+      marks.length >= 12 && marks.includes(0x061c) && shownAs === marks.map((cp) => `bidi-${cp.toString(16)}-a?b.txt`).sort().join()
+        && !BIDI.test(named.stdout) && namedText.status === 0 && !BIDI.test(namedText.stdout)
+        && marks.every((cp) => namedText.stdout.includes(`bidi-${cp.toString(16)}-a?b.txt`)), shownAs);
+  } finally {
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(aside, { recursive: true, force: true });
+  }
+} catch (e) { crashed(e); }
+
+// --- the Send a fight dialog's own steps ------------------------------------------
+// What the page does with /api/submit/*'s answers is exchange.js's alone,
+// and ui/lib/check-exchange.mjs drives it under a stand-in DOM, with the
+// routes answered in its own process - no server, no network. Run here as
+// it runs standalone: every check it prints passes.
+group('the Send a fight dialog: a deletion asked from its list, a send on its way, a send nobody answered, Save .zip of a bundle let go of, a receipt saved too soon');
+if (on) try {
+  const r = spawnSync(process.execPath, [fileURLToPath(new URL('../ui/lib/check-exchange.mjs', import.meta.url))], { encoding: 'utf8', timeout: 120_000 });
+  const lines = String(r.stdout ?? '').split(/\r?\n/);
+  const passed = lines.filter((l) => l.startsWith('PASS  '));
+  const failed = lines.filter((l) => l.startsWith('FAIL  '));
+  ok(`ui/lib/check-exchange.mjs: exit 0, every check passed (${passed.length})`, r.status === 0 && passed.length >= 8 && failed.length === 0
+    && lines.includes('all checks passed'), failed.join(' | ') || `${r.status}: ${String(r.stderr ?? '').slice(0, 400)}`);
+} catch (e) { crashed(e); }
+
+// --- the upload service Send was first written for --------------------------------
+// Until 2026-10-20 Send was written against a service of the project's own,
+// never deployed; it was taken out of the tree when Send moved to pCloud,
+// and its variable, its address constant and its folder must not come back
+// into the code, the tests or the UI. The words are put together here, so
+// that this file does not hold them whole.
+group('the upload service Send was first written for is gone: nothing under src/, bin/, tools/, test/ or ui/ names its variable, its address or its folder');
+if (on) try {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const words = [['FAREVER_BENCH_', 'RELAY'], ['RELAY', '_URL'], ['relay', '/']].map((p) => p.join(''));
+  const found = [];
+  let scanned = 0;
+  const walk = (rel) => {
+    for (const e of readdirSync(join(root, rel), { withFileTypes: true })) {
+      const at = `${rel}/${e.name}`;
+      if (e.isDirectory()) {
+        if (e.name !== 'node_modules' && e.name !== 'dist') walk(at);
+        continue;
+      }
+      if (!/\.(mjs|cjs|js|json|md|html|css|yml)$/.test(e.name)) continue;
+      scanned++;
+      readFileSync(join(root, at), 'utf8').split(/\r?\n/).forEach((line, i) => {
+        for (const w of words) if (line.includes(w)) found.push(`${at}:${i + 1} ${w}`);
+      });
+    }
+  };
+  for (const d of ['src', 'bin', 'tools', 'test', 'ui']) walk(d);
+  ok(`no file under src/, bin/, tools/, test/ or ui/ names ${words.join(', ')} (${scanned} files read)`, scanned > 40 && found.length === 0,
+    `${found.length} found: ${found.slice(0, 20).join('; ')}`);
 } catch (e) { crashed(e); }
 
 // --- summary ---------------------------------------------------------------

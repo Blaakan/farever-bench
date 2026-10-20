@@ -629,6 +629,11 @@ export function buildEnvelope({ engine, loadout, options = {}, metrics, ev, pinn
       // The slots whose INFUSION was held as the seed stated it (none stated
       // means held not infused) - what `bench optimize --build` re-pins.
       infusions: pinned?.infusions ?? [],
+      // The rune slots and the talent tree the run held, as the CLI's
+      // envelope records them, so `--build` and an import hold them again
+      // rather than searching them anew.
+      runes: pinned?.runes ?? [],
+      talents: !!pinned?.talents,
     },
     // What the infusion search was allowed to do, so `--build` reproduces it:
     // the infusions it could hand out and what an unowned piece's bonus roll

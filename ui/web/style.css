@@ -186,6 +186,19 @@ body {
 }
 .btn-red:active { transform: translateY(1px); box-shadow: 0 1px 0 #a53a2a; }
 .band .btn-red { align-self: center; margin-right: 16px; }
+/* Import and Send a fight (components/exchange.js): the tan of the result
+   toolbar, a size up to sit beside Optimize, and quieter than it - Optimize
+   stays the one red call to action on the band. */
+.band .btn-tan {
+  align-self: center;
+  margin-right: 10px;
+  background: linear-gradient(180deg, #c7b298, #b9a58d 55%, #a8927a);
+  box-shadow: 0 2px 0 #8f7c66, 0 3px 6px rgba(60,40,20,.25);
+  padding: 8px 16px;
+  font-size: 15px;
+  white-space: nowrap;
+}
+.band .btn-tan:active { transform: translateY(1px); box-shadow: 0 1px 0 #8f7c66; }
 
 /* -------------------------------------------------------------------- tabs */
 
@@ -923,6 +936,302 @@ body {
        background-repeat: no-repeat; flex: none; }
 .ico img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .ico-none { background: rgba(0,0,0,.12); }
+
+/* -------------------------------------- import / send (components/exchange.js) */
+
+/* The import report: docked under the band on the right, beside the sheet the
+   import changed rather than over it, and not modal - the build behind it
+   stays live. */
+/* The import report: a strip in the page's flow under the band, clear of
+   the crest like the build notice, that pushes the sheet down instead of
+   covering it. Past a third of the window it scrolls on its own; on a wide
+   window its lines run in two columns, so it stays short. */
+.xpanel {
+  position: relative;
+  margin: 10px 16px 0 236px;
+  max-height: 34vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--parchment);
+  border: 2px solid #d3bfa4;
+  border-radius: 12px;
+  box-shadow: 0 4px 14px rgba(80,55,25,.14);
+  overflow: hidden;
+  user-select: text;
+}
+.xpanel .xlines { columns: 2 460px; column-gap: 18px; }
+.xpanel .xlines li { break-inside: avoid; }
+.xpanel .xhead, .xmodal .xhead {
+  background: var(--teal-band);
+  color: #f2ede2;
+  font-family: Georgia, serif;
+  font-size: 17px;
+  padding: 9px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.xpanel.xerr .xhead { background: linear-gradient(180deg, #9a4a3a, #7a3428); }
+.xhead .xtitle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xhead .x {
+  margin-left: auto;
+  cursor: pointer;
+  font-size: 18px;
+  background: none;
+  border: none;
+  color: #f2ede2;
+}
+.xpanel .xbody, .xmodal .xbody { padding: 12px 16px 14px; overflow-y: auto; font-size: 13px; }
+.xpanel .xsummary { font-family: Georgia, serif; font-size: 16px; color: var(--ink); margin-bottom: 4px; }
+.xpanel .xlead { margin: 0 0 8px; color: var(--ink-soft); }
+.xpanel .xmsg, .xmodal .xmsg { margin: 2px 0 10px; font-size: 14px; color: var(--ink); line-height: 1.4; }
+.xpanel.xerr .xmsg, .xmodal .xmsg.xdropnote { color: #7a3428; }
+/* What an import did to the page beyond the file's own lines - the name the
+   band kept, the rank the page now prices with. Nothing else shows either. */
+.xpanel .xpage {
+  margin: 0 0 8px;
+  padding: 5px 9px;
+  border-left: 3px solid var(--teal);
+  border-radius: 3px;
+  background: var(--parchment-2);
+  color: var(--ink);
+  line-height: 1.35;
+}
+.xlines { list-style: none; margin: 0; padding: 0; }
+.xlines li {
+  padding: 4px 8px;
+  margin: 2px 0;
+  border-left: 3px solid transparent;
+  border-radius: 3px;
+  line-height: 1.35;
+  color: var(--ink);
+  word-break: break-word;
+}
+.xlines li.xl-drop { border-left-color: #c74936; background: #f6ddd3; }
+.xlines li.xl-warn { border-left-color: #c58a2c; background: #f6e8cc; }
+.xlines li.xl-gap { border-left-color: #b9a58d; background: var(--parchment-2); }
+.xlines li.xl-unknown { border-left-color: #c58a2c; background: var(--parchment-2); }
+.xlines li.xl-note { color: var(--ink-soft); }
+.xform { display: flex; gap: 12px; margin: 4px 0 6px; }
+.xform label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--ink-soft); }
+.xform select, .xform input {
+  padding: 6px 8px;
+  font-size: 14px;
+  border: 1px solid #cdb897;
+  border-radius: 6px;
+  background: #fff9f0;
+  color: var(--ink);
+}
+.xform input { width: 120px; }
+.xbtnrow { display: flex; gap: 8px; margin-top: 12px; }
+.xpanel .btn-tan, .xmodal .btn-tan {
+  background: linear-gradient(180deg, #c7b298, #b9a58d 55%, #a8927a);
+  box-shadow: 0 2px 0 #8f7c66, 0 2px 5px rgba(60,40,20,.25);
+  padding: 7px 16px;
+  font-size: 14px;
+}
+.xpanel .btn-tan.xprimary, .xmodal .btn-tan.xprimary {
+  background: linear-gradient(180deg, #3d93a5, #2a7f92 70%, #256e80);
+  box-shadow: 0 2px 0 #1f6674, 0 2px 5px rgba(20,40,50,.25);
+}
+.xpanel .btn-tan:active, .xmodal .btn-tan:active { transform: translateY(1px); }
+
+/* The exchange modal: the picker's veil, a box of its own. */
+.xmodal {
+  width: 640px;
+  max-width: 94vw;
+  max-height: 88vh;
+  background: var(--parchment);
+  border: 2px solid #d3bfa4;
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(30,18,8,.5);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  user-select: text;
+}
+
+/* Send a fight: wider, since it prints the bench's report line for line and
+   the zip's files with their sizes. */
+.xmodal.xsend { width: 780px; }
+.xsend .xlead { margin: 0 0 10px; color: var(--ink-soft); font-size: 14px; line-height: 1.4; }
+.xsend .xsec {
+  margin: 0 0 12px;
+  padding: 8px 12px 10px;
+  border: 1px solid #dccab2;
+  border-radius: 8px;
+  background: var(--parchment-2);
+  min-width: 0;
+}
+.xsend .xsec legend, .xsend .xsec h4 {
+  font-family: Georgia, serif;
+  font-size: 15px;
+  font-weight: normal;
+  color: var(--ink);
+  padding: 0 4px;
+  margin: 0 0 4px;
+}
+.xsend .xrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0; }
+.xsend .xradio, .xsend .xcheck { display: inline-flex; align-items: center; gap: 4px; font-size: 14px; color: var(--ink); cursor: pointer; }
+.xsend .xradio { margin: 2px 0; }
+.xsend .xcheck { margin: 6px 0 0; }
+.xsend .xdim { color: var(--ink-soft); }
+.xsend .xfile { font-size: 13px; color: var(--ink); word-break: break-all; }
+.xsend .xhint { margin: 4px 0 0; font-size: 12.5px; color: var(--ink-soft); line-height: 1.4; }
+.xsend .btn-tan.xsmall { padding: 4px 12px; font-size: 13px; }
+.xsend .xpicked { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; color: var(--ink); }
+.xsend .xpicked li { padding: 2px 0; word-break: break-all; }
+.xsend .xnote {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 6px 8px;
+  font: 13px/1.4 Georgia, serif;
+  color: var(--ink);
+  background: #fff9f0;
+  border: 1px solid #cdb897;
+  border-radius: 6px;
+}
+.xsend .xcount { text-align: right; font-size: 11.5px; color: var(--ink-soft); }
+/* The manual route's issue title, printed as the server wrote it. */
+.xsend .xissue {
+  margin-top: 6px;
+  border: 1px solid #cdb897;
+  border-radius: 6px;
+  background: #fffaf2;
+  overflow: hidden;
+}
+.xsend .xissue-title {
+  padding: 6px 10px;
+  font-family: Georgia, serif;
+  font-size: 15px;
+  color: var(--ink);
+  word-break: break-word;
+}
+.xsend .xfiles { list-style: none; margin: 6px 0 0; padding: 0; }
+.xsend .xfiles li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 8px;
+  font-size: 13px;
+  color: var(--ink);
+  border-bottom: 1px dotted #dccab2;
+}
+.xsend .xfiles code { font: 12.5px Consolas, 'Courier New', monospace; }
+.xsend .xreport { margin: 14px 0 0; }
+.xsend .xreport summary { cursor: pointer; font-size: 13px; color: var(--ink-soft); margin-bottom: 4px; }
+.xsend .xreport .xlines { max-height: 220px; overflow: auto; font-size: 12.5px; }
+.xsend .xlines li { white-space: pre-wrap; }
+.xsend .xconsent {
+  display: flex;
+  margin: 8px 0 0;
+  padding: 7px 10px;
+  border-left: 3px solid var(--teal);
+  border-radius: 3px;
+  background: var(--parchment-2);
+}
+.xsend .xmsg.xerrline { color: #7a3428; }
+/* The problems the bench found: said where the eye lands first. */
+.xsend .xwarn {
+  margin: 0 0 12px;
+  padding: 6px 10px;
+  background: #f6e8cc;
+  border-left: 3px solid #c58a2c;
+  border-radius: 3px;
+}
+.xsend .xwarn .xmsg { margin: 0 0 4px; color: #6e4a12; }
+/* What stops Send (a sheet of another class than the log's): above the
+   problems, in the error colour, since it is not one to weigh. */
+.xsend .xstop {
+  margin: 0 0 12px;
+  padding: 6px 10px;
+  background: #f6ddd3;
+  border-left: 3px solid #c74936;
+  border-radius: 3px;
+}
+.xsend .xstop .xmsg { margin: 0 0 4px; color: #7a3428; }
+.xsend .xwarn ul { margin: 0; padding-left: 18px; font-size: 13px; color: var(--ink); line-height: 1.4; }
+.xsend .xmsg.xstatus { color: var(--teal-dark); }
+.xsend .xroute { margin-top: 8px; }
+.xsend .xsent { margin-top: 6px; padding: 8px 12px; border-left: 3px solid var(--teal); background: var(--parchment-2); border-radius: 3px; }
+.xsend .xbtnrow { flex-wrap: wrap; }
+/* The footer: asking for a past submission's deletion, out of the way of
+   the send. */
+.xsend .xfoot { margin-top: 14px; padding-top: 8px; border-top: 1px solid #dccab2; }
+.xsend .xlink {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font: 13px Georgia, serif;
+  color: var(--teal-dark);
+  text-decoration: underline;
+}
+.xsend .xfootmsg { margin: 6px 0 0; font-size: 13px; color: var(--ink); line-height: 1.4; }
+.xsend .xfootmsg.xerrline { color: #7a3428; }
+.xsend .xfootmsg.xokline { color: var(--teal-dark); }
+.xsend .xconfirm { margin-top: 8px; }
+/* The receipts the bench keeps: one line each, its buttons at the end. */
+.xsend .xkept { margin-top: 8px; }
+.xsend .xkeptlist { list-style: none; margin: 4px 0 0; padding: 0; }
+.xsend .xkeptlist li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 8px;
+  font-size: 13px;
+  color: var(--ink);
+  border-bottom: 1px dotted #dccab2;
+}
+.xsend .xkeptacts { display: inline-flex; gap: 12px; flex-shrink: 0; }
+/* A question in place of the buttons (a receipt not saved, a send that may
+   have arrived): where the eye lands, in the problems' colour. */
+.xsend .xask {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  background: #f6e8cc;
+  border-left: 3px solid #c58a2c;
+  border-radius: 3px;
+}
+.xsend .xask .xmsg { margin: 0; color: #4a3010; }
+.xsend .xask .xbtnrow { margin-top: 8px; }
+/* Building a kept submission again: said above everything else. */
+.xsend .xagain {
+  margin: 0 0 12px;
+  padding: 6px 10px;
+  background: var(--parchment-2);
+  border-left: 3px solid var(--teal);
+  border-radius: 3px;
+}
+.xsend .xagain .xmsg { margin: 0 0 4px; }
+/* Where dropped files went: said, not an error. */
+.xsend .xmsg.xdropnote.xdropok { color: var(--teal-dark); }
+
+/* Shown while a file is dragged over the window. It never takes an event
+   itself (the document-level handlers do), so it cannot swallow the drop. */
+.xdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  pointer-events: none;
+  background: rgba(40,28,16,.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.xdrop[hidden] { display: none; }
+.xdrop .xdrop-msg {
+  background: var(--parchment);
+  border: 3px dashed var(--teal);
+  border-radius: 14px;
+  padding: 28px 40px;
+  font-family: Georgia, serif;
+  font-size: 20px;
+  color: var(--ink);
+  box-shadow: 0 10px 40px rgba(30,18,8,.4);
+}
 
 /* --------------------------------------------------------------- misc ui */
 

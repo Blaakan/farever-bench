@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Blaakan/farever-bench/master/docs/schema/combat-log.v1.json",
+  "title": "farever-combat-log v1",
+  "description": "One line of a farever-combat-log v1 file (JSON Lines, UTF-8, optionally gzip). Line 1 is a header (#/$defs/header); every following line is an event (#/$defs/event). Ids are CastleDB row ids from the game's data.cdb. See docs/COMBAT-LOG.md.",
+  "oneOf": [
+    { "$ref": "#/$defs/header" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "uid": {
+      "description": "A unit or object uid, as a JSON string. Decimal digits are best: the bench writes a target as <unit>#<uid>.",
+      "type": "string"
+    },
+    "header": {
+      "type": "object",
+      "required": ["format", "version", "startedAt", "me"],
+      "properties": {
+        "format": { "const": "farever-combat-log" },
+        "version": { "const": 1 },
+        "source": {
+          "type": "object",
+          "properties": {
+            "exporter": { "type": "string" },
+            "exporterVersion": { "type": "string" },
+            "gameVersion": { "type": "string", "description": "The game's own version string." },
+            "steamBuild": { "type": ["string", "integer"], "description": "The Steam build id (buildid in appmanifest_3672400.acf)." },
+            "bootSha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "sha256 of the hlboot.dat the game ran from. SHOULD be written: it is the only build identity the bench can hold against an install." },
+            "recordsPresses": { "type": "boolean", "description": "true: the log writes a press for every press of the character, so a window with none is one in which nothing was pressed." }
+          },
+          "additionalProperties": true
+        },
+        "startedAt": { "type": "number", "minimum": 1000000000000, "exclusiveMaximum": 10000000000000, "description": "Epoch MILLISECONDS of time 0 (2001-2286). Epoch seconds are refused." },
+        "startedAtEstimated": { "type": "boolean", "description": "true when startedAt was worked out, not observed." },
+        "clock": { "type": "string", "examples": ["client-observed", "server"] },
+        "me": { "$ref": "#/$defs/uid", "description": "The uid of the character the log is for, as the events write it." },
+        "character": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "class": { "type": "string", "description": "Unit id (Warrior, Rogue, Mage, Priest) or aptitude id (Fighter, Assassin, Wizard, Cleric), any case." },
+            "level": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": true
+        },
+        "encounter": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "bossKind": { "type": "string", "description": "Unit id of the boss or target." },
+            "difficulty": {
+              "description": "ActivityDifficulty: 0 Normal, 1 Veteran, 2 Heroic, -1 unknown. The case names are read too, in any case.",
+              "oneOf": [
+                { "type": "integer", "enum": [-1, 0, 1, 2] },
+                { "type": "string", "pattern": "^([Nn][Oo][Rr][Mm][Aa][Ll]|[Vv][Ee][Tt][Ee][Rr][Aa][Nn]|[Hh][Ee][Rr][Oo][Ii][Cc])$" }
+              ]
+            },
+            "activityId": { "type": "string" },
+            "targetDummy": { "type": "boolean" },
+            "partySize": { "type": "integer", "minimum": 1 },
+            "outcome": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        "initial": {
+          "type": "array",
+          "description": "Events standing at time 0: statuses already up, as status_present.",
+          "items": { "$ref": "#/$defs/initialEvent" }
+        },
+        "duration": { "type": "number", "minimum": 0 },
+        "count": { "type": "integer", "minimum": 0, "description": "The number of event lines; must match when present." },
+        "leadIn": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "initialEvent": {
+      "description": "An event of header.initial: as an event, with time optional. An entry without one stands at 0, or at the first event's time when the file opens earlier (a lead-in).",
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [ { "$ref": "#/$defs/eventFields" } ]
+    },
+    "event": {
+      "type": "object",
+      "required": ["time", "kind"],
+      "allOf": [
+        { "$ref": "#/$defs/eventFields" },
+        {
+          "if": { "properties": { "kind": { "const": "damage" } }, "required": ["kind"] },
+          "then": {
+            "required": ["source", "skill", "amount", "critical"],
+            "properties": { "skill": { "type": "string", "minLength": 1 } }
+          }
+        }
+      ]
+    },
+    "eventFields": {
+      "type": "object",
+      "properties": {
+        "seq": { "type": "integer" },
+        "time": { "type": "number", "minimum": -10000000, "maximum": 10000000, "description": "Seconds from startedAt; may be negative inside a lead-in. An event further than 10,000,000 s from startedAt is skipped." },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "examples": ["damage", "avoided", "heal", "press", "skill_use", "skill_context", "skill_end", "dodge_use", "block_use", "block_success", "status_applied", "status_present", "status_refreshed", "status_duration", "status_stacks", "status_removed", "shield_applied", "shield_changed", "shield_present", "proc_available", "proc_used", "proc_ended", "proc_present", "charge_update", "health_loss", "health_sample", "death", "recording_started", "recording_stopped", "recording_gap"]
+        },
+        "source": { "$ref": "#/$defs/uid", "description": "Who did it; a pet's hit names its owner." },
+        "target": { "$ref": "#/$defs/uid", "description": "Who it happened to; for a status, who wears it." },
+        "skill": { "type": "string", "description": "CastleDB id of what produced the event: a status id for its ticks, the pet's own skill for a pet swing. The join key." },
+        "origin": { "type": "string", "description": "CastleDB id of the parent skill." },
+        "instance": { "$ref": "#/$defs/uid", "description": "uid of the skill or status object; not the target's instance." },
+        "amount": { "type": "number", "description": "Raw, unrounded." },
+        "critical": { "type": "boolean" },
+        "lethal": { "type": "boolean" },
+        "hits": { "type": "integer" },
+        "damageType": { "enum": ["physical", "magical", "raw", "unclassified"] },
+        "outcome": { "type": "string", "description": "On damage: Hit, Blocked or the blocker's id. On avoided: DamageDodge or InvulnerableHit. On status_removed: the reason." },
+        "stacks": { "type": "integer" },
+        "duration": { "type": "number", "description": "A status's time left in seconds, -1 when it has no clock." },
+        "statusType": { "type": "string", "examples": ["buff", "debuff"] },
+        "related": { "type": "integer", "description": "seq of the use event this one belongs to." },
+        "estimated": { "type": "boolean" },
+        "sourceName": { "type": "string" },
+        "targetName": { "type": "string" },
+        "skillName": { "type": "string" },
+        "targetKind": { "type": "string", "description": "Unit id of the target." },
+        "item": { "type": "string" },
+        "itemName": { "type": "string" },
+        "sourceKind": { "type": "string", "description": "Bench addition: unit id of the source after owner attribution." },
+        "affinity": { "type": "string", "description": "Bench addition: the hit's affinity id; never derived from damageType." },
+        "targetLevel": { "type": "integer", "description": "Bench addition." },
+        "targetHp": { "type": "number", "description": "Bench addition." },
+        "targetMaxHp": { "type": "number", "description": "Bench addition." },
+        "targetArmor": { "type": "number", "description": "Bench addition." },
+        "targetMagicArmor": { "type": "number", "description": "Bench addition." },
+        "blocked": { "type": "number", "description": "Bench addition." },
+        "overkill": { "type": "number", "description": "Bench addition." },
+        "absorbed": { "type": "number", "description": "Bench addition." },
+        "summoned": { "type": "boolean", "description": "Bench addition: a pet of source dealt it." },
+        "isBaseAttack": { "type": "boolean", "description": "Bench addition." },
+        "stepId": { "type": ["string", "integer"], "description": "Bench addition." },
+        "spark": { "type": "number", "description": "Bench addition: on a press, skill_use or block_use of the character, its Spark at that moment." },
+        "rage": { "type": "number", "description": "Bench addition: on a press, skill_use or block_use of the character, its Rage at that moment." }
+      },
+      "additionalProperties": true
+    }
+  }
+}

@@ -61,6 +61,10 @@
 import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { isAbsolute, join } from 'node:path';
+// The combat-log hook (see "combat logs" above streamCapture).
+import { openSync, readSync, closeSync, readFileSync } from 'node:fs';
+import { basename } from 'node:path';
+import { readCombatLog, captureRows, MAX_LOG_BYTES, SUMMARY_ONLY, CombatLogError } from './combatlog.mjs';
 
 export const COLUMNS = [
   'ts_ms', 'event', 'source', 'target', 'skill_id',
@@ -203,6 +207,12 @@ export function parseSession(r) {
     bootMtimeMs: n(x.boot_mtime_ms),
     // The probe could not stat the file it booted from, and said so.
     bootUnreadable: x.boot === 'unreadable',
+    // A combat log's synthetic session row (combatlog.mjs captureRows): the
+    // build its header names, and whether the log records presses at all
+    // (0 or 1). Only on the rows that carry them: a probe's session row
+    // parses to the object it always did, so `--json` output is unchanged.
+    ...(typeof x.build === 'string' && x.build !== '' ? { build: x.build } : {}),
+    ...(x.presses !== undefined ? { presses: n(x.presses) } : {}),
   };
 }
 
@@ -221,6 +231,8 @@ export function bootFacts(gameDir) {
 //   sessionRows   every session row of the file (any reader's receipt has them)
 //   from, to      the window's first and last event, in ms
 //   boot          bootFacts() of the install, or null when it cannot be read
+//   bootSha       the installed hlboot.dat's sha256 (engine.meta.bootSha), for
+//                 a combat log's session row, which names a build by hash
 //
 // A window is spoken for by the session row that opened the boot it started in
 // - the last one at or before `from` - and by every session row inside it. If
@@ -234,13 +246,42 @@ export function bootFacts(gameDir) {
 //
 // `onThisBuild` is true, false, or null for "cannot tell"; `reason` is the
 // sentence to print. Pure, so it can be tested without a game.
-export function captureEra({ sessionRows = [], from = null, to = null, boot = null } = {}) {
+export function captureEra({ sessionRows = [], from = null, to = null, boot = null, bootSha = null } = {}) {
   const day = (ms) => (ms == null ? '?' : new Date(ms).toISOString().slice(0, 10));
   const sorted = [...sessionRows].filter((s) => s.ts != null).sort((a, b) => a.ts - b.ts);
   const opener = from == null ? null : sorted.filter((s) => s.ts <= from).pop() ?? null;
   const inside = sorted.filter((s) => (from == null || s.ts > from) && (to == null || s.ts <= to));
   const sessions = opener ? [opener, ...inside] : inside;
   const out = { sessions, from, to, boot, probe: sessions.length ? sessions[sessions.length - 1].probe : null };
+  // --- a combat log's session row (combatlog.mjs) ---------------------------
+  // A log some other tool wrote names its build by what its header carried -
+  // the hlboot.dat sha256, a Steam build, a game version - and never by a
+  // file on this machine, so the size-and-date rule below cannot speak for
+  // it. The sha matching the installed one is this build; anything else is
+  // "cannot tell", with both named. Never "another build": that answer would
+  // price the training Dummy at the armour it had before the 2026-10 build
+  // (verify.mjs TARGET_HISTORY) off nothing but a date.
+  const named = sessions.filter((s) => s.build != null);
+  if (named.length) {
+    const want = typeof bootSha === 'string' && bootSha !== '' ? bootSha.toLowerCase() : null;
+    if (want && named.every((s) => s.build.toLowerCase() === want)) {
+      return { ...out, onThisBuild: true,
+        reason: `recorded on this build (the ${out.probe ?? 'log'} header names the installed hlboot.dat, sha256 ${want.slice(0, 12)})` };
+    }
+    const said = [...new Set(named.map((s) => s.build))].join(', ');
+    // A Wink timeline's header carries no build: what its session row names
+    // is the game version of the summary beside it (combatlog.mjs buildOf),
+    // and the sentence sends a reader to that file, not to the header.
+    const whose = out.probe === 'wink-timeline'
+      ? (said === 'unknown' ? 'the Wink timeline names no build, and no summary beside it names a game version'
+        : `its Wink summary names the game version ${said}`)
+      : `the ${out.probe ?? 'log'} header names its build as ${said === 'unknown' ? 'nothing (no bootSha256, steamBuild or gameVersion)' : said}`;
+    return { ...out, onThisBuild: null,
+      reason: `${whose}, `
+        + `and the installed hlboot.dat is ${want ? `sha256 ${want.slice(0, 12)}` : 'not hashed here'} - a combat log's dates never place it on a build, `
+        + 'so which build it describes cannot be told' };
+  }
+  // --- end of the combat-log branch -------------------------------------------
   if (!boot) {
     return { ...out, onThisBuild: null, reason: 'the installed hlboot.dat could not be read, so the capture\'s build cannot be told' };
   }
@@ -274,12 +315,152 @@ export function captureEra({ sessionRows = [], from = null, to = null, boot = nu
     reason: 'no session row (probe v9 or older) on rows newer than the installed hlboot.dat - which build they describe cannot be told' };
 }
 
+// --- combat logs (src/combatlog.mjs) -----------------------------------------
+// `--capture` takes a combat log as well as a probe CSV: a farever-combat-log
+// or a Wink DPS Meter timeline, gzip or not (docs/COMBAT-LOG.md). Such a file
+// is not streamed line by line - its rows have to be sorted, a use's target
+// sits on a later row, and gzip has no lines at all - so it is read WHOLE by
+// combatlog.mjs, turned into the rows below once, and replayed to `onRow`.
+// What tells the two apart is the first bytes: gzip's magic, or a '{' as the
+// first character that is not blank. A probe CSV opens with its column names
+// and goes the old way, untouched.
+//
+// A command reads one capture several times (verify streams it six to eight
+// times), so the parsed log is kept per path, size and modification time -
+// and the sibling summary's, for a Wink timeline - and the rows are frozen:
+// every reader gets the same objects, and none of them may change one.
+const COMBAT_LOGS = new Map();   // path -> { key, log, rows }
+
+function sniffCombatLog(path) {
+  let fd = null;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(4096);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    if (n >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) return true;
+    let i = n >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf ? 3 : 0;
+    while (i < n && (buf[i] === 0x20 || buf[i] === 0x09 || buf[i] === 0x0a || buf[i] === 0x0d)) i++;
+    return i < n && buf[i] === 0x7b;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+// The Wink summary beside a timeline: `<id>.json.timeline` -> `<id>.json`,
+// as every reader of a log takes it (`--capture`, `bench import`, `bench
+// submit`). Null when the path is no timeline or nothing that is a FILE stands
+// there - a folder of that name is not a summary. A file that cannot be read
+// (past the reader's size guard, or the read fails) comes back with `why` and
+// no `data`: it costs the log its summary, never the log.
+//
+//   { path, name, size, mtimeMs, data: Buffer | null, why: string | null }
+//
+// `read: false` stats it and reads nothing (data stays null): what a cache
+// key needs.
+export function winkCompanion(path, { read = true } = {}) {
+  if (typeof path !== 'string' || !/\.timeline$/i.test(path)) return null;
+  const p = path.replace(/\.timeline$/i, '');
+  let st;
+  try { st = statSync(p); } catch { return null; }
+  if (!st.isFile()) return null;
+  const out = { path: p, name: basename(p), size: st.size, mtimeMs: st.mtimeMs, data: null, why: null };
+  if (st.size > MAX_LOG_BYTES) return { ...out, why: `it is larger than ${MAX_LOG_BYTES / 1024 / 1024} MB, which no Wink summary is` };
+  if (!read) return out;
+  try { return { ...out, data: readFileSync(p) }; } catch (e) { return { ...out, why: e.message }; }
+}
+
+// One combat log read from disk with the Wink summary beside it: what
+// readCombatLog returns, with a summary that stood there and could not be
+// read named among its problems. `data` is the file's bytes when the caller
+// has them already; `name` what the sentences call it (its base name).
+// Throws CombatLogError, as the reader does.
+export function readCombatLogAt(path, { data = null, name = basename(path) } = {}) {
+  const side = winkCompanion(path);
+  const log = readCombatLog({
+    name,
+    data: data ?? readFileSync(path),
+    mtimeMs: statSync(path).mtimeMs,
+    companion: side?.data ? { name: side.name, data: side.data } : null,
+  });
+  if (side?.why) log.problems.push(`${side.name} is beside the timeline and could not be read (${side.why}), so it was not used`);
+  return log;
+}
+
+// The rows of the header's initial[] - what stood when the recording opened -
+// carry `initial=1`, so that openingState holds them as standing at an
+// opening at or before them: an entry written without a time stands at the
+// log's first row (combatlog.mjs), which is exactly where a window over the
+// whole log, or one cut from its start, opens. They are told by their line:
+// combatlog.mjs gives every row the line its event was read from, the
+// header's to initial[], and no event of the file shares it. (A row already
+// tagged by the reader is left as it is.)
+function initialTagged(log, rows) {
+  if (!log.initial.length) return rows;
+  const head = new Set(captureRows({ ...log, events: [] }).filter((r) => r.event !== 'session').map((r) => r.line));
+  return rows.map((r) => (r.event !== 'session' && head.has(r.line) && parseExtra(r.extra).initial === undefined
+    ? { ...r, extra: r.extra ? `${r.extra};initial=1` : 'initial=1' } : r));
+}
+export const isInitialRow = (r) => r?.event === 'status_on' && parseExtra(r.extra).initial === '1';
+
+// The parsed log and its rows for a capture path, or null when the file is a
+// probe CSV. Throws CombatLogError - the reader's sentence when the file
+// cannot be read, and the refusal of a summary on its own: its rows are
+// totals under origin ids, and every reader here needs rows.
+//
+// `heroKinds`: the unit ids a player can be (the game's classes, from an
+// engine), for a caller that has one at hand - a uid of such a kind is a
+// player, named by its handle in the rows (combatlog.mjs captureRows), even
+// where the log itself names no player of that class. Without them the
+// kinds come from the log alone. The rows are read once per file and kept:
+// a later caller with no engine at hand (streamCapture, and every reader
+// under it) takes the rows the last caller that gave kinds read.
+export function combatLogOf(path, { heroKinds = null } = {}) {
+  if (!existsSync(path) || !sniffCombatLog(path)) return null;
+  const st = statSync(path);
+  const side = winkCompanion(path, { read: false });
+  const key = `${st.size}\t${st.mtimeMs}\t${side ? `${side.path}\t${side.size}\t${side.mtimeMs}` : ''}`;
+  const kinds = Array.isArray(heroKinds) && heroKinds.length ? [...new Set(heroKinds)].sort().join(',') : null;
+  const hit = COMBAT_LOGS.get(path);
+  if (hit && hit.key === key && (kinds === null || hit.kinds === kinds)) return hit;
+  // Refused before it is read into memory: the reader's own guard is on
+  // the text it would parse, and a gzip larger than that inflates past it.
+  if (st.size > MAX_LOG_BYTES) {
+    throw new CombatLogError(`capture: ${path} is larger than ${MAX_LOG_BYTES / 1024 / 1024} MB, which no one fight's combat log is`);
+  }
+  const log = readCombatLogAt(path);
+  if (!log.perEvent) {
+    const timeline = existsSync(`${path}.timeline`) ? `${path}.timeline` : null;
+    throw new CombatLogError(`capture: ${path} is a Wink fight summary - ${SUMMARY_ONLY}`
+      + (timeline ? `. Its timeline is ${timeline}: read that one` : ''));
+  }
+  const rows = initialTagged(log, captureRows(log, { heroKinds: kinds === null ? null : kinds.split(',') })).map((r) => Object.freeze(r));
+  const entry = { key, kinds, log, rows };
+  COMBAT_LOGS.set(path, entry);
+  while (COMBAT_LOGS.size > 4) COMBAT_LOGS.delete(COMBAT_LOGS.keys().next().value);
+  return entry;
+}
+
+function replayCombatLog(path, onRow) {
+  const { log, rows } = combatLogOf(path);
+  const sessionRows = [];
+  for (const r of rows) {
+    if (r.event === 'session') sessionRows.push(parseSession(r));
+    onRow(r);
+  }
+  return { header: JSON.stringify(log.header), lines: log.lineCount, rows: rows.length, malformed: log.malformed, sessionRows };
+}
+// --- end of the combat-log hook ------------------------------------------------
+
 // Stream every row, newest work first: `onRow` is called with a plain object
 // per data line. Returns the counts that let a caller trust the read - a
 // capture with malformed rows is a capture with a broken probe - and the
 // file's session rows, which every reader passes on in its receipt.
 export async function streamCapture(path, onRow) {
   if (!existsSync(path)) throw new Error(`capture: no such file ${path}`);
+  // A combat log (gzip, or JSON on its first line): see the block above.
+  if (sniffCombatLog(path)) return replayCombatLog(path, onRow);
   const rl = createInterface({
     input: createReadStream(path),
     crlfDelay: Infinity,
@@ -793,7 +974,9 @@ export async function poolAt(path, { source, since = null, until = null, key } =
 // something that happened before it, and the log says what.
 //
 //   source    the actor (exact handle)
-//   at        the opening, epoch ms; rows at or after it are not read
+//   at        the opening, epoch ms; rows at or after it are not read - but
+//             for a combat log's initial[] statuses, which stood before
+//             its first row (`initial: true` on the entry)
 //   wearers   keep only statuses worn by the actor itself or by one of these
 //             target instances ("Dummy#2180" - the ones the window's own rows
 //             hit, `aggregate().instances`); null keeps every wearer
@@ -809,7 +992,7 @@ export async function poolAt(path, { source, since = null, until = null, key } =
 // with no clock on dummies the second never saw), so both lists start over.
 //
 // Returns { lastPress: { skill, ts } | null, pressed: { <skill>: last ts },
-// standing: [{ status, wearer, self, since, lastAt, stacks, expires }] } -
+// standing: [{ status, wearer, self, since, lastAt, stacks, expires, initial? }] } -
 // `expires` null for a status with no clock.
 export async function openingState(path, { source, at, wearers = null } = {}) {
   let lastPress = null;
@@ -818,7 +1001,10 @@ export async function openingState(path, { source, at, wearers = null } = {}) {
   const seconds = (v) => { const n = num(v ?? ''); return n !== null && n > 0 ? n : null; };
   const worn = wearers ? new Set(wearers) : null;
   await streamCapture(path, (r) => {
-    if (r.ts === null || r.ts >= at) return;
+    // (A status of a combat log's initial[] stood before its recording
+    // opened, and so at an opening at or before its row - see initialTagged.)
+    const initial = isInitialRow(r);
+    if (r.ts === null || (r.ts >= at && !initial)) return;
     if (r.event === 'session') {
       up.clear(); lastPress = null;
       for (const k of Object.keys(pressed)) delete pressed[k];
@@ -847,6 +1033,9 @@ export async function openingState(path, { source, at, wearers = null } = {}) {
       up.set(key, {
         status: r.skill, wearer: r.target, self: r.target === source,
         since: still ? prev.since : r.ts, lastAt: r.ts, stacks: r.stacks, expires: dur === null ? null : r.ts + dur * 1000,
+        // Standing since before the log opens (its initial[]): `since` is
+        // then where the log starts, not when it was applied.
+        ...(initial || (still && prev.initial) ? { initial: true } : {}),
       });
       return;
     }

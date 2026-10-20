@@ -5,6 +5,54 @@
 // /icon/* are the icon service, and everything left is a static file out of
 // ui/web. The Electron shell imports startServer and owns the port; run
 // standalone with `node ui/server.mjs [--port N]` for a browser dev loop.
+//
+// WHO MAY CALL /api/. The server listens on loopback, and that alone does not
+// keep other pages out: any web page the user has open can aim a request at
+// http://127.0.0.1:<port>, and a page on a name that resolves to 127.0.0.1
+// (DNS rebinding) is even same-origin with it as far as the browser knows. A
+// route that imports a file, sends a fight to the project's pCloud folder or
+// asks for one's deletion, or lists the receipts that ask for it must not
+// answer such a page. So before any route runs (`guard`):
+//
+//   Host     every /api/ request must be addressed to THIS server by one of
+//            its own names - 127.0.0.1, localhost, [::1] at its port, plus
+//            the --host value when that is another loopback address. A
+//            rebinding page sends its own name, and is refused here. This is
+//            checked on GETs too: /api/bootstrap names the install folder,
+//            which on Windows carries the user's account name.
+//   method   each route answers one method; anything else is a 405, an
+//            OPTIONS preflight included, so a cross-site JSON request never
+//            gets the CORS answer it would need to be sent.
+//   Origin   on a POST, when the browser sends one, it must be this server's
+//            own origin, http://<the Host it was addressed to>.
+//   type     a POST body must be application/json. A plain HTML form or a
+//            "simple" fetch can only send text/plain or a form encoding
+//            without a preflight; refusing those is what makes the preflight
+//            above unavoidable.
+//   size     40 MB for the two routes that take a file (/api/import and
+//            /api/submit/preview), 1 MB for every other (bodyCapFor). A body
+//            over its cap is READ TO THE END AND THROWN AWAY, then answered
+//            413 with a sentence: closing the socket mid-upload left the
+//            client a connection reset instead of the reason (the old
+//            readBody did that, with a 400).
+//
+// SEND A FIGHT IS LOOPBACK ONLY. On a bind beyond loopback (`--host
+// 0.0.0.0`, a LAN address) the Host check above cannot be made, and a
+// request with no Origin - curl from any machine on the network - passes
+// the Origin check. For the rest of /api/ that exposes the install and
+// the CPU; for /api/submit/ it would lend the player's machine to the
+// network: sending fights to the project's pCloud folder from their
+// address, listing the kept receipts with their delete tokens, and asking
+// for those fights' deletion. So on such a bind every /api/submit/ route is
+// refused (403, `submitOffFor`), before its body is read, and bootstrap
+// carries the same sentence for the dialog. On loopback the guard keeps
+// out other pages, not other programs: anything running on this machine
+// can call the server as curl does (no Origin) - /receipts and its delete
+// tokens included, whatever the receipt files' modes (api.mjs) - which is
+// one more reason the bind stays on loopback.
+//
+// The refusals are sentences like every other error here, so the page and a
+// person with curl both learn what was wrong.
 // ---------------------------------------------------------------------------
 
 import http from 'node:http';
@@ -15,7 +63,56 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createApi } from './api.mjs';
 
-const BODY_CAP = 1024 * 1024; // 1MB is generous for a loadout
+const MB = 1024 * 1024;
+// 1 MB is generous for a loadout or a tooltip question; a file - a character
+// sheet the user picked, or the logs of a fight to send - comes base64'd or
+// as text inside JSON, so the routes that take one take 40 MB.
+const BODY_CAP = 1 * MB;
+const FILE_BODY_CAP = 40 * MB;
+// The routes that take a file. Every other submit route takes an id, a flag
+// or a receipt, and buffering 40 MB of JSON for one is 40 MB for nothing.
+const FILE_ROUTES = new Set(['/api/import', '/api/submit/preview']);
+
+/** The body cap of a route: 40 MB for one that takes a file, else 1 MB. */
+export function bodyCapFor(pathname) {
+  return FILE_ROUTES.has(pathname) ? FILE_BODY_CAP : BODY_CAP;
+}
+
+const mbText = (bytes) => `${Math.round((bytes / MB) * 10) / 10} MB`;
+
+// The 413 sentence. Sizes are rounded to a tenth of a MB, so a body a few
+// bytes over the cap would read "40 MB, and ... takes at most 40 MB" - a
+// refusal that contradicts itself. Where the two round alike it says "more
+// than" instead.
+export const overCapSentence = (size, cap, pathname) => {
+  const said = mbText(size) === mbText(cap) ? `more than ${mbText(cap)}` : mbText(size);
+  return `the request body is ${said}, and ${pathname} takes at most ${mbText(cap)} - none of it was read`;
+};
+
+// A bind address that only this machine can reach. Anything else - 0.0.0.0,
+// ::, a LAN address, a host name - is reached by names the server cannot
+// list, so the Host rule cannot be applied there (see `guard`).
+const isLoopback = (h) => {
+  const x = String(h ?? '').toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  return x === 'localhost' || x === '::1' || /^127(\.\d{1,3}){3}$/.test(x) || /^::ffff:127(\.\d{1,3}){3}$/.test(x);
+};
+// How a bind address reads in a Host header: an IPv6 literal in brackets.
+const asHostName = (h) => {
+  const x = String(h).toLowerCase();
+  return x.includes(':') && !x.startsWith('[') ? `[${x}]` : x;
+};
+
+/**
+ * Why "Send a fight" is off on a server bound to `host`, or null on a
+ * loopback bind (see the header): the sentence every /api/submit/ route is
+ * refused with there, and that bootstrap hands the page.
+ */
+export function submitOffFor(host) {
+  if (isLoopback(host)) return null;
+  return `Send a fight is off on this server: it listens on ${host}, beyond this machine, where anything on the network could `
+    + 'send fights to the project\'s folder from your address, read the receipts this bench keeps and ask for those fights\' deletion. '
+    + 'Run it on 127.0.0.1 (the default) to send, or use bench submit';
+}
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -29,31 +126,106 @@ const TYPES = {
   '.woff2': 'font/woff2',
 };
 
-function readBody(req) {
+// Reads the whole body. One over `cap` is still read to its end - kept
+// nothing of, just drained - and comes back as {raw: null, size}, so the
+// caller can answer 413 on a connection the client is still listening on. A
+// Content-Length that already says "over" skips the buffering from the first
+// byte.
+function readBody(req, cap) {
   return new Promise((resolvePromise, reject) => {
     let size = 0;
-    const chunks = [];
+    const declared = Number(req.headers['content-length']);
+    let chunks = Number.isFinite(declared) && declared > cap ? null : [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > BODY_CAP) {
-        reject(Object.assign(new Error('request body over 1MB'), { status: 400 }));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
+      if (chunks && size > cap) chunks = null;
+      if (chunks) chunks.push(c);
     });
-    req.on('end', () => resolvePromise(Buffer.concat(chunks)));
+    req.on('end', () => resolvePromise({ raw: chunks ? Buffer.concat(chunks) : null, size }));
     req.on('error', reject);
   });
 }
 
-export async function startServer({ benchRoot, host = '127.0.0.1', port = 0, game = null } = {}) {
-  const api = await createApi({ benchRoot, game });
+/**
+ * The server, bound to `host` (127.0.0.1 by default): every rule above is
+ * that bind's. `listen` is where it actually listens - `host` itself, unless
+ * it is given a loopback address, and nothing wider: ui/lib/check-api.mjs
+ * starts one configured as bound beyond this machine (`host: '0.0.0.0'`)
+ * that listens on 127.0.0.1, to hold every /api/submit/ route to its 403
+ * without a port open to the network.
+ */
+export async function startServer({ benchRoot, host = '127.0.0.1', port = 0, game = null, listen = host } = {}) {
+  if (listen !== host && !isLoopback(listen)) {
+    throw new Error(`startServer: listen is ${listen} - a server listens on its own host, or on loopback alone, never wider`);
+  }
+  const submitOff = submitOffFor(host);
+  const api = await createApi({ benchRoot, game, submitOff });
   const icons = api.icons;
   const webRoot = resolve(benchRoot, 'ui', 'web');
 
+  // Filled in once the port is known (port 0 picks one at listen time).
+  let allowedHosts = null;
+  // A bind beyond loopback (`--host 0.0.0.0`, a LAN address) is reached by
+  // whatever names point at this machine, which the server cannot enumerate,
+  // so there the Host is NOT checked and the Origin is compared with the
+  // request's own Host instead. That still stops an ordinary cross-site page
+  // (its Origin is its own site), but a DNS-rebinding page sends its own name
+  // as both Host and Origin and passes: binding beyond loopback gives that
+  // guard up, which is one more reason `bench ui` warns about such a bind -
+  // and why every /api/submit/ route is refused there (`submitOff`).
+  const openBind = !isLoopback(host);
+
+  const send = (res, status, error, headers = {}) => {
+    res.writeHead(status, { 'content-type': 'application/json', ...headers });
+    res.end(JSON.stringify({ error }));
+  };
+
+  // The checks every /api/ request passes before a route sees it (see the
+  // header). Returns true when it has answered the request itself.
+  function guard(req, res, pathname, method) {
+    const hostHeader = String(req.headers.host ?? '').toLowerCase();
+    if (!openBind && !allowedHosts.has(hostHeader)) {
+      send(res, 403, `this server answers requests addressed to ${[...allowedHosts].join(', ')} - `
+        + `not to ${hostHeader ? `"${hostHeader}"` : 'no host at all'}, which is how a page on another name reaches it`);
+      return true;
+    }
+    // Before the method and the body: nothing of a submit route runs here.
+    if (submitOff && pathname.startsWith('/api/submit/')) {
+      send(res, 403, submitOff);
+      return true;
+    }
+    if (!method) return false;              // no such route: api.handle says 404
+    if (req.method !== method) {
+      send(res, 405, `${pathname} takes ${method}, not ${req.method}`, { allow: method });
+      return true;
+    }
+    if (method !== 'POST') return false;
+    const origin = req.headers.origin;
+    if (origin !== undefined && origin.toLowerCase() !== `http://${hostHeader}`) {
+      send(res, 403, `a page from ${origin} may not call this server - only its own page, http://${hostHeader}, may`);
+      return true;
+    }
+    const type = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+    if (type !== 'application/json') {
+      send(res, 415, `${pathname} takes a JSON body (content-type: application/json), `
+        + `not ${type ? `"${type}"` : 'a body with no content type'}`);
+      return true;
+    }
+    return false;
+  }
+
   async function serveStatic(res, pathname) {
-    const rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname.slice(1));
+    // A malformed %-escape is the request's fault, not a bug: a 400 with a
+    // sentence, where it used to fall through to the 500 "URI malformed".
+    let rel = 'index.html';
+    if (pathname !== '/') {
+      try {
+        rel = decodeURIComponent(pathname.slice(1));
+      } catch {
+        send(res, 400, `bad url: ${pathname} has a %-escape that is not one`);
+        return;
+      }
+    }
     // Resolve and re-check the prefix: the resolved path must stay under
     // web/, or a ../ walks out of the tree.
     const path = resolve(webRoot, rel);
@@ -77,7 +249,9 @@ export async function startServer({ benchRoot, host = '127.0.0.1', port = 0, gam
   const server = http.createServer(async (req, res) => {
     let pathname, searchParams;
     try {
-      ({ pathname, searchParams } = new URL(req.url, `http://${host}`));
+      // A fixed base, not the bind address: only the path and query are read,
+      // and `http://${host}` is not a URL at all for an IPv6 bind (`::`).
+      ({ pathname, searchParams } = new URL(req.url, 'http://localhost'));
     } catch {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'bad url' }));
@@ -85,15 +259,28 @@ export async function startServer({ benchRoot, host = '127.0.0.1', port = 0, gam
     }
     try {
       let body;
-      if (req.method === 'POST') {
-        const raw = await readBody(req);
-        try {
-          body = raw.length ? JSON.parse(raw.toString('utf8')) : {};
-        } catch {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'body is not JSON' }));
-          return;
+      if (pathname.startsWith('/api/')) {
+        const method = api.routeMethod(pathname);
+        if (guard(req, res, pathname, method)) return;
+        if (method === 'POST') {
+          const cap = bodyCapFor(pathname);
+          const { raw, size } = await readBody(req, cap);
+          if (!raw) {
+            send(res, 413, overCapSentence(size, cap, pathname));
+            return;
+          }
+          try {
+            body = raw.length ? JSON.parse(raw.toString('utf8')) : {};
+          } catch {
+            send(res, 400, 'body is not JSON');
+            return;
+          }
         }
+      } else if (req.method !== 'GET' && req.method !== 'HEAD') {
+        // Icons and static files are only ever read. A POST here used to be
+        // buffered and then answered with the file as if it were a GET.
+        send(res, 405, `${pathname} is a file and takes GET, not ${req.method}`, { allow: 'GET, HEAD' });
+        return;
       }
       if (api.handle(req, res, pathname, searchParams, body)) return;
       if (await icons.handle(req, res, pathname, searchParams)) return;
@@ -118,14 +305,21 @@ export async function startServer({ benchRoot, host = '127.0.0.1', port = 0, gam
 
   await new Promise((resolvePromise, reject) => {
     server.once('error', reject);
-    server.listen(port, host, resolvePromise);
+    server.listen(port, listen, resolvePromise);
   });
 
+  const bound = server.address().port;
+  allowedHosts = new Set(['127.0.0.1', 'localhost', '[::1]', ...(isLoopback(host) ? [asHostName(host)] : [])]
+    .map((h) => `${h}:${bound}`));
+
   return {
-    port: server.address().port,
+    port: bound,
     // The "not the accepted build" sentence, or null - for whoever prints the
     // startup banner (this file's own main, and `bench ui`).
     notice: api.notice ?? null,
+    // Why "Send a fight" is off on this bind, or null on loopback - for the
+    // same banner, which should say what such a bind gives up.
+    submitOff,
     close: () => new Promise((resolvePromise) => {
       api.close();
       for (const s of sockets) s.destroy();
@@ -176,23 +370,29 @@ if (isMain) {
       '  --game <path>   your Farever install, if it is not auto-detected',
       '  --host H        bind address (default 127.0.0.1, this machine only)',
       '',
-      'Everything is read from your own copy of the game and nothing is sent',
-      'anywhere; the server listens on localhost only unless you say otherwise.',
+      'Everything is read from your own copy of the game, and nothing is sent',
+      'anywhere but on two clicks you make in the "Send a fight" dialog:',
+      'Send uploads the fight it previewed to the project\'s pCloud folder,',
+      'and Delete uploads a request to delete one you sent to the same folder.',
+      'The server listens on localhost only unless you say otherwise - and on',
+      'any other --host, "Send a fight" is off.',
     ].join('\n'));
     process.exit(0);
   }
   const port = parseInt(flag('--port') ?? '', 10);
   const benchRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+  const host = flag('--host') ?? '127.0.0.1';
   startServer({
     benchRoot,
     port: Number.isFinite(port) && port > 0 ? port : 0,
-    host: flag('--host') ?? '127.0.0.1',
+    host,
     game: flag('--game'),
   })
-    .then(({ port: p, notice }) => {
+    .then(({ port: p, notice, submitOff }) => {
       const url = `http://127.0.0.1:${p}/`;
       console.log(`farever-bench ui on ${url}`);
       if (notice) console.log(`  warning: ${notice}`);
+      if (submitOff) console.log(`  warning: bound to ${host}, so anything that can reach this machine can use this UI. ${submitOff}.`);
       if (args.includes('--open')) openBrowser(url);
       else console.log('  (--open launches your browser for you)');
       console.log('  press Ctrl+C to stop');

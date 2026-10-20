@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Blaakan/farever-bench/master/docs/schema/character-sheet.v1.json",
+  "title": "farever-character-sheet v1",
+  "description": "A Farever character as an in-game exporter reads it: class, level, the gear worn, talents, skill picks, runes, weapon-skill ranks, and what was observed. Ids are CastleDB row ids from the game's data.cdb. One rule for presence holds at every depth: an ABSENT key is not recorded (the bench leaves the choice open and names it as a gap); null, [] or {} is recorded as none; a path listed in `unreadable` is what the exporter tried and could not read. This schema describes a clean sheet; the bench's reader (bench import) is more forgiving and names every departure. See docs/CHARACTER-SHEET.md.",
+  "type": "object",
+  "required": ["format", "version", "character", "gear"],
+  "properties": {
+    "format": { "const": "farever-character-sheet" },
+    "version": { "const": 1, "description": "The format version. A bench that reads version 1 refuses a higher one with a sentence." },
+    "source": {
+      "description": "Provenance. Every field optional; carried and printed, never priced.",
+      "type": "object",
+      "properties": {
+        "exporter": { "type": "string", "description": "The exporter's name." },
+        "exporterVersion": { "type": "string" },
+        "writtenAt": { "type": "string", "description": "When the sheet was written, ISO-8601 (2026-10-19T12:34:56Z)." },
+        "gameVersion": { "type": "string", "description": "The game's own version string (Config.getVersion())." },
+        "steamBuild": { "type": "string", "pattern": "^[0-9]+$", "description": "The Steam build id the game ran as (buildid in steamapps/appmanifest_3672400.acf)." },
+        "bootSha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "sha256 of the hlboot.dat the game ran from. SHOULD be written when the exporter can hash it: it is the build identity the bench compares with its own install." }
+      },
+      "additionalProperties": false
+    },
+    "character": {
+      "type": "object",
+      "required": ["class", "level"],
+      "properties": {
+        "name": { "type": "string", "description": "The hero's name. Optional; replaced by a pseudonym before an upload unless the player keeps it." },
+        "class": { "type": "string", "minLength": 1, "description": "The unit id (Warrior, Rogue, Mage, Priest - what ent.Unit.kind holds) or the aptitude id (Fighter, Assassin, Wizard, Cleric), in any case." },
+        "level": { "type": "integer", "minimum": 1, "description": "The character level, 1 to the game's MaxLevel (25 on build 25959898)." }
+      },
+      "additionalProperties": false
+    },
+    "gear": {
+      "description": "The equipment, keyed by slot id. A combat slot that is absent is not recorded; one that is null is empty. Keys without the Slot_ prefix (Weapon1, FingerLeft) are read with a note; non-combat slot ids (Slot_Mount, Slot_Glider, tools, bags, consumables) are named and ignored.",
+      "type": "object",
+      "properties": {
+        "Slot_Weapon1": { "$ref": "#/$defs/slot" },
+        "Slot_Weapon2": { "$ref": "#/$defs/slot" },
+        "Slot_OffhandWeapon": { "$ref": "#/$defs/slot" },
+        "Slot_Head": { "$ref": "#/$defs/slot" },
+        "Slot_Neck": { "$ref": "#/$defs/slot" },
+        "Slot_Shoulders": { "$ref": "#/$defs/slot" },
+        "Slot_Chest": { "$ref": "#/$defs/slot" },
+        "Slot_Back": { "$ref": "#/$defs/slot" },
+        "Slot_Hands": { "$ref": "#/$defs/slot" },
+        "Slot_Waist": { "$ref": "#/$defs/slot" },
+        "Slot_Legs": { "$ref": "#/$defs/slot" },
+        "Slot_Feet": { "$ref": "#/$defs/slot" },
+        "Slot_FingerLeft": { "$ref": "#/$defs/slot" },
+        "Slot_Trinket": { "$ref": "#/$defs/slot" },
+        "Slot_FingerRight": { "$ref": "#/$defs/slot" }
+      },
+      "propertyNames": { "pattern": "^(Slot_)?[A-Za-z0-9]+$" },
+      "additionalProperties": { "$ref": "#/$defs/slot" }
+    },
+    "talents": {
+      "description": "Talent points SPENT: {talent node skill id: points}. A node a socketed DemonSigil grants costs no point and is left out (listed at 1 it is accepted and normalised away). {} = no point spent.",
+      "type": ["object", "null"],
+      "additionalProperties": { "type": "integer", "minimum": 1 }
+    },
+    "weaponSkills": {
+      "description": "Arsenal picks. Keyed by Slot_Weapon2, or by a weapon item id (a dump of HeroSpecialization.arsenals). Applied only to the weapon worn in Slot_Weapon2; entries keyed by the main-hand or offhand weapon's id, or by an unworn weapon's, are dormant and ignored with a note. The slot key Slot_Weapon1 is the main hand's own pick, read at level 1 where the hand holds one of its two skills (from level 2 it holds every one, and a list naming them all is read for its order only).",
+      "type": ["object", "null"],
+      "additionalProperties": { "$ref": "#/$defs/skillList" }
+    },
+    "classSkills": {
+      "description": "Class skill bars, keyed by the game's skill type id.",
+      "type": ["object", "null"],
+      "properties": {
+        "ClassSkill": { "$ref": "#/$defs/skillList", "description": "HeroSpecialization.skillSlots, positional; null is an empty position." },
+        "MageConduit": { "$ref": "#/$defs/skillList", "description": "The conduits in slot order; the same id may appear more than once." },
+        "PriestPrayer": { "$ref": "#/$defs/skillList", "description": "The prayer sequence." },
+        "RoguePoison": { "$ref": "#/$defs/skillList", "description": "Reserved: no class has a poison pool on build 25959898, so it is named and ignored." }
+      },
+      "additionalProperties": false
+    },
+    "runes": {
+      "description": "The slotted runes. Recommended: a list of rune (mastery) ids, as HeroSpecialization.skillMasteries holds them - each rune's host skill is found in data. Also accepted: {host skill id: rune id}. [] or {} = no rune slotted.",
+      "oneOf": [
+        { "type": "null" },
+        { "type": "array", "items": { "type": ["string", "null"] } },
+        { "type": "object", "additionalProperties": { "type": ["string", "null"] } }
+      ]
+    },
+    "weaponSkillRanks": {
+      "description": "Weapon mastery per skill: {skill id: rank} with rank an integer or {rank: integer}, as Progress.getWeaponSkillRank reports it. Write every rankable skill (AttackCombo, WeaponSkill, WeaponSubSkill, WeaponPassive) of every weapon worn; a held skill missing from the map reads rank 1, the game's own default.",
+      "type": ["object", "null"],
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "integer", "minimum": 1 },
+          {
+            "type": "object",
+            "required": ["rank"],
+            "properties": { "rank": { "type": "integer", "minimum": 1 } },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "buffs": {
+      "description": "Statuses active on the hero when the sheet was written. Printed and carried; not priced in v1.",
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "if": { "properties": { "id": { "const": "ItemStatus" } }, "required": ["id"] },
+        "then": { "required": ["item"] },
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "description": "The status's skill row id (status.inf.id)." },
+          "item": { "type": "string", "minLength": 1, "description": "The item that applied it. Required when id is ItemStatus, the status many consumables share (48 items apply it on build 25959898); write it for any other status whenever it is known." },
+          "stacks": { "type": "number", "minimum": 0 },
+          "remaining": { "type": "number", "description": "Seconds left; -1 for a status with no end." }
+        },
+        "additionalProperties": false
+      }
+    },
+    "stats": {
+      "description": "The hero's attributes as the game holds them: {attribute id: raw, unrounded value} - never the text the character panel prints. Printed and carried; not compared in v1.",
+      "type": ["object", "null"],
+      "additionalProperties": { "type": "number" }
+    },
+    "unreadable": {
+      "description": "Dotted paths the exporter tried to read and could not, e.g. gear.Slot_Neck.infusion or talents. Each is named as a gap, and the field is read as absent.",
+      "type": ["array", "null"],
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)*$" }
+    },
+    "x": { "type": "object", "description": "The exporter's own data, carried and never read." }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "slot": {
+      "oneOf": [
+        { "type": "null", "description": "An empty slot." },
+        { "$ref": "#/$defs/gearEntry" }
+      ]
+    },
+    "gearEntry": {
+      "description": "One worn item instance (st.item.Gear).",
+      "type": "object",
+      "required": ["item"],
+      "properties": {
+        "item": { "type": "string", "minLength": 1, "description": "The item id." },
+        "level": { "type": ["integer", "null"], "minimum": 0, "description": "The instance level, Gear.level - NOT the item level. 0, null or absent: the row's own level (the game stores 0 on crafted pieces and jewellery)." },
+        "upgrade": { "type": ["integer", "null"], "minimum": 0, "description": "Upgrade stars, Gear.upgradeLevel. null = recorded as none, 0 stars." },
+        "rarity": { "type": "string", "minLength": 1, "description": "A rarity id (Common, Uncommon, Rare, Epic, Legendary). On a weapon the ROLLED rarity (Weapon.rarity) - write it on every weapon. On anything else optional, and it must be the row's own." },
+        "flawless": { "type": "boolean", "description": "Item.flags bit 0." },
+        "prismatic": { "type": "boolean", "description": "Item.flags bit 1." },
+        "infusion": { "type": ["string", "null"], "description": "The InfusionPassive skill id infused into the piece (Gear.infusion); null = not infused." },
+        "infusionStat": { "type": ["string", "null"], "description": "The rating the infusion bonus rolled (Gear.infusionBonusStat): CritChanceRating, FervorRating, ArmorPenetrationRating or SpellPenetrationRating." },
+        "infusionBonusStat": { "type": ["string", "null"], "description": "The game's own name for infusionStat, accepted with a note." },
+        "sockets": {
+          "description": "The augment item ids socketed (Gear.slots). Order and nulls are ignored: each augment's own augmentType picks the socket. [] = nothing socketed.",
+          "type": ["array", "null"],
+          "items": { "type": ["string", "null"] }
+        },
+        "iLevel": { "type": "number", "description": "OBSERVED only: Gear.getILevel(). Compared with the bench's own reading of the same piece; never priced." },
+        "x": { "type": "object", "description": "The exporter's own data, carried and never read." }
+      },
+      "additionalProperties": false
+    },
+    "skillList": {
+      "type": ["array", "null"],
+      "items": { "type": ["string", "null"] }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "format": "farever-character-sheet",
+  "version": 1,
+  "character": {
+    "class": "Warrior",
+    "level": 25
+  },
+  "gear": {
+    "Slot_Weapon1": {
+      "item": "GS_Nova"
+    }
+  }
+}

@@ -30,6 +30,13 @@ export const FLAGS = {
   help: one, h: { alias: 'help' }, version: one, V: { alias: 'version' },
   class: one, level: one, game: one, build: one, json: one, verbose: one,
   questlog: one, 'questlog-build': one,
+  // a build read from a file another program wrote (charsheet.mjs), and
+  // `bench import`'s answer for an exporter's author
+  import: one, check: one,
+  // `bench submit`, and no other command: a fight packed for the project
+  // (src/submit.mjs), saved, sent, sent again as itself, or its deletion
+  // asked for
+  log: one, summary: one, note: one, 'keep-name': one, zip: one, send: one, receipt: one, delete: one,
   // the build
   pin: many, 'no-augment': many, skills: many, rune: many, talent: many, 'talent-points': one,
   stars: one, rarity: one, 'rarity-cap': one, 'no-rarity-roll': one, drops: one,

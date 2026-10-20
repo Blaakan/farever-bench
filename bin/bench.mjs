@@ -10,14 +10,39 @@
 // with the best legal combination it can find.
 //
 // Nothing here touches the game process or any file inside the install
-// directory. The network is reached in exactly one case: you handed it a
-// questlog.gg link, which is fetched, translated into pins, and then treated
-// as if you had typed them.
+// directory. The network is reached in two cases, each one you asked for in
+// so many words: you handed it a questlog.gg link, which is fetched,
+// translated into pins, and then treated as if you had typed them; or you
+// sent a fight to the project yourself (`bench submit --send`, or the UI's
+// Send button), which uploads that one bundle to the project's pCloud
+// folder, only on that explicit action - or asked for the deletion of one
+// you sent (`bench submit --delete <receipt>`, or the UI's Delete), which
+// uploads that request to the same folder.
 // ---------------------------------------------------------------------------
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
+// A build or a fight written by another program (--import, `bench import`).
+import { basename } from 'node:path';
+import {
+  readSheet, recordedSheet, pinnedSheet, reportItems as sheetReportItems, SheetError, detectSheetDialect, logClass, benchVersion,
+  dumpClassFromLog, classVouch,
+} from '../src/charsheet.mjs';
+import { logReportItems, detectLogDialect, CombatLogError, DIFFICULTIES, MAX_LOG_BYTES } from '../src/combatlog.mjs';
+import { combatLogOf, readCombatLogAt, winkCompanion } from '../src/capture.mjs';
+// One fight sent to the project (`bench submit`): packed, shown, saved, sent,
+// and its deletion asked for, by src/submit.mjs, the module the UI's Send
+// dialog calls too.
+import {
+  buildSubmission, reportItems as submitReportItems, sendRefusal, pendingReceipt, sendSubmission, deleteSubmission,
+  receiptText, parseReceipt, uploadLink,
+} from '../src/submit.mjs';
+import { SubmissionError } from '../src/submission-public.mjs';
+import { unlinkSync, chmodSync } from 'node:fs';
+// What --zip may write over (a bundle the bench saved).
+import { readZipDirectory, zipEntryProblem, MAX_ZIP_BYTES } from '../src/submission-public.mjs';
+import { resolve as resolvePath, dirname } from 'node:path';
 import { createEngine, GOALS, FERVOR_SCOPES, TICK_SOURCES } from '../src/engine.mjs';
 import { emptyLoadout, classOf } from '../src/loadout.mjs';
 import { optimize, rankSlot } from '../src/optimize.mjs';
@@ -52,9 +77,10 @@ import { FLAGS, REPEATABLE, nearestFlags } from '../src/flags.mjs';
 // number and ui/api.mjs reads the same file, so a bump cannot leave the CLI
 // printing a version nobody can file a bug against. package.json ships in
 // every layout the bench runs from: the repo, the zip, and the exe's
-// resources/bench (ui/package.json extraResources).
-export const VERSION = JSON.parse(
-  readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+// resources/bench (ui/package.json extraResources). Read by charsheet.mjs
+// benchVersion, the one reader a sheet's exporterVersion and a submission's
+// manifest are written from too, so the version a bundle names is this one.
+export const VERSION = benchVersion();
 
 // --- argument parsing ------------------------------------------------------
 
@@ -164,6 +190,113 @@ function resolveInfusion(cat, input) {
   die(`unknown infusion "${input}".\nKnown: ${listed(ids)}`);
 }
 
+// The talent nodes this build's socketed DemonSigils hand over: free, and
+// outside the tree's point thresholds (talents.mjs illegalAllocation). Read
+// off the augments, which are the durable record - the same read as
+// ui/view.mjs grantedNodes, which this file does not import (a copy of the
+// bench shipped without ui/ still runs every command but `ui`).
+function sigilGranted(engine, loadout) {
+  const tree = engine.talents.treeFor(loadout.class);
+  const granted = new Set();
+  for (const [key, augId] of Object.entries(loadout.augments ?? {})) {
+    if (!augId || !key.endsWith('/AugmentDemonSigil')) continue;
+    for (const sk of engine.cat.itemById.get(augId)?.skills ?? []) if (tree.byId.has(sk)) granted.add(sk);
+  }
+  return granted;
+}
+
+// The commands whose search chooses a talent tree when none is held (both
+// run optimize() with the pins applyPins returns). sheet and rank price the
+// loadout's tree as it stands.
+const TALENT_SEARCH = new Set(['optimize', 'rotation']);
+
+// --- what a saved or imported build holds: the pins applyPins starts from --
+//
+// A saved envelope (--build) records what was held fixed. Re-reading it
+// re-pins the same things, so `optimize --json x` then `optimize --build x`
+// reproduces the run rather than quietly re-opening every slot the user had
+// fixed. Any --pin (--skills, --rune) on the command line replaces the saved
+// set outright, because merging two pin sets silently is how a user ends up
+// unable to unpin.
+//
+// An IMPORTED build (--import) is the other case, and merges. Its pins are
+// not a run's choices to start over from but what a character WEARS - the
+// slots, sockets, pools, rune slots and talent tree the file recorded - and a
+// typed --pin is "this character, with that changed": it wins for the slot it
+// names and leaves every other recorded slot held, the way a typed pin wins
+// over a questlog link. A typed pin replaces the PIECE, so what was held of
+// the piece it replaced goes with it (`replaced`), and a pool the file
+// recorded is held only while it still holds what the file recorded
+// (`notePicks` before the pools are pruned, `keeps` after).
+//
+// Fills the gear, augment and infusion sets it is handed; returns the rest
+// of what applyPins asks of the file, in its order.
+function mergeImportedPins(engine, saved, args, { pinnedGear, pinnedAug, pinnedInfusion }) {
+  const slotIds = engine.cat.combatSlots().map((s) => s.id);
+  const savedPins = saved?.envelope?.pinned ?? null;
+  const imported = saved?.imported ? savedPins : null;
+  const merges = (flag) => !!savedPins && (!!imported || !(args.repeated[flag] ?? []).length);
+  if (merges('pin')) {
+    for (const slot of savedPins.gear ?? []) if (slotIds.includes(slot)) pinnedGear.add(slot);
+    for (const key of savedPins.augments ?? []) pinnedAug.add(key);
+    for (const slot of savedPins.infusions ?? []) if (slotIds.includes(slot)) pinnedInfusion.add(slot);
+  }
+  let picks = null;
+  return {
+    skills: merges('skills') ? (savedPins.skills ?? []) : [],
+    talents: savedPins?.talents === true,
+    // An imported piece a typed pin replaced: its infusion and its sockets
+    // were that piece's, and are no longer held.
+    replaced(loadout, slot, nextItem, infusionTyped) {
+      if (!imported || !(imported.gear ?? []).includes(slot)) return;
+      if (!infusionTyped && (imported.infusions ?? []).includes(slot)) pinnedInfusion.delete(slot);
+      if (nextItem != null && nextItem === saved.loadout.gear?.[slot]?.item) return;
+      for (const key of imported.augments ?? []) {
+        if (!key.startsWith(`${slot}/`)) continue;
+        pinnedAug.delete(key);
+        delete loadout.augments[key];
+      }
+    },
+    // The tree the file recorded, held as it was - asked again here, because
+    // a typed --level or a --pin that took a sigil away can make a tree that
+    // was legal in the file one this build cannot hold. Then it is not held,
+    // and the sentence says what becomes of it: a command that searches the
+    // tree chooses another; one that searches nothing (sheet, rank) prices
+    // the tree as the file recorded it, and must not say it was set aside
+    // while the page still prices it.
+    holdsTree(loadout) {
+      const bad = engine.talents.illegalAllocation(loadout.class, loadout.talents ?? {}, {
+        level: loadout.level,
+        points: engine.talents.pointsAt(loadout.level, null),
+        granted: sigilGranted(engine, loadout),
+      });
+      if (!bad) return true;
+      console.error(f.warn(TALENT_SEARCH.has(args._[0])
+        ? `note: the talents ${saved.path} recorded are not held - this build cannot hold them as they are (${bad}); the search chooses the tree`
+        : `note: the talents ${saved.path} recorded are priced as recorded, although this build cannot hold them as they are: ${bad}`));
+      return false;
+    },
+    // What an imported pool held before the pools are pruned to this build:
+    // a typed --pin that changed the weapon changes its pool, and a pick the
+    // prune refilled is not the one the file recorded.
+    notePicks(loadout) {
+      if (imported) picks = new Map((savedPins.skills ?? []).map((key) => [key, JSON.stringify(loadout.skills[key] ?? null)]));
+    },
+    keeps(loadout, key, typed) {
+      return !picks || typed.has(key) || JSON.stringify(loadout.skills[key]) === picks.get(key);
+    },
+    // The rune slots the file recorded - a rune, or held empty - on the
+    // skills this build still holds. A typed --rune replaces the saved set
+    // (--build) or wins for its own skill (--import).
+    runeHosts(loadout) {
+      if (!savedPins?.runes?.length || !merges('rune')) return [];
+      const hosts = new Set(engine.talents.runePools(loadout).map((p) => p.skill));
+      return savedPins.runes.filter((host) => hosts.has(host));
+    },
+  };
+}
+// --- end of what a saved or imported build holds ------------------------------
+
 function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
   const { cat } = engine;
   const slotIds = cat.combatSlots().map((s) => s.id);
@@ -173,20 +306,16 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
   // Slots whose infusion the user stated - `~something` or `~none`. A pin
   // without a `~` part fixes the item and leaves its infusion to the search.
   const pinnedInfusion = new Set();
+  // What each typed --pin stated of its piece beyond the item: the parts of
+  // the grammar below that were written, so `bench submit` sends what was
+  // typed and not the defaults the bench prices an unstated part at.
+  const typedPieces = new Map();
   const augPins = [];
 
-  // A saved envelope records what was held fixed. Re-reading it re-pins the
-  // same things, so `optimize --json x` then `optimize --build x` reproduces
-  // the run rather than quietly re-opening every slot the user had fixed.
-  // Any --pin on the command line replaces the saved set outright, because
-  // merging two pin sets silently is how a user ends up unable to unpin.
-  const savedPins = saved?.envelope?.pinned ?? null;
-  if (savedPins && !(args.repeated.pin ?? []).length) {
-    for (const slot of savedPins.gear ?? []) if (slotIds.includes(slot)) pinnedGear.add(slot);
-    for (const key of savedPins.augments ?? []) pinnedAug.add(key);
-    for (const slot of savedPins.infusions ?? []) if (slotIds.includes(slot)) pinnedInfusion.add(slot);
-  }
-  const savedSkillPins = savedPins && !(args.repeated.skills ?? []).length ? (savedPins.skills ?? []) : [];
+  // What a saved envelope (--build) or an imported sheet (--import) holds:
+  // replaced by what is typed, or merged with it (mergeImportedPins).
+  const held = mergeImportedPins(engine, saved, args, { pinnedGear, pinnedAug, pinnedInfusion });
+  const savedSkillPins = held.skills;
 
   for (const spec of args.repeated.pin ?? []) {
     if (spec === true) die('--pin needs a value, e.g. --pin chest=Chest_RManfish_Cle');
@@ -205,7 +334,7 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
 
     const slot = resolve(lhs, slotIds, 'slot');
     pinnedGear.add(slot);
-    if (/^(none|empty|-)$/i.test(rhs)) { delete loadout.gear[slot]; continue; }
+    if (/^(none|empty|-)$/i.test(rhs)) { delete loadout.gear[slot]; typedPieces.delete(slot); held.replaced(loadout, slot, null, false); continue; }
 
     // item [ ^instanceLevel ] [ @rarity ] [ *stars ] [ +generic ] [ ~infusion[/stat][!] ]
     // The infusion part is split off first: the item group below takes
@@ -320,6 +449,12 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
       }
     }
     loadout.gear[slot] = { item: itemId, rarity, stars: capped, level: instanceLevel, generic, ...inf };
+    // (The Prismatic flag is not a part of its own here: it is stated with the
+    // infusion, `~` with or without its `!`, and charsheet.mjs pinnedSheet
+    // writes it from the infusion's pin - the one rule the editor's build
+    // goes by too.)
+    typedPieces.set(slot, { level: m[2] != null, rarity: m[3] != null, stars: m[4] != null });
+    held.replaced(loadout, slot, itemId, infPart != null);
   }
 
   // --no-augment <slot> pins every socket that slot can have to empty. Applied
@@ -381,13 +516,20 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
       if (!Number.isFinite(rank) || rank < 1) die(`--talent "${spec}": rank must be a positive number`);
       loadout.talents[node] = rank;
     }
+    // A node a socketed DemonSigil hands over costs no point and stands
+    // outside the branch thresholds. Checked against no grant at all, a
+    // questlog build or a saved envelope holding a sigil (optimize writes
+    // the sigil's node into the talents it returns) was refused as a tier-4
+    // node with no points under it.
     const bad = engine.talents.illegalAllocation(loadout.class, loadout.talents, {
       level: loadout.level,
       points: engine.talents.pointsAt(loadout.level, null),
-      granted: new Set(),
+      granted: sigilGranted(engine, loadout),
     });
     if (bad) die(`--talent: ${bad}`);
     pinnedTalents = true;
+  } else if (held.talents) {
+    pinnedTalents = held.holdsTree(loadout);   // the tree a saved or imported build recorded
   }
 
   // --skills weapon1=Sword_Swarm_Skill1,Sword_Swarm_Passive
@@ -396,6 +538,7 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
   // Left alone, the search picks; named here, it is fixed.
   const pinnedSkills = new Set();
   loadout.skills ??= {};
+  held.notePicks(loadout);
   engine.plan.pruneSelection(loadout);
   for (const spec of args.repeated.skills ?? []) {
     if (spec === true) die('--skills needs a value, e.g. --skills weapon1=Skill1,Passive');
@@ -425,14 +568,16 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
     loadout.skills[pool.key] = picks;
     pinnedSkills.add(pool.key);
   }
-  // Saved skill pins hold whatever the file already put in `loadout.skills`.
-  for (const key of savedSkillPins) if (loadout.skills[key]?.length) pinnedSkills.add(key);
+  // Saved skill pins hold whatever the file already put in `loadout.skills`
+  // - an imported one only while it still holds what the file recorded.
+  for (const key of savedSkillPins) if (loadout.skills[key]?.length && held.keeps(loadout, key, pinnedSkills)) pinnedSkills.add(key);
 
   // --- runes, one pool at a time -------------------------------------------
   // `--rune <skill>=<rune>`. The pool is named by the skill that owns it, which
   // is how `runePools` keys them, and every other slot stays searchable.
   const pinnedRunes = new Set();
   loadout.runes ??= {};
+  for (const host of held.runeHosts(loadout)) pinnedRunes.add(host);
   for (const spec of args.repeated.rune ?? []) {
     if (spec === true) die('--rune needs a value, e.g. --rune Warrior_Charge=Warrior_Charge_M1');
     const eq = String(spec).indexOf('=');
@@ -447,7 +592,7 @@ function applyPins(engine, loadout, args, { stars, rarityRoll, saved = null }) {
     pinnedRunes.add(skill);
   }
 
-  return { pinnedGear, pinnedAug, pinnedSkills, pinnedRunes, pinnedTalents, pinnedInfusion };
+  return { pinnedGear, pinnedAug, pinnedSkills, pinnedRunes, pinnedTalents, pinnedInfusion, typedPieces };
 }
 
 function parseWeights(args) {
@@ -498,6 +643,7 @@ const DEFAULT_LOOKAHEAD = 8;
 export const ENVELOPE_KEYS = ['goal', 'weights', 'target', 'fervorScope', 'tickSource', 'stars', 'rank', 'level', 'mix'];
 
 function readBuildFile(args) {
+  if (args.flags.import != null) return readImport(args);
   if (typeof args.flags.build !== 'string') return null;
   let raw;
   try { raw = JSON.parse(readFileSync(args.flags.build, 'utf8')); } catch (e) {
@@ -514,6 +660,454 @@ function readBuildFile(args) {
   }
   return { envelope: isEnvelope ? raw : null, loadout, path: args.flags.build };
 }
+
+// --- an imported build -------------------------------------------------------
+//
+// `--import <file>` is a BUILD SOURCE beside --build, and reads what --build
+// cannot: a character sheet another program wrote (docs/CHARACTER-SHEET.md),
+// a modkit inventory dump, and the bench's own two shapes - all through ONE
+// reader (src/charsheet.mjs), the one behind the UI's Import button and
+// `bench import`, so the page and the command line cannot come to disagree
+// about what a file said.
+//
+// It hands commonSetup what readBuildFile hands it for a --build file, with
+// the reader's whole result beside it (`imported`): the loadout, and an
+// envelope whose `pinned` is what the file RECORDED - every slot, socket,
+// pool, rune slot and talent tree it said something about, held empty
+// included - so a recorded choice is held and an unrecorded one is left to
+// the search (applyPins merges it with what is typed). A weapon-skill rank
+// the file records is the default rank; a saved build's own settings (goal,
+// target, fight, stars...) are the defaults, as they are for --build.
+//
+// It is NOT turned into --pin strings, which is how a questlog link travels:
+// the pin grammar has no word for a Flawless piece, a talent tree recorded
+// empty or the rank, and a sigil's free node re-typed as --talent was
+// refused as an illegal tree. And the ids are checked against the install
+// the command runs on (--game), not whichever one a bare engine would find.
+//
+// Settings an import does not take from a saved build: its pins, rank and
+// level (the reader's own reading of them stands in), the hashes and version
+// it was written under (the reader reports another game build itself), and a
+// rotation or a stat profile - charsheet.mjs reads the BUILD, and --build is
+// the flag that replays a run.
+const NOT_IMPORTED = new Set(['pinned', 'rank', 'level', 'cdbSha', 'bootSha', 'version', 'rotation', 'profile', 'profileValues']);
+
+// The level a file records of its own, by its shape - null for a shape that
+// carries none (a modkit dump), which is when a typed --level is the file's
+// level rather than a re-levelling of it.
+function ownLevel(parsed) {
+  const dialect = detectSheetDialect(parsed);
+  return dialect === 'farever-character-sheet' ? (parsed.character?.level ?? null)
+    : dialect === 'bench-envelope' ? (parsed.build?.level ?? parsed.level ?? null)
+      : dialect === 'bench-loadout' ? (parsed.level ?? null) : null;
+}
+
+// The most the bench reads of one file another program wrote is
+// combatlog.mjs's own guard on one fight's log (64 MB). No character sheet,
+// saved build or inventory dump comes near it - an optimize envelope is a
+// quarter of a megabyte - and a file far past it cannot even be made a
+// string: a 1.8 GB bench-probe capture handed to `bench import` died on V8's
+// "Cannot create a string longer than ..." instead of a sentence. Asked of
+// the file's size before a byte is read; null when it is within reach (a
+// file that cannot be stat'ed is left to the read, which says why).
+function oversizedImport(path) {
+  let st;
+  try { st = statSync(path); } catch { return null; }
+  if (!st.isFile() || st.size <= MAX_LOG_BYTES) return null;
+  const mb = (n) => `${Math.round(n / 1024 / 1024).toLocaleString('en-US')} MB`;
+  return `${path} is ${mb(st.size)}, and no character sheet, saved build or one fight's combat log is near that `
+    + `(the bench reads ${mb(MAX_LOG_BYTES)} of one at most)`
+    + (/\.csv$/i.test(path) ? `. A bench-probe capture is read by bench verify --capture ${path}` : '');
+}
+
+// The engine a file another program wrote is read against: the install the
+// command runs on (--game) and the class-skill bar's size (--class-skills),
+// which decides how many picks a sheet's bar keeps. One place for --import,
+// `bench import` and `bench submit`.
+function engineOptions(args) {
+  return {
+    quiet: true,
+    game: typeof args.flags.game === 'string' ? args.flags.game : undefined,
+    classSkillSlots: args.flags['class-skills'] != null && args.flags['class-skills'] !== true
+      ? Number(args.flags['class-skills']) : undefined,
+  };
+}
+
+// The sheet inside what `bench import <sheet> --json` wrote - {kind: 'sheet',
+// sourceFormat, sheet, report} - or null for any other file. That file is the
+// sheet as the bench read it with the report beside it, and given back to
+// --import or `bench import` it is read as that sheet.
+function reportedSheet(parsed) {
+  if (parsed == null || typeof parsed !== 'object' || parsed.kind !== 'sheet' || parsed.character !== undefined) return null;
+  return detectSheetDialect(parsed.sheet) ? parsed.sheet : null;
+}
+
+// A report line the reader is warned of: the readers say so themselves, as
+// `warn: true` on the item (charsheet.mjs reportItems, combatlog.mjs
+// logReportItems, and submit.mjs reportItems, which carries it onto the
+// readers' lines it nests) - never told here by a list of kinds, nor by the
+// line's first word. The UI's Import and Send dialogs mark by the same flag.
+const warnedLine = (item) => item?.warn === true;
+
+// --- a modkit dump beside a combat log: the class the log names --------------
+// A modkit inventory dump records no class, and charsheet.mjs refuses it
+// without one. A combat log of the same character names it - its header's
+// character.class, or Wink's summary meClass - and `bench verify --capture
+// <log>` priced that character's dump on it, then refused the very same dump
+// given by --import. So a dump read beside a log of its own character takes
+// the log's class when its weapons fit it, and the report says so; a typed
+// --class still wins. When the log gives it is charsheet.mjs
+// dumpClassFromLog's to say - the rule `bench submit` and the UI's Send read
+// a dump beside a log by (src/submit.mjs buildSubmission) - and this only
+// reads the log and says it in the command line's words.
+// The unit ids a player can be: the game's classes. Handed to the combat-log
+// reader (capture.mjs combatLogOf) wherever an engine is at hand, so a party
+// member of a class the log itself never names is still read as a player.
+const heroKindsOf = (engine) => engine.cat.classes.map((c) => c.unit);
+function dumpClassBeside(engine, refusal, logPath) {
+  if (typeof logPath !== 'string') return null;
+  let log = null;
+  try { log = combatLogOf(logPath, { heroKinds: heroKindsOf(engine) })?.log ?? null; } catch (e) {
+    if (e instanceof CombatLogError) return null;
+    throw e;
+  }
+  const unit = dumpClassFromLog(engine.cat, refusal, log);
+  return unit
+    ? { unit, said: `a modkit dump names no class: it is read as a ${unit}, the class ${logPath} gives its character ${log.handle} (--class says otherwise)` }
+    : null;
+}
+// --- end of a modkit dump beside a combat log -----------------------------------
+
+function readImport(args) {
+  if (args.importedBuild !== undefined) return args.importedBuild;
+  const path = args.flags.import;
+  if (path === true || path === '') {
+    die('--import needs a file: a character sheet, a build the bench saved, or a modkit inventory dump');
+  }
+  if (args.flags.build != null) {
+    die('--import and --build are both the build a command starts from - give one of them.\n'
+      + '  --import reads a character sheet (or any file bench import reads as one); --build replays a run the bench saved.');
+  }
+  const tooBig = oversizedImport(path);
+  if (tooBig) die(`--import ${tooBig}`);
+  let bytes;
+  try { bytes = readFileSync(path); } catch (e) { die(`--import ${path}: ${e.message}`); }
+  const engine = createEngine(engineOptions(args));
+  // A typed --class names the class of a file that names none (a modkit
+  // dump); a file that names its own keeps it, and the report says so. A
+  // typed --level is handed to the reader the same way - for a file with no
+  // level of its own - and otherwise RE-LEVELS the build afterwards, exactly
+  // as it re-levels a --build file (loadBuild): the file is read at the level
+  // it was recorded at, and then asked about at the one typed.
+  const typedLevel = args.flags.level != null && args.flags.level !== true ? String(args.flags.level) : null;
+  const typedClass = typeof args.flags.class === 'string' ? args.flags.class : null;
+  let parsed = null;
+  try { parsed = JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, '')); } catch { parsed = null; }
+  const report = reportedSheet(parsed);
+  if (report) parsed = report;
+  const own = ownLevel(parsed);
+  const readAs = (cls) => readSheet(engine, parsed ?? bytes, { cls, level: own == null ? typedLevel : null });
+  let r;
+  let fromLog = null;
+  try {
+    r = readAs(typedClass);
+  } catch (e) {
+    if (!(e instanceof SheetError)) throw e;
+    // A modkit dump beside the fight `bench verify` holds it against: the
+    // class that log gives it, when it gives one (dumpClassBeside).
+    fromLog = args._[0] === 'verify' && typeof args.flags.capture === 'string' && e.needs === 'class'
+      ? dumpClassBeside(engine, e, resolveCapture(requireGame(args._), args.flags.capture).path) : null;
+    if (!fromLog) die(`--import ${path}: ${e.message}`);
+    try {
+      r = readAs(fromLog.unit);
+    } catch (again) {
+      if (again instanceof SheetError) die(`--import ${path}: ${again.message}`);
+      throw again;
+    }
+  }
+  const envelope = Object.fromEntries(Object.entries(r.envelope ?? {}).filter(([k]) => !NOT_IMPORTED.has(k)));
+  envelope.pinned = {
+    gear: r.pins.gear, augments: r.pins.augments, skills: r.pins.skills,
+    infusions: r.pins.infusions, runes: r.pins.runes, talents: r.pins.talents,
+  };
+  envelope.level = r.level;
+  if (r.rank != null) envelope.rank = r.rank;
+
+  // What was read, kept, dropped and left open - before the command's own
+  // output, like a questlog link's warnings. On stderr when stdout is the
+  // command's JSON: a bare --json, and verify's --json with or without a
+  // value (verify prints its ledger to stdout either way, so the report on
+  // stdout made the ledger unparseable).
+  const jsonOnStdout = args.flags.json === true || (args._[0] === 'verify' && !!args.flags.json);
+  const say = jsonOnStdout ? (s) => console.error(s) : (s) => console.log(s);
+  say(f.bold(`--import ${path}`));
+  if (report) say(f.dim('  The report `bench import --json` wrote: the sheet under its "sheet" key is read.'));
+  for (const item of sheetReportItems(r)) say((warnedLine(item) ? f.warn : f.dim)(`  ${item.text}`));
+  if (fromLog) say(f.dim(`  The class: ${fromLog.said}.`));
+  if (typedLevel != null && own != null && Number(typedLevel) !== r.level) {
+    say(f.warn(`  --level ${typedLevel} re-levels the imported build, which the file records at level ${r.level} - `
+      + 'as it re-levels a --build file. What that level cannot hold is not checked here.'));
+  }
+  if (r.envelope?.rotation != null || r.envelope?.profile != null) {
+    say(f.dim(`  The ${r.envelope.rotation != null ? 'rotation' : 'stat profile'} saved in ${path} is not used: --import reads the build, `
+      + `and --build ${path} replays the run it was saved with.`));
+  }
+  say('');
+  args.importedBuild = { envelope, loadout: r.loadout, path, imported: r };
+  return args.importedBuild;
+}
+
+// The object `bench verify` reads its build off - the shape inventory.mjs
+// toLoadout and fromSnapshot return - for an imported sheet. A sheet carries
+// no affix rows, so the SHEET check (the game's own arithmetic, which only a
+// capture snapshot logs) has nothing to run on; its runes are the slotted
+// ones it recorded; its gaps are what it left unrecorded, which is what the
+// ledger closes on, as it closes on what a dump cannot see.
+function builtFromSheet(r, loadout) {
+  return {
+    loadout,
+    character: r.name,
+    unit: r.unit,
+    level: loadout.level,
+    placed: Object.entries(loadout.gear ?? {}).filter(([, g]) => g?.item)
+      .map(([slot, g]) => ({ slot, item: g.item, stars: g.stars ?? 0 })),
+    gaps: [...r.gaps],
+    affixes: [],
+    sockets: [],
+    runesKnown: true,
+    attrs: {},
+    sheet: {},
+  };
+}
+
+// --- bench verify: an imported sheet as the build, a combat log as the capture --
+// Each is a helper called from one line of `verify`, so the command's own body
+// stays what it was beside them.
+//
+// The build can come from a character sheet (readImport, which commonSetup has
+// already run and which has said what it read) and the capture can be a
+// combat log another program wrote (capture.mjs combatLogOf: a
+// farever-combat-log or a Wink timeline). A log names its own character, which
+// is then the default --character; a Wink summary alone holds no row to
+// compare and is refused with the reader's sentence.
+function verifySources(args, game, engine) {
+  const at = resolveCapture(game, typeof args.flags.capture === 'string' ? args.flags.capture : null);
+  let combatLog = null;
+  if (at.exists) {
+    try { combatLog = combatLogOf(at.path, { heroKinds: heroKindsOf(engine) })?.log ?? null; } catch (e) {
+      if (!(e instanceof CombatLogError)) throw e;
+      die(e.message);
+    }
+  }
+  return { imported: args.importedBuild ?? null, combatLog };
+}
+
+// A COMBAT LOG IS ONE FIGHT: with no window asked for (and no --snapshot to
+// take one from), its whole span is the window - its first row to its last,
+// lead-in included - and it is treated as a GIVEN window from there on: dated
+// by its rows, refused when it holds nothing of the character's, replayed
+// over its own length, opened at the gauge it logs. The ledger says the
+// window is the log's own span. (Left to the default, a fight under thirty
+// seconds read as "no recorded damage", and a longer one as "the last 3 play
+// sessions" of a file that is one.) Null when that is not the case.
+function logSpanWindow(combatLog, capturePath, asked, args) {
+  if (!combatLog || asked.windows || args.flags.snapshot != null) return null;
+  let span = null;
+  for (const r of combatLogOf(capturePath).rows) {
+    if (!Number.isFinite(r.ts)) continue;
+    span ??= { from: r.ts, to: r.ts };
+    if (r.ts < span.from) span.from = r.ts;
+    if (r.ts > span.to) span.to = r.ts;
+  }
+  return span;
+}
+
+// THE DIFFICULTY A COMBAT LOG NAMES. Which difficulty a fight was is the one
+// thing no capture row says (verify.mjs modelTarget, "the difficulty"), and a
+// log's header can say it: encounter.difficulty 1 Veteran, 2 Heroic (the
+// game's ActivityDifficulty). A log that says so is priced on it -
+// <unit>@veteran or @heroic, the unit the --target filter names, else the
+// encounter's own boss - and the ledger says the log decided it. --price-as
+// still wins, and so does a mode typed on --target (Ratsar@heroic,
+// Ratsar#900@veteran); where that mode and the log disagree, the note says so.
+//
+// Only where the target COULD have stood in Veteran or Heroic: not the
+// training dummy (logged at its row's level 1, whatever the activity), not a
+// fight whose header says the target was a dummy, and not one whose hits the
+// log wrote at a level below MaxLevel - asked of the character's hits on the
+// unit priced. A header saying Heroic over a dummy at level 1 priced the
+// model as Dummy@heroic at level 25 (-22.5% where the same log at Normal read
+// -1.6%), and the logged level's own line went with it. Then the logged level
+// prices it, and the note says why the header was not followed. A log that
+// does not say (-1, or nothing) gets a line, where it could have mattered.
+//
+// Returns { priceAs, note }: priceAs is the model's pricing when the log
+// decided it, else null.
+function logPricing(engine, combatLog, { rawTarget, wantTarget, wantArchetype, priceAs }) {
+  if (!combatLog || priceAs) return { priceAs: null, note: null };
+  const enc = combatLog.stats.encounter;
+  const d = enc.difficulty;
+  const typedMode = wantTarget ? (/@([a-z]+)$/.exec(wantTarget)?.[1] ?? null) : null;
+  if (typedMode) {
+    const logMode = d === 0 || d === 1 || d === 2 ? DIFFICULTIES[d].toLowerCase() : null;
+    return {
+      priceAs: null,
+      note: logMode && logMode !== typedMode && !(typedMode === 'scaled' && d === 0)
+        ? `the log says the fight was ${DIFFICULTIES[d]}; --target ${rawTarget} prices it @${typedMode}, as typed` : null,
+    };
+  }
+  const units = engine.cdb.byId('unit');
+  const unit = wantArchetype && units.has(wantArchetype) ? wantArchetype : (enc.bossKind && units.has(enc.bossKind) ? enc.bossKind : null);
+  const maxLevel = Math.round(engine.ctx.consts.maxLevel);
+  const dummy = engine.combat.namedTargets.dummy?.unit ?? null;
+  const mine = combatLog.events.filter((e) => e.kind === 'damage' && e.source === combatLog.me);
+  const onUnit = unit ? mine.filter((e) => e.targetKind === unit) : [];
+  const hits = onUnit.length ? onUnit : mine;
+  const logged = (e) => Number.isFinite(e.targetLevel) && e.targetLevel !== maxLevel;
+  const couldBeHard = enc.targetDummy !== true && hits.some((e) => !(dummy && e.targetKind === dummy) && !logged(e));
+  if (d === 1 || d === 2) {
+    const mode = d === 1 ? 'veteran' : 'heroic';
+    if (!couldBeHard) {
+      const below = [...new Set(hits.filter(logged).map((e) => e.targetLevel))].sort((a, b) => a - b);
+      const why = enc.targetDummy === true ? 'its header says the target was a training dummy'
+        : dummy && hits.length && hits.every((e) => e.targetKind === dummy) ? `${dummy} is the training dummy`
+          : below.length ? `the hits${onUnit.length ? ` on ${unit}` : ''} were logged at level ${below.join(', ')}, below MaxLevel ${maxLevel}`
+            : `${combatLog.handle} landed no hit in it`;
+      return {
+        priceAs: null,
+        note: `the log says the fight was ${DIFFICULTIES[d]}, but ${why}, so it was not one: the model is priced at the level the hits were logged at, `
+          + `not @${mode} (--price-as <unit>@${mode} prices it so)`,
+      };
+    }
+    let stands = false;
+    if (unit) { try { engine.combat.foe(`${unit}@${mode}`, engine.ctx.consts.maxLevel); stands = true; } catch { stands = false; } }
+    if (!stands) {
+      return {
+        priceAs: null,
+        note: `the log says the fight was ${DIFFICULTIES[d]}, and names no unit to price that on - --target <unit> or --price-as <unit>@${mode} does`,
+      };
+    }
+    return {
+      priceAs: `${unit}@${mode}`,
+      note: `the log says the fight was ${DIFFICULTIES[d]}: the model is priced as ${unit}@${mode}`
+        + `${wantArchetype ? '' : ', the encounter\'s own boss'} (--price-as, or a mode on --target, prices it otherwise)`,
+    };
+  }
+  if ((d === -1 || d === null) && couldBeHard) {
+    return {
+      priceAs: null,
+      note: 'the log does not say which difficulty the fight was: a target at MaxLevel stood in Veteran or Heroic, '
+        + 'and --price-as <unit>@veteran or @heroic says which',
+    };
+  }
+  return { priceAs: null, note: null };
+}
+
+// THE CHARACTER A COMBAT LOG NAMES, against the build. A log's header says
+// which class and level its character was; a sheet for another character
+// priced against it gave a confident ledger at exit 0 (the example Warrior
+// log against the Rogue example sheet: "no base attack in this window",
+// "model: 0.0 dps"). Another class is refused - its rows cannot be this
+// build's - unless a typed --class CONFIRMS the build's own class, which
+// says the header is the one wrong: charsheet.mjs classVouch, the rule
+// `bench submit` holds the same pair to. Only an imported file that names
+// its own class can be confirmed; a modkit dump (imported, or read from the
+// game's folder), a sheet with no class and a capture snapshot have no class
+// but the one --class gave them, and that word cannot outvote the log's.
+// Another level is said (the note returned): --level re-levels the build to
+// the log's.
+function logCharacterNote(engine, combatLog, built, { capturePath, wantClass, importPath, imported = null }) {
+  if (!combatLog) return null;
+  const logUnit = logClass(engine.cat, combatLog);
+  const { vouchable, vouched } = classVouch(engine.cat, imported, wantClass, { stated: !imported });
+  if (logUnit && logUnit !== built.unit && !vouched) {
+    const why = vouchable
+      ? `, or --class ${built.unit} if the log's header is the one that is wrong.`
+      : `.${wantClass != null ? `\n  --class ${wantClass} is the build's only word on its class - ${imported
+        ? `${importPath} names none` : 'a dump or a capture snapshot names none'} - so it cannot say the log's header is the one that is wrong.` : ''}`;
+    die(`${capturePath} says its character${combatLog.handle ? ` ${combatLog.handle}` : ''} is a ${logUnit}, `
+      + `and the build ${importPath ? `${importPath} ` : ''}is a ${built.unit}: its rows cannot be priced as this build.\n`
+      + `  Give the build the log was fought in${importPath ? ' (--import <sheet>)' : ''}${why}`);
+  }
+  const lvl = combatLog.header?.character?.level;
+  return Number.isInteger(lvl) && lvl !== built.level
+    ? `the log says its character was level ${lvl}, and the build is priced at level ${built.level} - --level ${lvl} prices it at the log's`
+    : null;
+}
+
+// WHAT THE READER SAID ABOUT THE LOG, which the ledger stands on: every
+// problem it named - damage rows it could not read or place on a target
+// (none of which a --target filter reads), a recorder's gap, a summary it
+// could not use - and the notes a reader of the evidence needs: an estimated
+// start, what a Wink file cannot hold, a party fight. Only `bench import`
+// said them, and verify printed a ledger over the very rows they qualify.
+// Not the reader's line on the difficulty: verify says its own, the log's
+// difficulty being its pricing (logPricing). And a farever-combat-log whose
+// character's hits carry no affinity or no target level - the reader has no
+// line for it (both are bench additions), and the ledger then compares a
+// skill logged under two affinities as one row, at its target's row level.
+function logFindings(combatLog) {
+  if (!combatLog) return null;
+  const notes = combatLog.notes.filter((n) => !/^the difficulty is unknown/.test(n));
+  if (combatLog.dialect === 'farever-combat-log') {
+    const mine = combatLog.events.filter((e) => e.kind === 'damage' && e.source === combatLog.me);
+    const noAffinity = mine.filter((e) => typeof e.affinity !== 'string' || e.affinity === '').length;
+    const noLevel = mine.filter((e) => !Number.isFinite(e.targetLevel)).length;
+    const of = (n) => `${n === mine.length ? 'none' : `${(mine.length - n).toLocaleString('en-US')}`} of ${combatLog.handle}'s ${mine.length.toLocaleString('en-US')} hits`;
+    if (noAffinity) notes.push(`${of(noAffinity)} carry an affinity: a skill logged under two affinities is compared as one row`);
+    if (noLevel) notes.push(`${of(noLevel)} carry a targetLevel: the target is priced at its row's level`);
+  }
+  return { problems: [...combatLog.problems], notes };
+}
+
+// WHERE A COMBAT LOG LEAVES THE FIGHT TO THE MODEL, said. A log that records
+// no press of its character (combatlog.mjs stats.presses: none written, and
+// none declared with source.recordsPresses) cannot say what was pressed, so
+// the model plays its own rotation over it - and what it presses that the
+// log has no row of is its choice, not evidence. And a Mage's fight opens at
+// the Spark the log carries on the character's presses and skill starts
+// (the bench-addition field `spark`, read by poolAt): a log with none, or
+// none in the window, opens the model's fight on a full gauge, where the
+// conduits fire from the top. (Spark is the one gauge verify opens a fight
+// at; a log's `rage` is carried and not read.) Null lines where there is
+// nothing to say.
+function logPlayNotes(engine, combatLog, built, { rank, poolStart, replay }) {
+  if (!combatLog) return { presses: null, gauge: null };
+  const who = `${combatLog.handle}'s`;
+  const presses = combatLog.stats.presses ? null
+    : `presses: the log records none of ${who}, and does not say it records them (source.recordsPresses) - the model plays its own rotation, `
+      + `and what it presses that the log has no row of is its choice, not evidence${replay ? '; --replay has no recorded sequence to play' : ''}`;
+  let gauge = null;
+  try { gauge = engine.plan.resolve(built.loadout, rank).sparkGauge?.atb ?? null; } catch { gauge = null; }
+  if (!gauge || poolStart?.[gauge] != null) return { presses, gauge: null };
+  const key = gauge.toLowerCase();
+  return {
+    presses,
+    gauge: (combatLog.stats.pools ?? []).includes(key)
+      ? `${gauge}: no row of ${who} in the window carries it, so the model's fight opens on a full gauge`
+      : `${gauge}: the log carries no ${key} value on ${who} presses or skill starts (the field \`${key}\`), so the model's fight opens on a full gauge`,
+  };
+}
+
+// THE REPLAY'S OPENING IN A LOG THAT WRITES NO SKILL START. --replay opens
+// the model's fight where the character's state first becomes a skill (a
+// go_state row: a probe's, or captureRows' for every skill_use and
+// block_use). A log of presses alone has none, and the replayed fight moved
+// from its first second where the recorded one stood until the character
+// first acted. So it opens at the character's first press or first hit of
+// the base-attack chain in the window, whichever is earlier - a hit lands
+// after its swing began, so one opens the fight a windup late - and the
+// replay line says which. `see` is handed every row in the window.
+function logOpeningWatch(character, chainIds) {
+  const w = { ts: null, from: null };
+  w.see = (r) => {
+    if (r.source !== character) return;
+    const from = r.event === 'press' ? 'press' : r.event === 'inflict' && chainIds.has(r.skill) ? 'hit' : null;
+    if (from && (w.ts === null || r.ts < w.ts)) { w.ts = r.ts; w.from = from; }
+  };
+  return w;
+}
+// --- end of bench verify's import and combat-log helpers -------------------------
 
 function commonSetup(args) {
   const saved = readBuildFile(args);
@@ -1160,6 +1754,246 @@ function openBrowser(url) {
   }
 }
 
+// --- bench submit: what it reads and where it writes ------------------------
+//
+// A file `bench submit` packs - the fight's log, Wink's summary, an imported
+// sheet - read whole, with the size asked first (oversizedImport): the
+// submission's own caps (20 MB a log, 512 KB a sheet) are src/submit.mjs's,
+// and say themselves; this only keeps a file far past them from dying in V8
+// before either can. Sent under the file's base name - which the bundle
+// never carries (its entries have fixed names) and the reports print.
+function readSubmitPart(path, flag) {
+  const tooBig = oversizedImport(path);
+  if (tooBig) die(`${flag} ${tooBig}`);
+  let data;
+  let mtimeMs = null;
+  try {
+    data = readFileSync(path);
+    mtimeMs = statSync(path).mtimeMs;
+  } catch (e) {
+    die(`${flag} ${path}: ${e.message}`);
+  }
+  return { name: basename(path), data, mtimeMs };
+}
+
+// Where a send's receipt is written: beside the zip it was saved as (its
+// name with .receipt.json for .zip); else in the folder the bench keeps its
+// receipts in, the UI's own - <FAREVER_BENCH_CACHE, or the bench's .cache>/
+// submit-receipts/farever-bench-receipt-<id>.json - and not the current
+// folder. Run from a clone of the bench that folder is the repository, and
+// the receipt asks for the fight's deletion: `git add -A` published it, and
+// anyone could then ask for that. The run prints where it went.
+function submitReceiptPath(sub, zipPath) {
+  if (zipPath) return `${zipPath.replace(/\.zip$/i, '')}.receipt.json`;
+  const cache = process.env.FAREVER_BENCH_CACHE || join(fileURLToPath(new URL('..', import.meta.url)), '.cache');
+  return join(cache, 'submit-receipts', `farever-bench-receipt-${sub.id}.json`);
+}
+
+// The receipt already standing at `path`, or null when nothing does. A
+// receipt is the only way to ask for a sent fight's deletion, so a file there
+// that is not this bundle's receipt is never written over: one of another
+// submission would leave that one beyond its sender's reach. One saved
+// before a send whose answer never came is most often the player's own
+// earlier try at this very fight, and the way on is to send that bundle
+// again as itself - so that is said before the other name for --zip.
+function receiptStanding(path, sub) {
+  if (!existsSync(path)) return null;
+  let held;
+  try {
+    held = parseReceipt(readFileSync(path));
+  } catch (e) {
+    if (!(e instanceof SubmissionError)) throw e;
+    die(`${path} is already there and is not a receipt the bench wrote, so it is not written over - give --zip another name, `
+      + 'and the receipt goes beside it');
+  }
+  if (held.id !== sub.id) {
+    die(`${path} is the receipt of another submission (${held.id.slice(0, 8)}), and how that one's deletion is asked for - it is not written over. `
+      + (held.sentAt
+        ? 'Give --zip another name, and the receipt goes beside it.'
+        : `It was saved before a send whose answer never came: the same command with --receipt ${path} sends that bundle again as itself; `
+          + '--zip with another name packs this one as a new submission, its receipt beside it.'));
+  }
+  return held;
+}
+
+// A receipt written to disk: receiptText's (which names the bundle's SHA-256,
+// so --receipt builds that bundle again or refuses), readable by its owner
+// alone. Anyone who can read it can ask for the fight's deletion, so the
+// file is created 0600, and one already standing there (a receipt
+// saved before the send, now answered) is put back to 0600 as well: a mode
+// given to writeFileSync applies only to a file it creates. (On Windows the
+// mode is the read-only bit and nothing more; the folder's own ACL is what
+// keeps other accounts out, as it does for the UI's receipts.)
+function writeReceipt(path, receipt) {
+  writeFileSync(path, receiptText(receipt), { mode: 0o600 });
+  try { chmodSync(path, 0o600); } catch { /* written, and its mode left as the system made it */ }
+}
+
+// A path that names a file - not a folder, and not nothing.
+function isFileAt(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+// Wink's summary beside a timeline, read when the player named none: the
+// <id>.json of an <id>.json.timeline, when that is a file. The player did not
+// type it, so a read that fails is not their --summary failing: the summary
+// is left out, and that is said, and the log goes alone. Null when there is
+// none to read. Whether the log reader took it as this timeline's summary
+// is known only once the bundle is built (see `submit`). Found and read as
+// every reader of a log finds it (capture.mjs winkCompanion).
+function besideSummary(logPath) {
+  const side = winkCompanion(logPath);
+  if (!side) return null;
+  return { path: side.path, part: side.data ? { name: side.name, data: side.data, mtimeMs: side.mtimeMs } : null, why: side.why };
+}
+
+// Where --zip may write. Never over a file this run reads, nor a receipt -
+// the one way to ask for a sent fight's deletion, and not in the zip, so a
+// receipt written over is a fight whose deletion nobody can ask for - nor
+// anything that is not a bundle the bench saved: `--zip mylog.jsonl`
+// replaced the player's log with the zip and said "Saved". An earlier bundle
+// may be replaced; its receipt, if it was sent, is a file of its own. The
+// sentence, or null.
+function zipTargetProblem(zipPath, inputs) {
+  const key = (p) => {
+    const full = resolvePath(p);
+    return process.platform === 'win32' || process.platform === 'darwin' ? full.toLowerCase() : full;
+  };
+  for (const [what, path] of inputs) {
+    if (typeof path === 'string' && key(path) === key(zipPath)) {
+      return `--zip ${zipPath} is ${what}, and the bundle is not saved over it - give --zip another name`;
+    }
+  }
+  let st;
+  try {
+    st = statSync(zipPath);
+  } catch {
+    return null;
+  }
+  const other = `${zipPath} is already there and is not a bundle the bench saved, so it is not written over - give --zip another name`;
+  if (!st.isFile() || st.size > MAX_ZIP_BYTES) return other;
+  let bytes;
+  try {
+    bytes = readFileSync(zipPath);
+  } catch (e) {
+    return `--zip ${zipPath}: ${e.message}`;
+  }
+  try {
+    const held = parseReceipt(bytes);
+    return `${zipPath} is the receipt of submission ${held.id.slice(0, 8)}, and how that one's deletion is asked for - the bundle is not saved over it; `
+      + 'give --zip another name';
+  } catch {
+    /* not a receipt: is it a bundle? */
+  }
+  try {
+    if (zipEntryProblem(readZipDirectory(bytes).map((d) => d.name)) === null) return null;
+  } catch {
+    /* not a zip at all */
+  }
+  return other;
+}
+
+// --- bench submit: the build typed on the command line ----------------------
+// The build typed on the command line, as a build somebody stated:
+// buildSubmission's editor input ({loadout, rank, pins, pieces}), the input
+// the UI's editor build goes as, given the pins the flags set (applyPins).
+// So src writes it by its one rule (charsheet.mjs pinnedSheet), says what it
+// records empty (sub.problems, the report's Problem lines) and labels it as
+// it labels the editor's (the manifest's sourceFormat 'bench-editor': a
+// stated build, not a file an exporter wrote). A loadout has no "not
+// stated", and sent whole every slot the flags left alone went as recorded
+// empty and every pool as the character's - the maintainer held the model
+// against a character with one weapon and nothing else. So what a flag
+// stated is kept, and the rest is left out and named as a gap:
+//
+//   - a slot a --pin named (`none` is recorded empty), with its item, and of
+//     the rest only what the pin wrote: ^level, @rarity, *stars (or --stars,
+//     for every piece), the infusion after ~ with its /stat - and with it the
+//     Prismatic flag, true with a trailing ! and false without (pinnedSheet's
+//     rule, the editor's too). Flawless has no word in the pin grammar, so it
+//     is never stated;
+//   - a piece's sockets when a --pin or --no-augment named one of them;
+//   - the pools --skills filled, the tree when --talent was given, the runes
+//     when --rune was, the weapon-skill rank when --rank was;
+//   - the level, always: a sheet must name one, so the default is written,
+//     and said, when --level was not typed.
+//
+// A sheet records a piece's sockets, and the rune slots, WHOLE: what is not
+// listed is empty. src says what it so records empty, and a socket pinned
+// with no piece to sit on (its Problem lines); returned here beside the
+// build are only the CLI's own words: `said`, the level nobody typed, and
+// `hints`, the flag that names what each of those held - read off the same
+// pinnedSheet, so the hints and src's sentences cannot disagree.
+function typedBuild(engine, loadout, pins, { rank, typedLevel, typedStars }) {
+  // What each pinned piece's --pin wrote; --stars states every piece's stars.
+  const pieces = Object.fromEntries([...pins.pinnedGear].map((slot) => {
+    const t = pins.typedPieces.get(slot) ?? {};
+    return [slot, { ...t, stars: !!t.stars || !!typedStars }];
+  }));
+  const stated = {
+    gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills],
+    runes: [...pins.pinnedRunes], talents: !!pins.pinnedTalents, infusions: [...pins.pinnedInfusion],
+  };
+  const build = { loadout, name: null, rank: Number.isInteger(rank) ? rank : null, pins: stated, pieces };
+  const said = [];
+  if (!typedLevel) said.push(`--level was not given, and a sheet names one: it says ${loadout.level}, the bench's default - --level <n> says the character's`);
+  const { emptied, unplaced } = pinnedSheet(engine, loadout, stated, { pieces });
+  const hints = [
+    ...emptied.sockets.map(({ slot }) => `--pin ${f.short(slot).toLowerCase()}/<socket>=<augment> names what a socket of ${slot} held.`),
+    ...(emptied.runes.length ? ['--rune <skill>=<rune> names what a rune slot held.'] : []),
+    ...unplaced.map((slot) => `--pin ${f.short(slot).toLowerCase()}=<item> names the piece ${slot}'s pinned sockets sit on.`),
+  ];
+  return { build, said, hints };
+}
+// --- end bench submit: the build typed on the command line ------------------
+
+// What `bench submit` reads, by the way it is asked. Anything else typed
+// beside it was stored and never looked at - `--json out.json` wrote
+// nothing and exited 0, `--check` checked nothing, `--delete` with a --pin
+// beside it asked for a deletion and said nothing of the pin - so it is
+// refused, as the command's own flags are refused on every other command
+// (SUBMIT_ONLY).
+const SUBMIT_READS = ['log', 'summary', 'import', 'build', 'note', 'keep-name', 'zip', 'send', 'receipt', 'class', 'level', 'game', 'class-skills'];
+// The flags that assemble a build the way `bench sheet` takes them: read
+// when no file (--import, --build) is the build. Beside one, each would send
+// another build than the one the file recorded.
+const SUBMIT_BUILD = ['pin', 'no-augment', 'skills', 'rune', 'talent', 'stars', 'rank', 'questlog', 'questlog-build'];
+
+// The refusal for a flag `bench submit` would not read as it is asked, or
+// null. Asked in main() before a questlog link is fetched, so that a refusal
+// reaches nothing.
+function submitUnread(args) {
+  const typed = [
+    ...Object.keys(args.flags).filter((flag) => args.flags[flag] != null),
+    ...Object.keys(args.repeated).filter((flag) => (args.repeated[flag] ?? []).length),
+  ];
+  if (args.flags.delete != null) {
+    const beside = typed.filter((flag) => flag !== 'delete');
+    if (!beside.length) return null;
+    return `--delete asks for the deletion of a fight sent earlier and builds nothing, so --${beside[0]} has nothing to do beside it: `
+      + `bench submit --delete ${typeof args.flags.delete === 'string' ? args.flags.delete : '<receipt.json>'}`;
+  }
+  const unread = typed.filter((flag) => !SUBMIT_READS.includes(flag) && !SUBMIT_BUILD.includes(flag));
+  if (unread.length) {
+    return `--${unread[0]} is not read by \`bench submit\`, which would ignore it`
+      + (unread[0] === 'json' ? ' - --zip saves the bundle, and its manifest.json is what it holds, as data.'
+        : unread[0] === 'check' ? ' - bench import <file> --check checks a sheet or a log.'
+          : ' - it packs the build and the fight as they are and prices nothing (bench sheet prices the build).');
+  }
+  const file = args.flags.import ?? args.flags.build ?? null;
+  const beside = file != null ? typed.filter((flag) => SUBMIT_BUILD.includes(flag)) : [];
+  if (beside.length) {
+    return `--${args.flags.import != null ? 'import' : 'build'} ${file === true ? '<file>' : file} is the build the fight was fought in, as the file recorded it, `
+      + `and --${beside[0]} would send another - give the file alone (with --class and --level for a file that does not carry them), `
+      + 'or the build by flags without a file';
+  }
+  return null;
+}
+
 const commands = {
   /**
    * The same character sheet the packaged desktop app shows, served out of this
@@ -1219,6 +2053,9 @@ const commands = {
     if (!['127.0.0.1', '::1', 'localhost'].includes(host)) {
       console.log(f.warn(`  bound to ${host}, so anything that can reach this machine can read it`));
     }
+    // ...and Send a fight is off there (ui/server.mjs submitOffFor), in the
+    // server's own sentence: every /api/submit/ route answers 403 with it.
+    if (live.submitOff) console.log(f.warn(`  ${live.submitOff}.`));
     if (args.flags.open) openBrowser(url);
     else console.log(f.dim('  (--open launches your browser for you)'));
     console.log(f.dim('  press Ctrl+C to stop'));
@@ -1528,6 +2365,10 @@ const commands = {
         pinned: {
           gear: [...pins.pinnedGear], augments: [...pins.pinnedAug], skills: [...pins.pinnedSkills],
           infusions: [...pins.pinnedInfusion],
+          // The rune slots and the talent tree the run held (a --rune, a
+          // --talent, an imported build's), so --build holds them again
+          // rather than searching them anew.
+          runes: [...pins.pinnedRunes], talents: pins.pinnedTalents,
         },
         // What the infusion search was allowed to do, so --build reproduces it.
         infusionSearch: { offered: res.infusion.offered, stat: res.infusion.statPolicy },
@@ -3221,6 +4062,607 @@ const commands = {
     console.log('\n' + f.dim('See docs/MODEL.md for where each formula came from.'));
   },
 
+  /**
+   * What a file says, as the bench reads it: a character sheet in any of the
+   * four shapes charsheet.mjs reads, or a combat log in any dialect
+   * combatlog.mjs reads - told apart by the file itself, so an exporter's
+   * author has one command to check their output with. It prints what was
+   * read, kept, dropped and why, and runs nothing.
+   *
+   *   --check        exit 1 when anything was dropped, not understood or
+   *                  listed unreadable (a sheet), or when the reader names a
+   *                  problem (a log) - for an exporter's own tests
+   *   --json <out>   the same as data: for a sheet {kind, sourceFormat, sheet,
+   *                  report} - the version-1 sheet of what the file recorded,
+   *                  as the bench read it (charsheet.mjs recordedSheet), and
+   *                  the report beside it, which --import and this command
+   *                  read back as that sheet; a log as its dialect, figures
+   *                  and sentences.
+   *                  A bare --json prints that to stdout instead
+   *   --class, --level   for a shape that does not carry them (a modkit dump)
+   *
+   * A Wink timeline (<id>.json.timeline) is read with its summary, the
+   * <id>.json beside it, which carries the fight's start time.
+   */
+  import(args) {
+    let typed = args._.slice(1);
+    if (typed.length > 1) die(`bench import reads one file, not ${typed.length}: ${typed.join(', ')}`);
+    if (args.flags.import === true) die('--import needs a file');
+    const flagged = typeof args.flags.import === 'string' ? args.flags.import : null;
+    // `--check` takes no value, and the parser hands a flag the word after
+    // it: `bench import --check <file>`, the natural order, read the file as
+    // the flag's value and then said no file was given. With no file
+    // otherwise, that word IS the file; beside one, it is a second file.
+    if (typeof args.flags.check === 'string') {
+      if (!typed.length && !flagged) typed = [args.flags.check];
+      else die(`--check takes no value, and "${args.flags.check}" was given after it: bench import <file> --check`);
+      args.flags.check = true;
+    }
+    if (typed[0] && flagged && typed[0] !== flagged) die(`bench import was given two files, ${typed[0]} and --import ${flagged} - give one`);
+    const path = typed[0] ?? flagged;
+    if (!path) {
+      // `bench import --json <file>`: --json took the file as where to write.
+      if (typeof args.flags.json === 'string') {
+        die(`bench import needs a file to read, and --json took "${args.flags.json}" as the file its report is written to.\n`
+          + '  Name the file first: bench import <file> --json [<out>] (a bare --json prints the report).');
+      }
+      die('bench import needs a file: bench import <file>\n'
+        + '  a character sheet (docs/CHARACTER-SHEET.md), a build the bench saved, a bare loadout or a modkit inventory dump;\n'
+        + '  or a combat log (docs/COMBAT-LOG.md) - a farever-combat-log, or a Wink DPS Meter fight file');
+    }
+    if (args.flags.level === true) die('--level needs a number');
+    if (args.flags.class === true) die('--class needs a class');
+    const jsonOut = args.flags.json;
+    const toStdout = jsonOut === true;
+    const tooBig = oversizedImport(path);
+    if (tooBig) die(tooBig);
+    let bytes;
+    try { bytes = readFileSync(path); } catch (e) { die(`${path}: ${e.message}`); }
+
+    // WHICH KIND OF FILE, by its contents. Gzip is only ever a log. A file
+    // that is one JSON object is a sheet in one of the four shapes, or a log
+    // that fits on one line (a Wink summary, a header with no event); a file
+    // of JSON lines is a log by its first line.
+    const text = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b ? null : bytes.toString('utf8').replace(/^\uFEFF/, '');
+    let whole = null;
+    if (text != null) { try { whole = JSON.parse(text); } catch { whole = null; } }
+    // What `bench import <sheet> --json` wrote is read as the sheet it holds.
+    const wrapped = reportedSheet(whole);
+    if (wrapped) whole = wrapped;
+    let first = null;
+    if (text != null && whole == null) {
+      const line = text.split(/\r?\n/).find((l) => l.trim() !== '');
+      try { first = line == null ? null : JSON.parse(line); } catch { first = null; }
+    }
+    const kind = text == null ? 'log'
+      : detectSheetDialect(whole) ? 'sheet'
+        : detectLogDialect(whole) || detectLogDialect(first) ? 'log' : null;
+
+    const engineFor = () => createEngine(engineOptions(args));
+    // A Wink timeline with the summary beside it, as every reader takes it.
+    const readAsLog = () => readCombatLogAt(path, { data: bytes });
+
+    if (kind == null) {
+      // Neither: both readers say why, each in its own words.
+      let asSheet = null;
+      let asLog = null;
+      try { readSheet(engineFor(), whole ?? bytes); } catch (e) { asSheet = e.message; }
+      try { readAsLog(); } catch (e) { asLog = e.message; }
+      die(`${path} is neither a character sheet nor a combat log the bench reads.\n`
+        + `  As a character sheet: ${asSheet ?? 'not one'}\n  As a combat log: ${asLog ?? 'not one'}`);
+    }
+
+    if (kind === 'sheet') {
+      const engine = engineFor();
+      let r;
+      try {
+        r = readSheet(engine, whole, {
+          cls: typeof args.flags.class === 'string' ? args.flags.class : null,
+          level: args.flags.level != null ? String(args.flags.level) : null,
+        });
+      } catch (e) {
+        if (e instanceof SheetError) die(`${path}: ${e.message}`);
+        throw e;
+      }
+      const failing = r.dropped.length + r.unknownKeys.length + r.unreadable.length;
+      // The build as the bench would hand it on, written only when --json
+      // asks for it: the version-1 sheet of what was KEPT - not the file's
+      // bytes - recording what the file recorded and leaving open what it
+      // left open (charsheet.mjs recordedSheet, the cut a submission's
+      // sheet.json is too), with the game build the FILE said it was written
+      // on in its source, never this install's. A sheet that does not read
+      // back as the import is said beside it, on stderr when stdout is the
+      // report.
+      const recorded = toStdout || typeof jsonOut === 'string'
+        ? recordedSheet(engine, r, { source: 'file', label: 'the --json sheet' })
+        : null;
+      // `sourceFormat`, not `format`: a top-level format would make this
+      // wrapper pass for a sheet of that format (and be refused as one with
+      // no character). Given back to --import or here, its `sheet` is read.
+      const report = recorded && {
+        kind: 'sheet',
+        sourceFormat: r.format,
+        sheet: recorded.sheet,
+        report: {
+          dropped: r.dropped, notes: r.notes, gaps: r.gaps, unknownKeys: r.unknownKeys,
+          unreadable: r.unreadable, buildMismatch: r.buildMismatch,
+        },
+      };
+      const readBack = (recorded?.problems ?? []).map((p) => f.warn(`note: ${p}.`));
+      if (toStdout) {
+        console.log(JSON.stringify(report, null, 2));
+        for (const line of readBack) console.error(line);
+      } else {
+        console.log(f.header(engine, VERSION) + '\n');
+        console.log(f.bold(path));
+        if (wrapped) console.log(f.dim('  The report `bench import --json` wrote: the sheet under its "sheet" key is read.'));
+        for (const item of sheetReportItems(r)) console.log(warnedLine(item) ? f.warn(`  ${item.text}`) : `  ${item.text}`);
+        console.log('');
+        console.log(failing
+          ? f.warn(`${r.dropped.length} dropped, ${r.unknownKeys.length} unknown key${r.unknownKeys.length === 1 ? '' : 's'}, `
+            + `${r.unreadable.length} listed unreadable${args.flags.check ? ' - --check fails' : ''}.`)
+          : f.dim(`Nothing dropped, unknown or unreadable${r.gaps.length ? `; ${r.gaps.length} gap${r.gaps.length === 1 ? '' : 's'} left open to the search` : ''}.`));
+        // The --class and --level this read needed travel with the commands
+        // it suggests: a modkit dump names no class, and the suggestion
+        // without it died on that very sentence.
+        const needed = (r.format === 'modkit-inventory' && typeof args.flags.class === 'string' ? ` --class ${args.flags.class}` : '')
+          + (args.flags.level != null && ownLevel(whole) == null ? ` --level ${args.flags.level}` : '');
+        console.log(f.dim(`Every command that builds takes it as its build: bench sheet --import ${path}${needed}, `
+          + `bench optimize --import ${path}${needed}.`));
+        if (typeof jsonOut === 'string') {
+          writeFileSync(jsonOut, JSON.stringify(report, null, 2));
+          for (const line of readBack) console.log(line);
+          console.log(f.dim(`wrote ${jsonOut}`));
+        }
+      }
+      if (args.flags.check && failing) process.exitCode = 1;
+      return;
+    }
+
+    let log;
+    try { log = readAsLog(); } catch (e) {
+      if (!(e instanceof CombatLogError)) throw e;
+      // The reader names the file by its base name: that is the path typed.
+      const name = basename(path);
+      die(e.message.startsWith(name) ? `${path}${e.message.slice(name.length)}` : `${path}: ${e.message}`);
+    }
+    const report = { kind: 'log', dialect: log.dialect, stats: log.stats, problems: log.problems, notes: log.notes };
+    if (toStdout) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      for (const item of logReportItems(log)) console.log(warnedLine(item) ? f.warn(item.text) : item.text);
+      // A summary given alone, with its timeline beside it: the events are there.
+      if (!log.perEvent && existsSync(`${path}.timeline`)) {
+        console.log(f.dim(`Its timeline is beside it: bench import ${path}.timeline reads the fight's events, with this summary.`));
+      }
+      if (typeof args.flags.class === 'string' || args.flags.level != null) {
+        console.log(f.dim('--class and --level are read for a character sheet that does not carry them; a combat log names its own.'));
+      }
+      console.log('');
+      console.log(log.problems.length
+        ? f.warn(`${log.problems.length} problem${log.problems.length === 1 ? '' : 's'}${args.flags.check ? ' - --check fails' : ''}.`)
+        : f.dim('No problem.'));
+      // A log carries no build: verify takes one from the sheet of the
+      // character it was fought by - or, for a modkit player, their dump.
+      if (log.perEvent) {
+        console.log(f.dim(`bench verify --capture ${path} --import <character sheet> holds the model against it, `
+          + 'with the build it was fought in (with the modkit, the login dump stands in for the sheet).'));
+      }
+      if (typeof jsonOut === 'string') {
+        writeFileSync(jsonOut, JSON.stringify(report, null, 2));
+        console.log(f.dim(`wrote ${jsonOut}`));
+      }
+    }
+    if (args.flags.check && log.problems.length) process.exitCode = 1;
+  },
+
+  /**
+   * One fight, packed for the project: the build it was fought in and its
+   * combat log, every name taken out, as one zip of fixed entries
+   * (src/submit.mjs; docs/SUBMITTING.md is the player's account of it). It
+   * prints what the zip holds and where it would go - the same lines the
+   * UI's Send dialog shows - and does nothing else unless asked:
+   *
+   *   --log <file>        the fight, in any dialect combatlog.mjs reads; a
+   *                       Wink <id>.json.timeline brings the <id>.json beside it
+   *   --summary <file>    Wink's summary, named by hand
+   *   --import <file>     the build as a sheet recorded it (--build <file>
+   *                       reads a saved build the same way); without either,
+   *                       the build as typed by flags (typedBuild)
+   *   --note <text>, --keep-name   what the player adds, and keeps
+   *   --zip [<file>]      save the bundle
+   *   --send              upload it to the project's pCloud folder, its
+   *                       receipt written first
+   *   --receipt <file>    build it again as the bundle a receipt names
+   *   --delete <receipt>  ask for the deletion of a fight sent earlier
+   *
+   * What may stand beside what is held in main() (submitUnread), before a
+   * questlog link is fetched. Exit 0 when it did what was asked; 1, with one
+   * sentence, when it refused or pCloud did.
+   *
+   * The two calls that reach the network (sendSubmission, deleteSubmission)
+   * stand in this method's own body and nowhere else in the file: the suite's
+   * "network call sites" group holds the tree to that.
+   */
+  async submit(args) {
+    if (args._.length > 1) {
+      die(`bench submit takes its files by flag, and "${args._[1]}" was given on its own: `
+        + 'bench submit --log <combat log> --import <character sheet>');
+    }
+
+    // --- ask for the deletion of a fight sent earlier: its receipt, and
+    // nothing built
+    if (args.flags.delete != null) {
+      if (args.flags.delete === true || args.flags.delete === '') {
+        die('--delete needs the receipt the send wrote: bench submit --delete <receipt.json>');
+      }
+      let receipt;
+      try {
+        receipt = parseReceipt(readFileSync(args.flags.delete));
+      } catch (e) {
+        die(`--delete ${args.flags.delete}: ${e.message}`);
+      }
+      // Asked through this copy's own upload link and no other: a receipt
+      // anyone could have written names any link, and its id and token go
+      // there. src/submit.mjs deleteSubmission holds that rule - the UI's
+      // Delete asks it too - and says how to ask through the receipt's link
+      // when it is another (FAREVER_BENCH_UPLOAD_LINK).
+      let link;
+      try { link = uploadLink(); } catch (e) {
+        if (!(e instanceof SubmissionError)) throw e;
+        die(e.message);
+      }
+      try {
+        await deleteSubmission(receipt, { link });
+      } catch (e) {
+        if (!(e instanceof SubmissionError)) throw e;
+        die(e.message);
+      }
+      console.log(`Asked: the project's pCloud folder now holds a request to delete submission ${receipt.id.slice(0, 8)}. `
+        + 'The maintainer deletes the fight and the request when they next read the folder; nothing of it was ever public. '
+        + 'Asking again with the same receipt is harmless.');
+      return;
+    }
+
+    // --- the flags, held to their shapes before a file is read
+    for (const flag of ['send', 'keep-name']) {
+      if (typeof args.flags[flag] === 'string') {
+        die(`--${flag} takes no value, and "${args.flags[flag]}" was given after it - bench submit takes its files by flag (--log, --import)`);
+      }
+    }
+    if (args.flags.log === true || args.flags.log === '') {
+      die('--log needs the fight\'s file: a farever-combat-log (docs/COMBAT-LOG.md), or Wink\'s <id>.json.timeline');
+    }
+    if (args.flags.summary === true || args.flags.summary === '') die('--summary needs Wink\'s <id>.json, the summary saved beside its timeline');
+    if (args.flags.note === true) die('--note needs its text: --note "the bee buff was up the whole fight"');
+    if (args.flags.zip === '') die('--zip needs a file name, or nothing at all for the bundle\'s own');
+    if (args.flags.receipt === true || args.flags.receipt === '') die('--receipt needs the receipt a send wrote: --receipt <receipt.json>');
+    if (args.flags.import === true || args.flags.import === '') {
+      die('--import needs a file: a character sheet, a build the bench saved, or a modkit inventory dump');
+    }
+    if (args.flags.build === true || args.flags.build === '') die('--build needs a file: a build the bench saved (optimize --json, the UI\'s Save build)');
+    if (args.flags.import != null && args.flags.build != null) {
+      die('--import and --build are both the build the fight was fought in - give one of them (bench submit reads a saved build the same way either way)');
+    }
+    if (args.flags.log == null && args.flags.summary == null) {
+      die('bench submit needs the fight: --log <file> - a farever-combat-log (docs/COMBAT-LOG.md), gzipped or not, '
+        + 'or Wink\'s <id>.json.timeline, whose <id>.json beside it is read with it');
+    }
+
+    // --- a receipt to build again from, read first. It is given to
+    // buildSubmission whole (its `receipt`): its SHA-256 is what the rebuilt
+    // bundle is held to, its sentAt says whether its fight arrived and its
+    // link is where it may be sent - src/submit.mjs's rules, the UI's
+    // `again` too. One that did arrive, or names another upload link, is
+    // still built (--zip), and sendRefusal refuses to send it.
+    let again = null;
+    if (typeof args.flags.receipt === 'string') {
+      try {
+        again = parseReceipt(readFileSync(args.flags.receipt));
+      } catch (e) {
+        die(`--receipt ${args.flags.receipt}: ${e.message}`);
+      }
+    }
+
+    // --- the build the fight was fought in. A file (--import, or --build
+    // for a build the bench saved) goes as the file recorded it, which is
+    // what the maintainer is to read: sheet.json leaves open what the file
+    // left open (charsheet.mjs recordedSheet), and a pin typed beside it
+    // is refused in main(). Without one, the build typed by flags, given
+    // as a stated build - the input the UI's editor build goes as
+    // (typedBuild) - and `hints` names the flag for what src sends empty.
+    const sheetPath = typeof args.flags.import === 'string' ? args.flags.import : typeof args.flags.build === 'string' ? args.flags.build : null;
+    const sheetFlag = args.flags.build != null ? '--build' : '--import';
+    let engine;
+    let sheet;
+    let sheetOptions = null;
+    let typedSaid = [];
+    let typedHints = [];
+    if (sheetPath) {
+      const part = readSubmitPart(sheetPath, sheetFlag);
+      engine = createEngine(engineOptions(args));
+      sheet = { name: part.name, data: part.data };
+      // What was typed beside the file, and nothing more: a modkit dump with
+      // no --class takes the class its log gives it there, or is asked one
+      // (src/submit.mjs buildSubmission, the rule the UI's Send reads it by).
+      sheetOptions = {
+        cls: typeof args.flags.class === 'string' ? args.flags.class : null,
+        level: args.flags.level != null && args.flags.level !== true ? String(args.flags.level) : null,
+      };
+    } else {
+      if (typeof args.flags.class !== 'string') {
+        die('bench submit needs the build the fight was fought in: --import <character sheet> (bench import says what one holds) '
+          + 'or --build <a build the bench saved>, or the build as bench sheet takes it (--class <class> with --pin and the rest)');
+      }
+      const s = commonSetup(args);
+      engine = s.engine;
+      const loadout = loadBuild(args, s.engine, s.level, s.saved);
+      const pins = applyPins(s.engine, loadout, args, { stars: s.stars, rarityRoll: s.rarityRoll, saved: s.saved });
+      const typed = typedBuild(s.engine, loadout, pins, {
+        rank: args.flags.rank != null && args.flags.rank !== true ? s.rank : null,
+        typedLevel: args.flags.level != null && args.flags.level !== true,
+        typedStars: args.flags.stars != null && args.flags.stars !== true,
+      });
+      sheet = typed.build;
+      typedSaid = typed.said;
+      typedHints = typed.hints;
+    }
+
+    // --- the fight. Wink saves one as two files, and the timeline alone
+    // carries no start time: the summary beside it is read with it unless
+    // another is named.
+    const logIn = typeof args.flags.log === 'string' ? readSubmitPart(args.flags.log, '--log') : null;
+    const summaryPath = typeof args.flags.summary === 'string' ? args.flags.summary : null;
+    const beside = !summaryPath && logIn ? besideSummary(args.flags.log) : null;
+    const summaryIn = summaryPath ? readSubmitPart(summaryPath, '--summary') : (beside?.part ?? null);
+
+    const input = {
+      sheet,
+      sheetOptions,
+      log: logIn,
+      summary: summaryIn,
+      note: typeof args.flags.note === 'string' ? args.flags.note : null,
+      keepName: args.flags['keep-name'] === true,
+    };
+    // The bundle a receipt names, built again (its id, key, time, SHA-256,
+    // sentAt and link): the same zip or none - buildSubmission refuses
+    // another one under its id, which names one bundle.
+    let sub;
+    try {
+      sub = buildSubmission(engine, again ? { ...input, receipt: again } : input);
+    } catch (e) {
+      if (!(e instanceof SubmissionError)) throw e;
+      // A refusal of the receipt itself (src's `receipt` fact), named by its flag.
+      if (e.receipt === true) {
+        die(`--receipt ${args.flags.receipt}: ${e.message}\n  bench submit --delete ${args.flags.receipt} asks for the deletion of what it sent.`);
+      }
+      // That refusal, said with the flags that act on it. It is that one when
+      // the same files and flags pack as a new bundle: the receipt is then
+      // the only thing they do not match. (Nothing promises that the same
+      // files build the receipt's bundle again: after an update of the game
+      // or of the bench they make another one - src's sentence says both.)
+      let packs = false;
+      if (again?.zipSha256 && e.status === 400) {
+        try { buildSubmission(engine, input); packs = true; } catch { packs = false; }
+      }
+      if (packs) {
+        die(`--receipt ${args.flags.receipt}: ${e.message}\n`
+          + `  bench submit --delete ${args.flags.receipt} asks for the first one's deletion, and the same command without --receipt `
+          + 'packs these as a new submission.');
+      }
+      die(e.message);
+    }
+
+    // --- what the zip holds, and where it would go. The readers' own
+    // reports follow, and they name what the player's files named - the
+    // player's own screen, not the bundle - so a line says so above them.
+    console.log(f.header(engine, VERSION) + '\n');
+    if (!sheetPath) {
+      console.log(f.dim('The build goes as the flags typed it: a sheet of what they stated, and each Gap in its report below is a part '
+        + 'no flag stated - sent as not recorded, not as empty.'));
+    }
+    for (const line of typedSaid) console.log(f.warn(`note: ${line}`));
+    if (!sheetPath || typedSaid.length) console.log('');
+    if (beside) {
+      // Said from what was packed: a summary beside the timeline that the
+      // log reader did not take is not "read with it".
+      const packed = sub.files.some((x) => x.name === 'summary.json');
+      console.log(f.dim(packed
+        ? `--summary ${beside.path}: Wink's summary beside the timeline, read with it - it carries the fight's start time (--summary <file> names another).`
+        : beside.part
+          ? `${beside.path} is beside the timeline and was not taken as its summary - the Problem lines below say why; the log goes without it (--summary <file> names another).`
+          : `${beside.path} is beside the timeline and could not be read (${beside.why}) - the log goes without its summary (--summary <file> names one).`) + '\n');
+    }
+    if (again) {
+      console.log(f.dim(`--receipt ${args.flags.receipt}: built again as submission ${again.id}, made ${again.createdAt} - `
+        + (again.zipSha256
+          ? `the same zip, byte for byte, as the one the receipt was written for (SHA-256 ${sub.zipSha256}).`
+          : 'the receipt carries no SHA-256 of its bundle, so whether these are the same files is not checked: '
+            + 'other files would put a second, different bundle under this id in the project\'s folder.')) + '\n');
+    }
+    // --- where Send would go, read once. The upload link: one set that is
+    // none is said as what it is (uploadLink()'s sentence, which --send dies
+    // with below), never as "no upload link is set". And what src/submit.mjs
+    // sendRefusal refuses to send - a receipt whose fight arrived, a receipt
+    // written for another upload link than this copy's (or for one, when this
+    // copy has none), a sheet of one class with a log of another (unless the
+    // --class typed beside a file that names its own class names the same:
+    // buildSubmission decided that from sheetOptions) - the rule the UI's
+    // Send asks too. Said first in the report, as the UI's preview says it,
+    // in a dry run as well: its closing line must not offer --send for a
+    // bundle --send refuses.
+    let link = null;
+    let uploadProblem = null;
+    try {
+      link = uploadLink();
+    } catch (e) {
+      if (!(e instanceof SubmissionError)) throw e;
+      uploadProblem = e.message;
+    }
+    const refused = sendRefusal(sub, { front: 'cli', link });
+
+    // The report in the command line's words (--send, --zip), each line
+    // coloured by its kind; the readers' own reports open at the first heading.
+    // (After the module's own first two lines when the link set is none:
+    // its Problem line and the manual route "until that link is set right".)
+    const report = submitReportItems(sub, { front: 'cli', link, uploadProblem });
+    if (refused) {
+      report.splice(uploadProblem ? 2 : 0, 0, {
+        kind: 'refused', text: `Problem: ${/[.!?]$/.test(refused.message) ? refused.message : `${refused.message}.`}`, warn: true,
+      });
+    }
+    const ownFiles = report.findIndex((i) => i.kind === 'heading');
+    for (let i = 0; i < report.length; i++) {
+      if (i === ownFiles) {
+        console.log(f.dim('Below, what the bench read in your own files, for you to check. It is not sent as written: '
+          + 'the "Names" line above says which names the bundle carries.'));
+      }
+      console.log(warnedLine(report[i]) ? f.warn(report[i].text) : report[i].text);
+    }
+    // The flag that names what a Problem line above says the typed build
+    // sends empty, or does not send (typedBuild).
+    for (const hint of typedHints) console.log(f.dim(hint));
+    if (!sub.manifest.log.perEvent) {
+      const timeline = [args.flags.log, args.flags.summary].filter((p) => typeof p === 'string').map((p) => `${p}.timeline`).find(isFileAt);
+      if (timeline) console.log(f.dim(`Its timeline is beside it: --log ${timeline} sends every hit, with this summary.`));
+    }
+
+    // --- where it goes. Whatever would stop the run is asked before
+    // anything is written, so a refusal leaves the folder as it was: a --zip
+    // over a file it must not replace; and with --send, an upload link set
+    // and readable, what src/submit.mjs sendRefusal refuses to send (both
+    // read above), a receipt of another submission standing where this
+    // one's goes.
+    const zipPath = args.flags.zip == null ? null : args.flags.zip === true ? sub.zipName : args.flags.zip;
+    if (zipPath != null) {
+      const wrong = zipTargetProblem(zipPath, [
+        ['the fight\'s log (--log)', args.flags.log],
+        [beside ? 'the summary beside the timeline' : 'the summary (--summary)', summaryPath ?? beside?.path],
+        [`the build (${sheetFlag})`, sheetPath],
+        ['the receipt --receipt names', args.flags.receipt],
+      ]);
+      if (wrong) die(wrong);
+    }
+    let receiptPath = null;
+    let standing = null;
+    if (args.flags.send) {
+      if (uploadProblem) die(uploadProblem);
+      // What is not sent is src/submit.mjs sendRefusal's to say (read
+      // above). Refused here, before anything is written, and in
+      // sendSubmission's order: before whether there is a link at all. Said
+      // as it is: its remedy is in the command line's words.
+      if (refused) die(refused.message);
+      if (link) {
+        receiptPath = again ? args.flags.receipt : submitReceiptPath(sub, zipPath);
+        standing = receiptStanding(receiptPath, sub);
+      }
+    }
+
+    // --- saved
+    if (zipPath != null) {
+      try {
+        writeFileSync(zipPath, sub.zip);
+      } catch (e) {
+        die(`--zip ${zipPath}: ${e.message}`);
+      }
+      console.log(`\nSaved ${zipPath}: ${sub.zipBytes.toLocaleString('en-US')} bytes, SHA-256 ${sub.zipSha256}.`);
+      if (!args.flags.send) {
+        console.log(f.dim(`By hand, attach it to a new issue: ${sub.formUrl} - on that route every file in it, and the file's own name, is public.`));
+      }
+    }
+    if (!args.flags.send) {
+      // What --send would do with it, as the report above said it: sent,
+      // refused (sendRefusal), or off - for no link, or for one that is none.
+      // A bundle --receipt built again is that receipt's submission, under
+      // its id; any other run packs a new one.
+      if (zipPath == null) {
+        const id = again
+          ? `it is submission ${again.id.slice(0, 8)}, built again under the id --receipt ${args.flags.receipt} names `
+            + '(without --receipt, a run packs it anew, under a new id)'
+          : 'each run packs it anew, under a new id';
+        if (link) {
+          console.log(f.dim('\nNothing was saved or sent. --zip [<file>] saves this bundle; '
+            + `${refused ? '--send refuses it - the first Problem line above says why' : '--send sends it'}. ${id[0].toUpperCase()}${id.slice(1)}.`));
+        } else {
+          console.log(f.dim(`\nNothing was saved or sent. --zip [<file>] saves this bundle (${id}); `
+            + (uploadProblem
+              ? '--send is off until the upload link is set right (the first Problem line above says what is wrong with it) - the route '
+                + `meanwhile is --zip, then the GitHub form: ${sub.formUrl}`
+              : `--send is not available in this copy (no upload link is set) - the route is --zip, then the GitHub form: ${sub.formUrl}`)));
+        }
+      }
+      return;
+    }
+
+    // --- sent
+    if (!link) {
+      die(zipPath
+        ? `Send is off in this copy of the bench (no upload link is set) - ${zipPath} is saved: attach it to a new issue: ${sub.formUrl}`
+        : `Send is off in this copy of the bench (no upload link is set) - save the .zip (--zip <file>) and attach it to a new issue: ${sub.formUrl}`);
+    }
+    // THE RECEIPT FIRST. A send whose answer is lost - a timeout, a dropped
+    // connection - may still have put the fight in the project's folder, and
+    // the receipt is the player's one way to ask for its deletion: it is on
+    // disk before a byte leaves, and completed after. A receipt --receipt
+    // named stands already, and is only ever completed.
+    if (!standing) {
+      try {
+        mkdirSync(dirname(receiptPath), { recursive: true });
+        writeReceipt(receiptPath, pendingReceipt(sub, { link }));
+      } catch (e) {
+        if (e instanceof SubmissionError) die(e.message);
+        die(`The receipt could not be saved as ${receiptPath} (${e.message}) - nothing was sent: the deletion of a fight sent with no receipt `
+          + 'could not be asked for.');
+      }
+    }
+    console.log(`\nSending to the project's pCloud folder - the receipt ${receiptPath} is saved first.`);
+    let receipt;
+    try {
+      // (sendSubmission asks sendRefusal again, in the same words.)
+      receipt = await sendSubmission(sub, { link, benchVersion: VERSION, front: 'cli' });
+    } catch (e) {
+      if (!(e instanceof SubmissionError)) throw e;
+      // Refused by pCloud (src/submit.mjs: `arrived: false`, and no
+      // receipt): with nopartial=1 nothing of the zip was kept. A receipt
+      // this run saved would ask for nothing, and left standing it would
+      // refuse the next run's - it goes. One --receipt named is the first
+      // send's, and stays. Asked first: such a refusal carries no receipt,
+      // like the one below that never left.
+      if (e.arrived === false) {
+        const said = /nothing was (?:kept|sent)/.test(e.message) ? e.message : `${e.message} Nothing of this send was kept.`;
+        if (standing) {
+          die(`${said}\nThe receipt ${receiptPath} is kept: it still asks for the first send's deletion if that one arrived `
+            + `(bench submit --delete ${receiptPath}).`);
+        }
+        let removed = false;
+        try { unlinkSync(receiptPath); removed = true; } catch { /* said below */ }
+        die(said + (removed ? '\nThe receipt saved before sending is removed: no fight arrived under its id.'
+          : `\nThe receipt ${receiptPath} asks for nothing: no fight arrived under its id.`));
+      }
+      // Refused before the request left: there is nothing to ask for.
+      if (!e.receipt) {
+        if (!standing) {
+          try { unlinkSync(receiptPath); } catch { /* it would ask for nothing: no fight carries its id */ }
+        }
+        die(e.message);
+      }
+      die(`${e.message}\n`
+        + `The receipt is ${receiptPath}${standing ? '' : ' (saved before sending)'}: `
+        + (again ? 'the same command, as typed, sends the same bundle again' : `the same command with --receipt ${receiptPath} sends the same bundle again`)
+        + `, and bench submit --delete ${receiptPath} asks for the fight's deletion.`);
+    }
+    try {
+      writeReceipt(receiptPath, receipt);
+    } catch (e) {
+      console.error(f.warn(`The receipt could not be written as ${receiptPath} (${e.message}). Here it is - save it as a file, it is how this fight's `
+        + 'deletion is asked for:\n') + receiptText(receipt));
+    }
+    console.log(`Sent: submission ${receipt.id.slice(0, 8)} is in the project's pCloud folder as ${receipt.uploadedAs} `
+      + `(${sub.zipBytes.toLocaleString('en-US')} bytes, SHA-256 ${sub.zipSha256}). Only the maintainer can read it; nothing was made public.`);
+    console.log(`Receipt: ${receiptPath} - keep it. bench submit --delete ${receiptPath} asks for this fight's deletion; anyone holding the file can do that, `
+      + 'and nothing else with it.');
+  },
+
   // Hold the model against the record. Every other command reports what the
   // bench BELIEVES; this one reports where that belief disagrees with what the
   // game actually did, per skill, signed.
@@ -3234,7 +4676,9 @@ const commands = {
     // takes this from commonSetup; so does this one.
     const { engine, rank, mix, targetLevel, policy: authoredPolicy, fight: fightSetup } = commonSetup(args);
     const game = requireGame(args._);
-    const character = args.flags.character ?? args.flags.char;
+    // An imported sheet as the build, a combat log as the capture (verifySources).
+    const { imported, combatLog } = verifySources(args, game, engine);
+    const character = args.flags.character ?? args.flags.char ?? combatLog?.handle;
     if (typeof character !== 'string') {
       die('verify needs --character <Name> - the character the capture recorded.\n'
         + `Known in this install: ${listCharacters(game).join(', ') || '(none)'}`);
@@ -3365,6 +4809,9 @@ const commands = {
       since: args.flags.since ?? null, until: args.flags.until ?? null, windows: args.repeated?.window ?? [],
     });
     if (asked.error) die(asked.error);
+    // A combat log is one fight: its own span is the window (logSpanWindow).
+    const logSpan = logSpanWindow(combatLog, capturePath, asked, args);
+    if (logSpan) asked.windows = [logSpan];
     const isEquipment = (kind) => (engine.cat.itemById.get(kind)?.slots ?? []).some((x) => combatSlots.has(x));
     const differ = (a, b) => buildDiff(a, b, { relevant: isEquipment });
     const stamp = (ms) => (ms == null ? 'open' : `${new Date(ms).toISOString().replace('T', ' ').slice(0, 19)}Z (${ms})`);
@@ -3424,17 +4871,30 @@ const commands = {
         return evidence(c.s) > evidence(best.s) ? c : best;
       }).s
       : null);
+    // --- where the build comes from: an imported sheet, that snapshot, or the dump --
+    // One value from here on. `buildSnap` is the snapshot the build is read
+    // off: null for an import, whose sheet IS the build, and for the dump. An
+    // import takes no window from a snapshot either - unless --snapshot names
+    // one, whose span is then the window, as a given one.
+    const buildSnap = imported ? null : snap;
+    if (imported && args.flags.snapshot != null && snap && !asked.windows) asked.windows = [{ from: snap.ts, to: snap.until ?? null, snapshot: snap.index }];
+    // --- end of where the build comes from ---------------------------------------
     // Falling back is fine; falling back QUIETLY is not. A capture that holds
     // snapshots for this character which none of them can be used is a probe
     // problem, and the run must not read as though no snapshot was ever taken.
-    const snapNote = (!snap && snaps.snapshots.length)
+    const snapNote = (!buildSnap && !imported && snaps.snapshots.length)
       ? `${snaps.snapshots.length} snapshot(s) for ${character} are in the capture but carry no gear `
         + '- an older probe build. Falling back to the login dump; re-capture to use them.'
       : null;
 
     let built;
     let runeNote = null;
-    if (snap) {
+    if (imported) {
+      // The imported sheet, as the object the rest of this command reads
+      // off a dump or a snapshot. A typed --level re-levels it, as it does
+      // a --build file (loadBuild).
+      built = builtFromSheet(imported.imported, loadBuild(args, engine, wantLevel, imported));
+    } else if (snap) {
       // The snapshot has no runes, so the class still comes from the dump when
       // there is one - same character, and the class does not change.
       let unit = wantClass;
@@ -3502,8 +4962,21 @@ const commands = {
           + 'rune-gated rows may be phantom (FaithfulWinds was). Re-capture with probe v5+ for the slotted truth.';
       }
     } else {
-      built = toLoadout(engine.cat, readDump(game, character), { level: wantLevel, unit: wantClass });
+      // A combat log carries no build. A player without the modkit has no
+      // dump either, and the dump's own sentence never named the way out.
+      let dump;
+      try { dump = readDump(game, character); } catch (e) {
+        if (!combatLog) throw e;
+        die(`${e.message}\nA combat log carries no build: give the one it was fought in with --import <character sheet> `
+          + '(bench import <file> says what a sheet holds).');
+      }
+      built = toLoadout(engine.cat, dump, { level: wantLevel, unit: wantClass });
     }
+    // The character a combat log names, against the build (logCharacterNote), and what its reader said of it.
+    const logLevelNote = logCharacterNote(engine, combatLog, built, {
+      capturePath, wantClass, importPath: imported?.path ?? null, imported: imported?.imported ?? null,
+    });
+    const logSaid = logFindings(combatLog);
 
     // THE MECHANIC SLOTS (conduits, prayers), when nothing carried them. A
     // snapshot writes what they hold where the probe can read it; where it
@@ -3551,7 +5024,7 @@ const commands = {
           note: `${pool.label}: ${count(picks)} - named with --skills`,
         });
       }
-      if (snap) {
+      if (buildSnap) {
         const runes = new Set(Object.values(built.loadout.runes ?? {}).flat().filter(Boolean));
         for (const p of pools) {
           if (p.kind !== 'mechanic' || !p.repeats || built.loadout.skills[p.key]?.length) continue;
@@ -3607,12 +5080,12 @@ const commands = {
     let since = windows ? windows[0].from : null;
     let until = windows ? windows.reduce((m, w) => (w.to == null || m == null ? null : Math.max(m, w.to)), -Infinity) : null;
     if (until === -Infinity) until = null;
-    let window = windows ? { given: true, ranges: windows } : null;
+    let window = windows ? { given: true, ranges: windows, ...(logSpan ? { fromLog: true } : {}) } : null;
     // A snapshot IS the window: the build it describes stands from the moment it
     // was written until the next one. That is a far better boundary than "the
     // last few sessions", which was only ever a guess at when the gear last
     // changed.
-    if (!windows && snap) {
+    if (!windows && buildSnap) {
       since = snap.ts;
       until = snap.until;
       window = {
@@ -3685,6 +5158,10 @@ const commands = {
           + `${inWindow0.groups.length > 6 ? `, and ${inWindow0.groups.length - 6} more` : ''}.`);
       }
       const whole = await aggregate(capturePath, { source: character, groupBy: 'target' });
+      if (!whole.matched && combatLog) {
+        die(`${character} has no damage row in ${capturePath}. The log writes its own character as "${combatLog.handle}", `
+          + 'and --character names whose rows are read; bench import <file> prints what the log holds.');
+      }
       if (!whole.matched) {
         die(`${character} has no recorded damage in ${capturePath}.\n`
           + 'Either the probe never saw this character, or the name is wrong'
@@ -3705,6 +5182,8 @@ const commands = {
       from: cap.firstTs ?? (asked.windows ? null : since),
       to: cap.lastTs ?? (asked.windows ? null : until ?? since),
       boot: bootFacts(game),
+      // A combat log names its build by the hlboot.dat hash its header carries.
+      bootSha: engine.meta.bootSha,
     });
     // PRICE AGAINST WHAT WAS HIT. `--target Dummy` filtered the capture to
     // dummy hits and then priced the model against the default reference foe
@@ -3748,10 +5227,14 @@ const commands = {
         overread: through(veteran.armor) / through(heroic.armor) - 1,
       };
     })();
+    // The difficulty a combat log names prices the model, where it can (logPricing).
+    const fromLog = logPricing(engine, combatLog, { rawTarget, wantTarget, wantArchetype, priceAs: wantPriceAs });
     const priced = modelTarget({
-      filter: wantTarget, priceAs: wantPriceAs, unit: wantArchetype, era,
+      filter: wantTarget, priceAs: fromLog.priceAs ?? wantPriceAs, unit: wantArchetype, era,
       logged: cap.targetLevels, heroLevel: built.level, difficulty,
     });
+    // The log decided the difficulty, not a typed --price-as: said as that.
+    if (fromLog.priceAs) priced.note = fromLog.note;
     const verifyTarget = priced.name
       ? engine.combat.foe(priced.name, built.level, targetLevel ?? priced.level)
       : undefined;
@@ -3779,12 +5262,15 @@ const commands = {
     // and a basic-attack block was priced against a fight that pressed every
     // cooldown the build owns - Battle Shout's crit chance and Berserk's
     // damage on swings that had neither.
-    const nothingPressed = !pressed.size && era.sessions.length > 0 && cap.matched > 0;
+    // (A combat log says on its session row whether it writes presses at all:
+    // presses=0 is a log that never could, and its empty set says nothing.)
+    const nothingPressed = !pressed.size && era.sessions.some((s) => s.presses !== 0) && cap.matched > 0;
     let policy = null;
     let fightLen = null;
     let chainFeeds = null;
     let divergence = null;
     let replayOpens = null;
+    let replayOpensFrom = null;
     // --replay: hold the model to the capture's own PRESS SEQUENCE, not just
     // its press SET. The sim's chooser is replaced by the recorded timeline -
     // each press fires at its recorded offset if the model agrees it is
@@ -3819,12 +5305,18 @@ const commands = {
       // cast), which is where the model's fight starts moving too
       // (verify.mjs replaySchedule, `opens`).
       let opensTs = null;
+      // (A combat log with no skill start opens at a press or a swing: logOpeningWatch.)
+      let watch = null;
+      if (combatLog) { try { watch = logOpeningWatch(character, new Set((engine.plan.resolve(built.loadout, rank).filler ?? []).map((x) => x.prof.id))); } catch { watch = null; } }
       await streamCapture(capturePath, (r) => {
         if (!inWindow(r.ts)) return;
         if (opensTs === null && r.event === 'go_state' && r.target === character && parseExtra(r.extra).state === 'Skill') opensTs = r.ts;
+        watch?.see(r);
         if (r.source !== character || r.event !== 'press') return;
         presses.push({ t: (r.ts - since) / 1000, id: r.skill });
       });
+      replayOpensFrom = opensTs !== null ? 'state' : watch?.ts != null ? watch.from : null;
+      if (opensTs === null && watch?.ts != null) opensTs = watch.ts;
       // The schedule itself - the cut at a two-minute silence, the fight's
       // length, the policy and what it counts - is verify.mjs replaySchedule.
       const schedule = replaySchedule(presses, {
@@ -3923,6 +5415,8 @@ const commands = {
         }
       }
     }
+    // Where a combat log leaves the fight to the model: no press recorded, no gauge carried (logPlayNotes).
+    const logPlay = logPlayNotes(engine, combatLog, built, { rank, poolStart, replay: !!args.flags.replay });
     const ev = engine.evaluate(built.loadout, { rank, mix, target: verifyTarget, policy: authoredPolicy ?? policy, fight: fightLen, chainFeeds, holdChain: holdChain || nothingToPlay, poolStart });
     // Both clocks, for the RATE: the model's fight as it was played, and the
     // capture's time in play over the rows read.
@@ -3966,7 +5460,7 @@ const commands = {
           lastPress: state.lastPress ? { skill: state.lastPress.skill, name: nameOf(state.lastPress.skill), ts: state.lastPress.ts } : null,
           standing: state.standing.map((e) => ({
             status: e.status, name: nameOf(e.status), on: e.self ? 'self' : 'target', wearer: e.wearer,
-            since: e.since, lastAt: e.lastAt, stacks: e.stacks, expires: e.expires,
+            since: e.since, lastAt: e.lastAt, stacks: e.stacks, expires: e.expires, ...(e.initial ? { initial: true } : {}),
           })),
         };
         // Each carried-in line, with what the log holds behind it: the line
@@ -3980,13 +5474,13 @@ const commands = {
           const own = state.standing.find((e) => e.status === skill);
           const gate = own ? null : riders.filter((g) => String(g.prof?.id ?? '').split('#')[0] === skill && g.rule?.whileStatus)
             .map((g) => state.standing.find((e) => e.status === g.rule.whileStatus)).find(Boolean) ?? null;
-          r.carriedBy = own ? { standing: skill, since: own.since }
+          r.carriedBy = own ? { standing: skill, since: own.since, ...(own.initial ? { initial: true } : {}) }
             : gate ? { whileStanding: gate.status, since: gate.since }
               : state.pressed[skill] != null ? { pressed: skill, ts: state.pressed[skill] } : null;
         }
         const what = rowsIn.map((r) => {
           const by = r.carriedBy;
-          return nameOf(r.skill ?? r.id) + (by?.standing ? ` (standing, applied ${ago(by.since)} before it)`
+          return nameOf(r.skill ?? r.id) + (by?.standing ? (by.initial ? ' (standing when the log opens, its initial[])' : ` (standing, applied ${ago(by.since)} before it)`)
             : by?.whileStanding ? ` (plays while ${nameOf(by.whileStanding)} stands)`
               : by?.pressed ? ` (pressed ${ago(by.ts)} before it)`
                 // Nothing in the log behind it: carried in by elimination -
@@ -4077,7 +5571,7 @@ const commands = {
     // build. `chosen.mixed` is every other snapshot that stands somewhere in
     // a GIVEN window and differs; on the default path the window is the
     // chosen snapshot's own span and nothing else can stand in it.
-    const snapFacts = snap ? {
+    const snapFacts = buildSnap ? {
       index: snap.index ?? null, of: snaps.snapshots.length, ts: snap.ts, until: snap.until ?? null,
       how: chosen.how ?? 'most evidence', note: chosen.note ?? null,
       // The build standing when the window opens, when that is not the one
@@ -4088,7 +5582,7 @@ const commands = {
         return at && at !== snap ? { index: at.index, ts: at.ts, differs: differ(snap, at) } : null;
       })(),
     } : null;
-    const mixed = chosen.mixed ?? [];
+    const mixed = buildSnap ? (chosen.mixed ?? []) : [];
     const mixedNote = mixed.length
       ? 'THIS WINDOW MIXES BUILDS. It is priced with snapshot #' + snap.index + '; inside it the character also stood as:\n'
         + mixed.map((m) => `  #${m.index}, ${m.until != null && m.ts <= (windows[0].from ?? -Infinity) ? 'until' : 'from'} `
@@ -4154,7 +5648,7 @@ const commands = {
     // which neighbours are the same build, what they hold, and how to read
     // them together.
     let sameBuild = [];
-    if (snap && window?.fromSnapshot) {
+    if (buildSnap && window?.fromSnapshot) {
       const all = snaps.snapshots;
       const at = all.indexOf(snap);
       for (let i = at + 1; i < all.length && differ(snap, all[i]).length === 0; i++) sameBuild.push(all[i]);
@@ -4173,6 +5667,30 @@ const commands = {
       console.log(JSON.stringify({
         character, unit: built.unit, level: built.level,
         capture: capturePath, since, until, windows, window, gaps: built.gaps,
+        // Where the build came from: 'import' (--import, with its file and
+        // the shape it was read as), the capture's 'snapshot' or the modkit
+        // 'dump'.
+        build: imported ? { from: 'import', file: imported.path, format: imported.imported.format } : { from: snap ? 'snapshot' : 'dump' },
+        // A combat log as the capture: its dialect, the name its character
+        // is written under, the difficulty its header names (null: none) and
+        // what the ledger made of that.
+        combatLog: combatLog ? {
+          dialect: combatLog.dialect, handle: combatLog.handle, difficulty: combatLog.stats.encounter.difficulty,
+          note: fromLog.note, pricedByLog: fromLog.priceAs != null,
+          // The log's own level for its character, when the build's is another.
+          levelNote: logLevelNote,
+          // What its reader said of it (logFindings): the problems it named
+          // (rows skipped or read against no target, a recorder's gap ...)
+          // and the notes the ledger stands on (an estimated start, what a
+          // Wink file cannot hold, hits with no affinity or target level).
+          problems: logSaid.problems, notes: logSaid.notes,
+          // Whether it records its character's presses (false: the model
+          // played its own rotation), whether its header or dialect said so,
+          // the pools it carries a value of ('rage', 'spark'), and the line
+          // for a gauge it does not carry (the model's fight opened full).
+          presses: combatLog.stats.presses, pressesDeclared: combatLog.stats.pressesDeclared, pools: combatLog.stats.pools,
+          gaugeNote: logPlay.gauge,
+        } : null,
         // The window's stretches of play, and whether they were played alike
         // (`mixed`: some press and some do not, or a buff was pressed in
         // fewer than half of those that press - PER-HIT then mixes states).
@@ -4220,7 +5738,9 @@ const commands = {
         // `opens`: the second the recorded sitting's first skill state opened,
         // until which the replayed fight stands still (null: the log does not
         // say, and it moves from its first second).
-        replay: divergence ? { ...divergence, fight: fightLen, opens: replayOpens } : null,
+        // `opensFrom`: what said so - 'state' (a skill start), or, in a combat
+        // log that writes none, its first 'press' or base-attack 'hit'.
+        replay: divergence ? { ...divergence, fight: fightLen, opens: replayOpens, opensFrom: replayOpensFrom } : null,
         // The gauge pool at the opening of a given window, where the log says.
         poolStart,
         // Which build the window was recorded on: true, false, or null when
@@ -4260,11 +5780,16 @@ const commands = {
 
     console.log(f.header(engine, VERSION) + '\n');
     console.log(f.bold(`${character} - ${built.unit} ${built.level}`) + f.dim(
-      `  ${built.placed.length} slots from ${snap ? 'the capture\'s own snapshot' : 'the modkit dump'}`));
+      `  ${built.placed.length} slots from ${imported ? `the imported sheet ${imported.path}` : snap ? 'the capture\'s own snapshot' : 'the modkit dump'}`));
     const eraNote = eraWarning(era);
     if (eraNote) console.log(f.warn(eraNote));
     else console.log(f.dim(`capture: ${era.reason}`));
     if (priced.note && (!priced.difficulty || undecidedNote)) console.log(f.warn(priced.note));
+    // What the log said about the difficulty, when it did not price it.
+    if (fromLog.note && !fromLog.priceAs) console.log(f.dim(fromLog.note));
+    if (logLevelNote) console.log(f.warn(logLevelNote));
+    for (const p of logSaid?.problems ?? []) console.log(f.warn(`log: ${p}`));
+    for (const n of logSaid?.notes ?? []) console.log(f.dim(`log: ${n}`));
     console.log(f.dim(`target: capture rows on ${wantInstance ?? wantArchetype ?? 'every target'}`
       + (followInstance ? `, held to the instance being fought${cap.instances.length ? ` (${cap.instances.slice(0, 4).join(', ')}${cap.instances.length > 4 ? ', ...' : ''})` : ''}` : '')
       + `; model priced against ${pricedLabel ?? '(none)'}`));
@@ -4287,7 +5812,9 @@ const commands = {
     for (const pf of poolFacts) console.log(pf.how === 'default' ? f.warn(pf.note) : f.dim(pf.note));
     if (divergence) {
       console.log(f.dim(`replay: ${divergence.replayed}/${divergence.total} presses replayed over ${(fightLen ?? 0).toFixed(1).replace(/\.0$/, '')}s`
-        + (replayOpens > 0 ? `, opening ${replayOpens.toFixed(2)}s in where the log's first skill state does` : '')
+        + (replayOpens > 0 ? `, opening ${replayOpens.toFixed(2)}s in ${replayOpensFrom === 'press' ? `at ${character}'s first press (the log writes no skill start)`
+          : replayOpensFrom === 'hit' ? `at ${character}'s first base-attack hit (the log writes no skill start or press before it; the swing began a windup earlier)`
+            : 'where the log\'s first skill state does'}` : '')
         + (divergence.beyond ? ` (${divergence.beyond} more were pressed after the fight's end)` : '')
         + (divergence.cut && divergence.cut.kept + divergence.cut.voided > 0
           ? `, ${divergence.cut.kept + divergence.cut.voided} swing${divergence.cut.kept + divergence.cut.voided === 1 ? '' : 's'} cut short by a press that interrupts - ${divergence.cut.voided} before the hit (nothing landed), ${divergence.cut.kept} after it` : '')
@@ -4298,7 +5825,9 @@ const commands = {
     if (mixedNote) console.log(f.warn(mixedNote));
     if (window?.given) {
       for (const w of window.ranges) console.log(f.dim(`window: ${stamp(w.from)} .. ${stamp(w.to)}`
-        + (w.from != null && w.to != null ? `, ${((w.to - w.from) / 1000).toFixed(1)}s` : '') + ' (given)'));
+        + (w.from != null && w.to != null ? `, ${((w.to - w.from) / 1000).toFixed(1)}s` : '')
+        + (window.fromLog ? ' - the combat log\'s own span, first row to last (--since / --until or --window take a part of it)'
+          : w.snapshot != null ? ` - the span of snapshot #${w.snapshot} (--snapshot), priced with the imported sheet` : ' (given)')));
     }
     if (snapFacts && (window?.given || chosen.how === 'asked')) {
       console.log(f.dim(`build: snapshot #${snapFacts.index} of ${snapFacts.of}, written ${stamp(snapFacts.ts)} - `
@@ -4320,8 +5849,10 @@ const commands = {
     } else if (nothingPressed) {
       console.log(f.dim('presses: none in this window, in a log that writes them - the model plays the base-attack chain alone'));
     }
+    if (logPlay.presses) console.log(f.warn(logPlay.presses));
     if (carriedNote) console.log(f.warn(carriedNote));
     if (poolNote) console.log(f.dim(poolNote));
+    if (logPlay.gauge) console.log(f.warn(logPlay.gauge));
     if (holdChain) {
       const names = [...new Set(heldDown.map((b) => b.name))];
       console.log(f.dim('chain: no base attack in this window - the model stands still between presses, and every timed status of the\n'
@@ -4618,7 +6149,7 @@ f.dim('SKILL'.padEnd(38) + 'STATUS'.padEnd(9) + 'MODEL'.padStart(8) + 'LIVE'.pad
       }
     }
     if (built.gaps.length) {
-      console.log('\n' + f.warn('the dump cannot see:'));
+      console.log('\n' + f.warn(imported ? `${imported.path} does not record:` : 'the dump cannot see:'));
       for (const g of built.gaps) console.log(f.warn(`  - ${g}`));
       console.log(f.dim('  Damage from any of these arrives as MISSING and is not evidence\n'
         + '  that a formula is wrong.'));
@@ -4675,10 +6206,20 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
                    inside each row; --row <sheet>:<id> prints one row's
                    changes in full, a skill's script among them
   bench audit      every assumption and gap in the model
+  bench import     what a character sheet or a combat log says, as the bench
+                   reads it: kept, dropped and why (--check for an
+                   exporter's tests). Every command that builds takes a
+                   sheet as its build with --import <file>
+  bench submit     one fight for the project: the build it was fought in
+                   and its combat log, names removed, as one zip. Prints
+                   what it holds and where it would go, and sends nothing
+                   without --send (docs/SUBMITTING.md)
   bench verify     hold the model against a recorded capture and print the
                    per-skill difference, signed. Needs --character <Name>,
                    whose gear comes from the modkit's own inventory dump and
-                   whose damage comes from the HLX probe's log. Defaults to
+                   whose damage comes from the HLX probe's log - or from a
+                   character sheet (--import) and a combat log (--capture),
+                   which names its own character. Defaults to
                    the span of the capture's richest snapshot of that
                    character (else its last 3 play sessions, --sessions n),
                    optionally one target archetype (--target). --json emits
@@ -4778,13 +6319,28 @@ const USAGE = `farever-bench ${VERSION} - a gear bench for Farever
                    ledger opens by saying so when it matters, and
                    --price-as <unit>@heroic or @veteran settles it. \`heroic\`
                    speaks for every heroic boss and cannot filter a capture.
+                   --capture also reads a combat log another program wrote
+                   (docs/COMBAT-LOG.md): a farever-combat-log, or a Wink DPS
+                   Meter <id>.json.timeline with its <id>.json beside it.
+                   Its whole span is the window unless one is given, its
+                   own character is the default --character, and a header
+                   that names the difficulty (Veteran, Heroic) prices the
+                   model on it unless --price-as, or a mode on --target
+                   (Ratsar@heroic), says otherwise. A log whose header
+                   names another class than the build's is refused. A Wink
+                   summary alone holds totals and no row, and is refused.
+                   --import <sheet> builds the character from a character
+                   sheet instead of a snapshot or the dump (bench import
+                   says what the file holds); no snapshot is chosen then,
+                   unless --snapshot names one to take the window from.
 
 The UI in your browser
   The same sheet the packaged desktop app shows, out of this process. It costs
   no Chromium download and needs no code signature to get past SmartScreen, and
   it is how a Linux or macOS player gets the UI at all - the packaged build is
-  a Windows binary. Everything is read from your own copy of the game, nothing
-  is sent anywhere, and the server listens on this machine only unless you say
+  a Windows binary. Everything is read from your own copy of the game; nothing
+  is sent anywhere unless you send a fight to the project yourself, with the
+  Send button, and the server listens on this machine only unless you say
   otherwise.
 
   bench ui --open
@@ -4989,6 +6545,21 @@ Common flags
   --build <file.json>     start from a saved build - either a bare loadout or
                           the envelope --json writes, whose recorded goal,
                           target, level, fight and pins become the defaults
+  --import <file>         start from a build another program wrote down: a
+                          character sheet (docs/CHARACTER-SHEET.md), a modkit
+                          inventory dump (with --class, or beside a combat
+                          log of its character - verify --capture, submit
+                          --log - in the class the log names), a bare
+                          loadout or a saved envelope - every shape bench
+                          import reads. What it recorded is held, empty
+                          included; what it left out is searched and named;
+                          a typed --pin, --skills, --rune or --talent wins
+                          for what it names; its weapon-skill rank is the
+                          default --rank.
+                          What was read and dropped is printed first. Not
+                          with --build or a questlog link, nor on a command
+                          that builds nothing (classes, slots, targets,
+                          talents, profiles, rarity, audit, ui, update)
   --json <file.json>      write the result as JSON, and read it back with
                           --build to reproduce the run exactly
   --game <path>           the Farever install, if it cannot be found
@@ -5029,9 +6600,104 @@ A questlog.gg build, as pins
   on skills the build has no slot for, and the class-skill bar, which questlog
   does not store at all. That last one is why an imported build is not quite
   fully pinned: the bench still searches which class skills are on the bar.
-  This is the ONLY thing in the tool that touches the network.
+  This, and sending a fight to the project, or asking for its deletion, when
+  you do it yourself (bench submit --send or --delete, or the UI's Send and
+  Delete), are the only things in the tool that touch the network.
   To see the translation without running it:
     node tools/questlog-import.mjs <link>
+
+Importing a character sheet
+  A character sheet is the build a real character wears, written down by
+  whatever could read it - an in-game mod, the bench's own save, the modkit's
+  login dump (docs/CHARACTER-SHEET.md is the format for an exporter's author).
+  Every command that builds takes one as its build with --import <file>.
+
+  bench import <file>     what the file says, as the bench reads it: the
+                          character, what was kept, what was dropped and why,
+                          what was left open. It reads a combat log too
+                          (docs/COMBAT-LOG.md) and says what it holds. It
+                          runs nothing.
+  --check                 exit 1 when anything was dropped, not understood or
+                          listed unreadable (a sheet), or when the log reader
+                          names a problem - for an exporter's own tests
+  --json <out>            the same as data: for a sheet, {kind, sourceFormat,
+                          sheet, report} - under "sheet" the version-1 sheet
+                          of what it recorded, as the bench read it (what it
+                          left out is left out; a piece's stars, rarity and
+                          flags are written as priced), which --import and
+                          bench import read back; for a log, its dialect,
+                          figures and sentences (a bare --json prints it
+                          instead)
+  --class, --level        for a file that does not carry them (a modkit dump)
+
+Sending a fight to the project
+  The bench gets closer to the game each time its numbers are held against a
+  real fight. bench submit packs one - the build it was fought in and its
+  log, every other player's name removed and yours made "Submitter", as one
+  zip whose files have fixed names - and prints what it holds and where it
+  would go. Nothing leaves this machine without --send (or --delete, which
+  asks for the deletion of a fight you sent). docs/SUBMITTING.md says what is
+  sent, where it goes, and how its deletion is asked for.
+
+  bench submit --log fight.jsonl --import sheet.json
+  bench submit --log <id>.json.timeline --class Rogue --pin weapon1=<item>
+  bench submit --log fight.jsonl --import sheet.json --zip fight.zip --send
+
+  --log <file>            the fight: a farever-combat-log (docs/COMBAT-LOG.md),
+                          gzipped or not, or Wink's <id>.json.timeline - its
+                          <id>.json beside it is read with it, and said
+  --summary <file>        Wink's summary for that timeline, named by hand
+                          (given with no --log, it is sent as totals only)
+  --import <file>         the build, as a sheet recorded it (any shape bench
+                          import reads; --class and --level for a file that
+                          does not carry them); --build <file> reads a build
+                          the bench saved the same way. Without either, the
+                          build typed by flags (--class, --level, --pin,
+                          --no-augment, --skills, --rune, --talent, --stars,
+                          --rank, or --questlog <slug>) is sent as typed:
+                          what no flag stated is sent as not recorded, and
+                          named. Nothing else the build commands take is read
+                          here
+  --note <text>           a note for the maintainer, 2000 characters at most
+                          (private with --send, public on the manual route)
+  --keep-name             keep your character's name where your files had it
+  --zip [<file>]          save the bundle; with no name, as farever-bench-
+                          submission-<first 8 of its id>.zip, which names
+                          nothing of yours. Never written over a file it was
+                          built from, a receipt, or anything but a bundle.
+                          Attached to a new issue by hand, every file in it
+                          is public
+  --send                  upload it to the project's folder on pCloud, where
+                          only the maintainer can read it; nothing is made
+                          public. Its receipt is written BEFORE it is
+                          sent - beside the zip (<name>.receipt.json), or
+                          with no --zip in the folder the UI keeps its
+                          receipts in (.cache/submit-receipts), never the
+                          current folder - so the deletion of a fight whose
+                          answer is lost can still be asked for. Refused
+                          while no upload link is set (naming the GitHub
+                          form to use instead), and when the sheet and the
+                          log name different classes (beside a file, a
+                          --class naming the sheet's own class sends it)
+  --receipt <file>        build the bundle again as the one that receipt names
+                          (its id, key and time), held to the SHA-256 the
+                          receipt carries: anything but that zip is refused -
+                          other files, note or flags, or the same ones after
+                          an update of the game or of the bench. Sent
+                          again after a lost answer, it is the same bundle
+                          under the same id: if the first did arrive, the
+                          maintainer drops the duplicate. A receipt whose
+                          fight arrived, or one written for another upload
+                          link, is not sent (--zip still saves it)
+  --delete <receipt>      ask for a sent fight's deletion: a small request
+                          goes to the project's pCloud folder, and the
+                          maintainer deletes the fight and the request when
+                          they next read it. Asked only through this copy's
+                          own upload link; a receipt of another is refused,
+                          unless FAREVER_BENCH_UPLOAD_LINK names that one
+
+  FAREVER_BENCH_UPLOAD_LINK, when set, is the upload link sending goes
+  through instead of the project's own; none or off switches sending off.
 
 Skill selection
   --skills weapon1=Skill1,Passive      slot two of the three a weapon offers
@@ -5044,7 +6710,11 @@ Example
 `;
 
 // --- a questlog.gg link, as pins -------------------------------------------
-// The one place the bench reaches the network. A link is turned into the same
+// One of the two places the bench reaches the network; the other is
+// src/submit.mjs, which sends a fight to the project only on `bench submit
+// --send` or the UI's Send button, and asks for one's deletion only on `bench
+// submit --delete` or the UI's Delete (test/run.mjs "network call sites"
+// holds the tree to exactly those). A link is turned into the same
 // --pin/--skills/--talent/--rune flags a person would have typed, and pushed
 // in FRONT of the ones they did type - so anything named on the command line
 // overrides what the link said rather than fighting it.
@@ -5056,9 +6726,19 @@ async function getJson(url) {
   return r.json();
 }
 
+// The commands whose second argument is their own: `bench import <file>`
+// reads that file, and `bench submit` takes its files by flag. A link is not
+// looked for there, and nothing there is refused as stray.
+const OWN_ARGUMENTS = new Set(['import', 'submit']);
+
 async function applyQuestlog(args) {
   const flagged = typeof args.flags.questlog === 'string' ? args.flags.questlog : null;
-  const positional = args._.slice(1);
+  // `bench import` reads a file and builds nothing: a link would be fetched
+  // for a command that never looks at it.
+  if (args._[0] === 'import' && (flagged || args.flags['questlog-build'] != null)) {
+    die('bench import reads a file and does not build from a questlog link - give the link to the command that runs the build');
+  }
+  const positional = OWN_ARGUMENTS.has(args._[0]) ? [] : args._.slice(1);
   const link = flagged ?? positional.find((a) => QUESTLOG_LINK.test(a)) ?? null;
   // A second positional has never meant anything, so anything else there is a
   // mistake worth naming rather than ignoring.
@@ -5068,6 +6748,11 @@ async function applyQuestlog(args) {
       '  the only thing a second argument can be is a questlog.gg build link');
   }
   if (!link) return;
+  // Two builds to start from, and nothing to say which one: the link would be
+  // pushed in front as typed pins and merged with the imported file's.
+  if (args.flags.import != null) {
+    die('--import and a questlog link are both the build a command starts from - give one of them');
+  }
 
   const slug = slugOf(link);
   const character = await getJson(endpoints(slug).character);
@@ -5105,6 +6790,17 @@ async function applyQuestlog(args) {
 // to build from a dump or a snapshot adds itself here.
 const READS_CHARACTER = new Set(['verify']);
 
+// The commands that build nothing from a build source, and so refuse
+// --import: they list the data (classes, slots, targets, talents, profiles,
+// rarity, audit), serve the UI, or read the game for a patch. A command that
+// learns to read a build (loadBuild) leaves this list.
+const NO_BUILD = new Set(['classes', 'slots', 'targets', 'talents', 'profiles', 'rarity', 'audit', 'ui', 'update']);
+
+// The flags `bench submit` reads and no other command does. Anywhere else
+// they would be stored and never looked at - `bench verify --log <fight>`
+// pricing the live capture instead of the fight named - so they are refused.
+const SUBMIT_ONLY = ['log', 'summary', 'note', 'keep-name', 'zip', 'send', 'receipt', 'delete'];
+
 async function main(argv) {
   const args = parseArgs(argv);
   const cmd = args._[0];
@@ -5120,6 +6816,27 @@ async function main(argv) {
   if ((args.flags.character ?? args.flags.char) != null && !READS_CHARACTER.has(cmd)) {
     die(`--character is read by \`bench verify\` only. \`bench ${cmd}\` would ignore it: `
       + 'a build is given with --class and --pin, or a questlog link.');
+  }
+  // --import is a build to start from, and these commands start from none.
+  // Read anyway, the file was validated and its whole report printed above a
+  // listing that never looked at it (`bench talents --import <a Rogue>`
+  // printed the Rogue's report, then every class's tree from the Warrior's).
+  if (args.flags.import != null && NO_BUILD.has(cmd)) {
+    die(`--import is a build to start from, and \`bench ${cmd}\` builds nothing from one`
+      + (cmd === 'ui' ? ' - the Import button in the UI reads the same files.'
+        : ['talents', 'profiles', 'targets', 'rarity'].includes(cmd) ? ' - --class and --level say what it is asked about.' : '.'));
+  }
+  const submitFlags = cmd === 'submit' ? [] : SUBMIT_ONLY.filter((flag) => args.flags[flag] != null);
+  if (submitFlags.length) {
+    die(`--${submitFlags[0]} is read by \`bench submit\` only, and \`bench ${cmd}\` would ignore it`
+      + (cmd === 'verify' && submitFlags[0] === 'log' ? ' - bench verify reads a combat log with --capture <file>.'
+        : cmd === 'import' && submitFlags[0] === 'summary' ? ' - bench import reads a Wink timeline with the summary beside it.' : '.'));
+  }
+  // ...and the other way round: what `bench submit` would not read is
+  // refused there, before a questlog link is fetched.
+  if (cmd === 'submit') {
+    const unread = submitUnread(args);
+    if (unread) die(unread);
   }
   try {
     await applyQuestlog(args);

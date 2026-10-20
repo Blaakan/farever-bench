@@ -405,6 +405,7 @@ const showBuildNotice = () => {
     await import('./components/runes.js');
     await import('./components/picker.js');
     await import('./components/optimize.js');
+    await import('./components/exchange.js');
 
     App.render();
     App.refreshSheet();

@@ -8,8 +8,10 @@
 //   node bin/capture.mjs skills --source NAME  per-skill hits/rate/bands/crit
 //   node bin/capture.mjs sessions --source NAME
 //
-// Options: --file <csv> (defaults to <game>/hlx/logs/bench-probe.csv),
-//          --target <archetype>, --event <name>, --top <n>, --json
+// Options: --file <csv> (defaults to <game>/hlx/logs/bench-probe.csv; a
+//          combat log another program wrote is read too - capture.mjs
+//          combatLogOf, docs/COMBAT-LOG.md), --target <archetype>,
+//          --event <name>, --top <n>, --json
 //
 // Read-only, streaming. The reference capture is 400 MB and every command here
 // reads all of it - roughly ten seconds - because sampling the head of the file
@@ -97,7 +99,24 @@ if (cmd === 'info') {
   console.log(`${file}`);
   console.log(`${r.rows.toLocaleString()} rows over ${n(out.spanHours, 1)}h, ${sources.size.toLocaleString()} distinct sources`);
   // Which build the rows describe is the first thing to know about a log.
-  if (r.sessionRows.length) {
+  if (r.sessionRows.length && r.sessionRows[r.sessionRows.length - 1].build != null) {
+    // A combat log another program wrote (src/combatlog.mjs) opens with one
+    // synthetic session row naming the build its header carries - a boot
+    // hash, a Steam build or a game version - and no boot on this machine.
+    // A log that names no build cannot be placed on one by anybody, so the
+    // line says that instead of sending the reader to verify to ask.
+    const last = r.sessionRows[r.sessionRows.length - 1];
+    const named = last.build !== 'unknown';
+    // (A Wink timeline's header carries no build: what it names is the game
+    // version of the summary beside it.)
+    const wink = last.probe === 'wink-timeline';
+    console.log(`a ${last.probe ?? 'combat log'} file, `
+      + (named ? (wink ? `whose Wink summary names the game version ${last.build}` : `naming its build as ${last.build}`)
+        : wink ? 'naming no build (a Wink timeline carries none, and no summary beside it names a game version)'
+          : 'naming no build (no bootSha256, steamBuild or game version in its header)')
+      + `${last.presses === 0 ? ', with no press or skill use of its character' : ''}`
+      + (named ? '; `bench verify` says whether that is the installed one' : ', so no reader can place it on a build'));
+  } else if (r.sessionRows.length) {
     const last = r.sessionRows[r.sessionRows.length - 1];
     const boots = new Set(r.sessionRows.map((s) => `${s.bootBytes}/${s.bootMtimeMs}`));
     console.log(`${r.sessionRows.length} boot(s) recorded (${last.probe ?? 'probe ?'}), against ${boots.size} hlboot.dat - `

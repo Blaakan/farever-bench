@@ -1,0 +1,28 @@
+name: Send a fight (manual route)
+description: Attach the .zip that farever-bench saved. Files attached here become public.
+title: "Data submission: "
+labels: ["data-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is the manual way to send a fight to the project: the bench's **Save .zip** wrote one file, and it goes in the box below.
+
+        **Everything you attach here is public.** GitHub publishes an attachment on a public issue for anyone to download. The **Send** button in the bench (`bench submit --send`, or "Send a fight" in the app) keeps the files private instead: only the maintainer can read them, and nothing is made public. Use this form when Send is not available or you prefer it.
+
+        The bench already removed other players' names from the zip, and your character's name unless you chose to keep it. Do not add anything to the zip by hand, and do not paste logs or names into the notes.
+  - type: textarea
+    id: bundle
+    attributes:
+      label: Drag the .zip the bench saved here
+      description: One .zip, as the bench wrote it (at most 25 MB). Drop it into this box or click the box to pick it.
+      placeholder: Drop the .zip here.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (optional)
+      description: Anything the fight itself does not show - for example a buff you know was missing. This text is public too.
+    validations:
+      required: false

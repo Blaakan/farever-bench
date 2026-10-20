@@ -24,3 +24,11 @@ bench-layouts-*/
 # Release artifacts: both are rebuilt by tools/release.mjs and the workflow.
 farever-bench-v*.zip
 FareverBench-v*.exe
+
+# What `bench submit --zip` saves in the current folder: the private bundle of
+# a player's fight (farever-bench-submission-<id>.zip) and, with --send, its
+# receipt beside it (<name>.receipt.json), which asks for that fight's
+# deletion for whoever holds it - keep it out of repos. Neither is ever
+# committed; a receipt sent with no --zip goes to .cache/submit-receipts.
+farever-bench-submission-*
+*.receipt.json
