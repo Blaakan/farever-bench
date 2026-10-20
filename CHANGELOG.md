@@ -6,7 +6,7 @@ Every release of farever-bench, newest first:
 `ui/package.json` always carry the same version - `tools/release.mjs` moves
 them together and refuses to run when they disagree.
 
-## [Unreleased]
+## [0.6.0] - 2026-10-20
 
 Real characters and real fights, from outside the bench: a character sheet
 format any exporter can write and every build command reads; a combat log
